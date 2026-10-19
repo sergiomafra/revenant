@@ -61,7 +61,8 @@ Synthetic JPEGs and disk images for tests come from the `revenant-testkit` works
 
 `formats::IsoBmff` recognizes a `ftyp` box (declared size 8..=4096) at a sector start and measures the file by walking the
 top-level boxes (`ftyp moov mdat free skip wide uuid meta pdin moof mfra styp sidx udta`) from their declared sizes. Size 1
-means a 64-bit `largesize`; size 0 (only for `mdat`) runs to the end of the source. The walk stops at an unaccepted type, a
+means a 64-bit `largesize`; size 0 (only for `mdat`, e.g. a recording cut by a dead battery) runs to the first sector where
+another file starts, or to the end of the source. The walk stops at an unaccepted type, a
 size under 8, or the end of the source; a box that runs past the end counts only up to it. The major brand `qt  ` gives
 `FileKind::Mov`, anything else `Mp4`. Every size is checked against the source length; only `moov` is loaded into memory, and
 only up to `MOOV_MAX_LEN` (16 MiB).
@@ -69,13 +70,15 @@ only up to `MOOV_MAX_LEN` (16 MiB).
 Walk boundaries: `ftyp` is accepted only as the first box. Once both `moov` and `mdat` are seen, only trailing
 `free skip wide uuid meta udta mfra` boxes continue the file (plus `moof sidx styp mdat` when it is fragmented); anything else
 ends it, and a trailing box that overruns the source is left out. The walk also stops at a box that starts on a 512-byte sector
-that another format recognizes (checked at box starts, not inside boxes). A size-0 `mdat` measures to the end of the source.
-Chunk offsets are relative to the start of the file (its `ftyp`), not to the source.
+where a recognized file starts. Inside `mdat`, every 512-byte sector start (absolute offset) is checked as well: where a
+recognized file of any format starts, the video ends there. An `mdat` whose declared size is cut this way counts as a box
+declared larger than what exists (below). Chunk offsets are relative to the start of the file (its `ftyp`), not to the source.
 
 - No `mdat`: not a video (`None`).
 - No `moov`: `Damaged` (the media data is there but not the index; rebuilding it is a later product milestone).
 - `moov` larger than 16 MiB: `Damaged`.
-- A box declared larger than the source (cut mid-`mdat`, or mid-`moov`): `Partial`.
+- A box declared larger than what exists (cut mid-`mdat` or mid-`moov` by the end of the source, or an `mdat` cut by another
+  file written over it): `Partial`.
 - Garbled index: if the box walk inside `moov`, `trak`, `mdia`, `minf` or `stbl` ends on an invalid size (or leftover bytes)
   instead of consuming its parent exactly (fewer than 8 trailing zero bytes, a QuickTime terminator, are tolerated), or a non-fragmented file has no `trak` with both `stco`/`co64` and `stsz`:
   `Damaged`.
@@ -95,21 +98,24 @@ Unreadable sectors:
 `scan(source, formats, &ScanOptions, &CancelToken, &mut on_event) -> Result<ScanSummary, EngineError>` walks a source in blocks
 (`ScanOptions::block`, default 4 MiB, rounded down to whole sectors) and looks at the first 16 bytes of every sector
 (`ScanOptions::sector`, default 512, at least 16). The first format that recognizes a head and measures a file there wins. The
-scan keeps reading every block, but examines no head until the first sector at or after the file's end. `measure` reads the
-source directly, so files may cross block boundaries.
+scan keeps reading every block. After an `Intact` finding it examines no head until the first sector at or after the file's
+end; after a `Partial` or `Damaged` finding it keeps examining heads, so files inside a broken one are still reported (one bad
+file never hides the rest of the disk; a damaged file may then overlap another finding). `measure` reads the source directly,
+so files may cross block boundaries.
 
 Events:
 
-- `Found(Finding)`: sequential `id` from 1. It is emitted once the scan has read past the file's end, so unreadable sectors
-  inside the file are known: they are reported as `Unreadable` events before the `Found`, and an `Intact` finding that
-  contains any of them is downgraded to `Partial`.
+- `Found(Finding)`: sequential `id` from 1, in start order. It is emitted once the scan has read past the file's end, so
+  unreadable sectors inside the file are known: they are reported as `Unreadable` events before the `Found`, and an `Intact`
+  finding that contains any of them is downgraded to `Partial`. A file found inside a `Partial`/`Damaged` one is emitted right
+  after it.
 - `Progress { read, total }`: once per block, plus one for an empty source; the last has `read == total`.
 - `Unreadable { start, len }`: when a block cannot be read it is re-read sector by sector; each run of consecutive failed
   sectors (also across blocks) is one event and counts in `ScanSummary::unreadable_bytes`. A run is split where a finding
   ends. The scan then continues.
 
 `CancelToken::cancel()` (from any thread or from inside the callback) makes the scan return `EngineError::Cancelled` at the
-next block boundary; a finding still pending at that point is dropped.
+next block boundary; findings still pending at that point are dropped.
 
 ## Extract
 

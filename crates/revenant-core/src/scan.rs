@@ -1,5 +1,6 @@
 //! The scan: walks a source sector by sector, lets each format recognize and measure files, and reports events.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -103,14 +104,16 @@ fn read_block(
 
 /// Scans `source`, calling `on_event` for each finding, progress step and unreadable region.
 ///
-/// The first format that recognizes a sector start and measures a file there wins. The scan still reads every block, but
-/// examines no head until the first sector at or after the file's end. A finding is emitted once the scan has read past
-/// its end, so that unreadable sectors inside it are known: they are reported as `Unreadable` events (before the
-/// `Found`), and an `Intact` finding containing any of them is downgraded to `Partial`. `measure` reads the source
-/// directly, so files may cross block boundaries.
+/// The first format that recognizes a sector start and measures a file there wins. The scan reads every block. After an
+/// `Intact` finding it examines no head until the first sector at or after the file's end; after a `Partial` or `Damaged`
+/// one it keeps examining heads, so files inside it are still found (one broken file must not hide others). A finding is
+/// emitted once the scan has read past its end, so that unreadable sectors inside it are known: they are reported as
+/// `Unreadable` events (before the `Found`), and an `Intact` finding containing any of them is downgraded to `Partial`.
+/// Findings are emitted in the order they were found (by start), so one found inside another is emitted right after it.
+/// `measure` reads the source directly, so files may cross block boundaries.
 ///
 /// `opts.sector` is raised to at least 16 (the head length) and `opts.block` rounded down to whole sectors, so a head
-/// never straddles two blocks. On cancellation the scan returns `Err(Cancelled)` and a finding still pending is dropped.
+/// never straddles two blocks. On cancellation the scan returns `Err(Cancelled)` and findings still pending are dropped.
 pub fn scan(
     source: &dyn Source,
     formats: &[Box<dyn Format>],
@@ -123,7 +126,8 @@ pub fn scan(
     let total = source.len();
     let mut summary = ScanSummary::default();
     let mut run: Option<(u64, u64)> = None; // open unreadable run (start, len)
-    let mut pending: Option<Finding> = None;
+    // Found but not yet emitted, in start order, each with its end rounded up to a whole sector.
+    let mut pending: VecDeque<(Finding, u64)> = VecDeque::new();
     let mut skip_until = 0u64; // no heads are examined before this offset
     let mut next_id = 1;
     let mut pos = 0u64;
@@ -146,11 +150,12 @@ pub fn scan(
         let block_end = pos + want as u64;
         let mut at = pos;
         while at < block_end {
-            if at >= skip_until
-                && let Some(f) = pending.take()
+            while let Some((_, end)) = pending.front()
+                && at >= *end
             {
                 // Everything inside the finding has been read: report its unreadable run first.
                 flush(&mut run, &mut summary, on_event);
+                let (f, _) = pending.pop_front().expect("front exists");
                 summary.found += 1;
                 on_event(Event::Found(f));
             }
@@ -164,10 +169,10 @@ pub fn scan(
                         run = Some((at, sector_end - at));
                     }
                 }
-                if let Some(f) = &mut pending
-                    && f.health == Health::Intact
-                {
-                    f.health = Health::Partial;
+                for (f, end) in &mut pending {
+                    if at < *end && f.health == Health::Intact {
+                        f.health = Health::Partial;
+                    }
                 }
                 at = sector_end;
                 continue;
@@ -188,15 +193,19 @@ pub fn scan(
             });
             match found {
                 Some(m) if m.len > 0 => {
-                    pending = Some(Finding {
+                    let end = at.saturating_add(m.len).div_ceil(sector) * sector;
+                    if m.health == Health::Intact {
+                        skip_until = end;
+                    }
+                    let finding = Finding {
                         id: next_id,
                         start: at,
                         len: m.len,
                         kind: m.kind,
                         health: m.health,
-                    });
+                    };
+                    pending.push_back((finding, end));
                     next_id += 1;
-                    skip_until = at.saturating_add(m.len).div_ceil(sector) * sector;
                 }
                 _ => {}
             }
@@ -209,7 +218,7 @@ pub fn scan(
         }
     }
     flush(&mut run, &mut summary, on_event);
-    if let Some(f) = pending {
+    for (f, _) in pending {
         summary.found += 1;
         on_event(Event::Found(f));
     }

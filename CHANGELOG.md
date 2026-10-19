@@ -14,4 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   intact/partial/damaged; recovers them to another folder.
 - Unreadable sectors no longer hide files: a photo or video next to or containing a bad sector is still found, and is
   never labelled intact if it contains one.
+- A broken video no longer hides the files after it: a video whose size was never written (battery died mid-recording) or
+  whose data was partly overwritten ends where the next photo or video starts, and files inside a partial or damaged file
+  are still found.
 - `revenant-dev`: developer command line (`scan <image> [--extract <dir>]`) that prints findings as JSON lines.

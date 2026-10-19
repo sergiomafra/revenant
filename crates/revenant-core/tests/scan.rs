@@ -472,3 +472,177 @@ fn bad_sector_in_mdat_is_partial() {
     let m = IsoBmff.measure(&source, start).unwrap();
     assert_eq!((m.len, m.health), (video.len() as u64, Health::Partial));
 }
+
+fn findings(events: &[Event]) -> Vec<(u64, u64, FileKind, Health)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Found(f) => Some((f.start, f.len, f.kind, f.health)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn scan_image(img: &DiskImage) -> Vec<Event> {
+    let file = img.save();
+    let (r, events) = run(
+        &FileSource::open(file.path()).unwrap(),
+        &ScanOptions::default(),
+    );
+    r.unwrap();
+    events
+}
+
+#[test]
+fn size_zero_mdat_ends_at_the_next_file() {
+    // Camera battery died mid-recording: ftyp, then an mdat whose size was never written (0), no moov.
+    let mut video = testkit::mp4(&mp4_opts(false))[..20].to_vec();
+    video.extend_from_slice(&[0, 0, 0, 0]);
+    video.extend_from_slice(b"mdat");
+    let a = testkit::jpeg(64, 64, 31, 2000);
+    let b = testkit::jpeg(64, 64, 32, 2000);
+    let mut img = DiskImage::noise(16 * MIB, 33);
+    img.put(MIB, &video).put(3 * MIB, &a).put(9 * MIB, &b);
+    let events = scan_image(&img);
+    assert_eq!(
+        findings(&events),
+        vec![
+            (MIB as u64, 2 * MIB as u64, FileKind::Mp4, Health::Damaged),
+            (
+                3 * MIB as u64,
+                a.len() as u64,
+                FileKind::Jpeg,
+                Health::Intact
+            ),
+            (
+                9 * MIB as u64,
+                b.len() as u64,
+                FileKind::Jpeg,
+                Health::Intact
+            ),
+        ]
+    );
+}
+
+#[test]
+fn mdat_declared_larger_than_what_survives_ends_at_the_next_file() {
+    let mut video = testkit::mp4(&Mp4Options {
+        moov_at_end: false,
+        ..mp4_opts(false)
+    });
+    let mdat = video.windows(4).position(|w| w == b"mdat").unwrap() - 4;
+    video[mdat..mdat + 4].copy_from_slice(&(8 * MIB as u32).to_be_bytes());
+    let a = testkit::jpeg(64, 64, 34, 2000);
+    let b = testkit::jpeg(64, 64, 35, 2000);
+    let mut img = DiskImage::noise(16 * MIB, 36);
+    img.put(MIB, &video).put(3 * MIB, &a).put(5 * MIB, &b);
+    let events = scan_image(&img);
+    assert_eq!(
+        findings(&events),
+        vec![
+            (MIB as u64, 2 * MIB as u64, FileKind::Mp4, Health::Partial),
+            (
+                3 * MIB as u64,
+                a.len() as u64,
+                FileKind::Jpeg,
+                Health::Intact
+            ),
+            (
+                5 * MIB as u64,
+                b.len() as u64,
+                FileKind::Jpeg,
+                Health::Intact
+            ),
+        ]
+    );
+}
+
+#[test]
+fn photo_written_over_a_video_mdat_is_found() {
+    let video = testkit::mp4(&Mp4Options {
+        mdat_len: MIB,
+        moov_at_end: false,
+        mov: false,
+        mdat_64bit: false,
+    });
+    let photo = testkit::jpeg(64, 64, 37, 2000);
+    let photo_at = MIB + 1000 * 512;
+    let mut img = DiskImage::noise(4 * MIB, 38);
+    img.put(MIB, &video).put(photo_at, &photo);
+    let events = scan_image(&img);
+    assert_eq!(
+        findings(&events),
+        vec![
+            (MIB as u64, 1000 * 512, FileKind::Mp4, Health::Partial),
+            (
+                photo_at as u64,
+                photo.len() as u64,
+                FileKind::Jpeg,
+                Health::Intact
+            ),
+        ]
+    );
+}
+
+#[test]
+fn jpeg_like_bytes_off_sector_inside_mdat_do_not_split_a_video() {
+    let mut video = testkit::mp4(&Mp4Options {
+        moov_at_end: false,
+        ..mp4_opts(false)
+    });
+    let photo = testkit::jpeg(8, 8, 39, 0);
+    let start = MIB;
+    // Inside the mdat payload, one byte after a sector start.
+    let at = 200 * 512 + 1;
+    video[at..at + photo.len()].copy_from_slice(&photo);
+    let mut img = DiskImage::noise(2 * MIB, 40);
+    img.put(start, &video);
+    let events = scan_image(&img);
+    assert_eq!(
+        findings(&events),
+        vec![(
+            start as u64,
+            video.len() as u64,
+            FileKind::Mp4,
+            Health::Intact
+        )]
+    );
+}
+
+#[test]
+fn nested_file_inside_a_damaged_finding_is_reported() {
+    let mut outer = testkit::jpeg(256, 256, 7, 200_000);
+    let nested = testkit::jpeg(8, 8, 9, 0);
+    let nested_at = 512 * 20; // inside the APP1 padding, on a sector start
+    outer[nested_at..nested_at + nested.len()].copy_from_slice(&nested);
+    // Corrupt the entropy-coded data (stray DHT markers) so no decoder accepts the outer file.
+    let mid = outer.len() - 2000;
+    for pair in outer[mid..mid + 64].chunks_exact_mut(2) {
+        pair.copy_from_slice(&[0xFF, 0xC4]);
+    }
+    let start = MIB / 2;
+    let mut img = DiskImage::noise(2 * MIB, 5);
+    img.put(start, &outer);
+    let events = scan_image(&img);
+    let got = findings(&events);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!((got[0].0, got[0].1), (start as u64, outer.len() as u64));
+    assert_ne!(got[0].3, Health::Intact);
+    assert_eq!(
+        got[1],
+        (
+            (start + nested_at) as u64,
+            nested.len() as u64,
+            FileKind::Jpeg,
+            Health::Intact
+        )
+    );
+    let ids: Vec<u64> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Found(f) => Some(f.id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
+}

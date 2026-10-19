@@ -10,10 +10,14 @@
 //!   or `first chunk offset + total sample size` past the measured end (a lower bound on where the track's data ends)
 //!   -> `Partial`; else `Intact`.
 //!
-//! Chunk offsets are relative to the start of the file (the `ftyp`), not to the source. A size-0 `mdat` runs to the end of
-//! the source. The walk accepts `ftyp` only as the first box; once `moov` and `mdat` are both seen it continues only
-//! through trailing `free skip wide uuid meta udta mfra` (and `moof sidx styp mdat` for fragmented files), never counts a
-//! trailing box that overruns the source, and stops at a box-aligned 512-byte sector that another format recognizes.
+//! Chunk offsets are relative to the start of the file (the `ftyp`), not to the source. The walk accepts `ftyp` only as the
+//! first box; once `moov` and `mdat` are both seen it continues only through trailing `free skip wide uuid meta udta mfra`
+//! (and `moof sidx styp mdat` for fragmented files), never counts a trailing box that overruns the source, and stops at a
+//! box-aligned 512-byte sector where a recognized file starts.
+//!
+//! Inside `mdat` every 512-byte sector start is checked too: where a recognized file (of any format) starts, the video ends.
+//! A declared `mdat` size cut this way counts as a box larger than what exists (`Partial`, or `Damaged` without `moov`); a
+//! size-0 `mdat` runs to the first such sector, or to the end of the source.
 //!
 //! Only the first `moov` is parsed, and only if it is at most [`MOOV_MAX_LEN`] (larger -> `Damaged`).
 //!
@@ -83,6 +87,19 @@ fn parse_header(b: &[u8]) -> Option<BoxHeader> {
         }),
         _ => None,
     }
+}
+
+/// First 512-byte sector start strictly inside `(box_start, box_end)` where any format recognizes a file.
+fn next_file_inside(
+    r: &mut Reader,
+    formats: &[Box<dyn Format>],
+    box_start: u64,
+    box_end: u64,
+) -> Option<u64> {
+    (box_start / SECTOR + 1..)
+        .map(|i| i * SECTOR)
+        .take_while(|&s| s < box_end)
+        .find(|&s| r.file_starts_at(formats, s))
 }
 
 /// Children `(type, payload)` of a box payload, bounded by the payload itself. Sets `garbled` if the walk ends on an
@@ -236,7 +253,17 @@ impl Format for IsoBmff {
                 }
                 truncated = true;
             }
-            let size = size.min(available);
+            let mut size = size.min(available);
+            let mut cut = false;
+            if &h.kind == b"mdat"
+                && let Some(next) = next_file_inside(&mut r, &formats, pos, pos + size)
+            {
+                // Another file was written over the rest of this mdat (or a size-0 mdat ends where the next file
+                // begins): the video ends there. A declared size the data no longer reaches is a cut.
+                size = next - pos;
+                cut = true;
+                truncated |= h.size.is_some();
+            }
             match &h.kind {
                 b"ftyp" if size >= 12 => {
                     let mut brand = [0u8; 4];
@@ -253,7 +280,7 @@ impl Format for IsoBmff {
                 _ => {}
             }
             pos += size;
-            if truncated {
+            if truncated || cut {
                 break;
             }
         }
