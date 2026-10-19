@@ -2,8 +2,9 @@
 //!
 //! [`walk`] follows the IFD chain, SubIFDs, Exif, GPS and Interop IFDs of a TIFF whose header sits at some absolute
 //! position, collecting the extent, the EXIF fields the app shows, and the ranges of embedded JPEGs and raw data. It
-//! parses hostile on-disk data: every offset is checked against a limit, IFDs are visited once, and every loop and
-//! allocation driven by an on-disk number is capped.
+//! parses hostile on-disk data: every offset is checked against a limit, IFDs are visited once, a tag counts once per
+//! IFD, every value block is read with a single read, and every loop and allocation driven by an on-disk number is
+//! capped (per tag and per walk).
 
 use std::collections::HashSet;
 
@@ -16,12 +17,18 @@ pub(crate) const TIFF_MAX_LEN: u64 = 1 << 30;
 const MAX_IFDS: usize = 64;
 /// Entries read per IFD.
 const MAX_ENTRIES: u16 = 1024;
-/// Strip/tile offsets read per tag.
-const MAX_STRIPS: u64 = 4096;
+/// Strip/tile offsets or byte counts read per tag.
+const MAX_STRIPS: u64 = 65_536;
+/// Strip/tile values read per walk, over all tags and IFDs; also caps `data.len() + jpegs.len()`.
+const STRIP_BUDGET: u64 = 262_144;
 /// SubIFD pointers followed per tag.
 const MAX_SUBIFDS: u64 = 16;
 /// Bytes read of a string tag.
 const MAX_STRING: u64 = 256;
+/// Compression 6/7 ranges whose JPEG kind is looked up per walk (each lookup is a few random reads).
+const MAX_CLASSIFIED: usize = 64;
+/// Marker segments inspected looking for the SOF of a JPEG.
+const MAX_SEGMENTS: usize = 16;
 
 #[allow(dead_code)] // used by Task 3/5
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,34 +42,47 @@ pub(crate) enum Endian {
 pub(crate) struct TiffInfo {
     /// Furthest byte referenced, relative to the TIFF header.
     pub end: u64,
-    /// A structural error was hit (cycle, offset past the limit, bad type or count, too many IFDs or entries).
+    /// A structural error was hit: cycle, offset or value range past the limit, unknown type, truncated value block,
+    /// or a tag repeated within one IFD (the repeat is ignored).
     pub garbled: bool,
+    /// A size cap was hit (too many IFDs, entries, SubIFDs, strips, per-walk strip budget, a string longer than 256
+    /// bytes without NUL): the walk is incomplete but not malformed.
+    pub truncated: bool,
     /// DNGVersion (0xC612) present.
     pub dng: bool,
+    /// First value seen wins for the six fields below.
     pub make: Option<String>,
     pub model: Option<String>,
     pub lens: Option<String>,
     pub serial: Option<String>,
     pub iso: Option<u32>,
-    /// Raw EXIF strings, trimmed of NULs and spaces; ASCII only, else `None`.
+    /// Raw EXIF string, trimmed of NULs and spaces; ASCII only, else `None`.
     pub date_original: Option<String>,
     /// Largest ImageWidth/ImageLength seen.
     pub width: Option<u32>,
     pub height: Option<u32>,
-    /// `(offset, len)` relative to the header: JPEGInterchangeFormat ranges and strips/tiles of Compression 6/7 that
-    /// start with FF D8.
+    /// `(offset, len)` relative to the header: JPEGInterchangeFormat ranges, and strips/tiles of Compression 6/7 that
+    /// start with FF D8 and whose first SOF is SOF0, SOF1 or SOF2 (baseline, extended, progressive). Lossless JPEG
+    /// (SOF3, as in CR2 raw slices and lossless DNG) lands in `data`, as does a JPEG whose SOF is not found in the first
+    /// 16 marker segments.
     pub jpegs: Vec<(u64, u64)>,
     /// Other strip/tile ranges (raw data).
     pub data: Vec<(u64, u64)>,
+    /// IFD entries processed (test observation of the entry cap).
+    #[cfg(test)]
+    pub entries_seen: usize,
+    /// IFDs visited (test observation of the IFD cap).
+    #[cfg(test)]
+    pub ifds_seen: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// IFD0, its chain and SubIFDs: image data and size tags count.
     Image,
-    /// Exif and Interop IFDs: descriptive tags count.
+    /// Exif and Interop IFDs: descriptive tags count; their next pointer is not followed.
     Exif,
-    /// GPS: only the extent counts.
+    /// GPS: only the extent counts; its next pointer is not followed.
     Gps,
 }
 
@@ -82,6 +102,10 @@ struct Walker<'a, 'b> {
     limit: u64,
     endian: Endian,
     info: TiffInfo,
+    /// Strip/tile values still allowed in this walk.
+    budget: u64,
+    /// Ranges whose JPEG kind has been looked up.
+    classified: usize,
 }
 
 /// What one IFD says about its image data, resolved once the whole IFD has been read.
@@ -126,6 +150,8 @@ pub(crate) fn walk(r: &mut Reader, base: u64, limit: u64) -> Option<TiffInfo> {
             end: 8,
             ..TiffInfo::default()
         },
+        budget: STRIP_BUDGET,
+        classified: 0,
     };
     let first = w.u32_of([head[4], head[5], head[6], head[7]]);
     w.run(u64::from(first));
@@ -179,15 +205,20 @@ impl Walker<'_, '_> {
         let mut visited: HashSet<u64> = HashSet::new();
         let mut pending: Vec<(u64, Kind)> = vec![(first, Kind::Image)];
         while let Some((off, kind)) = pending.pop() {
-            if visited.len() >= MAX_IFDS {
-                self.info.garbled = true;
-                break;
-            }
-            if !visited.insert(off) {
+            if visited.contains(&off) {
                 self.info.garbled = true; // cycle
                 continue;
             }
+            if visited.len() >= MAX_IFDS {
+                self.info.truncated = true;
+                break;
+            }
+            visited.insert(off);
             self.ifd(off, kind, &mut pending);
+        }
+        #[cfg(test)]
+        {
+            self.info.ifds_seen = visited.len();
         }
     }
 
@@ -202,39 +233,57 @@ impl Walker<'_, '_> {
         };
         let n = declared.min(MAX_ENTRIES);
         if declared > MAX_ENTRIES {
-            self.info.garbled = true;
+            self.info.truncated = true;
         }
         let table = 2 + 12 * u64::from(n);
         if !self.claim(off, table) {
             return;
         }
         let mut tags = ImageTags::default();
-        // Pushed in reverse of the order we want to visit them.
+        let mut seen: HashSet<u16> = HashSet::new();
+        // Collected in visiting order.
         let mut found: Vec<(u64, Kind)> = Vec::new();
         for i in 0..u64::from(n) {
-            self.entry(off + 2 + 12 * i, kind, &mut tags, &mut found);
+            self.entry(off + 2 + 12 * i, kind, &mut seen, &mut tags, &mut found);
         }
         self.finish_image(&tags);
-        if declared <= MAX_ENTRIES
-            && self.claim(off + table, 4)
+        if self.claim(off + table, 4)
+            && declared <= MAX_ENTRIES
+            && kind == Kind::Image
             && let Some(next) = self.read_u32(off + table)
             && next != 0
         {
             found.push((u64::from(next), Kind::Image));
         }
+        // `pending` is a stack: push in reverse so the first found is visited first.
         found.reverse();
         pending.extend(found);
     }
 
-    fn entry(&mut self, at: u64, kind: Kind, tags: &mut ImageTags, found: &mut Vec<(u64, Kind)>) {
-        let (Some(tag), Some(typ), Some(count)) = (
-            self.read_u16(at),
-            self.read_u16(at + 2),
-            self.read_u32(at + 4),
-        ) else {
+    fn entry(
+        &mut self,
+        at: u64,
+        kind: Kind,
+        seen: &mut HashSet<u16>,
+        tags: &mut ImageTags,
+        found: &mut Vec<(u64, Kind)>,
+    ) {
+        #[cfg(test)]
+        {
+            self.info.entries_seen += 1;
+        }
+        let mut raw = [0u8; 8];
+        if self.r.read(self.abs(at), &mut raw) < 8 {
             self.info.garbled = true;
             return;
-        };
+        }
+        let tag = self.u16_of([raw[0], raw[1]]);
+        let typ = self.u16_of([raw[2], raw[3]]);
+        let count = self.u32_of([raw[4], raw[5], raw[6], raw[7]]);
+        if !seen.insert(tag) {
+            self.info.garbled = true; // only the first occurrence counts
+            return;
+        }
         let Some(size) = type_size(typ) else {
             self.info.garbled = true;
             return;
@@ -256,8 +305,9 @@ impl Walker<'_, '_> {
             return;
         }
         let count = u64::from(count);
+        let image = kind == Kind::Image;
         match tag {
-            0x0100 | 0x0101 if kind == Kind::Image => {
+            0x0100 | 0x0101 if image => {
                 if let Some(v) = self.uint(typ, value_at) {
                     let slot = if tag == 0x0100 {
                         &mut self.info.width
@@ -267,26 +317,22 @@ impl Walker<'_, '_> {
                     *slot = (*slot).max(Some(v));
                 }
             }
-            0x0103 if kind == Kind::Image => tags.compression = self.uint(typ, value_at),
-            0x0111 if kind == Kind::Image => tags.strip_offsets = self.uints(typ, value_at, count),
-            0x0117 if kind == Kind::Image => tags.strip_counts = self.uints(typ, value_at, count),
-            0x0144 if kind == Kind::Image => tags.tile_offsets = self.uints(typ, value_at, count),
-            0x0145 if kind == Kind::Image => tags.tile_counts = self.uints(typ, value_at, count),
-            0x0201 if kind == Kind::Image => {
-                tags.jpeg_offset = self.uint(typ, value_at).map(u64::from)
-            }
-            0x0202 if kind == Kind::Image => {
-                tags.jpeg_len = self.uint(typ, value_at).map(u64::from)
-            }
-            0x014A if kind == Kind::Image && matches!(typ, 4 | 13) => {
+            0x0103 if image => tags.compression = self.uint(typ, value_at),
+            0x0111 if image => tags.strip_offsets = self.uints(typ, value_at, count),
+            0x0117 if image => tags.strip_counts = self.uints(typ, value_at, count),
+            0x0144 if image => tags.tile_offsets = self.uints(typ, value_at, count),
+            0x0145 if image => tags.tile_counts = self.uints(typ, value_at, count),
+            0x0201 if image => tags.jpeg_offset = self.uint(typ, value_at).map(u64::from),
+            0x0202 if image => tags.jpeg_len = self.uint(typ, value_at).map(u64::from),
+            0x014A if image && matches!(typ, 4 | 13) => {
                 let n = count.min(MAX_SUBIFDS);
                 if count > MAX_SUBIFDS {
-                    self.info.garbled = true;
+                    self.info.truncated = true;
                 }
-                for i in 0..n {
-                    if let Some(o) = self.read_u32(value_at + 4 * i) {
-                        found.push((u64::from(o), Kind::Image));
-                    }
+                let mut buf = vec![0u8; 4 * n as usize];
+                let got = self.r.read(self.abs(value_at), &mut buf);
+                for &c in buf[..got].as_chunks::<4>().0 {
+                    found.push((u64::from(self.u32_of(c)), Kind::Image));
                 }
             }
             0x8769 | 0xA005 if matches!(typ, 4 | 13) => {
@@ -300,14 +346,30 @@ impl Walker<'_, '_> {
                 }
             }
             0xC612 => self.info.dng = true,
-            0x010F if kind == Kind::Image => self.info.make = self.string(typ, value_at, total),
-            0x0110 if kind == Kind::Image => self.info.model = self.string(typ, value_at, total),
-            0x9003 if kind == Kind::Exif => {
-                self.info.date_original = self.string(typ, value_at, total)
+            0x010F if image => {
+                let v = self.string(typ, value_at, total);
+                self.info.make = self.info.make.take().or(v);
             }
-            0xA434 if kind == Kind::Exif => self.info.lens = self.string(typ, value_at, total),
-            0xA431 if kind == Kind::Exif => self.info.serial = self.string(typ, value_at, total),
-            0x8827 if kind == Kind::Exif => self.info.iso = self.uint(typ, value_at),
+            0x0110 if image => {
+                let v = self.string(typ, value_at, total);
+                self.info.model = self.info.model.take().or(v);
+            }
+            0x9003 if !image => {
+                let v = self.string(typ, value_at, total);
+                self.info.date_original = self.info.date_original.take().or(v);
+            }
+            0xA434 if !image => {
+                let v = self.string(typ, value_at, total);
+                self.info.lens = self.info.lens.take().or(v);
+            }
+            0xA431 if !image => {
+                let v = self.string(typ, value_at, total);
+                self.info.serial = self.info.serial.take().or(v);
+            }
+            0x8827 if !image => {
+                let v = self.uint(typ, value_at);
+                self.info.iso = self.info.iso.or(v);
+            }
             _ => {}
         }
     }
@@ -321,31 +383,36 @@ impl Walker<'_, '_> {
         }
     }
 
-    /// Up to [`MAX_STRIPS`] SHORT/LONG values; flags `garbled` when truncated or of another type.
+    /// SHORT/LONG values read with one read, up to [`MAX_STRIPS`] and what is left of the walk's budget.
     fn uints(&mut self, typ: u16, at: u64, count: u64) -> Vec<u64> {
-        let Some(size) = (match typ {
-            3 => Some(2),
-            4 | 13 => Some(4),
-            _ => None,
-        }) else {
-            self.info.garbled = true;
-            return Vec::new();
-        };
-        let n = count.min(MAX_STRIPS);
-        if count > MAX_STRIPS {
-            self.info.garbled = true;
-        }
-        let mut out = Vec::with_capacity(n as usize);
-        for i in 0..n {
-            match self.uint(typ, at + size * i) {
-                Some(v) => out.push(u64::from(v)),
-                None => {
-                    self.info.garbled = true;
-                    break;
-                }
+        let size: usize = match typ {
+            3 => 2,
+            4 | 13 => 4,
+            _ => {
+                self.info.garbled = true;
+                return Vec::new();
             }
+        };
+        let n = count.min(MAX_STRIPS).min(self.budget);
+        if n < count {
+            self.info.truncated = true;
         }
-        out
+        self.budget -= n;
+        let mut buf = vec![0u8; n as usize * size];
+        let got = self.r.read(self.abs(at), &mut buf);
+        if got < buf.len() {
+            self.info.garbled = true;
+        }
+        buf[..got]
+            .chunks_exact(size)
+            .map(|c| {
+                if size == 2 {
+                    u64::from(self.u16_of([c[0], c[1]]))
+                } else {
+                    u64::from(self.u32_of([c[0], c[1], c[2], c[3]]))
+                }
+            })
+            .collect()
     }
 
     /// An ASCII value: up to [`MAX_STRING`] bytes, cut at the first NUL, trimmed; `None` unless plain ASCII.
@@ -356,8 +423,10 @@ impl Walker<'_, '_> {
         let mut buf = vec![0u8; total.min(MAX_STRING) as usize];
         let n = self.r.read(self.abs(at), &mut buf);
         buf.truncate(n);
-        if let Some(z) = buf.iter().position(|&b| b == 0) {
-            buf.truncate(z);
+        match buf.iter().position(|&b| b == 0) {
+            Some(z) => buf.truncate(z),
+            None if total > MAX_STRING => self.info.truncated = true,
+            None => {}
         }
         if !buf.iter().all(|&b| b.is_ascii() && !b.is_ascii_control()) {
             return None;
@@ -367,11 +436,46 @@ impl Walker<'_, '_> {
         (!s.is_empty()).then(|| s.to_string())
     }
 
+    /// Whether the JPEG at `o` (`len` bytes) starts with FF D8 and its first SOF is SOF0, SOF1 or SOF2.
+    fn is_lossy_jpeg(&mut self, o: u64, len: u64) -> bool {
+        let mut magic = [0u8; 2];
+        if self.r.read(self.abs(o), &mut magic) != 2 || magic != [0xFF, 0xD8] {
+            return false;
+        }
+        let mut pos = 2u64;
+        for _ in 0..MAX_SEGMENTS {
+            if pos.saturating_add(4) > len {
+                return false;
+            }
+            let mut seg = [0u8; 4];
+            if self.r.read(self.abs(o + pos), &mut seg) != 4 || seg[0] != 0xFF {
+                return false;
+            }
+            match seg[1] {
+                0xC0..=0xC2 => return true,
+                0xDA | 0xD9 => return false,
+                // Other SOFs (lossless, arithmetic, hierarchical) are not previews.
+                0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => return false,
+                0x01 | 0xD0..=0xD8 => pos += 2,
+                0xFF => pos += 1,
+                _ => {
+                    let seg_len = u64::from(u16::from_be_bytes([seg[2], seg[3]]));
+                    if seg_len < 2 {
+                        return false;
+                    }
+                    pos += 2 + seg_len;
+                }
+            }
+        }
+        false
+    }
+
     /// Turns the strip/tile/JPEG tags of one IFD into ranges.
     fn finish_image(&mut self, t: &ImageTags) {
         if let (Some(o), Some(l)) = (t.jpeg_offset, t.jpeg_len)
             && l > 0
             && self.claim(o, l)
+            && self.room()
         {
             self.info.jpegs.push((o, l));
         }
@@ -384,17 +488,34 @@ impl Walker<'_, '_> {
                 if l == 0 || !self.claim(o, l) {
                     continue;
                 }
-                let mut magic = [0u8; 2];
-                let is_jpeg = jpeg_compression
-                    && self.r.read(self.abs(o), &mut magic) == 2
-                    && magic == [0xFF, 0xD8];
-                if is_jpeg {
+                if !self.room() {
+                    return;
+                }
+                let mut lossy = false;
+                if jpeg_compression {
+                    if self.classified < MAX_CLASSIFIED {
+                        self.classified += 1;
+                        lossy = self.is_lossy_jpeg(o, l);
+                    } else {
+                        self.info.truncated = true;
+                    }
+                }
+                if lossy {
                     self.info.jpegs.push((o, l));
                 } else {
                     self.info.data.push((o, l));
                 }
             }
         }
+    }
+
+    /// Whether another range fits under the per-walk cap (flags `truncated` when not).
+    fn room(&mut self) -> bool {
+        let ok = ((self.info.data.len() + self.info.jpegs.len()) as u64) < STRIP_BUDGET;
+        if !ok {
+            self.info.truncated = true;
+        }
+        ok
     }
 }
 
@@ -551,29 +672,82 @@ mod tests {
         b[at..at + v.len()].copy_from_slice(v);
     }
 
+    fn entry(tag: u16, typ: u16, count: u32, val: u32) -> Vec<u8> {
+        let mut e = Vec::new();
+        e.extend_from_slice(&tag.to_le_bytes());
+        e.extend_from_slice(&typ.to_le_bytes());
+        e.extend_from_slice(&count.to_le_bytes());
+        e.extend_from_slice(&val.to_le_bytes());
+        e
+    }
+
+    /// Little-endian IFD bytes: entry count, entries as given, next pointer.
+    fn ifd_bytes(entries: &[Vec<u8>], next: u32) -> Vec<u8> {
+        let mut b = (entries.len() as u16).to_le_bytes().to_vec();
+        for e in entries {
+            b.extend_from_slice(e);
+        }
+        b.extend_from_slice(&next.to_le_bytes());
+        b
+    }
+
+    fn header() -> Vec<u8> {
+        let mut b = b"II*\0".to_vec();
+        b.extend_from_slice(&8u32.to_le_bytes());
+        b
+    }
+
     #[test]
-    fn hostile_ifds_are_bounded() {
-        let le = |v: u32| v.to_le_bytes();
-        let entry = |tag: u16, typ: u16, count: u32, val: u32| {
-            let mut e = Vec::new();
-            e.extend_from_slice(&tag.to_le_bytes());
-            e.extend_from_slice(&typ.to_le_bytes());
-            e.extend_from_slice(&le(count));
-            e.extend_from_slice(&le(val));
-            e
-        };
-        // Each hostile thing alone must be flagged (so removing one guard breaks the test).
-        let one = |entries: &[Vec<u8>], next: u32| {
-            let mut b = vec![0u8; 4096];
-            put(&mut b, 0, b"II*\0");
-            put(&mut b, 4, &le(8));
-            put(&mut b, 8, &(entries.len() as u16).to_le_bytes());
-            for (i, e) in entries.iter().enumerate() {
-                put(&mut b, 10 + 12 * i, e);
-            }
-            put(&mut b, 10 + 12 * entries.len(), &le(next));
-            b
-        };
+    fn amplification_is_bounded() {
+        // 64 chained IFDs of 1024 entries cycling the four strip/tile tags, all pointing at one 16 KiB value area.
+        let area = 800_000u32;
+        let ifd_len = 2 + 12 * 1024 + 4;
+        let mut b = vec![0u8; area as usize + 4096 * 4];
+        put(&mut b, 0, &header());
+        for k in 0..64usize {
+            let tags = [0x0111u16, 0x0117, 0x0144, 0x0145];
+            let entries: Vec<_> = (0..1024)
+                .map(|i| entry(tags[i % 4], 4, 4096, area))
+                .collect();
+            let next = if k < 63 {
+                (8 + (k + 1) * ifd_len) as u32
+            } else {
+                0
+            };
+            put(&mut b, 8 + k * ifd_len, &ifd_bytes(&entries, next));
+        }
+        for i in 0..4096usize {
+            put(&mut b, area as usize + 4 * i, &4u32.to_le_bytes());
+        }
+        let started = Instant::now();
+        let i = walk_all(&b).unwrap();
+        assert!(
+            started.elapsed().as_secs_f32() < 1.0,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(i.data.len() + i.jpegs.len() <= 262_144);
+        // The per-walk value budget is what stops it: 16 IFDs worth of values (2 ranges per offset/count pair).
+        assert_eq!(i.data.len(), 131_072);
+        assert!(i.truncated);
+    }
+
+    /// A file of `len` zero bytes with the header and `parts` (offset, bytes) put in.
+    fn file(len: usize, parts: &[(usize, Vec<u8>)]) -> Vec<u8> {
+        let mut b = vec![0u8; len];
+        put(&mut b, 0, &header());
+        for (at, bytes) in parts {
+            put(&mut b, *at, bytes);
+        }
+        b
+    }
+
+    fn le(v: u32) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    #[test]
+    fn structural_errors_are_garbled() {
         let cases = [
             ("self next", vec![], 8),
             (
@@ -584,47 +758,234 @@ mod tests {
             ("subifd cycle", vec![entry(0x014A, 4, 1, 8)], 0),
             ("bad type", vec![entry(0x0100, 0, 1 << 31, 0)], 0),
             ("far value", vec![entry(0x010F, 2, 100, 0xFFFF_0000)], 0),
+            ("huge count", vec![entry(0x0111, 4, 0xFFFF_FFFF, 100)], 0),
+            (
+                "duplicate tag",
+                vec![entry(0x0100, 4, 1, 5), entry(0x0100, 4, 1, 6)],
+                0,
+            ),
+            ("exif -> ifd0", vec![entry(0x8769, 4, 1, 8)], 0),
         ];
         for (name, entries, next) in cases {
             let started = Instant::now();
-            let i = walk_all(&one(&entries, next)).unwrap();
+            let i = walk_all(&file(4096, &[(8, ifd_bytes(&entries, next))])).unwrap();
             assert!(i.garbled, "{name}");
+            assert!(!i.truncated, "{name}");
             assert!(started.elapsed().as_secs_f32() < 1.0, "{name}");
         }
+        // The first of two duplicates is the one used.
+        let dup = ifd_bytes(&[entry(0x0100, 4, 1, 5), entry(0x0100, 4, 1, 6)], 0);
+        assert_eq!(walk_all(&file(4096, &[(8, dup)])).unwrap().width, Some(5));
         // A clean tiny TIFF is not flagged.
-        assert!(!walk_all(&one(&[], 0)).unwrap().garbled);
+        let i = walk_all(&file(4096, &[(8, ifd_bytes(&[], 0))])).unwrap();
+        assert!(!i.garbled && !i.truncated);
+    }
 
-        // 60_000 entries.
-        let mut b = vec![0u8; 4096];
-        put(&mut b, 0, b"II*\0");
-        put(&mut b, 4, &le(8));
-        put(&mut b, 8, &60_000u16.to_le_bytes());
+    #[test]
+    fn pointer_cycles_through_exif_are_garbled_and_gps_is_not_followed() {
+        // IFD0 -> Exif at 200 -> Interop pointing back at the Exif IFD.
+        let b = file(
+            4096,
+            &[
+                (8, ifd_bytes(&[entry(0x8769, 4, 1, 200)], 0)),
+                (200, ifd_bytes(&[entry(0xA005, 4, 1, 200)], 0)),
+            ],
+        );
         let i = walk_all(&b).unwrap();
         assert!(i.garbled);
-
-        // Huge strip counts.
-        let mut b = vec![0u8; 4096];
-        put(&mut b, 0, b"II*\0");
-        put(&mut b, 4, &le(8));
-        put(&mut b, 8, &2u16.to_le_bytes());
-        put(&mut b, 10, &entry(0x0111, 4, 0xFFFF_FFFF, 100));
-        put(&mut b, 22, &entry(0x0117, 4, 0xFFFF_FFFF, 100));
-        let started = Instant::now();
+        assert_eq!(i.ifds_seen, 2);
+        // GPS contents are extent only: a pointer inside is not followed, so no cycle is seen.
+        let b = file(
+            4096,
+            &[
+                (8, ifd_bytes(&[entry(0x8825, 4, 1, 200)], 0)),
+                (200, ifd_bytes(&[entry(0x8825, 4, 1, 200)], 0)),
+            ],
+        );
         let i = walk_all(&b).unwrap();
-        assert!(i.garbled);
-        assert!(i.data.len() <= 4096);
-        assert!(started.elapsed().as_secs_f32() < 1.0);
+        assert!(!i.garbled);
+        assert_eq!(i.ifds_seen, 2);
+    }
 
-        // A long chain of distinct IFDs stops at the IFD cap.
-        let mut b = vec![0u8; 4096];
-        put(&mut b, 0, b"II*\0");
-        put(&mut b, 4, &le(8));
-        for k in 0..200u32 {
-            let at = 8 + k as usize * 6;
-            put(&mut b, at, &0u16.to_le_bytes());
-            put(&mut b, at + 2, &le(8 + (k + 1) * 6));
+    #[test]
+    fn size_caps_set_truncated_not_garbled() {
+        // Entries above MAX_ENTRIES (the buffer holds all of them): only 1024 are read.
+        let entries: Vec<_> = (0..1500u16).map(|i| entry(0x2000 + i, 1, 1, 0)).collect();
+        let i = walk_all(&file(20_000, &[(8, ifd_bytes(&entries, 0))])).unwrap();
+        assert_eq!(i.entries_seen, 1024);
+        assert!(i.truncated && !i.garbled);
+
+        // Strip count above MAX_STRIPS that fits in the file.
+        let n = 70_000usize;
+        let (offs, cnts) = (1000usize, 1000 + 4 * n);
+        let ifd = ifd_bytes(
+            &[
+                entry(0x0111, 4, n as u32, offs as u32),
+                entry(0x0117, 4, n as u32, cnts as u32),
+            ],
+            0,
+        );
+        let mut b = file(cnts + 4 * n + 100, &[(8, ifd)]);
+        for k in 0..n {
+            put(&mut b, offs + 4 * k, &le(8));
+            put(&mut b, cnts + 4 * k, &le(1));
         }
-        assert!(walk_all(&b).unwrap().garbled);
+        let i = walk_all(&b).unwrap();
+        assert_eq!(i.data.len(), 65_536);
+        assert!(i.truncated && !i.garbled);
+
+        // SubIFD count above its cap, each pointing at a distinct empty IFD.
+        let mut parts = vec![(8, ifd_bytes(&[entry(0x014A, 4, 40, 300)], 0))];
+        parts.push((300, (0..40u32).flat_map(|k| le(500 + 6 * k)).collect()));
+        for k in 0..40usize {
+            parts.push((500 + 6 * k, ifd_bytes(&[], 0)));
+        }
+        let i = walk_all(&file(4096, &parts)).unwrap();
+        assert_eq!(i.ifds_seen, 1 + 16);
+        assert!(i.truncated && !i.garbled);
+
+        // A chain longer than MAX_IFDS.
+        let parts: Vec<_> = (0..100usize)
+            .map(|k| (8 + 6 * k, ifd_bytes(&[], (8 + 6 * (k + 1)) as u32)))
+            .collect();
+        let i = walk_all(&file(4096, &parts)).unwrap();
+        assert_eq!(i.ifds_seen, 64);
+        assert!(i.truncated && !i.garbled);
+
+        // A string over 256 bytes without NUL is cut and flagged; with a NUL early it is not.
+        let long = vec![b'A'; 300];
+        let make = ifd_bytes(&[entry(0x010F, 2, 300, 200)], 0);
+        let b = file(4096, &[(8, make.clone()), (200, long.clone())]);
+        let i = walk_all(&b).unwrap();
+        assert_eq!(i.make.as_deref(), Some("A".repeat(256).as_str()));
+        assert!(i.truncated && !i.garbled);
+        let mut nul = long;
+        nul[5] = 0;
+        let i = walk_all(&file(4096, &[(8, make), (200, nul)])).unwrap();
+        assert_eq!(i.make.as_deref(), Some("AAAAA"));
+        assert!(!i.truncated);
+    }
+
+    #[test]
+    fn end_covers_the_last_referenced_byte() {
+        // (a) the last bytes are the next-IFD pointer.
+        let i = walk_all(&file(14, &[(8, ifd_bytes(&[], 0))])).unwrap();
+        assert_eq!((i.end, i.garbled), (14, false));
+        // (b) the last bytes are an out-of-line value.
+        let at = 8 + 2 + 12 + 4;
+        let ifd = ifd_bytes(&[entry(0x010F, 2, 10, at as u32)], 0);
+        let i = walk_all(&file(at + 10, &[(8, ifd), (at, b"ABCDEFGHI\0".to_vec())])).unwrap();
+        assert_eq!((i.end, i.garbled), ((at + 10) as u64, false));
+        assert_eq!(i.make.as_deref(), Some("ABCDEFGHI"));
+        // (c) the last bytes are a JPEG range.
+        let at = 8 + 2 + 24 + 4;
+        let ifd = ifd_bytes(
+            &[entry(0x0201, 4, 1, at as u32), entry(0x0202, 4, 1, 50)],
+            0,
+        );
+        let i = walk_all(&file(at + 50, &[(8, ifd)])).unwrap();
+        assert_eq!((i.end, i.garbled), ((at + 50) as u64, false));
+        assert_eq!(i.jpegs, vec![(at as u64, 50)]);
+    }
+
+    #[test]
+    fn first_value_wins_and_exif_next_is_not_an_image_ifd() {
+        let word = |b: [u8; 4]| u32::from_le_bytes(b);
+        let iso = |v: u32| entry(0x8827, 3, 1, v);
+        let ifd0 = ifd_bytes(
+            &[
+                entry(0x010F, 2, 4, word(*b"AAA\0")),
+                entry(0x0110, 2, 4, word(*b"Mod\0")),
+                entry(0x8769, 4, 1, 300),
+            ],
+            100,
+        );
+        let ifd1 = ifd_bytes(
+            &[
+                entry(0x010F, 2, 4, word(*b"BBB\0")),
+                entry(0x0110, 2, 4, word([0xC3, 0xA9, 0, 0])), // non-ASCII must not erase "Mod"
+                entry(0x8769, 4, 1, 400),
+            ],
+            0,
+        );
+        let b = file(
+            4096,
+            &[
+                (8, ifd0),
+                (100, ifd1),
+                (300, ifd_bytes(&[iso(100)], 600)), // its next pointer must not be walked
+                (400, ifd_bytes(&[iso(200)], 0)),
+                (600, ifd_bytes(&[entry(0x0100, 4, 1, 9999)], 0)),
+            ],
+        );
+        let i = walk_all(&b).unwrap();
+        assert_eq!(i.make.as_deref(), Some("AAA"));
+        assert_eq!(i.model.as_deref(), Some("Mod"));
+        assert_eq!(i.iso, Some(100));
+        assert_eq!(i.width, None);
+        assert_eq!(i.ifds_seen, 4);
+        assert!(!i.garbled);
+    }
+
+    /// One IFD with the given compression and a single strip holding `strip`.
+    fn strip_tiff(compression: u16, strip: &[u8]) -> TiffInfo {
+        let at = 200;
+        let ifd = ifd_bytes(
+            &[
+                entry(0x0103, 3, 1, u32::from(compression)),
+                entry(0x0111, 4, 1, at),
+                entry(0x0117, 4, 1, strip.len() as u32),
+            ],
+            0,
+        );
+        let at = at as usize;
+        walk_all(&file(at + strip.len(), &[(8, ifd), (at, strip.to_vec())])).unwrap()
+    }
+
+    fn jpeg_with_sof(sof: u8) -> Vec<u8> {
+        // SOI, a DHT-like segment, the SOF segment, padding.
+        let mut b = vec![0xFF, 0xD8, 0xFF, 0xC4, 0, 4, 0, 0, 0xFF, sof, 0, 11];
+        b.extend_from_slice(&[0; 20]);
+        b
+    }
+
+    #[test]
+    fn only_lossy_jpeg_strips_are_previews() {
+        for sof in [0xC0, 0xC1, 0xC2] {
+            let i = strip_tiff(7, &jpeg_with_sof(sof));
+            assert_eq!((i.jpegs.len(), i.data.len()), (1, 0), "SOF {sof:#x}");
+        }
+        let i = strip_tiff(7, &jpeg_with_sof(0xC3));
+        assert_eq!((i.jpegs.len(), i.data.len()), (0, 1), "lossless");
+        // Not compressed as JPEG: raw data whatever the bytes are.
+        let i = strip_tiff(1, &jpeg_with_sof(0xC0));
+        assert_eq!((i.jpegs.len(), i.data.len()), (0, 1));
+        // Compression 6 but not a JPEG.
+        let i = strip_tiff(6, &[0u8; 40]);
+        assert_eq!((i.jpegs.len(), i.data.len()), (0, 1));
+    }
+
+    #[test]
+    fn jpeg_lookups_are_capped() {
+        let j = jpeg_with_sof(0xC0);
+        let n = 70usize;
+        let (offs, cnts, strip) = (300usize, 300 + 4 * n, 1000usize);
+        let ifd = ifd_bytes(
+            &[
+                entry(0x0103, 3, 1, 7),
+                entry(0x0111, 4, n as u32, offs as u32),
+                entry(0x0117, 4, n as u32, cnts as u32),
+            ],
+            0,
+        );
+        let mut b = file(strip + j.len(), &[(8, ifd), (strip, j.clone())]);
+        for k in 0..n {
+            put(&mut b, offs + 4 * k, &le(strip as u32));
+            put(&mut b, cnts + 4 * k, &le(j.len() as u32));
+        }
+        let i = walk_all(&b).unwrap();
+        assert_eq!((i.jpegs.len(), i.data.len()), (64, 6));
+        assert!(i.truncated && !i.garbled);
     }
 
     #[test]
