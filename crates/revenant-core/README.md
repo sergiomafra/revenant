@@ -29,3 +29,20 @@ the buffer except at the end of the source, returns 0 past the end) and `volume(
 Windows). `source::volume_of(path)` returns the `VolumeId` of any existing path (device id on Unix, volume serial number on
 Windows), so extraction onto the source's own volume can be refused. A test scans `src/source/` to ensure no write-capable open
 flags are ever introduced.
+
+## Formats: JPEG
+
+`formats::Format` is the detector interface: `recognizes(head)` checks a signature at a sector start and
+`measure(source, start)` returns a `Measurement { len, kind, health }` found by walking the file's structure, or `None` when
+the bytes are not a file of that format. `formats::all_formats()` lists the supported detectors.
+
+`formats::Jpeg` follows the marker segments by their declared lengths (so the thumbnail embedded in an APP1/EXIF segment does
+not end the file), requires DQT and SOF before SOS, and scans the entropy-coded data up to EOI (`FF D9`). The source is read in
+1 MiB windows, never whole, up to `JPEG_MAX_LEN` (64 MiB). Health:
+
+- `Intact`: EOI found and the bytes decode (`zune-jpeg`).
+- `Damaged`: EOI found but the decoder rejects the bytes; the length is still exact.
+- `Partial`: no EOI before the end of the source, `JPEG_MAX_LEN`, or a 512-byte sector that starts another recognized file;
+  the length stops there.
+
+Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`).
