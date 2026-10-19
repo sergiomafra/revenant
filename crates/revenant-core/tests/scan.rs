@@ -106,8 +106,13 @@ fn finds_photos_and_videos_on_formatted_card() {
 
 #[test]
 fn jpeg_crossing_blocks() {
-    let jpeg = testkit::jpeg(256, 256, 7, 300_000);
+    let mut jpeg = testkit::jpeg(256, 256, 7, 300_000);
+    // A complete small JPEG on a sector start, after the block boundary and inside the outer file's APP1 padding.
+    let nested = testkit::jpeg(8, 8, 9, 0);
+    let nested_at = 110 * 1024;
+    jpeg[nested_at..nested_at + nested.len()].copy_from_slice(&nested);
     let start = MIB - 100 * 1024;
+    assert!(start + nested_at > MIB);
     assert!(start % 512 == 0 && start + jpeg.len() > MIB);
     let file = DiskImage::noise(3 * MIB, 5).put(start, &jpeg).save();
     let source = FileSource::open(file.path()).unwrap();
@@ -266,4 +271,76 @@ fn cancel_interrupts() {
     });
     assert_eq!(r.unwrap_err().code(), "cancelled");
     assert_eq!(events, 1);
+}
+
+#[test]
+fn nested_signature_inside_a_file_is_not_reported() {
+    let mut outer = testkit::jpeg(256, 256, 7, 200_000);
+    let nested = testkit::jpeg(8, 8, 9, 0);
+    outer[512 * 20..512 * 20 + nested.len()].copy_from_slice(&nested);
+    let file = DiskImage::noise(2 * MIB, 5).put(MIB / 2, &outer).save();
+    let (r, events) = run(
+        &FileSource::open(file.path()).unwrap(),
+        &ScanOptions::default(),
+    );
+    assert_eq!(r.unwrap().found, 1);
+    assert_eq!(
+        found(&events),
+        vec![(MIB as u64 / 2, FileKind::Jpeg, Health::Intact)]
+    );
+}
+
+#[test]
+fn unreadable_sector_inside_a_file_makes_it_partial() {
+    let video = testkit::mp4(&Mp4Options {
+        mdat_len: 200_000,
+        moov_at_end: true,
+        mov: false,
+        mdat_64bit: false,
+    });
+    let start = MIB;
+    let bad = (start + 100 * 512) as u64;
+    let file = DiskImage::noise(2 * MIB, 6).put(start, &video).save();
+    // Sanity: without the failure the file is Intact.
+    let (_, events) = run(
+        &FileSource::open(file.path()).unwrap(),
+        &ScanOptions::default(),
+    );
+    assert_eq!(
+        found(&events),
+        vec![(start as u64, FileKind::Mp4, Health::Intact)]
+    );
+
+    let source = FailingSource {
+        inner: FileSource::open(file.path()).unwrap(),
+        bad: (bad, bad + 512),
+    };
+    let opts = ScanOptions {
+        block: 64 * 1024,
+        ..ScanOptions::default()
+    };
+    let (r, events) = run(&source, &opts);
+    assert_eq!(r.unwrap().unreadable_bytes, 512);
+    let relevant: Vec<&Event> = events
+        .iter()
+        .filter(|e| !matches!(e, Event::Progress { .. }))
+        .collect();
+    assert_eq!(relevant.len(), 2, "{relevant:?}");
+    assert_eq!(
+        relevant[0],
+        &Event::Unreadable {
+            start: bad,
+            len: 512
+        }
+    );
+    match relevant[1] {
+        Event::Found(f) => {
+            assert_eq!(
+                (f.start, f.kind, f.health),
+                (start as u64, FileKind::Mp4, Health::Partial)
+            );
+            assert_eq!(f.len, video.len() as u64);
+        }
+        other => panic!("{other:?}"),
+    }
 }

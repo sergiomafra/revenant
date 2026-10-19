@@ -103,8 +103,14 @@ fn read_block(
 
 /// Scans `source`, calling `on_event` for each finding, progress step and unreadable region.
 ///
-/// The first format that recognizes a sector start and measures a file there wins; the scan resumes at the first sector
-/// at or after the end of that file. `measure` reads the source directly, so files may cross block boundaries.
+/// The first format that recognizes a sector start and measures a file there wins. The scan still reads every block, but
+/// examines no head until the first sector at or after the file's end. A finding is emitted once the scan has read past
+/// its end, so that unreadable sectors inside it are known: they are reported as `Unreadable` events (before the
+/// `Found`), and an `Intact` finding containing any of them is downgraded to `Partial`. `measure` reads the source
+/// directly, so files may cross block boundaries.
+///
+/// `opts.sector` is raised to at least 16 (the head length) and `opts.block` rounded down to whole sectors, so a head
+/// never straddles two blocks. On cancellation the scan returns `Err(Cancelled)` and a finding still pending is dropped.
 pub fn scan(
     source: &dyn Source,
     formats: &[Box<dyn Format>],
@@ -112,14 +118,15 @@ pub fn scan(
     cancel: &CancelToken,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<ScanSummary, EngineError> {
-    let sector = opts.sector.max(1);
+    let sector = opts.sector.max(HEAD_LEN as u64);
     let block = ((opts.block as u64 / sector).max(1) * sector) as usize;
     let total = source.len();
     let mut summary = ScanSummary::default();
     let mut run: Option<(u64, u64)> = None; // open unreadable run (start, len)
+    let mut pending: Option<Finding> = None;
+    let mut skip_until = 0u64; // no heads are examined before this offset
     let mut next_id = 1;
     let mut pos = 0u64;
-    let mut last_progress = None;
 
     let flush = |run: &mut Option<(u64, u64)>,
                  summary: &mut ScanSummary,
@@ -139,6 +146,14 @@ pub fn scan(
         let block_end = pos + want as u64;
         let mut at = pos;
         while at < block_end {
+            if at >= skip_until
+                && let Some(f) = pending.take()
+            {
+                // Everything inside the finding has been read: report its unreadable run first.
+                flush(&mut run, &mut summary, on_event);
+                summary.found += 1;
+                on_event(Event::Found(f));
+            }
             let idx = ((at - pos) / sector) as usize;
             let sector_end = (at + sector).min(block_end);
             if bad.as_ref().is_some_and(|b| b[idx]) {
@@ -149,24 +164,23 @@ pub fn scan(
                         run = Some((at, sector_end - at));
                     }
                 }
+                if let Some(f) = &mut pending
+                    && f.health == Health::Intact
+                {
+                    f.health = Health::Partial;
+                }
                 at = sector_end;
                 continue;
             }
             flush(&mut run, &mut summary, on_event);
+            if at < skip_until {
+                at = sector_end;
+                continue;
+            }
 
             let rel = (at - pos) as usize;
             let head_len = HEAD_LEN.min((total - at) as usize);
-            let mut far = [0u8; HEAD_LEN];
-            let head: Option<&[u8]> = if rel + head_len <= data.len() {
-                Some(&data[rel..rel + head_len])
-            } else {
-                // Near the end of the block: read the head from the source instead of cutting it.
-                source
-                    .read_at(at, &mut far[..head_len])
-                    .ok()
-                    .map(|n| &far[..n])
-            };
-            let found = head.and_then(|head| {
+            let found = data.get(rel..rel + head_len).and_then(|head| {
                 formats
                     .iter()
                     .filter(|f| f.recognizes(head))
@@ -174,31 +188,33 @@ pub fn scan(
             });
             match found {
                 Some(m) if m.len > 0 => {
-                    on_event(Event::Found(Finding {
+                    pending = Some(Finding {
                         id: next_id,
                         start: at,
                         len: m.len,
                         kind: m.kind,
                         health: m.health,
-                    }));
+                    });
                     next_id += 1;
-                    summary.found += 1;
-                    at = (at + m.len).div_ceil(sector) * sector;
+                    skip_until = at.saturating_add(m.len).div_ceil(sector) * sector;
                 }
-                _ => at += sector,
+                _ => {}
             }
+            at = sector_end;
         }
-        pos = at.max(block_end);
-        let read = pos.min(total);
-        on_event(Event::Progress { read, total });
-        last_progress = Some(read);
+        pos = block_end;
+        on_event(Event::Progress { read: pos, total });
         if cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
     }
     flush(&mut run, &mut summary, on_event);
-    if last_progress != Some(total) {
-        on_event(Event::Progress { read: total, total });
+    if let Some(f) = pending {
+        summary.found += 1;
+        on_event(Event::Found(f));
+    }
+    if total == 0 {
+        on_event(Event::Progress { read: 0, total });
     }
     Ok(summary)
 }

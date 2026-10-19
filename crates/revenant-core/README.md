@@ -79,14 +79,20 @@ Chunk offsets are relative to the start of the file (its `ftyp`), not to the sou
 ## Scan
 
 `scan(source, formats, &ScanOptions, &CancelToken, &mut on_event) -> Result<ScanSummary, EngineError>` walks a source in blocks
-(`ScanOptions::block`, default 4 MiB) and looks at the first 16 bytes of every sector (`ScanOptions::sector`, default 512). The
-first format that recognizes a head and measures a file there wins; the scan emits `Event::Found(Finding)` (sequential `id` from
-1) and resumes at the first sector start at or after the file's end. A head near the end of a block is read from the source,
-never cut, and `measure` reads the source directly, so files may cross block boundaries.
+(`ScanOptions::block`, default 4 MiB, rounded down to whole sectors) and looks at the first 16 bytes of every sector
+(`ScanOptions::sector`, default 512, at least 16). The first format that recognizes a head and measures a file there wins. The
+scan keeps reading every block, but examines no head until the first sector at or after the file's end. `measure` reads the
+source directly, so files may cross block boundaries.
 
-Other events: `Progress { read, total }` (at most once per block, and a last one with `read == total`) and `Unreadable { start,
-len }`. When a block cannot be read it is re-read sector by sector; each run of consecutive failed sectors (also across blocks)
-is one `Unreadable` event and counts in `ScanSummary::unreadable_bytes`. The scan then continues.
+Events:
 
-`CancelToken::cancel()` (from any thread or from inside the callback) makes the scan return `EngineError::Cancelled` at the next
-block boundary.
+- `Found(Finding)`: sequential `id` from 1. It is emitted once the scan has read past the file's end, so unreadable sectors
+  inside the file are known: they are reported as `Unreadable` events before the `Found`, and an `Intact` finding that
+  contains any of them is downgraded to `Partial`.
+- `Progress { read, total }`: once per block, plus one for an empty source; the last has `read == total`.
+- `Unreadable { start, len }`: when a block cannot be read it is re-read sector by sector; each run of consecutive failed
+  sectors (also across blocks) is one event and counts in `ScanSummary::unreadable_bytes`. A run is split where a finding
+  ends. The scan then continues.
+
+`CancelToken::cancel()` (from any thread or from inside the callback) makes the scan return `EngineError::Cancelled` at the
+next block boundary; a finding still pending at that point is dropped.
