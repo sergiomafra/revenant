@@ -4,6 +4,8 @@
 //! Health rules:
 //! - no `mdat` -> not a video (`None`); no `moov` -> `Damaged` (the media data is there but the index is not);
 //! - a box (`mdat` or `moov`) that is declared larger than what exists in the source -> `Partial`;
+//! - a garbled index (a child walk in `moov/trak/mdia/minf/stbl` ending on an invalid size, or no `trak` with both a chunk
+//!   table and `stsz` in a non-fragmented file) -> `Damaged`;
 //! - otherwise, for each `trak`, from its `stco`/`co64` and `stsz` tables: any chunk offset at or past the measured end,
 //!   or `first chunk offset + total sample size` past the measured end (a lower bound on where the track's data ends)
 //!   -> `Partial`; else `Intact`.
@@ -102,17 +104,21 @@ fn read_header(source: &dyn Source, pos: u64) -> Option<BoxHeader> {
     parse_header(&b[..n])
 }
 
-/// Children `(type, payload)` of a box payload, bounded by the payload itself. Stops at the first invalid size.
-fn children(mut data: &[u8]) -> Vec<([u8; 4], &[u8])> {
+/// Children `(type, payload)` of a box payload, bounded by the payload itself. Sets `garbled` if the walk ends on an
+/// invalid size (or leftover bytes) instead of consuming the payload exactly.
+fn children<'a>(mut data: &'a [u8], garbled: &mut bool) -> Vec<([u8; 4], &'a [u8])> {
     let mut out = Vec::new();
-    while data.len() >= 8 {
-        let size = be32(data) as usize;
-        let (header, size) = match size {
-            0 => (8, data.len()),
-            1 if data.len() >= 16 => (16, usize::try_from(be64(&data[8..])).unwrap_or(usize::MAX)),
-            _ => (8, size),
+    while !data.is_empty() {
+        let (header, size) = match data.get(..8).map(be32) {
+            Some(0) => (8, data.len()),
+            Some(1) if data.len() >= 16 => {
+                (16, usize::try_from(be64(&data[8..])).unwrap_or(usize::MAX))
+            }
+            Some(size) => (8, size as usize),
+            None => (8, 0),
         };
         if size < header || size > data.len() {
+            *garbled = true;
             break;
         }
         out.push(([data[4], data[5], data[6], data[7]], &data[header..size]));
@@ -121,8 +127,8 @@ fn children(mut data: &[u8]) -> Vec<([u8; 4], &[u8])> {
     out
 }
 
-fn child<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
-    children(data)
+fn child<'a>(data: &'a [u8], kind: &[u8; 4], garbled: &mut bool) -> Option<&'a [u8]> {
+    children(data, garbled)
         .into_iter()
         .find(|(k, _)| k == kind)
         .map(|(_, p)| p)
@@ -158,27 +164,37 @@ fn total_sample_size(payload: &[u8]) -> Option<u64> {
     Some((0..n).map(|i| u64::from(be32(&table[i * 4..]))).sum())
 }
 
-/// True when some track's chunk table points at or past `end`, or its data cannot fit before `end`.
-fn index_exceeds(moov: &[u8], end: u64) -> bool {
-    children(moov)
+/// Judges the index in `moov` against the measured file end. A garbled box walk anywhere on the way to the sample
+/// tables is `Damaged`; so is a non-fragmented file with no `trak` carrying both a chunk table and `stsz`. Otherwise
+/// `Partial` if some track's chunks point at or past `end` or cannot fit before it, else `Intact`.
+fn index_health(moov: &[u8], end: u64, fragmented: bool) -> Health {
+    let mut garbled = false;
+    let (mut has_tables, mut exceeds) = (false, false);
+    for (_, trak) in children(moov, &mut garbled)
         .into_iter()
         .filter(|(k, _)| k == b"trak")
-        .any(|(_, trak)| {
-            let stbl = child(trak, b"mdia")
-                .and_then(|m| child(m, b"minf"))
-                .and_then(|m| child(m, b"stbl"));
-            let Some(stbl) = stbl else { return false };
-            let range = child(stbl, b"stco")
-                .and_then(|p| chunk_range(p, false))
-                .or_else(|| child(stbl, b"co64").and_then(|p| chunk_range(p, true)));
-            let Some((first, last)) = range else {
-                return false;
-            };
-            let total = child(stbl, b"stsz")
-                .and_then(total_sample_size)
-                .unwrap_or(0);
-            last >= end || first.saturating_add(total) > end
-        })
+    {
+        let stbl = child(trak, b"mdia", &mut garbled)
+            .and_then(|m| child(m, b"minf", &mut garbled))
+            .and_then(|m| child(m, b"stbl", &mut garbled));
+        let Some(stbl) = stbl else { continue };
+        let range = child(stbl, b"stco", &mut garbled)
+            .and_then(|p| chunk_range(p, false))
+            .or_else(|| child(stbl, b"co64", &mut garbled).and_then(|p| chunk_range(p, true)));
+        let stsz = child(stbl, b"stsz", &mut garbled).and_then(total_sample_size);
+        let (Some((first, last)), Some(total)) = (range, stsz) else {
+            continue;
+        };
+        has_tables = true;
+        exceeds |= last >= end || first.saturating_add(total) > end;
+    }
+    if garbled || !(has_tables || fragmented) {
+        Health::Damaged
+    } else if exceeds {
+        Health::Partial
+    } else {
+        Health::Intact
+    }
 }
 
 impl Format for IsoBmff {
@@ -209,7 +225,9 @@ impl Format for IsoBmff {
         while pos < source_len {
             if pos != start && pos % SECTOR == 0 {
                 let mut head = [0u8; 16];
-                let n = source.read_at(pos, &mut head).ok()?;
+                let Ok(n) = source.read_at(pos, &mut head) else {
+                    break;
+                };
                 if others.iter().any(|f| f.recognizes(&head[..n])) {
                     break;
                 }
@@ -275,10 +293,6 @@ impl Format for IsoBmff {
         }
         let mut data = vec![0u8; moov_len as usize];
         read_exact_at(source, moov_at, &mut data)?;
-        measured(if index_exceeds(&data, len) {
-            Health::Partial
-        } else {
-            Health::Intact
-        })
+        measured(index_health(&data, len, has_moof))
     }
 }

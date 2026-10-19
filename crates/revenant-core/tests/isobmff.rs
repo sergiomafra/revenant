@@ -243,14 +243,28 @@ fn huge_largesize_counts_only_to_source_end() {
 }
 
 #[test]
-fn child_larger_than_parent_is_ignored_without_panic() {
+fn child_larger_than_parent_is_damaged_without_panic() {
     let mut v = testkit::mp4(&opts());
     let trak = find(&v, b"trak");
     v[trak - 4..trak].copy_from_slice(&0x00FF_FFFFu32.to_be_bytes());
     let img = DiskImage::noise(AT + v.len() + 4096, 12).put(AT, &v).save();
-    // The unreadable trak is skipped: no tables to contradict the file, so the structure alone decides.
+    // A garbled index is unusable: Damaged, with the length still exact.
     let m = measure(&img).unwrap();
-    assert_eq!((m.len, m.health), (v.len() as u64, Health::Intact));
+    assert_eq!((m.len, m.health), (v.len() as u64, Health::Damaged));
+}
+
+#[test]
+fn moov_without_sample_tables_is_damaged() {
+    let ftyp = bx(b"ftyp", b"isom\0\0\0\0isom");
+    let v = [
+        ftyp,
+        bx(b"mdat", &[7u8; 400]),
+        bx(b"moov", &bx(b"mvhd", &[0; 100])),
+    ]
+    .concat();
+    let img = DiskImage::noise(AT + v.len() + 4096, 14).put(AT, &v).save();
+    let m = measure(&img).unwrap();
+    assert_eq!((m.len, m.health), (v.len() as u64, Health::Damaged));
 }
 
 fn bx(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {

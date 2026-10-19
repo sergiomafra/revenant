@@ -69,6 +69,9 @@ Chunk offsets are relative to the start of the file (its `ftyp`), not to the sou
 - No `moov`: `Damaged` (the media data is there but not the index; rebuilding it is a later product milestone).
 - `moov` larger than 16 MiB: `Damaged`.
 - A box declared larger than the source (cut mid-`mdat`, or mid-`moov`): `Partial`.
+- Garbled index: if the box walk inside `moov`, `trak`, `mdia`, `minf` or `stbl` ends on an invalid size (or leftover bytes)
+  instead of consuming its parent exactly, or a non-fragmented file has no `trak` with both `stco`/`co64` and `stsz`:
+  `Damaged`.
 - Otherwise the `stco`/`co64` and `stsz` tables of each `trak` are checked: any chunk offset at or past the measured end, or
   `first chunk offset + total sample size` past it, gives `Partial`; else `Intact`. Fragmented files (`moof`) have no such
   tables and are `Intact` when their boxes are complete.
