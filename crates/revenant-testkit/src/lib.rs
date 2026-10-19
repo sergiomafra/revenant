@@ -119,3 +119,82 @@ impl DiskImage {
         file
     }
 }
+
+/// Shape of a synthetic MP4/MOV built by [`mp4`].
+pub struct Mp4Options {
+    /// Payload bytes inside `mdat`.
+    pub mdat_len: usize,
+    /// `ftyp, mdat, moov` (the camera case) instead of `ftyp, moov, mdat`.
+    pub moov_at_end: bool,
+    /// Major brand `qt  ` instead of `isom`.
+    pub mov: bool,
+    /// `mdat` with a 64-bit `largesize` header, and `co64` instead of `stco`.
+    pub mdat_64bit: bool,
+}
+
+fn bmff_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+    let mut out = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+    out.extend_from_slice(kind);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn moov_box(chunk_offset: u64, sample_len: u32, wide: bool) -> Vec<u8> {
+    let mvhd = bmff_box(b"mvhd", &[0; 100]);
+    let mut stsz = vec![0; 4];
+    stsz.extend_from_slice(&0u32.to_be_bytes()); // sample_size = 0: per-sample table
+    stsz.extend_from_slice(&1u32.to_be_bytes());
+    stsz.extend_from_slice(&sample_len.to_be_bytes());
+    let mut chunks = vec![0; 4];
+    chunks.extend_from_slice(&1u32.to_be_bytes());
+    let chunk_table = if wide {
+        chunks.extend_from_slice(&chunk_offset.to_be_bytes());
+        bmff_box(b"co64", &chunks)
+    } else {
+        chunks.extend_from_slice(&(chunk_offset as u32).to_be_bytes());
+        bmff_box(b"stco", &chunks)
+    };
+    let stbl = bmff_box(b"stbl", &[bmff_box(b"stsz", &stsz), chunk_table].concat());
+    let trak = bmff_box(b"trak", &bmff_box(b"mdia", &bmff_box(b"minf", &stbl)));
+    bmff_box(b"moov", &[mvhd, trak].concat())
+}
+
+/// MP4/MOV with `ftyp`, an `mdat` of noise, and a `moov` holding one `trak` whose `stsz`/`stco` (or `co64`) describe the
+/// whole `mdat` payload as a single sample in a single chunk. The file starts at offset 0 of the returned bytes.
+pub fn mp4(opts: &Mp4Options) -> Vec<u8> {
+    let brand: &[u8; 4] = if opts.mov { b"qt  " } else { b"isom" };
+    let mut ftyp = brand.to_vec();
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(brand);
+    let ftyp = bmff_box(b"ftyp", &ftyp);
+
+    let mut payload = vec![0u8; opts.mdat_len];
+    SplitMix64(opts.mdat_len as u64).fill(&mut payload);
+    let mdat = if opts.mdat_64bit {
+        let mut b = 1u32.to_be_bytes().to_vec();
+        b.extend_from_slice(b"mdat");
+        b.extend_from_slice(&((payload.len() + 16) as u64).to_be_bytes());
+        b.extend(payload);
+        b
+    } else {
+        bmff_box(b"mdat", &payload)
+    };
+    let header = if opts.mdat_64bit { 16 } else { 8 };
+    let moov_len = moov_box(0, 0, opts.mdat_64bit).len();
+    let mdat_at = if opts.moov_at_end {
+        ftyp.len()
+    } else {
+        ftyp.len() + moov_len
+    };
+    let moov = moov_box(
+        (mdat_at + header) as u64,
+        opts.mdat_len as u32,
+        opts.mdat_64bit,
+    );
+
+    if opts.moov_at_end {
+        [ftyp, mdat, moov].concat()
+    } else {
+        [ftyp, moov, mdat].concat()
+    }
+}

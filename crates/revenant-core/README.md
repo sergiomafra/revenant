@@ -49,3 +49,20 @@ not end the file), requires DQT and SOF before SOS, and scans the entropy-coded 
 The validation decode outputs grayscale (1 byte per pixel) to bound memory.
 
 Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`).
+
+## Formats: MP4/MOV
+
+`formats::IsoBmff` recognizes a `ftyp` box (declared size 8..=4096) at a sector start and measures the file by walking the
+top-level boxes (`ftyp moov mdat free skip wide uuid meta pdin moof mfra styp sidx udta`) from their declared sizes. Size 1
+means a 64-bit `largesize`; size 0 (only for `mdat`) runs to the end of the source. The walk stops at an unaccepted type, a
+size under 8, or the end of the source; a box that runs past the end counts only up to it. The major brand `qt  ` gives
+`FileKind::Mov`, anything else `Mp4`. Every size is checked against the source length; only `moov` is loaded into memory, and
+only up to `MOOV_MAX_LEN` (16 MiB).
+
+- No `mdat`: not a video (`None`).
+- No `moov`: `Damaged` (the media data is there but not the index; rebuilding it is a later product milestone).
+- `moov` larger than 16 MiB: `Damaged`.
+- A box declared larger than the source (cut mid-`mdat`, or mid-`moov`): `Partial`.
+- Otherwise the `stco`/`co64` and `stsz` tables of each `trak` are checked: any chunk offset at or past the measured end, or
+  `first chunk offset + total sample size` past it, gives `Partial`; else `Intact`. Fragmented files (`moof`) have no such
+  tables and are `Intact` when their boxes are complete.

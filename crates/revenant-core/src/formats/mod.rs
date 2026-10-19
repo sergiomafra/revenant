@@ -1,8 +1,10 @@
 //! File-format detectors. Each recognizes a signature at a sector start and measures the file's exact extent by
 //! walking its structure.
 
+mod isobmff;
 mod jpeg;
 
+pub use isobmff::{IsoBmff, MOOV_MAX_LEN};
 pub use jpeg::{JPEG_MAX_LEN, Jpeg};
 
 use crate::source::Source;
@@ -58,5 +60,5 @@ pub trait Format: Send + Sync {
 
 /// Every supported format.
 pub fn all_formats() -> Vec<Box<dyn Format>> {
-    vec![Box::new(Jpeg)]
+    vec![Box::new(Jpeg), Box::new(IsoBmff)]
 }
