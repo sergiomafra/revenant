@@ -120,11 +120,10 @@ are accepted; BigTIFF and anything else gives `None`.
 It follows the IFD chain, SubIFDs, Exif, GPS (extent only) and Interop IFDs; the next pointer of Exif/GPS/Interop IFDs is
 not followed. The data is hostile, so everything is bounded. Each IFD is visited once, a tag counts once per IFD (repeats
 are ignored), and every value block is read with a single read. Caps: 64 IFDs, 1024 entries per IFD, 65,536 strip/tile
-values per tag, 262,144 per walk (which also bounds `data` + `jpegs`), 16 SubIFDs per tag, 256 bytes per string, and 64
-JPEG-kind lookups per walk. Two flags report trouble: `garbled` for structural errors (cycle, offset or value range past the
+values per tag, 262,144 per walk (which also bounds `data` + `jpegs`), 16 SubIFDs per tag and 256 bytes per string. Two flags report trouble: `garbled` for structural errors (cycle, offset or value range past the
 limit, unknown type, short value block, repeated tag; the entry is skipped and never extends `end`) and `truncated` for hitting
 a size cap (the walk is incomplete, not malformed). Callers treat either as "not fully verifiable" (`Partial`). First value
-wins for Make/Model/lens/serial/ISO/date. Only strips whose first SOF is SOF0/1/2 go to `jpegs`; lossless JPEG (SOF3) is `data`.
+wins for Make/Model/lens/serial/ISO/date. Each IFD is classified once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 go to `jpegs`; lossless JPEG (SOF3) is `data`.
 
 ## Scan
 

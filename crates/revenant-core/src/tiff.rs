@@ -25,8 +25,6 @@ const STRIP_BUDGET: u64 = 262_144;
 const MAX_SUBIFDS: u64 = 16;
 /// Bytes read of a string tag.
 const MAX_STRING: u64 = 256;
-/// Compression 6/7 ranges whose JPEG kind is looked up per walk (each lookup is a few random reads).
-const MAX_CLASSIFIED: usize = 64;
 /// Marker segments inspected looking for the SOF of a JPEG.
 const MAX_SEGMENTS: usize = 16;
 
@@ -104,8 +102,6 @@ struct Walker<'a, 'b> {
     info: TiffInfo,
     /// Strip/tile values still allowed in this walk.
     budget: u64,
-    /// Ranges whose JPEG kind has been looked up.
-    classified: usize,
 }
 
 /// What one IFD says about its image data, resolved once the whole IFD has been read.
@@ -151,7 +147,6 @@ pub(crate) fn walk(r: &mut Reader, base: u64, limit: u64) -> Option<TiffInfo> {
             ..TiffInfo::default()
         },
         budget: STRIP_BUDGET,
-        classified: 0,
     };
     let first = w.u32_of([head[4], head[5], head[6], head[7]]);
     w.run(u64::from(first));
@@ -480,6 +475,7 @@ impl Walker<'_, '_> {
             self.info.jpegs.push((o, l));
         }
         let jpeg_compression = matches!(t.compression, Some(6 | 7));
+        let mut kind: Option<bool> = None;
         for (offsets, counts) in [
             (&t.strip_offsets, &t.strip_counts),
             (&t.tile_offsets, &t.tile_counts),
@@ -491,15 +487,9 @@ impl Walker<'_, '_> {
                 if !self.room() {
                     return;
                 }
-                let mut lossy = false;
-                if jpeg_compression {
-                    if self.classified < MAX_CLASSIFIED {
-                        self.classified += 1;
-                        lossy = self.is_lossy_jpeg(o, l);
-                    } else {
-                        self.info.truncated = true;
-                    }
-                }
+                // One lookup per IFD: all its strips/tiles share one Compression.
+                let lossy =
+                    *kind.get_or_insert_with(|| jpeg_compression && self.is_lossy_jpeg(o, l));
                 if lossy {
                     self.info.jpegs.push((o, l));
                 } else {
@@ -965,27 +955,42 @@ mod tests {
         assert_eq!((i.jpegs.len(), i.data.len()), (0, 1));
     }
 
-    #[test]
-    fn jpeg_lookups_are_capped() {
-        let j = jpeg_with_sof(0xC0);
-        let n = 70usize;
-        let (offs, cnts, strip) = (300usize, 300 + 4 * n, 1000usize);
+    /// One IFD with compression 7, `n` tiles all at `tile` (`j.len()` bytes each) and a JPEG preview range.
+    fn tiled(n: usize, j: &[u8]) -> TiffInfo {
+        let (offs, cnts, tile, prev) = (300usize, 300 + 4 * n, 300 + 8 * n, 300 + 8 * n + j.len());
         let ifd = ifd_bytes(
             &[
                 entry(0x0103, 3, 1, 7),
-                entry(0x0111, 4, n as u32, offs as u32),
-                entry(0x0117, 4, n as u32, cnts as u32),
+                entry(0x0144, 4, n as u32, offs as u32),
+                entry(0x0145, 4, n as u32, cnts as u32),
+                entry(0x0201, 4, 1, prev as u32),
+                entry(0x0202, 4, 1, 30),
             ],
             0,
         );
-        let mut b = file(strip + j.len(), &[(8, ifd), (strip, j.clone())]);
+        let mut b = file(prev + 30, &[(8, ifd), (tile, j.to_vec())]);
         for k in 0..n {
-            put(&mut b, offs + 4 * k, &le(strip as u32));
+            put(&mut b, offs + 4 * k, &le(tile as u32));
             put(&mut b, cnts + 4 * k, &le(j.len() as u32));
         }
         let i = walk_all(&b).unwrap();
-        assert_eq!((i.jpegs.len(), i.data.len()), (64, 6));
-        assert!(i.truncated && !i.garbled);
+        assert_eq!(i.jpegs.first(), Some(&(prev as u64, 30)));
+        i
+    }
+
+    #[test]
+    fn many_lossless_tiles_are_not_truncated() {
+        let i = tiled(1000, &jpeg_with_sof(0xC3));
+        assert_eq!(i.data.len(), 1000);
+        assert_eq!(i.jpegs.len(), 1); // only the real preview
+        assert!(!i.truncated && !i.garbled);
+    }
+
+    #[test]
+    fn a_whole_ifd_is_classified_by_its_first_range() {
+        let i = tiled(100, &jpeg_with_sof(0xC0));
+        assert_eq!(i.jpegs.len(), 101);
+        assert!(i.data.is_empty() && !i.truncated);
     }
 
     #[test]
