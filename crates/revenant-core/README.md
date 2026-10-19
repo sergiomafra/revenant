@@ -59,6 +59,12 @@ size under 8, or the end of the source; a box that runs past the end counts only
 `FileKind::Mov`, anything else `Mp4`. Every size is checked against the source length; only `moov` is loaded into memory, and
 only up to `MOOV_MAX_LEN` (16 MiB).
 
+Walk boundaries: `ftyp` is accepted only as the first box. Once both `moov` and `mdat` are seen, only trailing
+`free skip wide uuid meta udta mfra` boxes continue the file (plus `moof sidx styp mdat` when it is fragmented); anything else
+ends it, and a trailing box that overruns the source is left out. The walk also stops at a box that starts on a 512-byte sector
+that another format recognizes (checked at box starts, not inside boxes). A size-0 `mdat` measures to the end of the source.
+Chunk offsets are relative to the start of the file (its `ftyp`), not to the source.
+
 - No `mdat`: not a video (`None`).
 - No `moov`: `Damaged` (the media data is there but not the index; rebuilding it is a later product milestone).
 - `moov` larger than 16 MiB: `Damaged`.

@@ -8,9 +8,14 @@
 //!   or `first chunk offset + total sample size` past the measured end (a lower bound on where the track's data ends)
 //!   -> `Partial`; else `Intact`.
 //!
+//! Chunk offsets are relative to the start of the file (the `ftyp`), not to the source. A size-0 `mdat` runs to the end of
+//! the source. The walk accepts `ftyp` only as the first box; once `moov` and `mdat` are both seen it continues only
+//! through trailing `free skip wide uuid meta udta mfra` (and `moof sidx styp mdat` for fragmented files), never counts a
+//! trailing box that overruns the source, and stops at a box-aligned 512-byte sector that another format recognizes.
+//!
 //! Only the first `moov` is parsed, and only if it is at most [`MOOV_MAX_LEN`] (larger -> `Damaged`).
 
-use super::{FileKind, Format, Health, Measurement};
+use super::{FileKind, Format, Health, Measurement, all_formats};
 use crate::source::Source;
 
 /// Largest `moov` box the detector will load into memory.
@@ -20,6 +25,9 @@ const ACCEPTED: [&[u8; 4]; 14] = [
     b"ftyp", b"moov", b"mdat", b"free", b"skip", b"wide", b"uuid", b"meta", b"pdin", b"moof",
     b"mfra", b"styp", b"sidx", b"udta",
 ];
+
+/// Sector size used for the "another file starts here" check, as in the JPEG detector.
+const SECTOR: u64 = 512;
 
 pub struct IsoBmff;
 
@@ -190,21 +198,48 @@ impl Format for IsoBmff {
         }
 
         let source_len = source.len();
+        let others: Vec<_> = all_formats()
+            .into_iter()
+            .filter(|f| f.name() != self.name())
+            .collect();
         let mut pos = start;
-        let (mut kind, mut has_mdat, mut truncated) = (FileKind::Mp4, false, false);
+        let (mut kind, mut has_mdat, mut has_moof, mut truncated) =
+            (FileKind::Mp4, false, false, false);
         let mut moov: Option<(u64, u64)> = None; // payload offset, payload length
         while pos < source_len {
+            if pos != start && pos % SECTOR == 0 {
+                let mut head = [0u8; 16];
+                let n = source.read_at(pos, &mut head).ok()?;
+                if others.iter().any(|f| f.recognizes(&head[..n])) {
+                    break;
+                }
+            }
             let Some(h) = read_header(source, pos) else {
                 break;
             };
+            let complete = has_mdat && moov.is_some();
+            let allowed = match &h.kind {
+                b"ftyp" => pos == start,
+                _ if !complete => true,
+                b"free" | b"skip" | b"wide" | b"uuid" | b"meta" | b"udta" | b"mfra" => true,
+                b"moof" | b"sidx" | b"styp" => has_moof,
+                b"mdat" => has_moof,
+                _ => false,
+            };
+            if !allowed {
+                break;
+            }
             let available = source_len - pos;
             let size = h.size.unwrap_or(available);
             if size > available {
+                if complete {
+                    break;
+                }
                 truncated = true;
             }
             let size = size.min(available);
             match &h.kind {
-                b"ftyp" if pos == start && size >= 12 => {
+                b"ftyp" if size >= 12 => {
                     let mut brand = [0u8; 4];
                     read_exact_at(source, pos + h.header_len, &mut brand)?;
                     if &brand == b"qt  " {
@@ -212,6 +247,7 @@ impl Format for IsoBmff {
                     }
                 }
                 b"mdat" => has_mdat = true,
+                b"moof" => has_moof = true,
                 b"moov" if moov.is_none() => {
                     moov = Some((pos + h.header_len, size.saturating_sub(h.header_len)))
                 }
