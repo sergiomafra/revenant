@@ -35,17 +35,27 @@ fn is_sof(m: u8) -> bool {
 struct Header {
     /// Offset just past SOS's segment: where the entropy-coded data starts.
     scan_start: u64,
+    /// A DAC segment (arithmetic coding conditioning) was seen: the content is beyond our decoder.
+    has_dac: bool,
 }
+
+/// Longest header [`Jpeg::confirms`] walks: it only has to tell a real header from a byte pattern.
+const CONFIRM_MAX_HEADER: u64 = 1 << 20;
 
 /// Walks the header segments of the JPEG at `start`, up to and including SOS. A walk that breaks on an unreadable
 /// sector is not proof that this is not a JPEG: the walk then ends where it broke (the search for EOI continues from
 /// there). `None` means "not a JPEG": a bad marker or length, no DQT/SOF, or the end of the source.
-fn walk_header(r: &mut Reader, start: u64) -> Option<Header> {
-    let (mut pos, mut has_dqt, mut has_sof) = (start + 2, false, false);
+fn walk_header(r: &mut Reader, start: u64, limit: u64) -> Option<Header> {
+    let (mut pos, mut has_dqt, mut has_sof, mut has_dac) = (start + 2, false, false, false);
+    // Whether the 4 bytes (marker and length) at `pos` are within `limit` of the start.
+    let within = |pos: u64| pos - start + 4 <= limit;
     loop {
         // Fill bytes (extra FF) may precede any marker.
-        while r.byte(pos)? == 0xFF && r.byte(pos + 1)? == 0xFF && pos - start <= JPEG_MAX_LEN {
+        while within(pos) && r.byte(pos)? == 0xFF && r.byte(pos + 1)? == 0xFF {
             pos += 1;
+        }
+        if !within(pos) {
+            return None;
         }
         let marker = match (r.byte(pos)?, r.byte(pos + 1)?) {
             (0xFF, m) if m == SOS || is_segment_marker(m) => Some(m),
@@ -54,21 +64,28 @@ fn walk_header(r: &mut Reader, start: u64) -> Option<Header> {
         let seg_len = u64::from(r.u16(pos + 2)?);
         let Some(marker) = marker.filter(|_| seg_len >= 2) else {
             if r.bad_in(start, pos + 4) {
-                return Some(Header { scan_start: pos });
+                return Some(Header {
+                    scan_start: pos,
+                    has_dac,
+                });
             }
             return None;
         };
         has_dqt |= marker == DQT;
         has_sof |= is_sof(marker);
+        has_dac |= marker == 0xCC;
         pos += 2 + seg_len;
-        if pos - start > JPEG_MAX_LEN {
+        if pos - start > limit {
             return None;
         }
         if marker == SOS {
             if !(has_dqt && has_sof) && !r.bad_in(start, pos) {
                 return None;
             }
-            return Some(Header { scan_start: pos });
+            return Some(Header {
+                scan_start: pos,
+                has_dac,
+            });
         }
     }
 }
@@ -125,7 +142,7 @@ impl Format for Jpeg {
     }
 
     fn confirms(&self, source: &dyn Source, start: u64) -> bool {
-        walk_header(&mut Reader::new(source), start).is_some()
+        walk_header(&mut Reader::new(source), start, CONFIRM_MAX_HEADER).is_some()
     }
 
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement> {
@@ -135,7 +152,8 @@ impl Format for Jpeg {
             return None;
         }
 
-        let mut pos = walk_header(&mut r, start)?.scan_start;
+        let header = walk_header(&mut r, start, JPEG_MAX_LEN)?;
+        let mut pos = header.scan_start;
 
         // Entropy-coded data. FF00 and RSTn are data; EOI ends the file.
         let formats = all_formats();
@@ -162,7 +180,11 @@ impl Format for Jpeg {
                 return Some(Measurement {
                     len,
                     kind: FileKind::Jpeg,
-                    health: decode_health(&mut r, start, len),
+                    health: match decode_health(&mut r, start, len) {
+                        // No decoder here handles arithmetic coding: complete but not verifiable.
+                        Health::Damaged if header.has_dac => Health::Partial,
+                        health => health,
+                    },
                 });
             }
             pos += 1;

@@ -674,3 +674,36 @@ fn random_head_inside_mdat_does_not_cut() {
         )]
     );
 }
+
+#[test]
+fn photo_over_motion_jpeg_mdat_is_still_found() {
+    // Motion-JPEG video whose index lists one chunk; a real photo written at a sector start that is not a chunk.
+    let photo = testkit::jpeg(64, 64, 42, 2000);
+    let mut payload = vec![0x11u8; 484];
+    payload.extend_from_slice(&photo);
+    payload.resize(payload.len() + 3000, 0x22);
+    let video = testkit::mp4_with(
+        &Mp4Options {
+            mov: true,
+            ..mp4_opts(true)
+        },
+        b"mjpa",
+        &payload,
+        &[0],
+    );
+    let mut img = DiskImage::noise(2 * MIB, 43);
+    img.put(MIB, &video);
+    let events = scan_image(&img);
+    assert_eq!(
+        findings(&events),
+        vec![
+            (MIB as u64, 512, FileKind::Mov, Health::Damaged),
+            (
+                MIB as u64 + 512,
+                photo.len() as u64,
+                FileKind::Jpeg,
+                Health::Intact
+            ),
+        ]
+    );
+}

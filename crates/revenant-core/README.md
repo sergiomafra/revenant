@@ -43,7 +43,8 @@ the bytes are not a file of that format. `None` never means "could not read": a 
 "Another file starts here" (used to cut a JPEG's scan data or an `mdat` at a sector start) means a format both `recognizes`
 the head and `confirms` it, so a random byte pattern that merely looks like a signature can no longer cut a file. JPEG
 confirms with the header walk up to SOS with DQT and SOF present (no scan-data walk); ISO BMFF confirms with a valid `ftyp`
-followed by a parseable header of an accepted box type. `scan` still uses `recognizes` plus `measure` for its candidates.
+followed by a parseable header of an accepted box type (a header that falls in an unreadable sector does not refute it, so it
+confirms, as for JPEG). JPEG's `confirms` walks at most 1 MiB of header. `scan` still uses `recognizes` plus `measure` for its candidates.
 
 Detectors read the source through one shared reader, in 1 MiB windows aligned to 512-byte sectors (never a whole file at
 once). When a window cannot be read it is re-read sector by sector: unreadable sectors read as zeros and are remembered, and
@@ -60,8 +61,8 @@ not end the file; DAC and JPG markers count as segments, and `FF` fill bytes bef
   sectors and a decode (strict or lenient) of the zero-filled bytes succeeds. The length never exceeds `JPEG_MAX_LEN`.
   Also `Partial`: the structure is complete but the declared size is over 210 megapixels, so it is not decoded ("not fully
   verifiable").
-- `Damaged`: EOI found but neither decode succeeds (this includes arithmetic-coded files with a DAC segment, which
-  `zune-jpeg` does not support). The length is still exact.
+  Also `Partial`: a DAC segment (arithmetic coding) with complete structure, which `zune-jpeg` cannot decode.
+- `Damaged`: EOI found but neither decode succeeds. The length is still exact.
 
 The validation decode outputs grayscale (1 byte per pixel) to bound memory.
 
@@ -82,9 +83,10 @@ Walk boundaries: `ftyp` is accepted only as the first box. Once both `moov` and 
 ends it, and a trailing box that overruns the source is left out. The walk also stops at a box that starts on a 512-byte sector
 where a recognized file starts. Inside `mdat`, every 512-byte sector start (absolute offset) is checked as well: where a
 recognized file of any format starts, the video ends there. An `mdat` whose declared size is cut this way counts as a box
-declared larger than what exists (below). Motion-JPEG exception: if the walk was cut inside `mdat`, the video is measured
-again without the checks inside `mdat`; when that measurement has a `moov` whose track sample entry (`stsd`) is `mjpa`,
-`mjpb` or `jpeg` and is `Intact`, it is used, because the JPEGs in `mdat` are the video's own frames. Chunk offsets are relative to the start of the file (its `ftyp`), not to the source.
+declared larger than what exists (below). Motion-JPEG exception: if the walk was cut inside `mdat`, the video is measured again without the checks inside `mdat`, and
+that measurement is used only if (a) its index health is `Intact`, (b) a video track (`hdlr` `vide`) has a first `stsd`
+entry of `mjpa`, `mjpb` or `jpeg`, and (c) every confirmed file head inside `mdat` lies exactly at one of that track's chunk
+offsets (`stco`/`co64`); a photo written over the video is not at a chunk offset, so the cut stays. Chunk offsets are relative to the start of the file (its `ftyp`), not to the source.
 
 - No `mdat`: not a video (`None`).
 - No `moov`: `Damaged` (the media data is there but not the index; rebuilding it is a later product milestone).

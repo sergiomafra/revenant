@@ -251,6 +251,43 @@ fn dac_and_fill_bytes_before_sos_are_measured() {
     let img = DiskImage::zeros(MIB).put(4096, &v).save();
     let m = measure(&img, 4096).unwrap();
     // The walk follows the DAC segment and the fill bytes to the exact end. zune-jpeg cannot decode DAC (arithmetic
-    // coding), so no decoder accepts the content: Damaged, never Intact without evidence.
-    assert_eq!((m.len, m.health), (v.len() as u64, Health::Damaged));
+    // coding): the structure is complete but not verifiable, so Partial, never Intact without evidence.
+    assert_eq!((m.len, m.health), (v.len() as u64, Health::Partial));
+}
+
+/// Counts the bytes requested through `read_at`.
+struct Counting {
+    inner: FileSource,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+impl revenant_core::source::Source for Counting {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, revenant_core::EngineError> {
+        self.bytes
+            .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_at(offset, buf)
+    }
+    fn volume(&self) -> Option<revenant_core::source::VolumeId> {
+        None
+    }
+}
+
+#[test]
+fn confirms_walks_at_most_one_mib_of_header() {
+    // SOI, then valid APP1 segments for about 1.3 MiB, never reaching SOS.
+    let mut v = vec![0xFF, 0xD8];
+    for _ in 0..20 {
+        v.extend_from_slice(&[0xFF, 0xE1, 0xFF, 0xFF]);
+        v.resize(v.len() + 65_533, 0);
+    }
+    let img = DiskImage::zeros(4 * MIB).put(4096, &v).save();
+    let source = Counting {
+        inner: FileSource::open(img.path()).unwrap(),
+        bytes: Default::default(),
+    };
+    assert!(!Jpeg.confirms(&source, 4096));
+    assert!(source.bytes.load(std::sync::atomic::Ordering::Relaxed) <= MIB as u64 + 4096);
 }

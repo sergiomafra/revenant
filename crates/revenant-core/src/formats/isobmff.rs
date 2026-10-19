@@ -25,7 +25,7 @@
 //! extraction keeps it); anywhere else in the file an otherwise `Intact` file becomes `Partial`. A box header that cannot
 //! be read ends the walk there, like a cut (`Partial`, or `Damaged` without `moov`).
 
-use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, all_formats};
+use super::{FileKind, Format, HEAD_LEN, Health, Measurement, Reader, SECTOR, all_formats};
 use crate::source::Source;
 
 /// Largest `moov` box the detector will load into memory.
@@ -214,8 +214,11 @@ impl Format for IsoBmff {
         if !self.recognizes(&head[..n]) {
             return false;
         }
-        let (next, n) = r.head(start + u64::from(be32(&head)));
-        parse_header(&next[..n]).is_some()
+        let next_at = start + u64::from(be32(&head));
+        let (next, n) = r.head(next_at);
+        // Like JPEG's `confirms`: a header that falls in an unreadable sector (read as zeros) is not proof that this is
+        // not a video, so it confirms.
+        parse_header(&next[..n]).is_some() || r.bad_in(next_at, next_at + HEAD_LEN as u64)
     }
 
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement> {
@@ -233,7 +236,9 @@ impl Format for IsoBmff {
             let again = walk_boxes(&mut r, &formats, start, false);
             if let Some(full) = judge(&mut r, start, &again)
                 && full.health == Health::Intact
-                && again.moov.is_some_and(|m| is_motion_jpeg(&mut r, m))
+                && again
+                    .moov
+                    .is_some_and(|m| frames_are_the_videos_own(&mut r, start, m, &again.heads))
             {
                 return Some(full);
             }
@@ -252,6 +257,8 @@ struct Walk {
     unreadable_header: bool,
     /// The walk ended because another file starts inside an `mdat`.
     cut_in_mdat: bool,
+    /// Every sector start inside an `mdat` where a file starts (only collected without the checks inside `mdat`).
+    heads: Vec<u64>,
     /// Payload offset and length of the first `moov`.
     moov: Option<(u64, u64)>,
 }
@@ -268,6 +275,7 @@ fn walk_boxes(r: &mut Reader, formats: &[Box<dyn Format>], start: u64, inner_che
         truncated: false,
         unreadable_header: false,
         cut_in_mdat: false,
+        heads: Vec::new(),
         moov: None,
     };
     let mut pos = start;
@@ -305,6 +313,14 @@ fn walk_boxes(r: &mut Reader, formats: &[Box<dyn Format>], start: u64, inner_che
         }
         let mut size = size.min(available);
         let mut cut = false;
+        if !inner_checks && &h.kind == b"mdat" {
+            let end = pos + size;
+            let mut from = pos;
+            while let Some(next) = next_file_inside(r, formats, from, end) {
+                w.heads.push(next);
+                from = next;
+            }
+        }
         if inner_checks
             && &h.kind == b"mdat"
             && let Some(next) = next_file_inside(r, formats, pos, pos + size)
@@ -372,24 +388,66 @@ fn judge(r: &mut Reader, start: u64, w: &Walk) -> Option<Measurement> {
     }
 }
 
-/// Whether a video track's sample entry (first entry of `stsd`) is Motion-JPEG: `mjpa`, `mjpb` or `jpeg`.
-fn is_motion_jpeg(r: &mut Reader, (at, len): (u64, u64)) -> bool {
+/// Whether every file head found inside `mdat` is a frame of a Motion-JPEG video track: the track is a video track
+/// (`hdlr` `vide`) whose first sample entry (`stsd`) is `mjpa`, `mjpb` or `jpeg`, and each head lies exactly at one of its
+/// chunk offsets (`stco`/`co64`, relative to `start`). A photo written over the video lies elsewhere.
+fn frames_are_the_videos_own(
+    r: &mut Reader,
+    start: u64,
+    (at, len): (u64, u64),
+    heads: &[u64],
+) -> bool {
     if len > MOOV_MAX_LEN {
         return false;
     }
     let mut moov = vec![0u8; len as usize];
     r.read(at, &mut moov);
     let mut garbled = false;
-    children(&moov, &mut garbled)
+    let mut chunks: Vec<u64> = Vec::new();
+    for (_, trak) in children(&moov, &mut garbled)
         .into_iter()
         .filter(|(k, _)| k == b"trak")
-        .any(|(_, trak)| {
-            let stsd = child(trak, b"mdia", &mut garbled)
-                .and_then(|m| child(m, b"minf", &mut garbled))
-                .and_then(|m| child(m, b"stbl", &mut garbled))
-                .and_then(|m| child(m, b"stsd", &mut garbled));
-            // version/flags (4), entry count (4), then the first entry: size (4), type (4).
-            stsd.and_then(|p| p.get(12..16))
-                .is_some_and(|t| t == b"mjpa" || t == b"mjpb" || t == b"jpeg")
+    {
+        let mdia = child(trak, b"mdia", &mut garbled);
+        let video = mdia
+            .and_then(|m| child(m, b"hdlr", &mut garbled))
+            .is_some_and(|p| p.get(8..12) == Some(b"vide"));
+        let stbl = mdia
+            .and_then(|m| child(m, b"minf", &mut garbled))
+            .and_then(|m| child(m, b"stbl", &mut garbled));
+        let Some(stbl) = stbl.filter(|_| video) else {
+            continue;
+        };
+        // version/flags (4), entry count (4), then the first entry: size (4), type (4).
+        let mjpeg = child(stbl, b"stsd", &mut garbled)
+            .and_then(|p| p.get(12..16))
+            .is_some_and(|t| t == b"mjpa" || t == b"mjpb" || t == b"jpeg");
+        if mjpeg {
+            if let Some(p) = child(stbl, b"stco", &mut garbled) {
+                chunks.extend(chunk_offsets(p, false));
+            } else if let Some(p) = child(stbl, b"co64", &mut garbled) {
+                chunks.extend(chunk_offsets(p, true));
+            }
+        }
+    }
+    chunks.sort_unstable();
+    !chunks.is_empty()
+        && heads
+            .iter()
+            .all(|h| chunks.binary_search(&(h - start)).is_ok())
+}
+
+/// All chunk offsets of an `stco` (32-bit) or `co64` (64-bit) payload, bounded by the table's actual size.
+fn chunk_offsets(payload: &[u8], wide: bool) -> Vec<u64> {
+    let entry = if wide { 8 } else { 4 };
+    let (Some(table), Some(count)) = (payload.get(8..), payload.get(4..8)) else {
+        return Vec::new();
+    };
+    let count = (be32(count) as usize).min(table.len() / entry);
+    (0..count)
+        .map(|i| {
+            let e = &table[i * entry..];
+            if wide { be64(e) } else { u64::from(be32(e)) }
         })
+        .collect()
 }

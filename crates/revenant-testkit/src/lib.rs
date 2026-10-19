@@ -149,26 +149,35 @@ fn stsd_box(codec: &[u8; 4]) -> Vec<u8> {
     bmff_box(b"stsd", &payload)
 }
 
-fn moov_box(chunk_offset: u64, sample_len: u32, wide: bool, codec: &[u8; 4]) -> Vec<u8> {
+fn moov_box(chunk_offsets: &[u64], sample_len: u32, wide: bool, codec: &[u8; 4]) -> Vec<u8> {
     let mvhd = bmff_box(b"mvhd", &[0; 100]);
     let mut stsz = vec![0; 4];
     stsz.extend_from_slice(&0u32.to_be_bytes()); // sample_size = 0: per-sample table
     stsz.extend_from_slice(&1u32.to_be_bytes());
     stsz.extend_from_slice(&sample_len.to_be_bytes());
     let mut chunks = vec![0; 4];
-    chunks.extend_from_slice(&1u32.to_be_bytes());
-    let chunk_table = if wide {
-        chunks.extend_from_slice(&chunk_offset.to_be_bytes());
-        bmff_box(b"co64", &chunks)
-    } else {
-        chunks.extend_from_slice(&(chunk_offset as u32).to_be_bytes());
-        bmff_box(b"stco", &chunks)
-    };
+    chunks.extend_from_slice(&(chunk_offsets.len() as u32).to_be_bytes());
+    for &offset in chunk_offsets {
+        if wide {
+            chunks.extend_from_slice(&offset.to_be_bytes());
+        } else {
+            chunks.extend_from_slice(&(offset as u32).to_be_bytes());
+        }
+    }
+    let chunk_table = bmff_box(if wide { b"co64" } else { b"stco" }, &chunks);
+    // hdlr: version/flags, pre_defined, handler type, reserved, empty name.
+    let mut hdlr = vec![0; 8];
+    hdlr.extend_from_slice(b"vide");
+    hdlr.extend_from_slice(&[0; 13]);
+    let hdlr = bmff_box(b"hdlr", &hdlr);
     let stbl = bmff_box(
         b"stbl",
         &[stsd_box(codec), bmff_box(b"stsz", &stsz), chunk_table].concat(),
     );
-    let trak = bmff_box(b"trak", &bmff_box(b"mdia", &bmff_box(b"minf", &stbl)));
+    let trak = bmff_box(
+        b"trak",
+        &bmff_box(b"mdia", &[hdlr, bmff_box(b"minf", &stbl)].concat()),
+    );
     bmff_box(b"moov", &[mvhd, trak].concat())
 }
 
@@ -177,13 +186,14 @@ fn moov_box(chunk_offset: u64, sample_len: u32, wide: bool, codec: &[u8; 4]) -> 
 pub fn mp4(opts: &Mp4Options) -> Vec<u8> {
     let mut payload = vec![0u8; opts.mdat_len];
     SplitMix64(opts.mdat_len as u64).fill(&mut payload);
-    mp4_with(opts, b"avc1", &payload)
+    mp4_with(opts, b"avc1", &payload, &[0])
 }
 
 /// Like [`mp4`], but the video track's sample entry type is `codec` (`avc1`, `mjpa`, ...) and the `mdat` payload is
 /// `payload` (`opts.mdat_len` is ignored). The payload sits at offset 28 of the file (20-byte `ftyp`, 8-byte `mdat`
-/// header; 36 with `mdat_64bit`) when `moov` is at the end.
-pub fn mp4_with(opts: &Mp4Options, codec: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+/// header; 36 with `mdat_64bit`) when `moov` is at the end. `chunks` are the chunk offsets listed in the index, relative to
+/// the start of the payload.
+pub fn mp4_with(opts: &Mp4Options, codec: &[u8; 4], payload: &[u8], chunks: &[u64]) -> Vec<u8> {
     let brand: &[u8; 4] = if opts.mov { b"qt  " } else { b"isom" };
     let mut ftyp = brand.to_vec();
     ftyp.extend_from_slice(&0u32.to_be_bytes());
@@ -200,18 +210,17 @@ pub fn mp4_with(opts: &Mp4Options, codec: &[u8; 4], payload: &[u8]) -> Vec<u8> {
         bmff_box(b"mdat", payload)
     };
     let header = if opts.mdat_64bit { 16 } else { 8 };
-    let moov_len = moov_box(0, 0, opts.mdat_64bit, codec).len();
+    let moov_len = moov_box(&vec![0; chunks.len()], 0, opts.mdat_64bit, codec).len();
     let mdat_at = if opts.moov_at_end {
         ftyp.len()
     } else {
         ftyp.len() + moov_len
     };
-    let moov = moov_box(
-        (mdat_at + header) as u64,
-        payload.len() as u32,
-        opts.mdat_64bit,
-        codec,
-    );
+    let absolute: Vec<u64> = chunks
+        .iter()
+        .map(|c| (mdat_at + header) as u64 + c)
+        .collect();
+    let moov = moov_box(&absolute, payload.len() as u32, opts.mdat_64bit, codec);
 
     if opts.moov_at_end {
         [ftyp, mdat, moov].concat()

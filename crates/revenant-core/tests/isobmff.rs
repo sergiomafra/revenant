@@ -385,8 +385,9 @@ fn complete_video_followed_by_unreadable_sector_is_intact() {
     assert_eq!((m.len, m.health), (v.len() as u64, Health::Intact));
 }
 
-/// A moov-at-end MOV whose mdat holds a JPEG frame; one frame starts on a sector start of the image.
-fn mjpeg_layout(codec: &[u8; 4]) -> (Vec<u8>, Vec<u8>) {
+/// A moov-at-end MOV whose mdat holds a JPEG frame; one frame starts on a sector start of the image
+/// and is listed as a chunk (payload offset 484) in the index.
+fn mjpeg_layout(codec: &[u8; 4], extra_chunk: Option<u64>) -> (Vec<u8>, Vec<u8>) {
     let frame = testkit::jpeg(64, 64, 21, 2000);
     // The payload starts at file offset 28; AT is a sector start, so payload offset 484 is a sector start too.
     let mut payload = vec![0x11u8; 484];
@@ -399,13 +400,14 @@ fn mjpeg_layout(codec: &[u8; 4]) -> (Vec<u8>, Vec<u8>) {
         },
         codec,
         &payload,
+        &[&[0, 484][..], extra_chunk.as_slice()].concat(),
     );
     (video, frame)
 }
 
 #[test]
 fn motion_jpeg_frames_do_not_cut_the_video() {
-    let (video, _) = mjpeg_layout(b"mjpa");
+    let (video, _) = mjpeg_layout(b"mjpa", None);
     let img = DiskImage::noise(AT + video.len() + 20_000, 11)
         .put(AT, &video)
         .save();
@@ -418,11 +420,44 @@ fn motion_jpeg_frames_do_not_cut_the_video() {
 
 #[test]
 fn h264_video_is_still_cut_by_a_real_jpeg() {
-    let (video, _) = mjpeg_layout(b"avc1");
+    let (video, _) = mjpeg_layout(b"avc1", None);
     let img = DiskImage::noise(AT + video.len() + 20_000, 12)
         .put(AT, &video)
         .save();
     let m = measure(&img).unwrap();
     // The cut lands before the moov, so the index is gone.
     assert_eq!((m.len, m.health), (512, Health::Damaged));
+}
+
+#[test]
+fn motion_jpeg_exception_needs_an_intact_index() {
+    // Same MJPEG video, but the index also lists a chunk far past the end of the file: not Intact, so the cut stays.
+    let (video, _) = mjpeg_layout(b"mjpa", Some(10_000_000));
+    let img = DiskImage::noise(AT + video.len() + 20_000, 13)
+        .put(AT, &video)
+        .save();
+    let m = measure(&img).unwrap();
+    assert_eq!((m.len, m.health), (512, Health::Damaged));
+}
+
+#[test]
+fn confirms_a_header_in_an_unreadable_sector_like_jpeg_does() {
+    // ftyp of 512 bytes, so the next box header is the first thing in the following sector.
+    let mut v = 512u32.to_be_bytes().to_vec();
+    v.extend_from_slice(b"ftypisom");
+    v.resize(512, 0);
+    let mut moov = 8u32.to_be_bytes().to_vec();
+    moov.extend_from_slice(b"free");
+    v.extend_from_slice(&moov);
+    let img = DiskImage::zeros(AT + 4096).put(AT, &v).save();
+    let source = BadSector {
+        inner: FileSource::open(img.path()).unwrap(),
+        bad: (AT + 512) as u64,
+    };
+    // Not provably a non-file: an unreadable sector does not refute it.
+    assert!(IsoBmff.confirms(&source, AT as u64));
+    // The same bytes, readable and valid, confirm too; readable zeros do not.
+    assert!(IsoBmff.confirms(&FileSource::open(img.path()).unwrap(), AT as u64));
+    let img = DiskImage::zeros(AT + 4096).put(AT, &v[..512]).save();
+    assert!(!IsoBmff.confirms(&FileSource::open(img.path()).unwrap(), AT as u64));
 }
