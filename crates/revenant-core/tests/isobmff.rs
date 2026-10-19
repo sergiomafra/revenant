@@ -312,3 +312,38 @@ fn interleaved_two_track_file_is_intact() {
     let m = measure(&img).unwrap();
     assert_eq!((m.len, m.health), (v.len() as u64, Health::Intact));
 }
+
+/// Appends `extra` inside a box and fixes its size field.
+fn pad_box(b: &[u8], extra: &[u8]) -> Vec<u8> {
+    let mut o = b.to_vec();
+    o.extend_from_slice(extra);
+    let n = o.len() as u32;
+    o[..4].copy_from_slice(&n.to_be_bytes());
+    o
+}
+
+fn video_with_trailing(extra: &[u8]) -> Vec<u8> {
+    let ftyp = bx(b"ftyp", b"isom\0\0\0\0isom");
+    let t = pad_box(&trak([0, 0], [0, 0]), &[]);
+    let moov_len = pad_box(&bx(b"moov", &pad_box(&t, extra)), extra).len() as u32;
+    let base = ftyp.len() as u32 + moov_len + 8;
+    let t = pad_box(&trak([base, base + 100], [100, 100]), extra);
+    let moov = pad_box(&bx(b"moov", &t), extra);
+    [ftyp, moov, bx(b"mdat", &[7u8; 200])].concat()
+}
+
+#[test]
+fn zero_terminator_in_moov_is_tolerated() {
+    let v = video_with_trailing(&[0; 4]);
+    let img = DiskImage::noise(AT + v.len() + 4096, 15).put(AT, &v).save();
+    let m = measure(&img).unwrap();
+    assert_eq!((m.len, m.health), (v.len() as u64, Health::Intact));
+}
+
+#[test]
+fn nonzero_trailing_bytes_in_moov_are_damaged() {
+    let v = video_with_trailing(&[0, 0, 0, 1]);
+    let img = DiskImage::noise(AT + v.len() + 4096, 16).put(AT, &v).save();
+    let m = measure(&img).unwrap();
+    assert_eq!((m.len, m.health), (v.len() as u64, Health::Damaged));
+}

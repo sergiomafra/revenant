@@ -105,10 +105,14 @@ fn read_header(source: &dyn Source, pos: u64) -> Option<BoxHeader> {
 }
 
 /// Children `(type, payload)` of a box payload, bounded by the payload itself. Sets `garbled` if the walk ends on an
-/// invalid size (or leftover bytes) instead of consuming the payload exactly.
+/// invalid size (or leftover bytes) instead of consuming the payload exactly. Fewer than 8 trailing zero bytes (a
+/// QuickTime terminator or padding) are tolerated.
 fn children<'a>(mut data: &'a [u8], garbled: &mut bool) -> Vec<([u8; 4], &'a [u8])> {
     let mut out = Vec::new();
     while !data.is_empty() {
+        if data.len() < 8 && data.iter().all(|&b| b == 0) {
+            break; // QuickTime-style zero terminator or padding
+        }
         let (header, size) = match data.get(..8).map(be32) {
             Some(0) => (8, data.len()),
             Some(1) if data.len() >= 16 => {
