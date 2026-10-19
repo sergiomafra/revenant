@@ -22,9 +22,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Scan an image file or device read-only; one JSON line per event on stdout, progress on stderr.
+    /// Scan a disk image file read-only; one JSON line per event on stdout, progress on stderr.
     Scan {
-        /// Disk image file or device node to scan.
+        /// Disk image file to scan.
         image: PathBuf,
         /// Extract each finding into this directory as it is found (never onto the source's volume).
         #[arg(long, value_name = "DIR")]
@@ -75,10 +75,10 @@ impl Source for UnknownVolume<'_> {
     }
 }
 
-fn emit(line: &Line) {
+/// Returns false when stdout is closed (e.g. `| head`), so the caller can stop.
+fn emit(line: &Line) -> bool {
     let mut out = std::io::stdout().lock();
-    // A closed stdout (e.g. `| head`) is not worth a panic.
-    let _ = writeln!(out, "{}", serde_json::to_string(line).expect("serialize"));
+    writeln!(out, "{}", serde_json::to_string(line).expect("serialize")).is_ok()
 }
 
 fn found_line(f: &Finding, file: Option<String>, error: Option<&'static str>) -> Line {
@@ -128,9 +128,15 @@ fn run_scan(image: &Path, dest: Option<&Path>, allow_same_volume: bool) -> Resul
                         Err(e) => error = Some(e.code()),
                     }
                 }
-                emit(&found_line(&f, path, error));
+                if !emit(&found_line(&f, path, error)) {
+                    cancel.cancel();
+                }
             }
-            Event::Unreadable { start, len } => emit(&Line::Unreadable { start, len }),
+            Event::Unreadable { start, len } => {
+                if !emit(&Line::Unreadable { start, len }) {
+                    cancel.cancel();
+                }
+            }
             Event::Progress { read, total } => {
                 let pct = (read * 100).checked_div(total).unwrap_or(100);
                 if pct != last_pct {

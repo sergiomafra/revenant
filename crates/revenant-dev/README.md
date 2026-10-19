@@ -16,7 +16,7 @@ cargo build --release -p revenant-dev
 revenant-dev scan <IMAGE> [--extract <DIR>] [--allow-same-volume]
 ```
 
-- `<IMAGE>`: a disk image file or a device node.
+- `<IMAGE>`: a disk image file (scanning devices directly comes in a later part).
 - `--extract <DIR>`: copies each finding into `<DIR>` as soon as it is found. The engine refuses to extract onto the
   source's own volume (error `destination_on_source`, exit 1), so use a folder on another disk.
 - `--allow-same-volume`: **developer only: use when scanning an image FILE, never a card.** Treats the source's volume as
@@ -44,14 +44,15 @@ Work on an image of the card, not on the card itself. Imaging only reads from th
 
 macOS:
 
+**Double-check the device name with `diskutil list` before running `dd`, and never swap `if` and `of`: `of=` is written to.**
+
 ```sh
-diskutil list                      # find the card, e.g. /dev/disk4
-diskutil unmountDisk /dev/disk4    # unmount without ejecting
-sudo dd if=/dev/rdisk4 of=card.img bs=4m
+diskutil list                          # find the card: /dev/diskN
+diskutil unmountDisk /dev/diskN        # unmount without ejecting
+sudo dd if=/dev/rdiskN of=card.img bs=4m
 ```
 
-**Double-check the device name with `diskutil list` before running `dd`, and never swap `if` and `of`: `of=` is written to.**
-`card.img` must be on a different disk than the card, with enough free space.
+Replace `N` with the card's number. `card.img` must be on a different disk than the card, with enough free space.
 
 Windows: use a read-only imaging tool (for example FTK Imager, which can create a raw image of a physical drive) rather than
 `dd`, and save the image to a different drive than the card.
