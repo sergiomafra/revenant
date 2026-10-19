@@ -96,3 +96,16 @@ Events:
 
 `CancelToken::cancel()` (from any thread or from inside the callback) makes the scan return `EngineError::Cancelled` at the
 next block boundary; a finding still pending at that point is dropped.
+
+## Extract
+
+`extract(source, &Finding, dest_dir) -> Result<PathBuf, EngineError>` copies a finding's bytes (in 1 MiB chunks) into `dest_dir`
+as `revenant_<start as 12 hex digits>.<ext>`; if that exists, `_2`, `_3`… are tried (files are created with `create_new`, so
+nothing is ever overwritten; after 10,000 attempts it fails with `write_failed`).
+
+- Refuses with `destination_on_source` when the destination is on the source's volume (writing to a damaged card could destroy
+  what is still recoverable). If the source's volume is unknown (`None`) extraction is allowed. If the destination's volume
+  cannot be determined (e.g. the directory does not exist) it returns `open_failed` and writes nothing.
+- A chunk that cannot be read is re-read sector by sector (512 bytes); only the unreadable sectors are written as zeros, so a
+  partial file comes out instead of none. Bytes past the source's end are also zeros.
+- A write error returns `write_failed` and removes the incomplete file.
