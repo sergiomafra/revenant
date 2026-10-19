@@ -6,8 +6,8 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 
 ## Onde o desenvolvimento está
 
-**19/10/2026.** Módulo 1 (motor), Parte 1.1 (fundação e escultura) em andamento na branch `feat/m1-p1-engine`. Tarefa 1
-(workspace Rust, licença, CI, docs, `EngineError`) feita.
+**19/10/2026.** Módulo 1 (motor), Parte 1.1 (fundação e escultura) concluída na branch `feat/m1-p1-engine`, aguardando o
+aceite e o merge do Sérgio. Próximo: Parte 1.2 (a spec já cobre; plano a escrever). CLI de desenvolvimento: `revenant-dev`.
 
 ## Diretrizes fixas
 

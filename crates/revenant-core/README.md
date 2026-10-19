@@ -4,7 +4,7 @@ The Revenant recovery engine (library). It never writes to the source being read
 
 ## Current state
 
-For now the crate only defines `EngineError`, the engine's error type. Every variant has a stable `snake_case` code, returned by
+Every engine error is an `EngineError`; each variant has a stable `snake_case` code, returned by
 `EngineError::code()`:
 
 | Variant               | Code                    |
@@ -109,3 +109,8 @@ nothing is ever overwritten; after 10,000 attempts it fails with `write_failed`)
 - A chunk that cannot be read is re-read sector by sector (512 bytes); only the unreadable sectors are written as zeros, so a
   partial file comes out instead of none. Bytes past the source's end are also zeros.
 - A write error returns `write_failed` and removes the incomplete file.
+
+## Trying it
+
+The `revenant-dev` crate is a command line over this engine: `revenant-dev scan <image> [--extract <dir>]` prints each finding
+as a JSON line. See `crates/revenant-dev/README.md`.
