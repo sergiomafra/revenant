@@ -75,3 +75,18 @@ Chunk offsets are relative to the start of the file (its `ftyp`), not to the sou
 - Otherwise the `stco`/`co64` and `stsz` tables of each `trak` are checked: any chunk offset at or past the measured end, or
   `first chunk offset + total sample size` past it, gives `Partial`; else `Intact`. Fragmented files (`moof`) have no such
   tables and are `Intact` when their boxes are complete.
+
+## Scan
+
+`scan(source, formats, &ScanOptions, &CancelToken, &mut on_event) -> Result<ScanSummary, EngineError>` walks a source in blocks
+(`ScanOptions::block`, default 4 MiB) and looks at the first 16 bytes of every sector (`ScanOptions::sector`, default 512). The
+first format that recognizes a head and measures a file there wins; the scan emits `Event::Found(Finding)` (sequential `id` from
+1) and resumes at the first sector start at or after the file's end. A head near the end of a block is read from the source,
+never cut, and `measure` reads the source directly, so files may cross block boundaries.
+
+Other events: `Progress { read, total }` (at most once per block, and a last one with `read == total`) and `Unreadable { start,
+len }`. When a block cannot be read it is re-read sector by sector; each run of consecutive failed sectors (also across blocks)
+is one `Unreadable` event and counts in `ScanSummary::unreadable_bytes`. The scan then continues.
+
+`CancelToken::cancel()` (from any thread or from inside the callback) makes the scan return `EngineError::Cancelled` at the next
+block boundary.
