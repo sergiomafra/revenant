@@ -7,14 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- MP4/MOV detection: exact length from the box structure, health from the `moov` chunk and sample tables.
-- Sector scan: finds photos and videos in a disk image with progress, cancellation, and unreadable-region reporting.
-- Extraction: copies a found file into a chosen folder without overwriting, and refuses to write onto the source's own volume.
-- Engine: finds JPEG photos and MP4/MOV videos in card images, including formatted cards; classifies them as
-  intact/partial/damaged; recovers them to another folder.
-- Unreadable sectors no longer hide files: a photo or video next to or containing a bad sector is still found, and is
-  never labelled intact if it contains one.
-- A broken video no longer hides the files after it: a video whose size was never written (battery died mid-recording) or
-  whose data was partly overwritten ends where the next photo or video starts, and files inside a partial or damaged file
-  are still found.
+- JPEG photo detection: exact length from the marker structure (an embedded EXIF thumbnail does not end the file), health
+  from a real decode.
+- MP4/MOV video detection: exact length from the box structure, health from the `moov` chunk and sample tables; a video
+  whose size was never written (battery died mid-recording) or whose data was partly overwritten ends where the next file
+  starts.
+- Sector scan of a disk image (including formatted cards) with progress, cancellation and unreadable-region reporting; each
+  file is classified as intact, partial or damaged. Unreadable sectors never hide a file (a file containing one is never
+  intact), and files inside a partial or damaged file are still found.
+- Extraction: copies a found file into a chosen folder without overwriting, never past the end of the source, and refuses to
+  write onto the source's own volume.
 - `revenant-dev`: developer command line (`scan <image> [--extract <dir>]`) that prints findings as JSON lines.

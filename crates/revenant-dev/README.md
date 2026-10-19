@@ -17,7 +17,8 @@ revenant-dev scan <IMAGE> [--extract <DIR>] [--allow-same-volume]
 ```
 
 - `<IMAGE>`: a disk image file (scanning devices directly comes in a later part).
-- `--extract <DIR>`: copies each finding into `<DIR>` as soon as it is found. The engine refuses to extract onto the
+- `--extract <DIR>`: copies each finding into `<DIR>` as soon as it is found. `<DIR>` must already exist and be a folder;
+  otherwise the command stops before scanning with `error: open_failed` (exit 1). The engine refuses to extract onto the
   source's own volume (error `destination_on_source`, exit 1), so use a folder on another disk.
 - `--allow-same-volume`: **developer only: use when scanning an image FILE, never a card.** Treats the source's volume as
   unknown, so extraction onto the same volume is allowed. Tests use it because the image and the output folder live in the
@@ -34,8 +35,10 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
 ```
 
 - `kind`: `jpeg`, `mp4` or `mov`. `health`: `intact`, `partial` or `damaged`.
-- With `--extract`, a `found` line gets `"file":"<path>"`. If extracting that one finding fails, it gets
-  `"error":"<code>"` instead and the scan continues.
+- `health` follows the engine: a file containing unreadable sectors is never `intact`. Files inside a `partial` or
+  `damaged` finding are reported as findings of their own, so their ranges may overlap.
+- With `--extract`, a `found` line gets `"file":"<path>"`. If extracting that one finding fails (for example
+  `write_failed` when the folder is not writable), it gets `"error":"<code>"` instead and the scan continues.
 - Fatal errors print `error: <code>` to stderr and exit with 1 (for example `open_failed`, `destination_on_source`).
 
 ## Making a card image (read-only)
@@ -49,10 +52,12 @@ macOS:
 ```sh
 diskutil list                          # find the card: /dev/diskN
 diskutil unmountDisk /dev/diskN        # unmount without ejecting
-sudo dd if=/dev/rdiskN of=card.img bs=4m
+sudo dd if=/dev/rdiskN of=card.img bs=4m conv=noerror,sync
 ```
 
 Replace `N` with the card's number. `card.img` must be on a different disk than the card, with enough free space.
+`conv=noerror,sync` keeps `dd` going past unreadable sectors (plain `dd` stops at the first one), padding them with zeros so
+every later byte stays at its offset.
 
 Windows: use a read-only imaging tool (for example FTK Imager, which can create a raw image of a physical drive) rather than
 `dd`, and save the image to a different drive than the card.

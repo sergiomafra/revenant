@@ -3,7 +3,8 @@ use crate::EngineError;
 use std::fs::File;
 use std::path::Path;
 
-/// A [`Source`] backed by a regular file or a raw device node, opened read-only.
+/// A [`Source`] backed by a regular file (a disk image file), opened read-only. Reading devices directly comes in a
+/// later part.
 pub struct FileSource {
     file: File,
     len: u64,

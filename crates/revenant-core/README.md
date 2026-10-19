@@ -25,10 +25,11 @@ assert_eq!(EngineError::Cancelled.code(), "cancelled");
 `source::Source` is the engine's read-only disk-access layer: `len()`, `read_at(offset, buf)` (positional, no shared cursor; fills
 the buffer except at the end of the source, returns 0 past the end) and `volume()`. There is no write method.
 
-`source::FileSource` implements it for regular files and device nodes, opened read-only (`pread` on Unix, `seek_read` on
-Windows). `source::volume_of(path)` returns the `VolumeId` of any existing path (device id on Unix, volume serial number on
-Windows), so extraction onto the source's own volume can be refused. A test scans `src/source/` to ensure no write-capable open
-flags are ever introduced.
+`source::FileSource` implements it for regular files (disk image files), opened read-only (`pread` on Unix, `seek_read` on
+Windows); reading devices directly comes in a later part. `source::volume_of(path)` returns the `VolumeId` of any existing
+path (device id on Unix, volume serial number on Windows), so extraction onto the source's own volume can be refused. A test
+scans `src/source/` to ensure no write-capable open flags are ever introduced, and another checks that the image's bytes and
+modification time are unchanged after a full scan that extracts every finding.
 
 ## Formats: JPEG
 
@@ -127,7 +128,7 @@ nothing is ever overwritten; after 10,000 attempts it fails with `write_failed`)
   what is still recoverable). If the source's volume is unknown (`None`) extraction is allowed. If the destination's volume
   cannot be determined (e.g. the directory does not exist) it returns `open_failed` and writes nothing.
 - A chunk that cannot be read is re-read sector by sector (512 bytes); only the unreadable sectors are written as zeros, so a
-  partial file comes out instead of none. Bytes past the source's end are also zeros.
+  partial file comes out instead of none. The copy stops at the source's end, even if the finding's length runs past it.
 - A write error returns `write_failed` and removes the incomplete file.
 
 ## Trying it

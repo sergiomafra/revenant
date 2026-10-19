@@ -159,3 +159,21 @@ fn unreadable_sector_becomes_zeros() {
     assert_eq!(out.len(), expected.len());
     assert_eq!(out, expected);
 }
+
+#[test]
+fn length_past_the_source_end_is_clamped() {
+    let mut f = fixture(other(), None, 0);
+    let source_len = f.image.len() as u64;
+    for len in [source_len * 2, u64::MAX] {
+        f.finding.len = len;
+        let dir = tempfile::tempdir().unwrap();
+        let path = run_extract(&f, dir.path());
+        let out = std::fs::read(path).unwrap();
+        assert_eq!(
+            out.len() as u64,
+            source_len - f.finding.start,
+            "len = {len}"
+        );
+        assert_eq!(out, f.image[f.finding.start as usize..]);
+    }
+}

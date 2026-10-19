@@ -101,10 +101,24 @@ fn found_line(f: &Finding, file: Option<String>, error: Option<&'static str>) ->
     }
 }
 
+/// The extraction folder must exist and be a directory; checked once, before scanning.
+fn check_folder(dest: &Path) -> Result<(), EngineError> {
+    match std::fs::metadata(dest) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(EngineError::Open {
+            cause: std::io::Error::other("not a directory"),
+        }),
+        Err(cause) => Err(EngineError::Open { cause }),
+    }
+}
+
 fn run_scan(image: &Path, dest: Option<&Path>, allow_same_volume: bool) -> Result<(), EngineError> {
     let file = FileSource::open(image)?;
     let wrapped = UnknownVolume(&file);
     let source: &dyn Source = if allow_same_volume { &wrapped } else { &file };
+    if let Some(dest) = dest {
+        check_folder(dest)?;
+    }
 
     let cancel = CancelToken::default();
     let mut fatal: Option<EngineError> = None;

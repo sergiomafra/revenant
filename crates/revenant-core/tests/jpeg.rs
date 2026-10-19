@@ -92,8 +92,8 @@ fn corrupted_scan_data_is_damaged() {
     let mid = j.len() / 2;
     // Stray DHT markers in the middle of the entropy-coded data: the structure still reaches EOI, but zune-jpeg
     // rejects the stream in both modes.
-    for pair in j[mid..mid + 64].chunks_exact_mut(2) {
-        pair.copy_from_slice(&[0xFF, 0xC4]);
+    for pair in j[mid..mid + 64].as_chunks_mut::<2>().0 {
+        *pair = [0xFF, 0xC4];
     }
     let img = DiskImage::zeros(1 << 20).put(4096, &j).save();
     let m = measure(&img, 4096).unwrap();

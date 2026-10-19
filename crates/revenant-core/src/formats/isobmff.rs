@@ -223,7 +223,7 @@ impl Format for IsoBmff {
         let mut moov: Option<(u64, u64)> = None; // payload offset, payload length
         let mut unreadable_header = false;
         while pos < source_len {
-            if pos != start && pos % SECTOR == 0 && r.file_starts_at(&formats, pos) {
+            if pos != start && pos.is_multiple_of(SECTOR) && r.file_starts_at(&formats, pos) {
                 break;
             }
             let (head, n) = r.head(pos);

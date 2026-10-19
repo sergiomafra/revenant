@@ -20,7 +20,7 @@ aceite e o merge do Sérgio. Próximo: Parte 1.2 (a spec já cobre; plano a escr
 - Licenças: só MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, Unlicense, CC0-1.0, BSL-1.0. Proibido
   GPL/AGPL/LGPL/MPL de terceiros e qualquer código copiado do PhotoRec/TestDisk. O Revenant é GPL-3.0-only.
 - Erros por código: todo erro do motor tem `code() -> &'static str` em `snake_case`; nenhum texto de UI no motor.
-- Rust edição 2024, `rust-version = "1.85"`. Sem `unsafe` fora de `source/windows.rs`, cada bloco com `// SAFETY:`.
+- Rust edição 2024, `rust-version = "1.88"`. Sem `unsafe` fora de `source/windows.rs`, cada bloco com `// SAFETY:`.
 - Testes nunca tocam dados reais nem discos físicos: só imagens sintéticas em `tempfile`. Todo teste novo é visto falhando antes.
 - Commits em Conventional Commits, com o trailer `Co-Authored-By`. Nunca `git add -A`.
 

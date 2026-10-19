@@ -131,7 +131,7 @@ impl Format for Jpeg {
             let Some(b) = r.byte(pos) else {
                 return Some(partial(pos));
             };
-            if pos % SECTOR == 0 && r.file_starts_at(&formats, pos) {
+            if pos.is_multiple_of(SECTOR) && r.file_starts_at(&formats, pos) {
                 return Some(partial(pos));
             }
             if b == 0xFF && r.byte(pos + 1) == Some(EOI) {

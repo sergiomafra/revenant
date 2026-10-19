@@ -113,7 +113,7 @@ fn jpeg_crossing_blocks() {
     jpeg[nested_at..nested_at + nested.len()].copy_from_slice(&nested);
     let start = MIB - 100 * 1024;
     assert!(start + nested_at > MIB);
-    assert!(start % 512 == 0 && start + jpeg.len() > MIB);
+    assert!(start.is_multiple_of(512) && start + jpeg.len() > MIB);
     let file = DiskImage::noise(3 * MIB, 5).put(start, &jpeg).save();
     let source = FileSource::open(file.path()).unwrap();
     let opts = ScanOptions {
@@ -218,7 +218,7 @@ fn small_and_unaligned_images() {
     assert!(jpeg.len() <= 784, "jpeg is {} bytes", jpeg.len());
     // Ends exactly at the last byte; the image is not a multiple of 512.
     let len = 9216 + jpeg.len();
-    assert!(len % 512 != 0);
+    assert!(!len.is_multiple_of(512));
     let file = DiskImage::noise(len, 8).put(9216, &jpeg).save();
     let (r, events) = run(
         &FileSource::open(file.path()).unwrap(),
@@ -617,8 +617,8 @@ fn nested_file_inside_a_damaged_finding_is_reported() {
     outer[nested_at..nested_at + nested.len()].copy_from_slice(&nested);
     // Corrupt the entropy-coded data (stray DHT markers) so no decoder accepts the outer file.
     let mid = outer.len() - 2000;
-    for pair in outer[mid..mid + 64].chunks_exact_mut(2) {
-        pair.copy_from_slice(&[0xFF, 0xC4]);
+    for pair in outer[mid..mid + 64].as_chunks_mut::<2>().0 {
+        *pair = [0xFF, 0xC4];
     }
     let start = MIB / 2;
     let mut img = DiskImage::noise(2 * MIB, 5);
