@@ -34,15 +34,22 @@ flags are ever introduced.
 
 `formats::Format` is the detector interface: `recognizes(head)` checks a signature at a sector start and
 `measure(source, start)` returns a `Measurement { len, kind, health }` found by walking the file's structure, or `None` when
-the bytes are not a file of that format. `formats::all_formats()` lists the supported detectors.
+the bytes are not a file of that format. `None` never means "could not read": a read error does not make a file vanish.
+`formats::all_formats()` lists the supported detectors.
+
+Detectors read the source through one shared reader, in 1 MiB windows aligned to 512-byte sectors (never a whole file at
+once). When a window cannot be read it is re-read sector by sector: unreadable sectors read as zeros and are remembered, and
+only the end of the source ends a walk for lack of data. A file whose measured range contains an unreadable sector is never
+`Intact` (details per format below).
 
 `formats::Jpeg` follows the marker segments by their declared lengths (so the thumbnail embedded in an APP1/EXIF segment does
-not end the file), requires DQT and SOF before SOS, and scans the entropy-coded data up to EOI (`FF D9`). The source is read in
-1 MiB windows, never whole, up to `JPEG_MAX_LEN` (64 MiB). Health:
+not end the file), requires DQT and SOF before SOS, and scans the entropy-coded data up to EOI (`FF D9`), up to
+`JPEG_MAX_LEN` (64 MiB). If the header walk breaks on an unreadable sector, the search for EOI continues from there. Health:
 
-- `Intact`: EOI found and `zune-jpeg` decodes the bytes in strict mode.
+- `Intact`: EOI found, no unreadable sector inside, and `zune-jpeg` decodes the bytes in strict mode.
 - `Partial`: no EOI before the end of the source, `JPEG_MAX_LEN`, or a 512-byte sector that starts another recognized file
-  (the length stops there); or EOI found and only the lenient decode succeeds. The length never exceeds `JPEG_MAX_LEN`.
+  (the length stops there); or EOI found and only the lenient decode succeeds; or EOI found, the file contains unreadable
+  sectors and a decode (strict or lenient) of the zero-filled bytes succeeds. The length never exceeds `JPEG_MAX_LEN`.
 - `Damaged`: EOI found but neither decode succeeds, or the declared size is over 210 megapixels (not decoded). The length is
   still exact.
 
@@ -75,6 +82,13 @@ Chunk offsets are relative to the start of the file (its `ftyp`), not to the sou
 - Otherwise the `stco`/`co64` and `stsz` tables of each `trak` are checked: any chunk offset at or past the measured end, or
   `first chunk offset + total sample size` past it, gives `Partial`; else `Intact`. Fragmented files (`moof`) have no such
   tables and are `Intact` when their boxes are complete.
+
+Unreadable sectors:
+
+- Inside `moov`: the index is unusable, so `Damaged`; the length still covers `moov`, so extraction keeps it.
+- Elsewhere in the file (for example inside `mdat`): an otherwise `Intact` file is `Partial`.
+- On a box header: the header cannot be parsed, so the walk ends there as if the file were cut (`Partial`, or `Damaged` when
+  no `moov` was seen before it).
 
 ## Scan
 

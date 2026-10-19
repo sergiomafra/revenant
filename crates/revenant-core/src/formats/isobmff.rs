@@ -16,8 +16,12 @@
 //! trailing box that overruns the source, and stops at a box-aligned 512-byte sector that another format recognizes.
 //!
 //! Only the first `moov` is parsed, and only if it is at most [`MOOV_MAX_LEN`] (larger -> `Damaged`).
+//!
+//! Unreadable sectors read as zeros: inside `moov` the index is unusable -> `Damaged` (the length still covers `moov`, so
+//! extraction keeps it); anywhere else in the file an otherwise `Intact` file becomes `Partial`. A box header that cannot
+//! be read ends the walk there, like a cut (`Partial`, or `Damaged` without `moov`).
 
-use super::{FileKind, Format, Health, Measurement, all_formats};
+use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, all_formats};
 use crate::source::Source;
 
 /// Largest `moov` box the detector will load into memory.
@@ -28,9 +32,6 @@ const ACCEPTED: [&[u8; 4]; 14] = [
     b"mfra", b"styp", b"sidx", b"udta",
 ];
 
-/// Sector size used for the "another file starts here" check, as in the JPEG detector.
-const SECTOR: u64 = 512;
-
 pub struct IsoBmff;
 
 struct BoxHeader {
@@ -38,20 +39,6 @@ struct BoxHeader {
     header_len: u64,
     /// Declared total size; `None` when the box runs to the end of the source (size 0).
     size: Option<u64>,
-}
-
-fn read_exact_at(source: &dyn Source, offset: u64, buf: &mut [u8]) -> Option<()> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let n = source
-            .read_at(offset + filled as u64, &mut buf[filled..])
-            .ok()?;
-        if n == 0 {
-            return None;
-        }
-        filled += n;
-    }
-    Some(())
 }
 
 fn be32(b: &[u8]) -> u32 {
@@ -96,12 +83,6 @@ fn parse_header(b: &[u8]) -> Option<BoxHeader> {
         }),
         _ => None,
     }
-}
-
-fn read_header(source: &dyn Source, pos: u64) -> Option<BoxHeader> {
-    let mut b = [0u8; 16];
-    let n = source.read_at(pos, &mut b).ok()?;
-    parse_header(&b[..n])
 }
 
 /// Children `(type, payload)` of a box payload, bounded by the payload itself. Sets `garbled` if the walk ends on an
@@ -211,32 +192,28 @@ impl Format for IsoBmff {
     }
 
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement> {
-        let mut head = [0u8; 16];
-        let n = source.read_at(start, &mut head).ok()?;
+        let mut r = Reader::new(source);
+        let (head, n) = r.head(start);
         if !self.recognizes(&head[..n]) {
             return None;
         }
 
         let source_len = source.len();
-        let others: Vec<_> = all_formats()
-            .into_iter()
-            .filter(|f| f.name() != self.name())
-            .collect();
+        let formats = all_formats();
         let mut pos = start;
         let (mut kind, mut has_mdat, mut has_moof, mut truncated) =
             (FileKind::Mp4, false, false, false);
         let mut moov: Option<(u64, u64)> = None; // payload offset, payload length
+        let mut unreadable_header = false;
         while pos < source_len {
-            if pos != start && pos % SECTOR == 0 {
-                let mut head = [0u8; 16];
-                let Ok(n) = source.read_at(pos, &mut head) else {
-                    break;
-                };
-                if others.iter().any(|f| f.recognizes(&head[..n])) {
-                    break;
-                }
+            if pos != start && pos % SECTOR == 0 && r.file_starts_at(&formats, pos) {
+                break;
             }
-            let Some(h) = read_header(source, pos) else {
+            let (head, n) = r.head(pos);
+            let Some(h) = parse_header(&head[..n]) else {
+                // An unreadable box header: what follows is lost, as if the file were cut here.
+                unreadable_header = r.bad_in(pos, pos + n as u64);
+                truncated |= unreadable_header;
                 break;
             };
             let complete = has_mdat && moov.is_some();
@@ -263,7 +240,7 @@ impl Format for IsoBmff {
             match &h.kind {
                 b"ftyp" if size >= 12 => {
                     let mut brand = [0u8; 4];
-                    read_exact_at(source, pos + h.header_len, &mut brand)?;
+                    r.read(pos + h.header_len, &mut brand);
                     if &brand == b"qt  " {
                         kind = FileKind::Mov;
                     }
@@ -280,7 +257,7 @@ impl Format for IsoBmff {
                 break;
             }
         }
-        if !has_mdat {
+        if !has_mdat && !unreadable_header {
             return None;
         }
         let len = pos - start;
@@ -289,14 +266,23 @@ impl Format for IsoBmff {
         let Some((moov_at, moov_len)) = moov else {
             return measured(Health::Damaged);
         };
+        let mut data = Vec::new();
+        if moov_len <= MOOV_MAX_LEN {
+            data.resize(moov_len as usize, 0);
+            r.read(moov_at, &mut data);
+            if r.bad_in(moov_at, moov_at + moov_len) {
+                return measured(Health::Damaged);
+            }
+        }
         if truncated {
             return measured(Health::Partial);
         }
         if moov_len > MOOV_MAX_LEN {
             return measured(Health::Damaged);
         }
-        let mut data = vec![0u8; moov_len as usize];
-        read_exact_at(source, moov_at, &mut data)?;
-        measured(index_health(&data, len, has_moof))
+        match index_health(&data, len, has_moof) {
+            Health::Intact if r.bad_in(start, pos) => measured(Health::Partial),
+            health => measured(health),
+        }
     }
 }

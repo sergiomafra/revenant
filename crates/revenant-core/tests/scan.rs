@@ -1,4 +1,4 @@
-use revenant_core::formats::{FileKind, Health, all_formats};
+use revenant_core::formats::{FileKind, Format, Health, IsoBmff, Jpeg, all_formats};
 use revenant_core::source::{FileSource, Source, VolumeId};
 use revenant_core::{CancelToken, EngineError, Event, ScanOptions, ScanSummary, scan};
 use revenant_testkit as testkit;
@@ -343,4 +343,132 @@ fn unreadable_sector_inside_a_file_makes_it_partial() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+fn relevant(events: &[Event]) -> Vec<&Event> {
+    events
+        .iter()
+        .filter(|e| !matches!(e, Event::Progress { .. }))
+        .collect()
+}
+
+#[test]
+fn bad_sector_inside_a_jpeg_keeps_it() {
+    let jpeg = testkit::jpeg(640, 480, 21, 0);
+    let start = 4096;
+    let bad = (start + jpeg.len() / 2) / 512 * 512;
+    let file = DiskImage::noise(2 * MIB, 22).put(start, &jpeg).save();
+    let source = FailingSource {
+        inner: FileSource::open(file.path()).unwrap(),
+        bad: (bad as u64, bad as u64 + 512),
+    };
+    let (r, events) = run(&source, &ScanOptions::default());
+    assert_eq!(r.unwrap().found, 1, "{:?}", relevant(&events));
+    let relevant = relevant(&events);
+    assert_eq!(
+        relevant[0],
+        &Event::Unreadable {
+            start: bad as u64,
+            len: 512
+        }
+    );
+    match relevant[1] {
+        Event::Found(f) => {
+            assert_eq!((f.start, f.kind), (start as u64, FileKind::Jpeg));
+            assert_eq!(f.len, jpeg.len() as u64);
+            assert_ne!(f.health, Health::Intact);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn bad_sector_shortly_after_a_jpeg_does_not_hide_it() {
+    let jpeg = testkit::jpeg(64, 64, 23, 2000);
+    let bad = 500 * 1024u64;
+    let file = DiskImage::noise(2 * MIB, 24).put(0, &jpeg).save();
+    let source = FailingSource {
+        inner: FileSource::open(file.path()).unwrap(),
+        bad: (bad, bad + 512),
+    };
+    let (r, events) = run(&source, &ScanOptions::default());
+    assert_eq!(r.unwrap().unreadable_bytes, 512);
+    assert_eq!(found(&events), vec![(0, FileKind::Jpeg, Health::Intact)]);
+}
+
+#[test]
+fn bad_sector_in_moov_is_damaged_and_keeps_moov() {
+    // moov-at-end video whose moov header sits at byte 400 of a sector, so the payload runs into the next sector.
+    let video = testkit::mp4(&Mp4Options {
+        mdat_len: 200_052,
+        moov_at_end: true,
+        mov: false,
+        mdat_64bit: false,
+    });
+    let moov_at = 28 + 200_052;
+    assert_eq!(moov_at % 512, 400);
+    let start = MIB;
+    let bad = (start + moov_at - 400 + 512) as u64;
+    assert!(bad < (start + video.len()) as u64);
+    let file = DiskImage::noise(2 * MIB, 25).put(start, &video).save();
+    let source = FailingSource {
+        inner: FileSource::open(file.path()).unwrap(),
+        bad: (bad, bad + 512),
+    };
+    let (r, events) = run(&source, &ScanOptions::default());
+    r.unwrap();
+    let findings: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Found(f) => Some((f.start, f.len, f.kind, f.health)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        findings,
+        vec![(
+            start as u64,
+            video.len() as u64,
+            FileKind::Mp4,
+            Health::Damaged
+        )]
+    );
+}
+
+#[test]
+fn bad_sector_in_jpeg_header_keeps_it() {
+    let jpeg = testkit::jpeg(640, 480, 26, 0);
+    let start = 4096u64;
+    // The second sector of the file holds the end of the header segments (DHT, SOS).
+    let sos = jpeg.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap();
+    assert!((512..1024).contains(&sos), "SOS at {sos}");
+    let file = DiskImage::noise(2 * MIB, 27)
+        .put(start as usize, &jpeg)
+        .save();
+    let source = FailingSource {
+        inner: FileSource::open(file.path()).unwrap(),
+        bad: (start + 512, start + 1024),
+    };
+    let m = Jpeg.measure(&source, start).expect("still a JPEG");
+    assert_eq!(m.len, jpeg.len() as u64);
+    assert_ne!(m.health, Health::Intact);
+}
+
+#[test]
+fn bad_sector_in_mdat_is_partial() {
+    let video = testkit::mp4(&Mp4Options {
+        mdat_len: 200_000,
+        moov_at_end: false,
+        mov: false,
+        mdat_64bit: false,
+    });
+    let start = MIB as u64;
+    let bad = start + 100 * 512;
+    let file = DiskImage::noise(2 * MIB, 28).put(MIB, &video).save();
+    let source = FailingSource {
+        inner: FileSource::open(file.path()).unwrap(),
+        bad: (bad, bad + 512),
+    };
+    let m = IsoBmff.measure(&source, start).unwrap();
+    assert_eq!((m.len, m.health), (video.len() as u64, Health::Partial));
 }
