@@ -1,0 +1,21 @@
+[package]
+name = "revenant-core"
+description = "Revenant recovery engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+thiserror = "2"
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
+
+[dev-dependencies]
+revenant-testkit = { path = "../revenant-testkit" }
+tempfile = "3.27.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
