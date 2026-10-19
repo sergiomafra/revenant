@@ -18,3 +18,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Extraction: copies a found file into a chosen folder without overwriting, never past the end of the source, and refuses to
   write onto the source's own volume.
 - `revenant-dev`: developer command line (`scan <image> [--extract <dir>]`) that prints findings as JSON lines.
+
+### Changed
+
+- A random byte pattern that looks like a JPEG or MP4 signature no longer cuts another file: "another file starts here" now
+  requires a valid header, not just a signature.
+- A complete video followed by an unreadable sector stays intact; Motion-JPEG videos (`mjpa`, `mjpb`, `jpeg`) are no longer
+  cut by the JPEG frames inside their data.
+- JPEGs with DAC/JPG segments or `FF` fill bytes before a marker are measured instead of skipped; a JPEG too large to decode
+  (over 210 megapixels) with a complete structure is partial instead of damaged.

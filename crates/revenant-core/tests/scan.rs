@@ -646,3 +646,31 @@ fn nested_file_inside_a_damaged_finding_is_reported() {
         .collect();
     assert_eq!(ids, vec![1, 2]);
 }
+
+#[test]
+fn random_head_inside_mdat_does_not_cut() {
+    let video = {
+        let mut v = testkit::mp4(&Mp4Options {
+            mdat_len: 100_000,
+            moov_at_end: false,
+            ..mp4_opts(false)
+        });
+        // A JPEG-looking head (SOI + APP1) followed by bytes that form no valid segment chain, on a sector start.
+        let at = 100 * 512;
+        v[at..at + 4].copy_from_slice(&[0xFF, 0xD8, 0xFF, 0xE1]);
+        v[at + 4..at + 16].copy_from_slice(&[0x5A; 12]);
+        v
+    };
+    let mut img = DiskImage::noise(2 * MIB, 41);
+    img.put(MIB, &video);
+    let events = scan_image(&img);
+    assert_eq!(
+        findings(&events),
+        vec![(
+            MIB as u64,
+            video.len() as u64,
+            FileKind::Mp4,
+            Health::Intact
+        )]
+    );
+}

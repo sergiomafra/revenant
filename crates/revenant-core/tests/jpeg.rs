@@ -213,7 +213,7 @@ fn eoi_beyond_the_maximum_length_is_cut_at_the_maximum() {
 }
 
 #[test]
-fn huge_declared_size_is_damaged_without_decoding() {
+fn huge_declared_size_is_partial() {
     let mut j = testkit::jpeg(64, 64, 9, 0);
     let sof = j.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
     // SOF0 payload: length(2) precision(1) height(2) width(2).
@@ -222,6 +222,35 @@ fn huge_declared_size_is_damaged_without_decoding() {
     let t = std::time::Instant::now();
     let m = measure(&img, 4096).unwrap();
     assert_eq!(m.len, j.len() as u64);
-    assert_eq!(m.health, Health::Damaged);
+    assert_eq!(m.health, Health::Partial);
     assert!(t.elapsed().as_secs() < 5);
+}
+
+/// `j` with `insert` placed right after its first segment (so the head still looks like a JPEG).
+fn with_after_first_segment(j: &[u8], insert: &[u8]) -> Vec<u8> {
+    assert_eq!(j[2], 0xFF);
+    let first_end = 2 + 2 + usize::from(u16::from_be_bytes([j[4], j[5]]));
+    [&j[..first_end], insert, &j[first_end..]].concat()
+}
+
+#[test]
+fn fill_bytes_before_a_marker_are_accepted() {
+    let v = with_after_first_segment(&testkit::jpeg(64, 64, 12, 0), &[0xFF, 0xFF, 0xFF]);
+    let img = DiskImage::zeros(MIB).put(4096, &v).save();
+    let m = measure(&img, 4096).unwrap();
+    assert_eq!((m.len, m.health), (v.len() as u64, Health::Intact));
+}
+
+#[test]
+fn dac_and_fill_bytes_before_sos_are_measured() {
+    // FF CC is DAC (arithmetic coding conditioning): length 4 and two bytes.
+    let v = with_after_first_segment(
+        &testkit::jpeg(64, 64, 12, 0),
+        &[0xFF, 0xFF, 0xFF, 0xCC, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xFF],
+    );
+    let img = DiskImage::zeros(MIB).put(4096, &v).save();
+    let m = measure(&img, 4096).unwrap();
+    // The walk follows the DAC segment and the fill bytes to the exact end. zune-jpeg cannot decode DAC (arithmetic
+    // coding), so no decoder accepts the content: Damaged, never Intact without evidence.
+    assert_eq!((m.len, m.health), (v.len() as u64, Health::Damaged));
 }

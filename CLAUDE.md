@@ -6,12 +6,14 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 
 ## Onde o desenvolvimento está
 
-**19/10/2026.** Módulo 1 (motor), Parte 1.1 (fundação e escultura) concluída na branch `feat/m1-p1-engine`, aguardando o
-aceite e o merge do Sérgio. Próximo: Parte 1.2 (a spec já cobre; plano a escrever). CLI de desenvolvimento: `revenant-dev`.
+**19/10/2026.** Módulo 1 (motor), Parte 1.1 (fundação e escultura) mergeada (PR #1, CI verde nas 4 arquiteturas). Parte 1.2
+em andamento na branch `feat/m1-p2-raw`. Roteiro até a 1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de
+desenvolvimento: `revenant-dev`.
 
 ## Diretrizes fixas
 
 - Um módulo por vez: spec → telas → plano → subagentes. O Sérgio decide o merge.
+- Fim de parte = push + PR; o merge é do Sérgio.
 - Código e repositório em inglês (identificadores, comentários, códigos de erro, commits, READMEs, CHANGELOG). Exceções:
   este arquivo e `docs/superpowers/**` (pt-BR).
 - Documentação sempre atualizada e explicando como usar: toda tarefa que muda comportamento atualiza o README do crate e, se

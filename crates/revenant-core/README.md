@@ -33,10 +33,17 @@ modification time are unchanged after a full scan that extracts every finding.
 
 ## Formats: JPEG
 
-`formats::Format` is the detector interface: `recognizes(head)` checks a signature at a sector start and
+`formats::Format` is the detector interface: `recognizes(head)` checks a signature at a sector start,
+`confirms(source, start)` validates the header there (cheap, never recursive, never measures the whole file), and
 `measure(source, start)` returns a `Measurement { len, kind, health }` found by walking the file's structure, or `None` when
 the bytes are not a file of that format. `None` never means "could not read": a read error does not make a file vanish.
-`formats::all_formats()` lists the supported detectors.
+`formats::all_formats()` lists the supported detectors. `FileKind::as_str()` gives a stable lowercase id (`"jpeg"`, `"mp4"`,
+`"mov"`).
+
+"Another file starts here" (used to cut a JPEG's scan data or an `mdat` at a sector start) means a format both `recognizes`
+the head and `confirms` it, so a random byte pattern that merely looks like a signature can no longer cut a file. JPEG
+confirms with the header walk up to SOS with DQT and SOF present (no scan-data walk); ISO BMFF confirms with a valid `ftyp`
+followed by a parseable header of an accepted box type. `scan` still uses `recognizes` plus `measure` for its candidates.
 
 Detectors read the source through one shared reader, in 1 MiB windows aligned to 512-byte sectors (never a whole file at
 once). When a window cannot be read it is re-read sector by sector: unreadable sectors read as zeros and are remembered, and
@@ -44,15 +51,17 @@ only the end of the source ends a walk for lack of data. A file whose measured r
 `Intact` (details per format below).
 
 `formats::Jpeg` follows the marker segments by their declared lengths (so the thumbnail embedded in an APP1/EXIF segment does
-not end the file), requires DQT and SOF before SOS, and scans the entropy-coded data up to EOI (`FF D9`), up to
+not end the file; DAC and JPG markers count as segments, and `FF` fill bytes before a marker are skipped), requires DQT and SOF before SOS, and scans the entropy-coded data up to EOI (`FF D9`), up to
 `JPEG_MAX_LEN` (64 MiB). If the header walk breaks on an unreadable sector, the search for EOI continues from there. Health:
 
 - `Intact`: EOI found, no unreadable sector inside, and `zune-jpeg` decodes the bytes in strict mode.
 - `Partial`: no EOI before the end of the source, `JPEG_MAX_LEN`, or a 512-byte sector that starts another recognized file
   (the length stops there); or EOI found and only the lenient decode succeeds; or EOI found, the file contains unreadable
   sectors and a decode (strict or lenient) of the zero-filled bytes succeeds. The length never exceeds `JPEG_MAX_LEN`.
-- `Damaged`: EOI found but neither decode succeeds, or the declared size is over 210 megapixels (not decoded). The length is
-  still exact.
+  Also `Partial`: the structure is complete but the declared size is over 210 megapixels, so it is not decoded ("not fully
+  verifiable").
+- `Damaged`: EOI found but neither decode succeeds (this includes arithmetic-coded files with a DAC segment, which
+  `zune-jpeg` does not support). The length is still exact.
 
 The validation decode outputs grayscale (1 byte per pixel) to bound memory.
 
@@ -73,7 +82,9 @@ Walk boundaries: `ftyp` is accepted only as the first box. Once both `moov` and 
 ends it, and a trailing box that overruns the source is left out. The walk also stops at a box that starts on a 512-byte sector
 where a recognized file starts. Inside `mdat`, every 512-byte sector start (absolute offset) is checked as well: where a
 recognized file of any format starts, the video ends there. An `mdat` whose declared size is cut this way counts as a box
-declared larger than what exists (below). Chunk offsets are relative to the start of the file (its `ftyp`), not to the source.
+declared larger than what exists (below). Motion-JPEG exception: if the walk was cut inside `mdat`, the video is measured
+again without the checks inside `mdat`; when that measurement has a `moov` whose track sample entry (`stsd`) is `mjpa`,
+`mjpb` or `jpeg` and is `Intact`, it is used, because the JPEGs in `mdat` are the video's own frames. Chunk offsets are relative to the start of the file (its `ftyp`), not to the source.
 
 - No `mdat`: not a video (`None`).
 - No `moov`: `Damaged` (the media data is there but not the index; rebuilding it is a later product milestone).
@@ -92,7 +103,8 @@ Unreadable sectors:
 - Inside `moov`: the index is unusable, so `Damaged`; the length still covers `moov`, so extraction keeps it.
 - Elsewhere in the file (for example inside `mdat`): an otherwise `Intact` file is `Partial`.
 - On a box header: the header cannot be parsed, so the walk ends there as if the file were cut (`Partial`, or `Damaged` when
-  no `moov` was seen before it).
+  no `moov` was seen before it). A header that cannot be read after a complete video (`moov` and `mdat` both seen) is only
+  what follows the file: the video stays `Intact` (if nothing else is wrong).
 
 ## Scan
 

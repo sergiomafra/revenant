@@ -86,11 +86,7 @@ fn found_line(f: &Finding, file: Option<String>, error: Option<&'static str>) ->
         id: f.id,
         start: f.start,
         len: f.len,
-        kind: match f.kind {
-            revenant_core::formats::FileKind::Jpeg => "jpeg",
-            revenant_core::formats::FileKind::Mp4 => "mp4",
-            revenant_core::formats::FileKind::Mov => "mov",
-        },
+        kind: f.kind.as_str(),
         health: match f.health {
             revenant_core::formats::Health::Intact => "intact",
             revenant_core::formats::Health::Partial => "partial",

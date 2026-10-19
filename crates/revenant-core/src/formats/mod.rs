@@ -22,6 +22,15 @@ pub enum FileKind {
 }
 
 impl FileKind {
+    /// Stable lowercase identifier (`"jpeg"`, `"mp4"`, `"mov"`), for machine-readable output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileKind::Jpeg => "jpeg",
+            FileKind::Mp4 => "mp4",
+            FileKind::Mov => "mov",
+        }
+    }
+
     /// Conventional file extension, without the dot.
     pub fn extension(self) -> &'static str {
         match self {
@@ -58,6 +67,11 @@ pub trait Format: Send + Sync {
 
     /// `head`: up to 16 bytes read at a sector start.
     fn recognizes(&self, head: &[u8]) -> bool;
+
+    /// Header-level validation at `start` (cheap, never recursive, never measures the whole file): true when a real file
+    /// of this format plausibly starts here. Used to decide that "another file starts here", so a stray byte pattern
+    /// that merely looks like a signature cannot cut a file.
+    fn confirms(&self, source: &dyn Source, start: u64) -> bool;
 
     /// Measures the file starting at `start`. `None` means "not a file of this format", never "could not read": an
     /// unreadable sector inside a file lowers its health instead (see [`Health`]).
@@ -166,10 +180,13 @@ impl<'a> Reader<'a> {
         (head, n)
     }
 
-    /// Whether a recognized file of any format starts at `pos`.
+    /// Whether a file of any format starts at `pos`: some format recognizes the head and confirms its header.
     pub(crate) fn file_starts_at(&mut self, formats: &[Box<dyn Format>], pos: u64) -> bool {
         let (head, n) = self.head(pos);
-        formats.iter().any(|f| f.recognizes(&head[..n]))
+        let source = self.source;
+        formats
+            .iter()
+            .any(|f| f.recognizes(&head[..n]) && f.confirms(source, pos))
     }
 
     /// Whether an unreadable sector seen so far overlaps `[start, end)`.

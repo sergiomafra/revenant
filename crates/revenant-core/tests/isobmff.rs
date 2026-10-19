@@ -1,5 +1,6 @@
+use revenant_core::EngineError;
 use revenant_core::formats::{FileKind, Format, Health, IsoBmff, Measurement};
-use revenant_core::source::FileSource;
+use revenant_core::source::{FileSource, Source, VolumeId};
 use revenant_testkit as testkit;
 use testkit::{DiskImage, Mp4Options};
 
@@ -346,4 +347,82 @@ fn nonzero_trailing_bytes_in_moov_are_damaged() {
     let img = DiskImage::noise(AT + v.len() + 4096, 16).put(AT, &v).save();
     let m = measure(&img).unwrap();
     assert_eq!((m.len, m.health), (v.len() as u64, Health::Damaged));
+}
+
+/// Fails every read that touches `[bad, bad + 512)`.
+struct BadSector {
+    inner: FileSource,
+    bad: u64,
+}
+
+impl Source for BadSector {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        if offset < self.bad + 512 && offset + buf.len() as u64 > self.bad {
+            return Err(EngineError::Read {
+                offset,
+                cause: std::io::Error::other("injected"),
+            });
+        }
+        self.inner.read_at(offset, buf)
+    }
+    fn volume(&self) -> Option<VolumeId> {
+        None
+    }
+}
+
+#[test]
+fn complete_video_followed_by_unreadable_sector_is_intact() {
+    let v = sector_aligned(&opts());
+    let img = DiskImage::zeros(AT + v.len() + 4096).put(AT, &v).save();
+    let source = BadSector {
+        inner: FileSource::open(img.path()).unwrap(),
+        bad: (AT + v.len()) as u64,
+    };
+    let m = IsoBmff.measure(&source, AT as u64).unwrap();
+    assert_eq!((m.len, m.health), (v.len() as u64, Health::Intact));
+}
+
+/// A moov-at-end MOV whose mdat holds a JPEG frame; one frame starts on a sector start of the image.
+fn mjpeg_layout(codec: &[u8; 4]) -> (Vec<u8>, Vec<u8>) {
+    let frame = testkit::jpeg(64, 64, 21, 2000);
+    // The payload starts at file offset 28; AT is a sector start, so payload offset 484 is a sector start too.
+    let mut payload = vec![0x11u8; 484];
+    payload.extend_from_slice(&frame);
+    payload.resize(payload.len() + 3000, 0x22);
+    let video = testkit::mp4_with(
+        &Mp4Options {
+            mov: true,
+            ..opts()
+        },
+        codec,
+        &payload,
+    );
+    (video, frame)
+}
+
+#[test]
+fn motion_jpeg_frames_do_not_cut_the_video() {
+    let (video, _) = mjpeg_layout(b"mjpa");
+    let img = DiskImage::noise(AT + video.len() + 20_000, 11)
+        .put(AT, &video)
+        .save();
+    let m = measure(&img).unwrap();
+    assert_eq!(
+        (m.len, m.kind, m.health),
+        (video.len() as u64, FileKind::Mov, Health::Intact)
+    );
+}
+
+#[test]
+fn h264_video_is_still_cut_by_a_real_jpeg() {
+    let (video, _) = mjpeg_layout(b"avc1");
+    let img = DiskImage::noise(AT + video.len() + 20_000, 12)
+        .put(AT, &video)
+        .save();
+    let m = measure(&img).unwrap();
+    // The cut lands before the moov, so the index is gone.
+    assert_eq!((m.len, m.health), (512, Health::Damaged));
 }

@@ -208,108 +208,188 @@ impl Format for IsoBmff {
         head.len() >= 8 && &head[4..8] == b"ftyp" && (8..=4096).contains(&be32(head))
     }
 
+    fn confirms(&self, source: &dyn Source, start: u64) -> bool {
+        let mut r = Reader::new(source);
+        let (head, n) = r.head(start);
+        if !self.recognizes(&head[..n]) {
+            return false;
+        }
+        let (next, n) = r.head(start + u64::from(be32(&head)));
+        parse_header(&next[..n]).is_some()
+    }
+
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement> {
         let mut r = Reader::new(source);
         let (head, n) = r.head(start);
         if !self.recognizes(&head[..n]) {
             return None;
         }
-
-        let source_len = source.len();
         let formats = all_formats();
-        let mut pos = start;
-        let (mut kind, mut has_mdat, mut has_moof, mut truncated) =
-            (FileKind::Mp4, false, false, false);
-        let mut moov: Option<(u64, u64)> = None; // payload offset, payload length
-        let mut unreadable_header = false;
-        while pos < source_len {
-            if pos != start && pos.is_multiple_of(SECTOR) && r.file_starts_at(&formats, pos) {
-                break;
-            }
-            let (head, n) = r.head(pos);
-            let Some(h) = parse_header(&head[..n]) else {
-                // An unreadable box header: what follows is lost, as if the file were cut here.
-                unreadable_header = r.bad_in(pos, pos + n as u64);
-                truncated |= unreadable_header;
-                break;
-            };
-            let complete = has_mdat && moov.is_some();
-            let allowed = match &h.kind {
-                b"ftyp" => pos == start,
-                _ if !complete => true,
-                b"free" | b"skip" | b"wide" | b"uuid" | b"meta" | b"udta" | b"mfra" => true,
-                b"moof" | b"sidx" | b"styp" => has_moof,
-                b"mdat" => has_moof,
-                _ => false,
-            };
-            if !allowed {
-                break;
-            }
-            let available = source_len - pos;
-            let size = h.size.unwrap_or(available);
-            if size > available {
-                if complete {
-                    break;
-                }
-                truncated = true;
-            }
-            let mut size = size.min(available);
-            let mut cut = false;
-            if &h.kind == b"mdat"
-                && let Some(next) = next_file_inside(&mut r, &formats, pos, pos + size)
+        let walk = walk_boxes(&mut r, &formats, start, true);
+        let first = judge(&mut r, start, &walk)?;
+        if walk.cut_in_mdat {
+            // Motion-JPEG stores one JPEG per frame in `mdat`: those are the video's own, not another file. Walk again
+            // without the checks inside `mdat`; keep the cut unless the whole video then checks out as Motion-JPEG.
+            let again = walk_boxes(&mut r, &formats, start, false);
+            if let Some(full) = judge(&mut r, start, &again)
+                && full.health == Health::Intact
+                && again.moov.is_some_and(|m| is_motion_jpeg(&mut r, m))
             {
-                // Another file was written over the rest of this mdat (or a size-0 mdat ends where the next file
-                // begins): the video ends there. A declared size the data no longer reaches is a cut.
-                size = next - pos;
-                cut = true;
-                truncated |= h.size.is_some();
+                return Some(full);
             }
-            match &h.kind {
-                b"ftyp" if size >= 12 => {
-                    let mut brand = [0u8; 4];
-                    r.read(pos + h.header_len, &mut brand);
-                    if &brand == b"qt  " {
-                        kind = FileKind::Mov;
-                    }
-                }
-                b"mdat" => has_mdat = true,
-                b"moof" => has_moof = true,
-                b"moov" if moov.is_none() => {
-                    moov = Some((pos + h.header_len, size.saturating_sub(h.header_len)))
-                }
-                _ => {}
-            }
-            pos += size;
-            if truncated || cut {
+        }
+        Some(first)
+    }
+}
+
+/// Result of walking the top-level boxes.
+struct Walk {
+    end: u64,
+    kind: FileKind,
+    has_mdat: bool,
+    has_moof: bool,
+    truncated: bool,
+    unreadable_header: bool,
+    /// The walk ended because another file starts inside an `mdat`.
+    cut_in_mdat: bool,
+    /// Payload offset and length of the first `moov`.
+    moov: Option<(u64, u64)>,
+}
+
+/// Walks the top-level boxes of the video at `start`. With `inner_checks`, every sector start inside `mdat` where a file
+/// starts ends the video there.
+fn walk_boxes(r: &mut Reader, formats: &[Box<dyn Format>], start: u64, inner_checks: bool) -> Walk {
+    let source_len = r.source.len();
+    let mut w = Walk {
+        end: start,
+        kind: FileKind::Mp4,
+        has_mdat: false,
+        has_moof: false,
+        truncated: false,
+        unreadable_header: false,
+        cut_in_mdat: false,
+        moov: None,
+    };
+    let mut pos = start;
+    while pos < source_len {
+        if pos != start && pos.is_multiple_of(SECTOR) && r.file_starts_at(formats, pos) {
+            break;
+        }
+        let (head, n) = r.head(pos);
+        let complete = w.has_mdat && w.moov.is_some();
+        let Some(h) = parse_header(&head[..n]) else {
+            // An unreadable box header: what follows is lost, as if the file were cut here, unless the video was
+            // already complete (then it is only what comes after the file).
+            w.unreadable_header = r.bad_in(pos, pos + n as u64);
+            w.truncated |= w.unreadable_header && !complete;
+            break;
+        };
+        let allowed = match &h.kind {
+            b"ftyp" => pos == start,
+            _ if !complete => true,
+            b"free" | b"skip" | b"wide" | b"uuid" | b"meta" | b"udta" | b"mfra" => true,
+            b"moof" | b"sidx" | b"styp" => w.has_moof,
+            b"mdat" => w.has_moof,
+            _ => false,
+        };
+        if !allowed {
+            break;
+        }
+        let available = source_len - pos;
+        let size = h.size.unwrap_or(available);
+        if size > available {
+            if complete {
                 break;
             }
+            w.truncated = true;
         }
-        if !has_mdat && !unreadable_header {
-            return None;
+        let mut size = size.min(available);
+        let mut cut = false;
+        if inner_checks
+            && &h.kind == b"mdat"
+            && let Some(next) = next_file_inside(r, formats, pos, pos + size)
+        {
+            // Another file was written over the rest of this mdat (or a size-0 mdat ends where the next file
+            // begins): the video ends there. A declared size the data no longer reaches is a cut.
+            size = next - pos;
+            cut = true;
+            w.truncated |= h.size.is_some();
         }
-        let len = pos - start;
-        let measured = |health| Some(Measurement { len, kind, health });
-
-        let Some((moov_at, moov_len)) = moov else {
-            return measured(Health::Damaged);
-        };
-        let mut data = Vec::new();
-        if moov_len <= MOOV_MAX_LEN {
-            data.resize(moov_len as usize, 0);
-            r.read(moov_at, &mut data);
-            if r.bad_in(moov_at, moov_at + moov_len) {
-                return measured(Health::Damaged);
+        match &h.kind {
+            b"ftyp" if size >= 12 => {
+                let mut brand = [0u8; 4];
+                r.read(pos + h.header_len, &mut brand);
+                if &brand == b"qt  " {
+                    w.kind = FileKind::Mov;
+                }
             }
+            b"mdat" => w.has_mdat = true,
+            b"moof" => w.has_moof = true,
+            b"moov" if w.moov.is_none() => {
+                w.moov = Some((pos + h.header_len, size.saturating_sub(h.header_len)))
+            }
+            _ => {}
         }
-        if truncated {
-            return measured(Health::Partial);
-        }
-        if moov_len > MOOV_MAX_LEN {
-            return measured(Health::Damaged);
-        }
-        match index_health(&data, len, has_moof) {
-            Health::Intact if r.bad_in(start, pos) => measured(Health::Partial),
-            health => measured(health),
+        pos += size;
+        w.cut_in_mdat |= cut;
+        if w.truncated || cut {
+            break;
         }
     }
+    w.end = pos;
+    w
+}
+
+/// Judges a walked video: `None` if it is not a video at all.
+fn judge(r: &mut Reader, start: u64, w: &Walk) -> Option<Measurement> {
+    if !w.has_mdat && !w.unreadable_header {
+        return None;
+    }
+    let (pos, kind) = (w.end, w.kind);
+    let len = pos - start;
+    let measured = |health| Some(Measurement { len, kind, health });
+
+    let Some((moov_at, moov_len)) = w.moov else {
+        return measured(Health::Damaged);
+    };
+    let mut data = Vec::new();
+    if moov_len <= MOOV_MAX_LEN {
+        data.resize(moov_len as usize, 0);
+        r.read(moov_at, &mut data);
+        if r.bad_in(moov_at, moov_at + moov_len) {
+            return measured(Health::Damaged);
+        }
+    }
+    if w.truncated {
+        return measured(Health::Partial);
+    }
+    if moov_len > MOOV_MAX_LEN {
+        return measured(Health::Damaged);
+    }
+    match index_health(&data, len, w.has_moof) {
+        Health::Intact if r.bad_in(start, pos) => measured(Health::Partial),
+        health => measured(health),
+    }
+}
+
+/// Whether a video track's sample entry (first entry of `stsd`) is Motion-JPEG: `mjpa`, `mjpb` or `jpeg`.
+fn is_motion_jpeg(r: &mut Reader, (at, len): (u64, u64)) -> bool {
+    if len > MOOV_MAX_LEN {
+        return false;
+    }
+    let mut moov = vec![0u8; len as usize];
+    r.read(at, &mut moov);
+    let mut garbled = false;
+    children(&moov, &mut garbled)
+        .into_iter()
+        .filter(|(k, _)| k == b"trak")
+        .any(|(_, trak)| {
+            let stsd = child(trak, b"mdia", &mut garbled)
+                .and_then(|m| child(m, b"minf", &mut garbled))
+                .and_then(|m| child(m, b"stbl", &mut garbled))
+                .and_then(|m| child(m, b"stsd", &mut garbled));
+            // version/flags (4), entry count (4), then the first entry: size (4), type (4).
+            stsd.and_then(|p| p.get(12..16))
+                .is_some_and(|t| t == b"mjpa" || t == b"mjpb" || t == b"jpeg")
+        })
 }

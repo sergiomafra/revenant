@@ -22,13 +22,55 @@ const DQT: u8 = 0xDB;
 
 pub struct Jpeg;
 
-/// Markers allowed before SOS, all carrying a length: SOFn, DHT, DQT, DNL, DRI, APPn, COM.
+/// Markers allowed before SOS, all carrying a length: SOFn, JPG (0xC8), DHT, DAC (0xCC), DQT, DNL, DRI, APPn, COM.
 fn is_segment_marker(m: u8) -> bool {
-    matches!(m, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF | 0xC4 | DQT | 0xDC | 0xDD | 0xE0..=0xEF | 0xFE)
+    matches!(m, 0xC0..=0xCF | DQT | 0xDC | 0xDD | 0xE0..=0xEF | 0xFE)
 }
 
 fn is_sof(m: u8) -> bool {
     matches!(m, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF)
+}
+
+/// Result of walking the header segments.
+struct Header {
+    /// Offset just past SOS's segment: where the entropy-coded data starts.
+    scan_start: u64,
+}
+
+/// Walks the header segments of the JPEG at `start`, up to and including SOS. A walk that breaks on an unreadable
+/// sector is not proof that this is not a JPEG: the walk then ends where it broke (the search for EOI continues from
+/// there). `None` means "not a JPEG": a bad marker or length, no DQT/SOF, or the end of the source.
+fn walk_header(r: &mut Reader, start: u64) -> Option<Header> {
+    let (mut pos, mut has_dqt, mut has_sof) = (start + 2, false, false);
+    loop {
+        // Fill bytes (extra FF) may precede any marker.
+        while r.byte(pos)? == 0xFF && r.byte(pos + 1)? == 0xFF && pos - start <= JPEG_MAX_LEN {
+            pos += 1;
+        }
+        let marker = match (r.byte(pos)?, r.byte(pos + 1)?) {
+            (0xFF, m) if m == SOS || is_segment_marker(m) => Some(m),
+            _ => None,
+        };
+        let seg_len = u64::from(r.u16(pos + 2)?);
+        let Some(marker) = marker.filter(|_| seg_len >= 2) else {
+            if r.bad_in(start, pos + 4) {
+                return Some(Header { scan_start: pos });
+            }
+            return None;
+        };
+        has_dqt |= marker == DQT;
+        has_sof |= is_sof(marker);
+        pos += 2 + seg_len;
+        if pos - start > JPEG_MAX_LEN {
+            return None;
+        }
+        if marker == SOS {
+            if !(has_dqt && has_sof) && !r.bad_in(start, pos) {
+                return None;
+            }
+            return Some(Header { scan_start: pos });
+        }
+    }
 }
 
 /// Largest image (in pixels) the validation decode will attempt: 1 byte per pixel keeps it near 200 MB.
@@ -56,7 +98,7 @@ fn try_decode(data: &[u8], strict: bool) -> Option<bool> {
 }
 
 /// Health of a complete (EOI-terminated) JPEG: strict decode succeeds -> Intact; only the lenient decode succeeds ->
-/// Partial (salvageable); neither -> Damaged. Oversized images are Damaged without decoding. With unreadable sectors
+/// Partial (salvageable); neither -> Damaged. Oversized images are not decoded: complete structure -> Partial (not fully verifiable). With unreadable sectors
 /// (decoded as zeros) a successful decode, strict or lenient, gives at most Partial.
 fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
     let mut data = vec![0u8; len as usize];
@@ -66,7 +108,8 @@ fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
         Some(true) if !unreadable => Health::Intact,
         Some(true) => Health::Partial,
         Some(false) if try_decode(&data, false) == Some(true) => Health::Partial,
-        _ => Health::Damaged,
+        None => Health::Partial, // too large to decode: structure complete, content not verifiable
+        Some(_) => Health::Damaged,
     }
 }
 
@@ -81,6 +124,10 @@ impl Format for Jpeg {
             && matches!(head[3], 0xE0..=0xEF | DQT | 0xC0..=0xC4 | 0xFE)
     }
 
+    fn confirms(&self, source: &dyn Source, start: u64) -> bool {
+        walk_header(&mut Reader::new(source), start).is_some()
+    }
+
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement> {
         let mut r = Reader::new(source);
         let (head, n) = r.head(start);
@@ -88,34 +135,7 @@ impl Format for Jpeg {
             return None;
         }
 
-        // Header segments, up to and including SOS. A walk that breaks on an unreadable sector is not proof that this
-        // is not a JPEG: the search for EOI continues from where it broke.
-        let (mut pos, mut has_dqt, mut has_sof) = (start + 2, false, false);
-        loop {
-            let marker = match (r.byte(pos)?, r.byte(pos + 1)?) {
-                (0xFF, m) if m == SOS || is_segment_marker(m) => Some(m),
-                _ => None,
-            };
-            let seg_len = u64::from(r.u16(pos + 2)?);
-            let Some(marker) = marker.filter(|_| seg_len >= 2) else {
-                if r.bad_in(start, pos + 4) {
-                    break;
-                }
-                return None;
-            };
-            has_dqt |= marker == DQT;
-            has_sof |= is_sof(marker);
-            pos += 2 + seg_len;
-            if pos - start > JPEG_MAX_LEN {
-                return None;
-            }
-            if marker == SOS {
-                if !(has_dqt && has_sof) && !r.bad_in(start, pos) {
-                    return None;
-                }
-                break;
-            }
-        }
+        let mut pos = walk_header(&mut r, start)?.scan_start;
 
         // Entropy-coded data. FF00 and RSTn are data; EOI ends the file.
         let formats = all_formats();

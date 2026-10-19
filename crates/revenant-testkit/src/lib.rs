@@ -139,7 +139,17 @@ fn bmff_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn moov_box(chunk_offset: u64, sample_len: u32, wide: bool) -> Vec<u8> {
+/// `stsd` with one video sample entry of the given codec type (`avc1`, `mjpa`, ...).
+fn stsd_box(codec: &[u8; 4]) -> Vec<u8> {
+    let mut payload = vec![0; 4]; // version and flags
+    payload.extend_from_slice(&1u32.to_be_bytes()); // entry count
+    let mut entry = vec![0; 6]; // reserved
+    entry.extend_from_slice(&1u16.to_be_bytes()); // data reference index
+    payload.extend(bmff_box(codec, &entry));
+    bmff_box(b"stsd", &payload)
+}
+
+fn moov_box(chunk_offset: u64, sample_len: u32, wide: bool, codec: &[u8; 4]) -> Vec<u8> {
     let mvhd = bmff_box(b"mvhd", &[0; 100]);
     let mut stsz = vec![0; 4];
     stsz.extend_from_slice(&0u32.to_be_bytes()); // sample_size = 0: per-sample table
@@ -154,7 +164,10 @@ fn moov_box(chunk_offset: u64, sample_len: u32, wide: bool) -> Vec<u8> {
         chunks.extend_from_slice(&(chunk_offset as u32).to_be_bytes());
         bmff_box(b"stco", &chunks)
     };
-    let stbl = bmff_box(b"stbl", &[bmff_box(b"stsz", &stsz), chunk_table].concat());
+    let stbl = bmff_box(
+        b"stbl",
+        &[stsd_box(codec), bmff_box(b"stsz", &stsz), chunk_table].concat(),
+    );
     let trak = bmff_box(b"trak", &bmff_box(b"mdia", &bmff_box(b"minf", &stbl)));
     bmff_box(b"moov", &[mvhd, trak].concat())
 }
@@ -162,25 +175,32 @@ fn moov_box(chunk_offset: u64, sample_len: u32, wide: bool) -> Vec<u8> {
 /// MP4/MOV with `ftyp`, an `mdat` of noise, and a `moov` holding one `trak` whose `stsz`/`stco` (or `co64`) describe the
 /// whole `mdat` payload as a single sample in a single chunk. The file starts at offset 0 of the returned bytes.
 pub fn mp4(opts: &Mp4Options) -> Vec<u8> {
+    let mut payload = vec![0u8; opts.mdat_len];
+    SplitMix64(opts.mdat_len as u64).fill(&mut payload);
+    mp4_with(opts, b"avc1", &payload)
+}
+
+/// Like [`mp4`], but the video track's sample entry type is `codec` (`avc1`, `mjpa`, ...) and the `mdat` payload is
+/// `payload` (`opts.mdat_len` is ignored). The payload sits at offset 28 of the file (20-byte `ftyp`, 8-byte `mdat`
+/// header; 36 with `mdat_64bit`) when `moov` is at the end.
+pub fn mp4_with(opts: &Mp4Options, codec: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let brand: &[u8; 4] = if opts.mov { b"qt  " } else { b"isom" };
     let mut ftyp = brand.to_vec();
     ftyp.extend_from_slice(&0u32.to_be_bytes());
     ftyp.extend_from_slice(brand);
     let ftyp = bmff_box(b"ftyp", &ftyp);
 
-    let mut payload = vec![0u8; opts.mdat_len];
-    SplitMix64(opts.mdat_len as u64).fill(&mut payload);
     let mdat = if opts.mdat_64bit {
         let mut b = 1u32.to_be_bytes().to_vec();
         b.extend_from_slice(b"mdat");
         b.extend_from_slice(&((payload.len() + 16) as u64).to_be_bytes());
-        b.extend(payload);
+        b.extend_from_slice(payload);
         b
     } else {
-        bmff_box(b"mdat", &payload)
+        bmff_box(b"mdat", payload)
     };
     let header = if opts.mdat_64bit { 16 } else { 8 };
-    let moov_len = moov_box(0, 0, opts.mdat_64bit).len();
+    let moov_len = moov_box(0, 0, opts.mdat_64bit, codec).len();
     let mdat_at = if opts.moov_at_end {
         ftyp.len()
     } else {
@@ -188,8 +208,9 @@ pub fn mp4(opts: &Mp4Options) -> Vec<u8> {
     };
     let moov = moov_box(
         (mdat_at + header) as u64,
-        opts.mdat_len as u32,
+        payload.len() as u32,
         opts.mdat_64bit,
+        codec,
     );
 
     if opts.moov_at_end {
