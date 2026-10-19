@@ -108,6 +108,20 @@ Unreadable sectors:
   no `moov` was seen before it). A header that cannot be read after a complete video (`moov` and `mdat` both seen) is only
   what follows the file: the video stays `Intact` (if nothing else is wrong).
 
+## TIFF reader (internal)
+
+`tiff::walk` is the crate-private reader the TIFF-based RAW formats (CR2, NEF, ARW, DNG, ORF, RW2) share. It takes a
+`Reader`, the absolute position of the TIFF header and a limit (at most `TIFF_MAX_LEN`, 1 GiB), and returns a `TiffInfo`:
+the extent (`end`, relative to the header), Make/Model/lens/serial/ISO/DateTimeOriginal, the largest image size, whether
+`DNGVersion` is present, the embedded JPEG ranges (`JPEGInterchangeFormat`, and strips/tiles of Compression 6/7 starting
+with FF D8) and the other strip/tile ranges (raw data). Header magics `II*\0`, `MM\0*`, `IIRO`, `IIRS`, `MMOR`, `IIU\0`
+are accepted; BigTIFF and anything else gives `None`.
+
+It follows the IFD chain, SubIFDs, Exif, GPS (extent only) and Interop IFDs. The data is hostile, so everything is bounded:
+each IFD is visited once (a cycle sets `garbled`), at most 64 IFDs, 1024 entries per IFD, 4096 strip/tile offsets per tag,
+16 SubIFDs per tag and 256 bytes per string; an offset or value range past the limit, an unknown type or a truncated list
+sets `garbled` and is skipped (it never extends `end`). Callers treat `garbled` as "not fully verifiable" (`Partial`).
+
 ## Scan
 
 `scan(source, formats, &ScanOptions, &CancelToken, &mut on_event) -> Result<ScanSummary, EngineError>` walks a source in blocks
