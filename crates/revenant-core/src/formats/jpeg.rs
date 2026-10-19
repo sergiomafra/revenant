@@ -2,6 +2,11 @@
 //! entropy-coded data up to EOI.
 
 use super::{FileKind, Format, Health, Measurement, all_formats};
+use zune_core::bytestream::ZCursor;
+use zune_core::colorspace::ColorSpace;
+use zune_core::options::DecoderOptions;
+use zune_jpeg::JpegDecoder;
+
 use crate::source::Source;
 
 /// Longest JPEG the detector will follow (and decode).
@@ -78,7 +83,33 @@ fn head_at(source: &dyn Source, offset: u64) -> Option<Vec<u8>> {
     Some(head[..n].to_vec())
 }
 
-fn decodes(source: &dyn Source, start: u64, len: u64) -> Option<bool> {
+/// Largest image (in pixels) the validation decode will attempt: 1 byte per pixel keeps it near 200 MB.
+const MAX_DECODE_PIXELS: u64 = 210_000_000;
+
+/// Decodes `data` as grayscale (1 byte per pixel). A decoder panic on hostile input counts as failure.
+///
+/// Returns `None` when the declared size is above `MAX_DECODE_PIXELS` (not decoded) and `Some(ok)` otherwise.
+fn try_decode(data: &[u8], strict: bool) -> Option<bool> {
+    std::panic::catch_unwind(|| {
+        let options = DecoderOptions::default()
+            .jpeg_set_out_colorspace(ColorSpace::Luma)
+            .set_strict_mode(strict);
+        let mut decoder = JpegDecoder::new_with_options(ZCursor::new(data), options);
+        if decoder.decode_headers().is_err() {
+            return Some(false);
+        }
+        let info = decoder.info()?;
+        if u64::from(info.width) * u64::from(info.height) > MAX_DECODE_PIXELS {
+            return None;
+        }
+        Some(decoder.decode().is_ok())
+    })
+    .unwrap_or(Some(false))
+}
+
+/// Health of a complete (EOI-terminated) JPEG: strict decode succeeds -> Intact; only the lenient decode succeeds ->
+/// Partial (salvageable); neither -> Damaged. Oversized images are Damaged without decoding.
+fn decode_health(source: &dyn Source, start: u64, len: u64) -> Option<Health> {
     let mut data = vec![0u8; len as usize];
     let mut filled = 0;
     while filled < data.len() {
@@ -90,13 +121,11 @@ fn decodes(source: &dyn Source, start: u64, len: u64) -> Option<bool> {
         }
         filled += n;
     }
-    // A decoder panic on hostile input counts as "does not decode".
-    let ok = std::panic::catch_unwind(|| {
-        zune_jpeg::JpegDecoder::new(zune_core::bytestream::ZCursor::new(&data[..]))
-            .decode()
-            .is_ok()
-    });
-    Some(ok.unwrap_or(false))
+    Some(match try_decode(&data, true) {
+        Some(true) => Health::Intact,
+        Some(false) if try_decode(&data, false) == Some(true) => Health::Partial,
+        _ => Health::Damaged,
+    })
 }
 
 impl Format for Jpeg {
@@ -169,11 +198,10 @@ impl Format for Jpeg {
             }
             if b == 0xFF && r.byte(pos + 1) == Some(EOI) {
                 let len = pos + 2 - start;
-                let health = if decodes(source, start, len)? {
-                    Health::Intact
-                } else {
-                    Health::Damaged
-                };
+                if len > JPEG_MAX_LEN {
+                    return Some(partial(start + JPEG_MAX_LEN));
+                }
+                let health = decode_health(source, start, len)?;
                 return Some(Measurement {
                     len,
                     kind: FileKind::Jpeg,

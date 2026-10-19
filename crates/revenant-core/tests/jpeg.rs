@@ -72,12 +72,26 @@ fn jpeg_cut_by_end_of_source_is_partial() {
     assert_eq!(m.len, cut as u64);
 }
 
+// Health tiers depend on how zune-jpeg 0.5.x treats corrupt input: strict mode rejects what the default (lenient) mode
+// tolerates. Re-verify these two tests when upgrading zune-jpeg.
+#[test]
+fn lenient_only_decode_is_partial() {
+    let mut j = testkit::jpeg(640, 480, 8, 0);
+    let mid = j.len() / 2;
+    // Invalid markers in the entropy-coded data: lenient zune-jpeg 0.5.x still decodes, strict mode rejects.
+    j[mid..mid + 8].copy_from_slice(&[0xFF, 0x01, 0xFF, 0x01, 0xFF, 0x01, 0xFF, 0x01]);
+    let img = DiskImage::zeros(1 << 20).put(4096, &j).save();
+    let m = measure(&img, 4096).unwrap();
+    assert_eq!(m.len, j.len() as u64);
+    assert_eq!(m.health, Health::Partial);
+}
+
 #[test]
 fn corrupted_scan_data_is_damaged() {
     let mut j = testkit::jpeg(640, 480, 8, 0);
     let mid = j.len() / 2;
     // Stray DHT markers in the middle of the entropy-coded data: the structure still reaches EOI, but zune-jpeg
-    // rejects the stream.
+    // rejects the stream in both modes.
     for pair in j[mid..mid + 64].chunks_exact_mut(2) {
         pair.copy_from_slice(&[0xFF, 0xC4]);
     }
@@ -111,4 +125,103 @@ fn recognizes_only_jpeg_signatures() {
     assert!(!Jpeg.recognizes(&[0xFF, 0xD8, 0xFF, 0x00]));
     assert!(!Jpeg.recognizes(&[0x89, b'P', b'N', b'G']));
     assert!(!Jpeg.recognizes(&[0xFF, 0xD8]));
+}
+
+// ---- scan-walk risk paths (hand-built streams; they need not decode, only be measured) ----
+
+/// SOI, DQT, SOF (`sof` marker byte), DHT, SOS header. Scan data and EOI are appended by the caller.
+fn header(sof: u8, width: u16, height: u16) -> Vec<u8> {
+    let mut v = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00];
+    v.extend_from_slice(&[1; 64]);
+    v.extend_from_slice(&[0xFF, sof, 0x00, 0x0B, 0x08]);
+    v.extend_from_slice(&height.to_be_bytes());
+    v.extend_from_slice(&width.to_be_bytes());
+    v.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+    v.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01]);
+    v.extend_from_slice(&[0; 16]);
+    v.extend_from_slice(&sos());
+    v
+}
+
+fn sos() -> Vec<u8> {
+    vec![0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]
+}
+
+const MIB: usize = 1 << 20;
+
+fn measure_stream(stream: &[u8], image_len: usize) -> Measurement {
+    let img = DiskImage::zeros(image_len).put(4096, stream).save();
+    measure(&img, 4096).expect("measurable")
+}
+
+#[test]
+fn eoi_at_a_read_window_boundary_is_found() {
+    // The FF of the final FF D9 lands on every byte around the end of the 1st and of the 2nd 1 MiB read window
+    // (the exact window anchor is an implementation detail, so sweep a few bytes either side of each boundary).
+    for windows in [1, 2] {
+        for delta in 0..8 {
+            let mut stream = header(0xC0, 64, 64);
+            stream.resize(windows * MIB - 4 + delta, 0x11);
+            stream.extend_from_slice(&[0xFF, 0xD9]);
+            let m = measure_stream(&stream, 3 * MIB + 8192);
+            assert_eq!(
+                m.len,
+                stream.len() as u64,
+                "windows = {windows}, delta = {delta}"
+            );
+        }
+    }
+}
+
+#[test]
+fn progressive_scans_are_walked_to_the_last_eoi() {
+    let mut stream = header(0xC2, 64, 64);
+    stream.extend_from_slice(&[0x12, 0x34, 0xFF, 0x00, 0x56]);
+    // Second scan: a new DHT and SOS inside the entropy-coded stream.
+    stream.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, 0x10, 0x01]);
+    stream.extend_from_slice(&[0; 16]);
+    stream.extend_from_slice(&sos());
+    stream.extend_from_slice(&[0x78, 0x9A, 0xBC]);
+    stream.extend_from_slice(&[0xFF, 0xD9]);
+    let m = measure_stream(&stream, MIB);
+    assert_eq!(m.len, stream.len() as u64);
+}
+
+#[test]
+fn stuffing_and_restart_markers_do_not_end_the_scan() {
+    let mut stream = header(0xC0, 64, 64);
+    stream.extend_from_slice(&[0x11, 0xFF, 0x00, 0x22]);
+    for rst in 0xD0..=0xD7 {
+        stream.extend_from_slice(&[0x33, 0xFF, rst, 0x44, 0xFF, 0x00]);
+    }
+    stream.extend_from_slice(&[0xFF, 0xD9]);
+    let m = measure_stream(&stream, MIB);
+    assert_eq!(m.len, stream.len() as u64);
+}
+
+#[test]
+fn eoi_beyond_the_maximum_length_is_cut_at_the_maximum() {
+    use revenant_core::formats::JPEG_MAX_LEN;
+    let max = JPEG_MAX_LEN as usize;
+    let mut stream = header(0xC0, 64, 64);
+    // FF at offset MAX - 1, D9 at offset MAX: the file would be MAX + 1 bytes long.
+    stream.resize(max - 1, 0x11);
+    stream.extend_from_slice(&[0xFF, 0xD9]);
+    let m = measure_stream(&stream, max + 8192);
+    assert_eq!(m.len, JPEG_MAX_LEN);
+    assert_eq!(m.health, Health::Partial);
+}
+
+#[test]
+fn huge_declared_size_is_damaged_without_decoding() {
+    let mut j = testkit::jpeg(64, 64, 9, 0);
+    let sof = j.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+    // SOF0 payload: length(2) precision(1) height(2) width(2).
+    j[sof + 5..sof + 9].copy_from_slice(&[0x40, 0x00, 0x40, 0x00]); // 16384 x 16384 (zune-jpeg's own limit; 268 MP is over our cap)
+    let img = DiskImage::zeros(MIB).put(4096, &j).save();
+    let t = std::time::Instant::now();
+    let m = measure(&img, 4096).unwrap();
+    assert_eq!(m.len, j.len() as u64);
+    assert_eq!(m.health, Health::Damaged);
+    assert!(t.elapsed().as_secs() < 5);
 }

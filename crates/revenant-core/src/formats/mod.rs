@@ -29,11 +29,12 @@ impl FileKind {
 /// How complete a measured file is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Health {
-    /// Structure complete and content decodes.
+    /// Structure complete and content decodes cleanly.
     Intact,
-    /// Structure ends early (cut by another file or the end of the source).
+    /// Salvageable but not clean: the structure ends early (cut by another file or the end of the source), or the
+    /// structure is complete and only a lenient decoder accepts the content.
     Partial,
-    /// Structure complete but content does not decode.
+    /// Structure complete but no decoder accepts the content.
     Damaged,
 }
 

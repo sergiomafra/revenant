@@ -40,9 +40,12 @@ the bytes are not a file of that format. `formats::all_formats()` lists the supp
 not end the file), requires DQT and SOF before SOS, and scans the entropy-coded data up to EOI (`FF D9`). The source is read in
 1 MiB windows, never whole, up to `JPEG_MAX_LEN` (64 MiB). Health:
 
-- `Intact`: EOI found and the bytes decode (`zune-jpeg`).
-- `Damaged`: EOI found but the decoder rejects the bytes; the length is still exact.
-- `Partial`: no EOI before the end of the source, `JPEG_MAX_LEN`, or a 512-byte sector that starts another recognized file;
-  the length stops there.
+- `Intact`: EOI found and `zune-jpeg` decodes the bytes in strict mode.
+- `Partial`: no EOI before the end of the source, `JPEG_MAX_LEN`, or a 512-byte sector that starts another recognized file
+  (the length stops there); or EOI found and only the lenient decode succeeds. The length never exceeds `JPEG_MAX_LEN`.
+- `Damaged`: EOI found but neither decode succeeds, or the declared size is over 210 megapixels (not decoded). The length is
+  still exact.
+
+The validation decode outputs grayscale (1 byte per pixel) to bound memory.
 
 Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`).
