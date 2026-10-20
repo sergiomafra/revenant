@@ -75,7 +75,7 @@ top-level boxes (`ftyp moov mdat free skip wide uuid meta pdin moof mfra styp si
 means a 64-bit `largesize`; size 0 (only for `mdat`, e.g. a recording cut by a dead battery) runs to the first sector where
 another file starts, or to the end of the source. The walk stops at an unaccepted type, a
 size under 8, or the end of the source; a box that runs past the end counts only up to it. The major brand `qt  ` gives
-`FileKind::Mov`, anything else `Mp4`. Every size is checked against the source length; only `moov` is loaded into memory, and
+`FileKind::Mov`, `crx ` gives `Cr3` and, with a HEIC brand and no `moov`, `Heic` (see below); anything else `Mp4`. Every size is checked against the source length; only `moov` is loaded into memory, and
 only up to `MOOV_MAX_LEN` (16 MiB).
 
 Walk boundaries: `ftyp` is accepted only as the first box. Once both `moov` and `mdat` are seen, only trailing
@@ -107,6 +107,44 @@ Unreadable sectors:
 - On a box header: the header cannot be parsed, so the walk ends there as if the file were cut (`Partial`, or `Damaged` when
   no `moov` was seen before it). A header that cannot be read after a complete video (`moov` and `mdat` both seen) is only
   what follows the file: the video stays `Intact` (if nothing else is wrong).
+
+## Formats: CR3 and HEIC (ISO BMFF)
+
+The same `IsoBmff` detector picks the kind from the `ftyp` brands: major brand `crx ` is `FileKind::Cr3` (extension `cr3`); a
+HEIC brand (`heic heix heim heis mif1 msf1`) as major or compatible brand, with no `moov` anywhere in the file, is
+`FileKind::Heic` (extension `heic`). An MP4 that merely lists `mif1` has a `moov` and stays `Mp4`; an `avif`/`avis` major
+brand is never HEIC.
+
+- CR3: the `moov`/`stco`/`stsz` rules above apply unchanged (a CR3 has `trak`s). In addition the `PRVW` JPEG in the top-level
+  `uuid` `eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16` must decode strictly for `Intact` (same judgment as a RAW's preview: the
+  raw image itself is never verified); no `PRVW`, or one that decodes leniently or not at all, is `Partial`. The `PRVW`
+  field layout comes from public format notes and the testkit, not yet from real files.
+- HEIC: needs a `meta` (at most 16 MiB) whose `iloc` (versions 0, 1, 2; offset, length, base offset and index sizes of 0, 4
+  or 8 bytes) lists the items' extents. `Intact` when every extent (construction method 0, data reference 0, offsets
+  absolute in the file) ends inside the measured file; `Partial` when one ends past it (or the file is cut, or contains an
+  unreadable sector); `Damaged` for a garbled `meta`, no `iloc`, or an `iloc` with no extents. There is no `mdat` rule (the
+  data may be in `idat`), but extents the engine cannot check (construction method 1 or 2, an external data reference, a
+  zero length meaning "the whole resource", an `iloc` version above 2, more than 65,536 items or 262,144 extents) make the
+  file at best `Partial`. The pixel data is HEVC (or similar) and is never decoded: `Intact` means complete structure with
+  every extent inside the file, not that the image decodes.
+- A sector-aligned file head inside `mdat` is normally "another file starts here". For CR3 and HEIC the starts of the
+  file's own data (CR3: the chunks of every track, which include its full-size JPEG; HEIC: the `iloc` extents) are skipped,
+  so a JPEG the file itself keeps there does not cut it; any other head still does. The checks need the index to be
+  readable: if `moov`/`meta` is missing or unusable, a head inside `mdat` cuts the file as before.
+
+## Formats: Fujifilm RAF
+
+`formats::Raf` recognizes the 16-byte magic `FUJIFILMCCD-RAW ` (`FileKind::Raf`, extension `raf`). The header holds three
+big-endian `(offset, length)` pairs at 0x54, 0x5C and 0x64: the embedded JPEG, the CFA header and the CFA (raw sensor) data.
+`confirms` (used for "another file starts here") requires each pair to end within 1 GiB; a head that does not confirm is not
+a file.
+
+- Length: the furthest end of the three blocks (at least the 0x6C-byte header). A block that starts past the end of the
+  source is not counted (a corrupted offset never claims the rest of the source), one that starts inside is kept up to the
+  end of the source; either makes the file `Partial`. The file also ends at the first 512-aligned sector inside it where
+  another file starts, except at the starts of its own blocks (`Partial`).
+- Health: like a TIFF RAW, only the embedded JPEG can be verified. `Intact` needs a complete file, no unreadable sector and a
+  strict decode of the JPEG; no JPEG, or one that decodes leniently or not at all, is `Partial`.
 
 ## Formats: TIFF-based RAW
 

@@ -461,3 +461,314 @@ fn confirms_a_header_in_an_unreadable_sector_like_jpeg_does() {
     let img = DiskImage::zeros(AT + 4096).put(AT, &v[..512]).save();
     assert!(!IsoBmff.confirms(&FileSource::open(img.path()).unwrap(), AT as u64));
 }
+
+fn exif() -> testkit::TestExif {
+    testkit::TestExif {
+        make: Some("Canon".into()),
+        model: Some("EOS R6".into()),
+        iso: Some(400),
+        ..testkit::TestExif::default()
+    }
+}
+
+fn place(bytes: &[u8]) -> tempfile::NamedTempFile {
+    DiskImage::noise(AT + bytes.len() + 40_000, 11)
+        .put(AT, bytes)
+        .save()
+}
+
+fn pos(bytes: &[u8], needle: &[u8]) -> usize {
+    bytes
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .unwrap()
+}
+
+fn scan_kinds(img: &tempfile::NamedTempFile) -> Vec<(u64, u64, FileKind, Health)> {
+    use revenant_core::formats::all_formats;
+    use revenant_core::{CancelToken, Event, ScanOptions, scan};
+    let source = FileSource::open(img.path()).unwrap();
+    let mut out = Vec::new();
+    scan(
+        &source,
+        &all_formats(),
+        &ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |e| {
+            if let Event::Found(f) = e {
+                out.push((f.start, f.len, f.kind, f.health));
+            }
+        },
+    )
+    .unwrap();
+    out
+}
+
+#[test]
+fn mp4_and_mov_kinds_unchanged() {
+    for (mov, kind) in [(false, FileKind::Mp4), (true, FileKind::Mov)] {
+        let v = testkit::mp4(&Mp4Options { mov, ..opts() });
+        let m = measure(&place(&v)).unwrap();
+        assert_eq!(
+            (m.kind, m.len, m.health),
+            (kind, v.len() as u64, Health::Intact)
+        );
+    }
+    assert_eq!(FileKind::Cr3.extension(), "cr3");
+    assert_eq!(FileKind::Heic.as_str(), "heic");
+}
+
+#[test]
+fn mp4_listing_mif1_as_compatible_stays_mp4() {
+    let mut v = testkit::mp4(&opts());
+    assert_eq!(&v[16..20], b"isom"); // the compatible brand
+    v[16..20].copy_from_slice(b"mif1");
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!((m.kind, m.health), (FileKind::Mp4, Health::Intact));
+}
+
+#[test]
+fn cr3_is_found_intact_with_kind_cr3() {
+    let v = testkit::cr3(7, &exif());
+    let img = place(&v);
+    assert_eq!(
+        measure(&img),
+        Some(Measurement {
+            len: v.len() as u64,
+            kind: FileKind::Cr3,
+            health: Health::Intact
+        })
+    );
+    // The full-size JPEG in mdat starts at a sector boundary; it is the file's own, and the scan reports one file.
+    assert_eq!(
+        scan_kinds(&img),
+        vec![(AT as u64, v.len() as u64, FileKind::Cr3, Health::Intact)]
+    );
+}
+
+#[test]
+fn cr3_with_broken_preview_is_partial() {
+    let mut v = testkit::cr3(7, &exif());
+    let prvw = pos(&v, b"PRVW");
+    let size = u32::from_be_bytes(v[prvw + 16..prvw + 20].try_into().unwrap()) as usize;
+    let mid = prvw + 20 + size / 2;
+    v[mid..mid + 64].copy_from_slice(&[0xFF, 0xC4].repeat(32));
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!(
+        (m.kind, m.len, m.health),
+        (FileKind::Cr3, v.len() as u64, Health::Partial)
+    );
+}
+
+#[test]
+fn cr3_without_a_preview_is_partial() {
+    let mut v = testkit::cr3(7, &exif());
+    let prvw = pos(&v, b"PRVW");
+    v[prvw..prvw + 4].copy_from_slice(b"PRVX");
+    assert_eq!(measure(&place(&v)).unwrap().health, Health::Partial);
+}
+
+#[test]
+fn cr3_keeps_the_moov_index_rules() {
+    // A chunk table that points past the end of the file: Partial; a track without `stsz`: Damaged.
+    let mut v = testkit::cr3(7, &exif());
+    let stsz = pos(&v, b"stsz");
+    v[stsz + 16..stsz + 20].copy_from_slice(&90_000_000u32.to_be_bytes());
+    assert_eq!(measure(&place(&v)).unwrap().health, Health::Partial);
+
+    let mut v = testkit::cr3(7, &exif());
+    let stsz = pos(&v, b"stsz");
+    v[stsz..stsz + 4].copy_from_slice(b"stsx");
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!((m.kind, m.health), (FileKind::Cr3, Health::Damaged));
+}
+
+#[test]
+fn cr3_cut_is_partial() {
+    let v = testkit::cr3(7, &exif());
+    let keep = v.len() - 10_000;
+    let img = DiskImage::zeros(AT + keep).put(AT, &v[..keep]).save();
+    let m = measure(&img).unwrap();
+    assert_eq!(
+        (m.kind, m.len, m.health),
+        (FileKind::Cr3, keep as u64, Health::Partial)
+    );
+}
+
+#[test]
+fn heic_is_found_intact_with_kind_heic() {
+    let v = testkit::heic(60_000, 5, &exif());
+    let img = place(&v);
+    assert_eq!(
+        measure(&img),
+        Some(Measurement {
+            len: v.len() as u64,
+            kind: FileKind::Heic,
+            health: Health::Intact
+        })
+    );
+    assert_eq!(
+        scan_kinds(&img),
+        vec![(AT as u64, v.len() as u64, FileKind::Heic, Health::Intact)]
+    );
+}
+
+/// Offset of the first iloc extent's length field (the testkit layout: version 1, 4-byte offsets and lengths).
+fn first_extent_len_at(v: &[u8]) -> usize {
+    pos(v, b"iloc") + 4 + 20
+}
+
+#[test]
+fn heic_extent_past_end_is_partial() {
+    let mut v = testkit::heic(60_000, 5, &exif());
+    let at = first_extent_len_at(&v);
+    v[at..at + 4].copy_from_slice(&5_000_000u32.to_be_bytes());
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!(
+        (m.kind, m.len, m.health),
+        (FileKind::Heic, v.len() as u64, Health::Partial)
+    );
+}
+
+#[test]
+fn heic_extent_ending_exactly_at_the_end_is_intact_one_byte_more_is_partial() {
+    let mut v = testkit::heic(60_000, 5, &exif());
+    // The second extent (the Exif item) ends at the end of the file: stretch it by one byte.
+    let tail = pos(&v, b"iloc") + 4 + 4 + 2 + 2 + 16; // the second item starts 16 bytes after the first
+    let len_at = tail + 2 + 2 + 2 + 2 + 4;
+    let len = u32::from_be_bytes(v[len_at..len_at + 4].try_into().unwrap());
+    v[len_at..len_at + 4].copy_from_slice(&(len + 1).to_be_bytes());
+    assert_eq!(measure(&place(&v)).unwrap().health, Health::Partial);
+}
+
+#[test]
+fn heic_without_iloc_is_damaged() {
+    let mut v = testkit::heic(60_000, 5, &exif());
+    let at = pos(&v, b"iloc");
+    v[at..at + 4].copy_from_slice(b"ilox");
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!((m.kind, m.health), (FileKind::Heic, Health::Damaged));
+}
+
+#[test]
+fn heic_with_a_garbled_meta_is_damaged() {
+    let mut v = testkit::heic(60_000, 5, &exif());
+    // The size of hdlr (the first child of meta) becomes larger than meta.
+    let at = pos(&v, b"hdlr") - 4;
+    v[at..at + 4].copy_from_slice(&0x0100_0000u32.to_be_bytes());
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!((m.kind, m.health), (FileKind::Heic, Health::Damaged));
+}
+
+#[test]
+fn heic_with_data_we_cannot_verify_is_partial() {
+    // construction_method 1 (idat) and a data reference outside the file are not checked against the file.
+    let base = testkit::heic(60_000, 5, &exif());
+    let item = pos(&base, b"iloc") + 4 + 4 + 2 + 2;
+    for (name, at, value) in [("idat", item + 2, 1u16), ("external", item + 4, 1u16)] {
+        let mut v = base.clone();
+        v[at..at + 2].copy_from_slice(&value.to_be_bytes());
+        assert_eq!(
+            measure(&place(&v)).unwrap().health,
+            Health::Partial,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn heic_cut_is_partial() {
+    let v = testkit::heic(60_000, 5, &exif());
+    let keep = v.len() - 20_000;
+    let img = DiskImage::zeros(AT + keep).put(AT, &v[..keep]).save();
+    let m = measure(&img).unwrap();
+    assert_eq!(
+        (m.kind, m.len, m.health),
+        (FileKind::Heic, keep as u64, Health::Partial)
+    );
+}
+
+#[test]
+fn heic_cut_by_the_next_file_is_partial() {
+    let v = testkit::heic(60_000, 5, &exif());
+    let cut = (AT + 30_000).next_multiple_of(512);
+    let jpeg = testkit::jpeg(64, 64, 9, 0);
+    let img = DiskImage::noise(AT + v.len() + 40_000, 5)
+        .put(AT, &v)
+        .put(cut, &jpeg)
+        .save();
+    let found = scan_kinds(&img);
+    assert_eq!(
+        found[0],
+        (
+            AT as u64,
+            (cut - AT) as u64,
+            FileKind::Heic,
+            Health::Partial
+        )
+    );
+}
+
+#[test]
+fn heic_item_that_is_a_jpeg_at_a_sector_start_does_not_cut() {
+    // An item whose data is a JPEG (a thumbnail item) at a sector boundary inside mdat is the file's own.
+    let mut v = testkit::heic(60_000, 5, &exif());
+    let mdat = pos(&v, b"mdat") + 4;
+    let jpeg_at = (mdat + 100).next_multiple_of(512);
+    let jpeg = testkit::jpeg(64, 64, 9, 0);
+    v[jpeg_at..jpeg_at + jpeg.len()].copy_from_slice(&jpeg);
+    // Point the first extent at it.
+    let off_at = pos(&v, b"iloc") + 4 + 16;
+    v[off_at..off_at + 4].copy_from_slice(&(jpeg_at as u32).to_be_bytes());
+    v[off_at + 4..off_at + 8].copy_from_slice(&(jpeg.len() as u32).to_be_bytes());
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!(
+        (m.kind, m.len, m.health),
+        (FileKind::Heic, v.len() as u64, Health::Intact)
+    );
+}
+
+#[test]
+fn heic_without_meta_or_mdat_is_not_a_file() {
+    let v = testkit::heic(60_000, 5, &exif());
+    let ftyp_len = u32::from_be_bytes(v[..4].try_into().unwrap()) as usize;
+    let img = DiskImage::zeros(AT + 4096).put(AT, &v[..ftyp_len]).save();
+    assert_eq!(measure(&img), None);
+}
+
+#[test]
+fn heic_iloc_with_hostile_fields_is_damaged() {
+    let base = testkit::heic(60_000, 5, &exif());
+    let iloc = pos(&base, b"iloc") + 4;
+    // Offset size 3 is not a legal size; an item count far beyond the table's data.
+    for (name, at, bytes) in [
+        ("size", iloc + 4, vec![0x34u8]),
+        ("count", iloc + 6, vec![0xFF, 0xFF]),
+    ] {
+        let mut v = base.clone();
+        v[at..at + bytes.len()].copy_from_slice(&bytes);
+        let m = measure(&place(&v)).unwrap();
+        assert_eq!(
+            (m.kind, m.health),
+            (FileKind::Heic, Health::Damaged),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn cr3_cut_by_a_foreign_jpeg_inside_mdat_keeps_the_cut() {
+    let v = testkit::cr3(7, &exif());
+    // The full-size JPEG is the file's own; a different file written over the mdat further in ends the CR3 there.
+    let cut = (AT + v.len() - 200_000).next_multiple_of(512);
+    let jpeg = testkit::jpeg(64, 64, 9, 0);
+    let img = DiskImage::noise(AT + v.len() + 40_000, 11)
+        .put(AT, &v)
+        .put(cut, &jpeg)
+        .save();
+    let found = scan_kinds(&img);
+    assert_eq!(
+        found[0],
+        (AT as u64, (cut - AT) as u64, FileKind::Cr3, Health::Partial)
+    );
+}

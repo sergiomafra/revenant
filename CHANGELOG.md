@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   starts.
 - TIFF-based RAW photo detection (CR2, NEF, ARW, DNG, ORF, RW2) and generic TIFF: exact length from the IFD structure, health
   from the embedded JPEG preview (the raw data itself cannot be verified, so a RAW without a decodable preview is partial).
+- Fujifilm RAF, Canon CR3 and HEIC photo detection: exact length from the file structure (RAF header blocks; CR3 and HEIC
+  boxes), health from the embedded JPEG (RAF, CR3 preview) or from whether every item extent lies inside the file (HEIC; the
+  image data itself is never decoded). A JPEG a CR3 or HEIC keeps inside its own data no longer cuts it.
 - Sector scan of a disk image (including formatted cards) with progress, cancellation and unreadable-region reporting; each
   file is classified as intact, partial or damaged. Unreadable sectors never hide a file (a file containing one is never
   intact), and files inside a partial or damaged file are still found.

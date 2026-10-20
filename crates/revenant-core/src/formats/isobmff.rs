@@ -1,4 +1,4 @@
-//! ISO BMFF (MP4/MOV): walks the top-level boxes by their declared sizes to measure the file, then judges its health
+//! ISO BMFF (MP4/MOV, Canon CR3, HEIC): walks the top-level boxes by their declared sizes to measure the file, then judges its health
 //! from the chunk and sample tables inside `moov`.
 //!
 //! Health rules:
@@ -21,10 +21,31 @@
 //!
 //! Only the first `moov` is parsed, and only if it is at most [`MOOV_MAX_LEN`] (larger -> `Damaged`).
 //!
+//! Kind from the `ftyp` brands: major brand `crx ` is a CR3, `qt  ` a MOV; a HEIC brand (`heic heix heim heis mif1 msf1`,
+//! as the major or a compatible brand, but not with an `avif`/`avis` major brand) with no `moov` in the file is a HEIC
+//! (an MP4 that merely lists `mif1` has a `moov` and stays an MP4); anything else is an MP4.
+//!
+//! CR3 follows the rules above (it has `trak`s), and in addition its `PRVW` preview JPEG (in the top-level `uuid`
+//! `eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16`) must decode strictly, else the file is at best `Partial` (a missing or
+//! oversized preview too). The `PRVW` layout (after the 16-byte uuid and 8 bytes: the box with 4+2 reserved bytes, width,
+//! height, a 1, the JPEG size, then the JPEG) is from public format notes and the testkit; not yet checked on real files.
+//!
+//! HEIC has no `moov` or `mdat` rule: it needs a `meta` (at most [`MOOV_MAX_LEN`]) whose `iloc` lists the items' extents.
+//! Every extent (construction method 0 and data reference 0: offsets absolute in the file, plus the item's base offset)
+//! must end inside the measured file, else `Partial`; no `meta` (with an `mdat`), a garbled `meta`, no `iloc` or an `iloc`
+//! without extents is `Damaged`. Extents the engine cannot check (construction method 1 or 2, an external data
+//! reference, a zero length, an `iloc` version above 2, more than 65,536 items or 262,144 extents) make the file at best
+//! `Partial`. The pixel data is HEVC (or similar) and is never decoded: `Intact` means the structure is complete and every
+//! extent lies inside the file. `mdat` may be absent (data in `idat`), but then the extents are method 1: `Partial`.
+//!
+//! An `mdat` head that is exactly a chunk start (CR3: of any track; Motion-JPEG video: of its track) or an extent start
+//! (HEIC) is the file's own data, not another file: see `measure`.
+//!
 //! Unreadable sectors read as zeros: inside `moov` the index is unusable -> `Damaged` (the length still covers `moov`, so
 //! extraction keeps it); anywhere else in the file an otherwise `Intact` file becomes `Partial`. A box header that cannot
 //! be read ends the walk there, like a cut (`Partial`, or `Damaged` without `moov`).
 
+use super::jpeg::preview_health;
 use super::{FileKind, Format, HEAD_LEN, Health, Measurement, Reader, SECTOR, all_formats};
 use crate::source::Source;
 
@@ -89,17 +110,19 @@ fn parse_header(b: &[u8]) -> Option<BoxHeader> {
     }
 }
 
-/// First 512-byte sector start strictly inside `(box_start, box_end)` where any format recognizes a file.
+/// First 512-byte sector start strictly inside `(box_start, box_end)` where any format recognizes a file, except the
+/// sorted absolute positions in `own` (data the file itself keeps there).
 fn next_file_inside(
     r: &mut Reader,
     formats: &[Box<dyn Format>],
     box_start: u64,
     box_end: u64,
+    own: &[u64],
 ) -> Option<u64> {
     (box_start / SECTOR + 1..)
         .map(|i| i * SECTOR)
         .take_while(|&s| s < box_end)
-        .find(|&s| r.file_starts_at(formats, s))
+        .find(|&s| own.binary_search(&s).is_err() && r.file_starts_at(formats, s))
 }
 
 /// Children `(type, payload)` of a box payload, bounded by the payload itself. Sets `garbled` if the walk ends on an
@@ -228,18 +251,29 @@ impl Format for IsoBmff {
             return None;
         }
         let formats = all_formats();
-        let walk = walk_boxes(&mut r, &formats, start, true);
+        let walk = walk_boxes(&mut r, &formats, start, true, &[]);
         let first = judge(&mut r, start, &walk)?;
         if walk.cut_in_mdat {
-            // Motion-JPEG stores one JPEG per frame in `mdat`: those are the video's own, not another file. Walk again
-            // without the checks inside `mdat`; keep the cut unless the whole video then checks out as Motion-JPEG.
-            let again = walk_boxes(&mut r, &formats, start, false);
-            if let Some(full) = judge(&mut r, start, &again)
+            // Motion-JPEG stores one JPEG per frame in `mdat`, a CR3 keeps its full-size JPEG there and a HEIC may hold
+            // JPEG items: those are the file's own, not another file. Walk again without the checks inside `mdat` to
+            // learn the file's own data from its index.
+            let again = walk_boxes(&mut r, &formats, start, false, &[]);
+            if matches!(again.kind, FileKind::Cr3 | FileKind::Heic) {
+                // Skip the file's own data starts: only a head that is not one ends the file (and a damaged or partial
+                // index keeps its own health).
+                let own: Vec<u64> = own_starts(&mut r, &again)
+                    .iter()
+                    .map(|o| start + o)
+                    .collect();
+                if !own.is_empty() {
+                    let walk = walk_boxes(&mut r, &formats, start, true, &own);
+                    return judge(&mut r, start, &walk);
+                }
+            } else if let Some(full) = judge(&mut r, start, &again)
                 && full.health == Health::Intact
-                && again
-                    .moov
-                    .is_some_and(|m| frames_are_the_videos_own(&mut r, start, m, &again.heads))
+                && heads_are_own(&mut r, start, &again)
             {
+                // A Motion-JPEG video whose whole index checks out and whose every head is one of its frames.
                 return Some(full);
             }
         }
@@ -261,11 +295,29 @@ struct Walk {
     heads: Vec<u64>,
     /// Payload offset and length of the first `moov`.
     moov: Option<(u64, u64)>,
+    /// Payload offset and length of the first top-level `meta`.
+    meta: Option<(u64, u64)>,
+    /// Payload start and box end of the first top-level `uuid` boxes (bounded).
+    uuids: Vec<(u64, u64)>,
+    /// The `ftyp` lists a HEIC brand (and does not make it an AVIF).
+    heic_brand: bool,
 }
 
-/// Walks the top-level boxes of the video at `start`. With `inner_checks`, every sector start inside `mdat` where a file
-/// starts ends the video there.
-fn walk_boxes(r: &mut Reader, formats: &[Box<dyn Format>], start: u64, inner_checks: bool) -> Walk {
+/// Top-level `uuid` boxes remembered while walking (the CR3 preview is the second or third one).
+const MAX_UUIDS: usize = 16;
+/// Compatible brands read from `ftyp`.
+const MAX_BRANDS: usize = 64;
+const HEIC_BRANDS: [&[u8; 4]; 6] = [b"heic", b"heix", b"heim", b"heis", b"mif1", b"msf1"];
+
+/// Walks the top-level boxes of the file at `start`. With `inner_checks`, every sector start inside `mdat` where a file
+/// starts ends the file there, except the sorted absolute positions in `own`.
+fn walk_boxes(
+    r: &mut Reader,
+    formats: &[Box<dyn Format>],
+    start: u64,
+    inner_checks: bool,
+    own: &[u64],
+) -> Walk {
     let source_len = r.source.len();
     let mut w = Walk {
         end: start,
@@ -277,6 +329,9 @@ fn walk_boxes(r: &mut Reader, formats: &[Box<dyn Format>], start: u64, inner_che
         cut_in_mdat: false,
         heads: Vec::new(),
         moov: None,
+        meta: None,
+        uuids: Vec::new(),
+        heic_brand: false,
     };
     let mut pos = start;
     while pos < source_len {
@@ -316,14 +371,14 @@ fn walk_boxes(r: &mut Reader, formats: &[Box<dyn Format>], start: u64, inner_che
         if !inner_checks && &h.kind == b"mdat" {
             let end = pos + size;
             let mut from = pos;
-            while let Some(next) = next_file_inside(r, formats, from, end) {
+            while let Some(next) = next_file_inside(r, formats, from, end, &[]) {
                 w.heads.push(next);
                 from = next;
             }
         }
         if inner_checks
             && &h.kind == b"mdat"
-            && let Some(next) = next_file_inside(r, formats, pos, pos + size)
+            && let Some(next) = next_file_inside(r, formats, pos, pos + size, own)
         {
             // Another file was written over the rest of this mdat (or a size-0 mdat ends where the next file
             // begins): the video ends there. A declared size the data no longer reaches is a cut.
@@ -337,13 +392,28 @@ fn walk_boxes(r: &mut Reader, formats: &[Box<dyn Format>], start: u64, inner_che
                 r.read(pos + h.header_len, &mut brand);
                 if &brand == b"qt  " {
                     w.kind = FileKind::Mov;
+                } else if &brand == b"crx " {
+                    w.kind = FileKind::Cr3;
                 }
+                // Compatible brands follow the 4-byte minor version.
+                let mut compat =
+                    vec![0u8; (size.saturating_sub(16) as usize / 4).min(MAX_BRANDS) * 4];
+                r.read(pos + 16, &mut compat);
+                let listed = |b: &[u8]| HEIC_BRANDS.iter().any(|h| h.as_slice() == b);
+                w.heic_brand = (listed(&brand) || compat.chunks(4).any(listed))
+                    && &brand != b"avif"
+                    && &brand != b"avis"
+                    && &brand != b"crx ";
             }
             b"mdat" => w.has_mdat = true,
             b"moof" => w.has_moof = true,
             b"moov" if w.moov.is_none() => {
                 w.moov = Some((pos + h.header_len, size.saturating_sub(h.header_len)))
             }
+            b"meta" if w.meta.is_none() => {
+                w.meta = Some((pos + h.header_len, size.saturating_sub(h.header_len)))
+            }
+            b"uuid" if w.uuids.len() < MAX_UUIDS => w.uuids.push((pos + h.header_len, pos + size)),
             _ => {}
         }
         pos += size;
@@ -353,11 +423,26 @@ fn walk_boxes(r: &mut Reader, formats: &[Box<dyn Format>], start: u64, inner_che
         }
     }
     w.end = pos;
+    if w.heic_brand && w.moov.is_none() && w.kind == FileKind::Mp4 {
+        w.kind = FileKind::Heic;
+    }
     w
 }
 
-/// Judges a walked video: `None` if it is not a video at all.
+/// Loads a box payload for parsing; `None` when it is over [`MOOV_MAX_LEN`].
+fn load(r: &mut Reader, at: u64, len: u64) -> Option<Vec<u8>> {
+    (len <= MOOV_MAX_LEN).then(|| {
+        let mut data = vec![0u8; len as usize];
+        r.read(at, &mut data);
+        data
+    })
+}
+
+/// Judges a walked file: `None` if it is not a video, CR3 or HEIC at all.
 fn judge(r: &mut Reader, start: u64, w: &Walk) -> Option<Measurement> {
+    if w.kind == FileKind::Heic {
+        return judge_heic(r, start, w);
+    }
     if !w.has_mdat && !w.unreadable_header {
         return None;
     }
@@ -368,73 +453,225 @@ fn judge(r: &mut Reader, start: u64, w: &Walk) -> Option<Measurement> {
     let Some((moov_at, moov_len)) = w.moov else {
         return measured(Health::Damaged);
     };
-    let mut data = Vec::new();
-    if moov_len <= MOOV_MAX_LEN {
-        data.resize(moov_len as usize, 0);
-        r.read(moov_at, &mut data);
-        if r.bad_in(moov_at, moov_at + moov_len) {
-            return measured(Health::Damaged);
-        }
+    let data = load(r, moov_at, moov_len);
+    if data.is_some() && r.bad_in(moov_at, moov_at + moov_len) {
+        return measured(Health::Damaged);
     }
     if w.truncated {
         return measured(Health::Partial);
     }
-    if moov_len > MOOV_MAX_LEN {
+    let Some(data) = data else {
         return measured(Health::Damaged);
-    }
+    };
     match index_health(&data, len, w.has_moof) {
         Health::Intact if r.bad_in(start, pos) => measured(Health::Partial),
+        Health::Intact if kind == FileKind::Cr3 => measured(cr3_preview_health(r, w)),
         health => measured(health),
     }
 }
 
-/// Whether every file head found inside `mdat` is a frame of a Motion-JPEG video track: the track is a video track
-/// (`hdlr` `vide`) whose first sample entry (`stsd`) is `mjpa`, `mjpb` or `jpeg`, and each head lies exactly at one of its
-/// chunk offsets (`stco`/`co64`, relative to `start`). A photo written over the video lies elsewhere.
-fn frames_are_the_videos_own(
-    r: &mut Reader,
-    start: u64,
-    (at, len): (u64, u64),
-    heads: &[u64],
-) -> bool {
-    if len > MOOV_MAX_LEN {
-        return false;
-    }
-    let mut moov = vec![0u8; len as usize];
-    r.read(at, &mut moov);
-    let mut garbled = false;
-    let mut chunks: Vec<u64> = Vec::new();
-    for (_, trak) in children(&moov, &mut garbled)
-        .into_iter()
-        .filter(|(k, _)| k == b"trak")
-    {
-        let mdia = child(trak, b"mdia", &mut garbled);
-        let video = mdia
-            .and_then(|m| child(m, b"hdlr", &mut garbled))
-            .is_some_and(|p| p.get(8..12) == Some(b"vide"));
-        let stbl = mdia
-            .and_then(|m| child(m, b"minf", &mut garbled))
-            .and_then(|m| child(m, b"stbl", &mut garbled));
-        let Some(stbl) = stbl.filter(|_| video) else {
+/// Canon's top-level `uuid` that holds the `PRVW` preview.
+const CR3_PRVW_UUID: [u8; 16] = [
+    0xea, 0xf4, 0x2b, 0x5e, 0x1c, 0x98, 0x4b, 0x88, 0xb9, 0xfb, 0xb7, 0xdc, 0x40, 0x6e, 0x4d, 0x16,
+];
+
+/// Content check of a CR3 whose structure is complete: the `PRVW` JPEG must decode strictly. No preview found, or one
+/// whose size field does not fit its box, is `Partial`.
+fn cr3_preview_health(r: &mut Reader, w: &Walk) -> Health {
+    for &(payload, end) in &w.uuids {
+        // uuid (16), 8 bytes, then the PRVW box: size (4), "PRVW", 4+2 reserved, width, height, 1, JPEG size (4).
+        let mut head = [0u8; 16 + 8 + 8 + 16];
+        if r.read(payload, &mut head) != head.len() || head[..16] != CR3_PRVW_UUID {
             continue;
-        };
-        // version/flags (4), entry count (4), then the first entry: size (4), type (4).
-        let mjpeg = child(stbl, b"stsd", &mut garbled)
-            .and_then(|p| p.get(12..16))
-            .is_some_and(|t| t == b"mjpa" || t == b"mjpb" || t == b"jpeg");
-        if mjpeg {
-            if let Some(p) = child(stbl, b"stco", &mut garbled) {
-                chunks.extend(chunk_offsets(p, false));
-            } else if let Some(p) = child(stbl, b"co64", &mut garbled) {
-                chunks.extend(chunk_offsets(p, true));
+        }
+        if &head[28..32] != b"PRVW" {
+            return Health::Partial;
+        }
+        let jpeg_len = u64::from(be32(&head[44..48]));
+        let jpeg_at = payload + head.len() as u64;
+        if jpeg_at + jpeg_len > end {
+            return Health::Partial;
+        }
+        return preview_health(r, &[(jpeg_at, jpeg_len)]);
+    }
+    Health::Partial
+}
+
+/// Extents the `iloc` of a HEIC `meta` lists, and whether some of them could not be checked.
+struct Iloc {
+    /// `(offset, length)` relative to the start of the file, for construction method 0 and data reference 0 with a
+    /// non-zero length.
+    extents: Vec<(u64, u64)>,
+    /// Some extent (or the whole table) cannot be checked against the file.
+    unverifiable: bool,
+}
+
+const ILOC_MAX_ITEMS: u32 = 65_536;
+const ILOC_MAX_EXTENTS: usize = 262_144;
+
+/// Big-endian reader over a byte slice, for `iloc`.
+struct Cursor<'a>(&'a [u8]);
+
+impl Cursor<'_> {
+    /// An unsigned integer of `n` (0 to 8) bytes; `None` past the end of the data.
+    fn uint(&mut self, n: usize) -> Option<u64> {
+        let (head, rest) = self.0.split_at_checked(n)?;
+        self.0 = rest;
+        Some(head.iter().fold(0, |acc, &b| (acc << 8) | u64::from(b)))
+    }
+}
+
+/// Parses the `iloc` payload. `None` if it is garbled (a bad field size or data that ends early).
+fn parse_iloc(payload: &[u8]) -> Option<Iloc> {
+    let version = *payload.first()?;
+    let mut out = Iloc {
+        extents: Vec::new(),
+        unverifiable: false,
+    };
+    if version > 2 {
+        out.unverifiable = true;
+        return Some(out);
+    }
+    let mut c = Cursor(payload.get(4..)?);
+    let sizes = c.uint(2)?;
+    let (offset_size, length_size) = ((sizes >> 12) as usize & 15, (sizes >> 8) as usize & 15);
+    let (base_size, index_size) = (
+        (sizes >> 4) as usize & 15,
+        if version >= 1 { sizes as usize & 15 } else { 0 },
+    );
+    if ![offset_size, length_size, base_size, index_size]
+        .iter()
+        .all(|s| [0, 4, 8].contains(s))
+    {
+        return None;
+    }
+    let count = if version < 2 { c.uint(2)? } else { c.uint(4)? } as u32;
+    if count > ILOC_MAX_ITEMS {
+        out.unverifiable = true;
+    }
+    for _ in 0..count.min(ILOC_MAX_ITEMS) {
+        c.uint(if version < 2 { 2 } else { 4 })?; // item_ID
+        let method = if version >= 1 { c.uint(2)? & 15 } else { 0 };
+        let data_reference = c.uint(2)?;
+        let base = c.uint(base_size)?;
+        let extent_count = c.uint(2)?;
+        for _ in 0..extent_count {
+            c.uint(index_size)?;
+            let offset = c.uint(offset_size)?;
+            let length = c.uint(length_size)?;
+            if method != 0 || data_reference != 0 || length == 0 {
+                out.unverifiable = true;
+            } else if out.extents.len() < ILOC_MAX_EXTENTS {
+                out.extents.push((base.saturating_add(offset), length));
+            } else {
+                out.unverifiable = true;
             }
         }
     }
-    chunks.sort_unstable();
-    !chunks.is_empty()
-        && heads
+    Some(out)
+}
+
+/// The parsed `iloc` of a `meta` payload: `None` if there is no `iloc` or the boxes (or the table) are garbled.
+fn meta_iloc(meta: &[u8]) -> Option<Iloc> {
+    let mut garbled = false;
+    let iloc = child(meta.get(4..)?, b"iloc", &mut garbled)?; // meta is a full box: version and flags first
+    if garbled { None } else { parse_iloc(iloc) }
+}
+
+/// Judges a HEIC: `meta` with an `iloc` whose extents lie inside the measured file.
+fn judge_heic(r: &mut Reader, start: u64, w: &Walk) -> Option<Measurement> {
+    if w.meta.is_none() && !w.has_mdat && !w.unreadable_header {
+        return None;
+    }
+    let (pos, kind) = (w.end, w.kind);
+    let len = pos - start;
+    let measured = |health| Some(Measurement { len, kind, health });
+
+    let Some((at, meta_len)) = w.meta else {
+        return measured(Health::Damaged);
+    };
+    let data = load(r, at, meta_len);
+    if data.is_some() && r.bad_in(at, at + meta_len) {
+        return measured(Health::Damaged);
+    }
+    if w.truncated {
+        return measured(Health::Partial);
+    }
+    let Some(data) = data else {
+        return measured(Health::Damaged);
+    };
+    let Some(iloc) = meta_iloc(&data) else {
+        return measured(Health::Damaged);
+    };
+    if iloc.extents.is_empty() && !iloc.unverifiable {
+        return measured(Health::Damaged); // nothing to open
+    }
+    let inside = iloc
+        .extents
+        .iter()
+        .all(|&(o, l)| o.saturating_add(l) <= len);
+    measured(if inside && !iloc.unverifiable && !r.bad_in(start, pos) {
+        Health::Intact
+    } else {
+        Health::Partial
+    })
+}
+
+/// Starts (relative to the file) of the data the file itself keeps in `mdat`: for a HEIC its extents, for a CR3 the chunks
+/// of every track, for an MP4/MOV only the chunks of Motion-JPEG video tracks (`hdlr` `vide` whose first sample entry
+/// is `mjpa`, `mjpb` or `jpeg`).
+fn own_starts(r: &mut Reader, w: &Walk) -> Vec<u64> {
+    let mut starts: Vec<u64> = Vec::new();
+    if w.kind == FileKind::Heic {
+        if let Some((at, len)) = w.meta
+            && let Some(data) = load(r, at, len)
+            && let Some(iloc) = meta_iloc(&data)
+        {
+            starts.extend(iloc.extents.iter().map(|e| e.0));
+        }
+    } else if let Some((at, len)) = w.moov
+        && let Some(moov) = load(r, at, len)
+    {
+        let all_tracks = w.kind == FileKind::Cr3;
+        let mut garbled = false;
+        for (_, trak) in children(&moov, &mut garbled)
+            .into_iter()
+            .filter(|(k, _)| k == b"trak")
+        {
+            let mdia = child(trak, b"mdia", &mut garbled);
+            let video = mdia
+                .and_then(|m| child(m, b"hdlr", &mut garbled))
+                .is_some_and(|p| p.get(8..12) == Some(b"vide"));
+            let stbl = mdia
+                .and_then(|m| child(m, b"minf", &mut garbled))
+                .and_then(|m| child(m, b"stbl", &mut garbled));
+            let Some(stbl) = stbl.filter(|_| all_tracks || video) else {
+                continue;
+            };
+            // version/flags (4), entry count (4), then the first entry: size (4), type (4).
+            let mjpeg = child(stbl, b"stsd", &mut garbled)
+                .and_then(|p| p.get(12..16))
+                .is_some_and(|t| t == b"mjpa" || t == b"mjpb" || t == b"jpeg");
+            if all_tracks || mjpeg {
+                if let Some(p) = child(stbl, b"stco", &mut garbled) {
+                    starts.extend(chunk_offsets(p, false));
+                } else if let Some(p) = child(stbl, b"co64", &mut garbled) {
+                    starts.extend(chunk_offsets(p, true));
+                }
+            }
+        }
+    }
+    starts.sort_unstable();
+    starts
+}
+
+/// Whether every file head found inside `mdat` is one of the file's own data starts (see [`own_starts`]).
+fn heads_are_own(r: &mut Reader, start: u64, w: &Walk) -> bool {
+    let starts = own_starts(r, w);
+    !starts.is_empty()
+        && w.heads
             .iter()
-            .all(|h| chunks.binary_search(&(h - start)).is_ok())
+            .all(|h| starts.binary_search(&(h - start)).is_ok())
 }
 
 /// All chunk offsets of an `stco` (32-bit) or `co64` (64-bit) payload, bounded by the table's actual size.

@@ -11,10 +11,8 @@
 
 use std::collections::HashSet;
 
-use super::jpeg::{decode_health, sof_pixels};
-use super::{
-    FileKind, Format, HEAD_LEN, Health, JPEG_MAX_LEN, Measurement, Reader, SECTOR, all_formats,
-};
+use super::jpeg::preview_health;
+use super::{FileKind, Format, HEAD_LEN, Health, Measurement, Reader, SECTOR, all_formats};
 use crate::source::Source;
 use crate::tiff::{TIFF_MAX_LEN, TiffInfo, type_size, walk};
 
@@ -138,7 +136,9 @@ impl Format for TiffRaw {
         } else if cut || info.truncated || r.bad_in(start, start + len) {
             Health::Partial
         } else {
-            preview_health(&mut r, start, &info)
+            let previews: Vec<(u64, u64)> =
+                info.jpegs.iter().map(|&(o, l)| (start + o, l)).collect();
+            preview_health(&mut r, &previews)
         };
         Some(Measurement { len, kind, health })
     }
@@ -154,26 +154,6 @@ fn kind_of(head: &[u8], magic: Magic, info: &TiffInfo) -> FileKind {
         Magic::Tiff if make.starts_with("NIKON") => FileKind::Nef,
         Magic::Tiff if make.starts_with("SONY") => FileKind::Arw,
         Magic::Tiff => FileKind::Tiff,
-    }
-}
-
-/// Content check of a structurally complete file: only the largest embedded preview can be verified. The largest is
-/// chosen over all previews; if the size of any of them cannot be measured (no SOF, zero size, over the decode cap), a
-/// small thumbnail must not vouch for the file, so it is `Partial`.
-fn preview_health(r: &mut Reader, start: u64, info: &TiffInfo) -> Health {
-    let mut best: Option<(u64, u64, u64)> = None; // (pixels, offset, len)
-    for &(o, l) in &info.jpegs {
-        let pixels = match sof_pixels(r, start + o, l) {
-            Some(p) if p > 0 && l <= JPEG_MAX_LEN => p,
-            _ => return Health::Partial,
-        };
-        if best.is_none_or(|(p, _, _)| pixels > p) {
-            best = Some((pixels, o, l));
-        }
-    }
-    match best {
-        Some((_, o, l)) if decode_health(r, start + o, l) == Health::Intact => Health::Intact,
-        _ => Health::Partial,
     }
 }
 

@@ -7,10 +7,12 @@
 
 mod isobmff;
 mod jpeg;
+mod raf;
 mod tiffraw;
 
 pub use isobmff::{IsoBmff, MOOV_MAX_LEN};
 pub use jpeg::{JPEG_MAX_LEN, Jpeg};
+pub use raf::Raf;
 pub use tiffraw::TiffRaw;
 
 use crate::source::Source;
@@ -27,12 +29,18 @@ pub enum FileKind {
     Dng,
     Orf,
     Rw2,
+    /// Fujifilm RAW.
+    Raf,
+    /// Canon CR3 (ISO BMFF with major brand `crx `).
+    Cr3,
+    /// HEIC/HEIF photo (ISO BMFF without a video `moov`).
+    Heic,
     /// A TIFF that is not a recognizable camera RAW.
     Tiff,
 }
 
 impl FileKind {
-    /// Stable lowercase identifier (`"jpeg"`, `"mp4"`, `"mov"`, `"cr2"`, ..., `"tiff"`), for machine-readable output.
+    /// Stable lowercase identifier (`"jpeg"`, `"mp4"`, `"mov"`, `"cr2"`, ..., `"heic"`, `"tiff"`), for machine-readable output.
     pub fn as_str(self) -> &'static str {
         match self {
             FileKind::Jpeg => "jpeg",
@@ -44,6 +52,9 @@ impl FileKind {
             FileKind::Dng => "dng",
             FileKind::Orf => "orf",
             FileKind::Rw2 => "rw2",
+            FileKind::Raf => "raf",
+            FileKind::Cr3 => "cr3",
+            FileKind::Heic => "heic",
             FileKind::Tiff => "tiff",
         }
     }
@@ -60,6 +71,9 @@ impl FileKind {
             FileKind::Dng => "dng",
             FileKind::Orf => "orf",
             FileKind::Rw2 => "rw2",
+            FileKind::Raf => "raf",
+            FileKind::Cr3 => "cr3",
+            FileKind::Heic => "heic",
             FileKind::Tiff => "tif",
         }
     }
@@ -104,7 +118,12 @@ pub trait Format: Send + Sync {
 
 /// Every supported format.
 pub fn all_formats() -> Vec<Box<dyn Format>> {
-    vec![Box::new(Jpeg), Box::new(IsoBmff), Box::new(TiffRaw)]
+    vec![
+        Box::new(Jpeg),
+        Box::new(IsoBmff),
+        Box::new(TiffRaw),
+        Box::new(Raf),
+    ]
 }
 
 /// Bytes of a sector start shown to [`Format::recognizes`].

@@ -161,6 +161,28 @@ pub(super) fn sof_pixels(r: &mut Reader, start: u64, len: u64) -> Option<u64> {
     None
 }
 
+/// Content check of a structurally complete file whose only verifiable content is its embedded JPEG previews
+/// (`(absolute offset, length)` each): the largest (by SOF pixel count) must decode strictly for `Intact`. If the size of
+/// any of them cannot be measured (no SOF, zero size, over [`JPEG_MAX_LEN`]), a smaller one must not vouch for the file,
+/// so it is `Partial`; so it is with no preview at all, or a largest one that decodes only leniently or not at all (the
+/// raw data may still be fine).
+pub(super) fn preview_health(r: &mut Reader, previews: &[(u64, u64)]) -> Health {
+    let mut best: Option<(u64, u64, u64)> = None; // (pixels, offset, len)
+    for &(o, l) in previews {
+        let pixels = match sof_pixels(r, o, l) {
+            Some(p) if p > 0 && l <= JPEG_MAX_LEN => p,
+            _ => return Health::Partial,
+        };
+        if best.is_none_or(|(p, _, _)| pixels > p) {
+            best = Some((pixels, o, l));
+        }
+    }
+    match best {
+        Some((_, o, l)) if decode_health(r, o, l) == Health::Intact => Health::Intact,
+        _ => Health::Partial,
+    }
+}
+
 impl Format for Jpeg {
     fn name(&self) -> &'static str {
         "jpeg"

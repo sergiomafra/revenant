@@ -1045,4 +1045,60 @@ mod tests {
         // BigTIFF is not supported.
         assert!(walk_all(b"II+\0\x08\0\0\0\0\0\0\0\0\0\0\0").is_none());
     }
+
+    fn at(hay: &[u8], needle: &[u8]) -> usize {
+        hay.windows(needle.len()).position(|w| w == needle).unwrap()
+    }
+
+    /// The `n` bytes after `tag` (a box type) in `bytes`, past the 4 bytes of the tag.
+    fn after<'a>(bytes: &'a [u8], tag: &[u8], skip: usize) -> &'a [u8] {
+        &bytes[at(bytes, tag) + 4 + skip..]
+    }
+
+    fn assert_fields(i: &TiffInfo, with_ifd0: bool) {
+        if with_ifd0 {
+            assert_eq!(i.make.as_deref(), Some("Acme"));
+            assert_eq!(i.model.as_deref(), Some("Model X"));
+        }
+        assert_eq!(i.lens.as_deref(), Some("Lens 50mm f/1.8"));
+        assert_eq!(i.serial.as_deref(), Some("SN12345"));
+        assert_eq!(i.iso, Some(400));
+        assert_eq!(i.date_original.as_deref(), Some("2024:05:06 07:08:09"));
+        assert!(!i.garbled);
+    }
+
+    #[test]
+    fn testkit_exif_in_a_jpeg_raf_cr3_and_heic_is_readable() {
+        // jpeg_with_exif (and the RAF that embeds it): APP1 "Exif\0\0" + TIFF.
+        let jpeg = revenant_testkit::jpeg_with_exif(32, 24, 1, &exif());
+        assert_eq!(&jpeg[2..4], &[0xFF, 0xE1]);
+        assert_eq!(&jpeg[6..12], b"Exif\0\0");
+        assert_fields(&walk_all(&jpeg[12..]).unwrap(), true);
+        let raf = revenant_testkit::raf(1000, 2, &exif());
+        let jpeg_at = u32::from_be_bytes(raf[0x54..0x58].try_into().unwrap()) as usize;
+        assert_eq!(&raf[jpeg_at + 6..jpeg_at + 12], b"Exif\0\0");
+        assert_fields(&walk_all(&raf[jpeg_at + 12..]).unwrap(), true);
+
+        // CR3: CMT1 holds IFD0 (Make, Model), CMT2 the Exif IFD as its IFD0.
+        let cr3 = revenant_testkit::cr3(3, &exif());
+        let cmt1 = walk_all(after(&cr3, b"CMT1", 0)).unwrap();
+        assert_eq!(cmt1.make.as_deref(), Some("Acme"));
+        assert_eq!(cmt1.model.as_deref(), Some("Model X"));
+        // CMT2's IFD0 is the Exif IFD itself (as in real CR3): `walk` reads Exif tags only behind an Exif pointer, so
+        // check the tags directly: ISO, DateTimeOriginal, BodySerialNumber, LensModel.
+        let cmt2 = after(&cr3, b"CMT2", 0);
+        assert_eq!(&cmt2[..8], b"II*\0\x08\0\0\0");
+        let n = usize::from(u16::from_le_bytes([cmt2[8], cmt2[9]]));
+        let tags: Vec<u16> = (0..n)
+            .map(|i| u16::from_le_bytes([cmt2[10 + 12 * i], cmt2[11 + 12 * i]]))
+            .collect();
+        assert_eq!(tags, [0x8827, 0x9003, 0xA431, 0xA434]);
+
+        // HEIC: the Exif item is a 4-byte offset prefix then the TIFF; find it through iloc's second extent.
+        let heic = revenant_testkit::heic(500, 4, &exif());
+        let iloc = at(&heic, b"iloc") + 4;
+        let item2 = iloc + 4 + 2 + 2 + 16; // version/flags, sizes, count, first item
+        let off = u32::from_be_bytes(heic[item2 + 8..item2 + 12].try_into().unwrap()) as usize;
+        assert_fields(&walk_all(&heic[off + 4..]).unwrap(), true);
+    }
 }

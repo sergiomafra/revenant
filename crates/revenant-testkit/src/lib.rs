@@ -150,6 +150,17 @@ fn stsd_box(codec: &[u8; 4]) -> Vec<u8> {
 }
 
 fn moov_box(chunk_offsets: &[u64], sample_len: u32, wide: bool, codec: &[u8; 4]) -> Vec<u8> {
+    moov_box_with(chunk_offsets, sample_len, wide, codec, &[])
+}
+
+/// Like [`moov_box`], with `extra` (already-built boxes) placed after `mvhd` and before the `trak`.
+fn moov_box_with(
+    chunk_offsets: &[u64],
+    sample_len: u32,
+    wide: bool,
+    codec: &[u8; 4],
+    extra: &[u8],
+) -> Vec<u8> {
     let mvhd = bmff_box(b"mvhd", &[0; 100]);
     let mut stsz = vec![0; 4];
     stsz.extend_from_slice(&0u32.to_be_bytes()); // sample_size = 0: per-sample table
@@ -178,7 +189,7 @@ fn moov_box(chunk_offsets: &[u64], sample_len: u32, wide: bool, codec: &[u8; 4])
         b"trak",
         &bmff_box(b"mdia", &[hdlr, bmff_box(b"minf", &stbl)].concat()),
     );
-    bmff_box(b"moov", &[mvhd, trak].concat())
+    bmff_box(b"moov", &[mvhd, extra.to_vec(), trak].concat())
 }
 
 /// MP4/MOV with `ftyp`, an `mdat` of noise, and a `moov` holding one `trak` whose `stsz`/`stco` (or `co64`) describe the
@@ -403,20 +414,7 @@ pub fn tiff_raw(opts: &TiffRawOptions) -> TiffRaw {
             e0.push(enc.long(0x0201, prev));
             e0.push(enc.long(0x0202, preview_len));
         }
-        let x = &opts.exif;
-        let mut ex = Vec::new();
-        if let Some(v) = x.iso {
-            ex.push(enc.short(0x8827, v));
-        }
-        if let Some(v) = &x.date {
-            ex.push(enc.ascii(0x9003, v));
-        }
-        if let Some(v) = &x.serial {
-            ex.push(enc.ascii(0xA431, v));
-        }
-        if let Some(v) = &x.lens {
-            ex.push(enc.ascii(0xA434, v));
-        }
+        let ex = exif_entries(enc, &opts.exif);
         if !ex.is_empty() {
             e0.push(enc.long(0x8769, exif));
         }
@@ -490,4 +488,232 @@ pub fn tiff_raw(opts: &TiffRawOptions) -> TiffRaw {
         raw: raw_start..bytes.len(),
         bytes,
     }
+}
+
+/// The Exif-IFD entries for the `TestExif` fields that are set (ISO, date, serial, lens).
+fn exif_entries(enc: Enc, x: &TestExif) -> Vec<TiffEntry> {
+    let mut ex = Vec::new();
+    if let Some(v) = x.iso {
+        ex.push(enc.short(0x8827, v));
+    }
+    if let Some(v) = &x.date {
+        ex.push(enc.ascii(0x9003, v));
+    }
+    if let Some(v) = &x.serial {
+        ex.push(enc.ascii(0xA431, v));
+    }
+    if let Some(v) = &x.lens {
+        ex.push(enc.ascii(0xA434, v));
+    }
+    ex
+}
+
+/// IFD0 entries for Make and Model (those that are set).
+fn make_model_entries(enc: Enc, x: &TestExif) -> Vec<TiffEntry> {
+    let mut e = Vec::new();
+    if let Some(v) = &x.make {
+        e.push(enc.ascii(0x010F, v));
+    }
+    if let Some(v) = &x.model {
+        e.push(enc.ascii(0x0110, v));
+    }
+    e
+}
+
+/// Little-endian TIFF header (offset of IFD0 = 8) followed by one IFD.
+fn le_tiff(enc: Enc, entries: Vec<TiffEntry>) -> Vec<u8> {
+    let mut out = b"II*\0".to_vec();
+    out.extend_from_slice(&enc.u32(8));
+    out.extend(enc.ifd(8, entries));
+    out
+}
+
+/// Little-endian TIFF with IFD0 (Make, Model, Exif pointer) and an Exif IFD holding the other `TestExif` fields.
+fn exif_tiff(exif: &TestExif) -> Vec<u8> {
+    let enc = Enc(false);
+    let ifd0 = |ptr: u32| {
+        let mut e = make_model_entries(enc, exif);
+        if !exif_entries(enc, exif).is_empty() {
+            e.push(enc.long(0x8769, ptr));
+        }
+        e
+    };
+    let exif_at = 8 + enc.ifd(8, ifd0(0)).len() as u32;
+    let mut out = le_tiff(enc, ifd0(exif_at));
+    let ex = exif_entries(enc, exif);
+    if !ex.is_empty() {
+        out.extend(enc.ifd(exif_at, ex));
+    }
+    out
+}
+
+/// Like [`jpeg`] without padding, with an APP1 `Exif\0\0` segment holding a little-endian TIFF: IFD0 with Make and Model
+/// (those set in `exif`) and an Exif IFD with the other fields.
+pub fn jpeg_with_exif(width: u32, height: u32, seed: u64, exif: &TestExif) -> Vec<u8> {
+    let base = encode_noise(width, height, seed);
+    let mut payload = b"Exif\0\0".to_vec();
+    payload.extend(exif_tiff(exif));
+    let mut out = base[..2].to_vec(); // SOI
+    out.extend(app1_segment(&payload));
+    out.extend_from_slice(&base[2..]);
+    out
+}
+
+fn put_be32(buf: &mut [u8], at: usize, v: u32) {
+    buf[at..at + 4].copy_from_slice(&v.to_be_bytes());
+}
+
+/// "FUJIFILMCCD-RAW " header; at 0x54/0x58 the JPEG offset/len (big-endian u32), at 0x5C/0x60 the CFA header offset/len,
+/// at 0x64/0x68 the CFA offset/len. The JPEG is a testkit JPEG with an EXIF APP1 built from `exif`. The CFA data is
+/// `raw_len` bytes of noise and comes last.
+pub fn raf(raw_len: usize, seed: u64, exif: &TestExif) -> Vec<u8> {
+    const HEADER: usize = 0x94;
+    const CFA_HEADER_LEN: usize = 64;
+    let jpeg = jpeg_with_exif(160, 120, seed, exif);
+    let cfa_header_at = (HEADER + jpeg.len()).next_multiple_of(16);
+    let cfa_at = cfa_header_at + CFA_HEADER_LEN;
+    let mut out = vec![0u8; cfa_at + raw_len];
+    out[..16].copy_from_slice(b"FUJIFILMCCD-RAW ");
+    out[16..20].copy_from_slice(b"0201");
+    out[20..28].copy_from_slice(b"FF129502");
+    for (at, v) in [
+        (0x54, HEADER),
+        (0x58, jpeg.len()),
+        (0x5C, cfa_header_at),
+        (0x60, CFA_HEADER_LEN),
+        (0x64, cfa_at),
+        (0x68, raw_len),
+    ] {
+        put_be32(&mut out, at, v as u32);
+    }
+    out[HEADER..HEADER + jpeg.len()].copy_from_slice(&jpeg);
+    SplitMix64(seed ^ 0x0052_4146).fill(&mut out[cfa_header_at..]);
+    out
+}
+
+/// Canon's `uuid` that holds CMT1/CMT2 inside `moov`.
+const CR3_META_UUID: [u8; 16] = [
+    0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a, 0x48,
+];
+/// Canon's top-level `uuid` that holds the `PRVW` preview.
+const CR3_PRVW_UUID: [u8; 16] = [
+    0xea, 0xf4, 0x2b, 0x5e, 0x1c, 0x98, 0x4b, 0x88, 0xb9, 0xfb, 0xb7, 0xdc, 0x40, 0x6e, 0x4d, 0x16,
+];
+
+/// `ftyp` major brand "crx " ; `moov` with uuid 85c0b687-820f-11e0-8111-f4ce462b6a48 holding CMT1 (TIFF IFD0: Make/Model)
+/// and CMT2 (Exif IFD) boxes; one trak whose single chunk (stco) is a full-size testkit JPEG in `mdat`; uuid
+/// eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16 at top level holding a `PRVW` box with a smaller JPEG. Box order: `ftyp`, `moov`,
+/// preview `uuid`, a `free` pad, `mdat`; the `mdat` payload (the full-size JPEG) starts at a multiple of 512.
+pub fn cr3(seed: u64, exif: &TestExif) -> Vec<u8> {
+    let enc = Enc(false);
+    let full = jpeg(640, 480, seed, 0);
+    let small = jpeg(160, 120, seed ^ 0x5052_5657, 0);
+
+    let mut ftyp = b"crx ".to_vec();
+    ftyp.extend_from_slice(&1u32.to_be_bytes());
+    ftyp.extend_from_slice(b"crx isom");
+    let ftyp = bmff_box(b"ftyp", &ftyp);
+
+    let cmt1 = le_tiff(enc, make_model_entries(enc, exif));
+    let cmt2 = le_tiff(enc, exif_entries(enc, exif));
+    let mut meta = CR3_META_UUID.to_vec();
+    meta.extend(bmff_box(b"CMT1", &cmt1));
+    meta.extend(bmff_box(b"CMT2", &cmt2));
+    let meta = bmff_box(b"uuid", &meta);
+
+    // PRVW: reserved (4), reserved (2), width (2), height (2), 1 (2), JPEG size (4), JPEG.
+    let mut prvw = vec![0u8; 6];
+    prvw.extend_from_slice(&160u16.to_be_bytes());
+    prvw.extend_from_slice(&120u16.to_be_bytes());
+    prvw.extend_from_slice(&1u16.to_be_bytes());
+    prvw.extend_from_slice(&(small.len() as u32).to_be_bytes());
+    prvw.extend_from_slice(&small);
+    let mut prvw_uuid = CR3_PRVW_UUID.to_vec();
+    prvw_uuid.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+    prvw_uuid.extend(bmff_box(b"PRVW", &prvw));
+    let prvw_uuid = bmff_box(b"uuid", &prvw_uuid);
+
+    let moov_len = moov_box_with(&[0], full.len() as u32, false, b"CRAW", &meta).len();
+    let before = ftyp.len() + moov_len + prvw_uuid.len();
+    let pad = 8 + (512 - (before + 16) % 512) % 512;
+    let payload_at = before + pad + 8;
+    let moov = moov_box_with(
+        &[payload_at as u64],
+        full.len() as u32,
+        false,
+        b"CRAW",
+        &meta,
+    );
+    let mut free = vec![0u8; pad - 8];
+    SplitMix64(seed).fill(&mut free);
+    [
+        ftyp,
+        moov,
+        prvw_uuid,
+        bmff_box(b"free", &free),
+        bmff_box(b"mdat", &full),
+    ]
+    .concat()
+}
+
+/// ftyp "heic" (compatible "mif1"); meta with hdlr "pict", pitm, iinf (item 1 "hvc1", item 2 "Exif"), iloc (version 1,
+/// extents for both items into `mdat`); `mdat` with `image_len` random bytes for item 1 and the Exif item (4-byte offset
+/// prefix + TIFF built from `exif`).
+pub fn heic(image_len: usize, seed: u64, exif: &TestExif) -> Vec<u8> {
+    let mut ftyp = b"heic".to_vec();
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(b"mif1heic");
+    let ftyp = bmff_box(b"ftyp", &ftyp);
+
+    let mut image = vec![0u8; image_len];
+    SplitMix64(seed).fill(&mut image);
+    let mut exif_item = 0u32.to_be_bytes().to_vec();
+    exif_item.extend(exif_tiff(exif));
+
+    let full_box = |kind: &[u8; 4], version: u8, body: &[u8]| {
+        let mut p = vec![version, 0, 0, 0];
+        p.extend_from_slice(body);
+        bmff_box(kind, &p)
+    };
+    let mut hdlr = vec![0u8; 4];
+    hdlr.extend_from_slice(b"pict");
+    hdlr.extend_from_slice(&[0; 13]);
+    let infe = |id: u16, typ: &[u8; 4]| {
+        let mut b = id.to_be_bytes().to_vec();
+        b.extend_from_slice(&[0, 0]);
+        b.extend_from_slice(typ);
+        b.push(0);
+        full_box(b"infe", 2, &b)
+    };
+    let mut iinf = 2u16.to_be_bytes().to_vec();
+    iinf.extend(infe(1, b"hvc1"));
+    iinf.extend(infe(2, b"Exif"));
+    let meta_with = |image_at: u32, exif_at: u32| {
+        // iloc v1: offset and length 4 bytes, no base offset, no extent index.
+        let mut iloc = vec![0x44, 0x00];
+        iloc.extend_from_slice(&2u16.to_be_bytes());
+        for (id, at, len) in [
+            (1u16, image_at, image.len() as u32),
+            (2, exif_at, exif_item.len() as u32),
+        ] {
+            iloc.extend_from_slice(&id.to_be_bytes());
+            iloc.extend_from_slice(&0u16.to_be_bytes()); // construction method 0
+            iloc.extend_from_slice(&0u16.to_be_bytes()); // data reference index
+            iloc.extend_from_slice(&1u16.to_be_bytes()); // extent count
+            iloc.extend_from_slice(&at.to_be_bytes());
+            iloc.extend_from_slice(&len.to_be_bytes());
+        }
+        let children = [
+            full_box(b"hdlr", 0, &hdlr),
+            full_box(b"pitm", 0, &1u16.to_be_bytes()),
+            full_box(b"iinf", 0, &iinf),
+            full_box(b"iloc", 1, &iloc),
+        ]
+        .concat();
+        full_box(b"meta", 0, &children)
+    };
+    let meta_len = meta_with(0, 0).len();
+    let payload_at = (ftyp.len() + meta_len + 8) as u32;
+    let meta = meta_with(payload_at, payload_at + image.len() as u32);
+    [ftyp, meta, bmff_box(b"mdat", &[image, exif_item].concat())].concat()
 }
