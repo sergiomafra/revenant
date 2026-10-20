@@ -53,6 +53,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cut by the JPEG frames inside their data.
 - JPEGs with DAC/JPG segments or `FF` fill bytes before a marker are measured instead of skipped; a JPEG too large to decode
   (over 210 megapixels) with a complete structure is partial instead of damaged.
+- The scan and the file detectors share what they read, so each sector of a card is read once (a JPEG gap search may
+  re-read up to its 64 MiB window), and known unreadable sectors are never retried (retrying a bad sector on a failing card
+  can take seconds each time).
 
 ### Fixed
 

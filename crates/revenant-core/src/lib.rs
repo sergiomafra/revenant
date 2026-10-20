@@ -1,5 +1,6 @@
 //! Revenant recovery engine.
 
+pub(crate) mod cache;
 pub mod error;
 pub mod extract;
 pub mod formats;

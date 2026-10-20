@@ -301,8 +301,21 @@ kept only if it starts with `FF D8 FF`, its SOF parses and its whole range lies 
 (`ScanOptions::sector`, default 512, at least 16). The first format that recognizes a head and measures a file there wins. The
 scan keeps reading every block. After an `Intact` finding it examines no head until the first sector at or after the file's
 end; after a `Partial` or `Damaged` finding it keeps examining heads, so files inside a broken one are still reported (one bad
-file never hides the rest of the disk; a damaged file may then overlap another finding). `measure` reads the source directly,
-so files may cross block boundaries.
+file never hides the rest of the disk; a damaged file may then overlap another finding). `measure` reads the whole source
+(not just the block), so files may cross block boundaries.
+
+Reading once: the scan and every `measure` read through one shared cache (`CachedSource`, crate-private) of
+`ScanOptions::cache_bytes` (default 256 MiB; values below 1 MiB are raised to it). Each sector is read once by the scan and
+the detectors; a JPEG gap search may re-read up to its 64 MiB window. The cache reads the source in aligned 1 MiB windows
+(rounded down to whole sectors) and keeps the most recently used ones up to `cache_bytes`. A window that cannot be read in
+one go is resolved sector by sector (scan sector size); each unreadable sector is remembered in a shared bad-sector map, and
+a read that overlaps it fails every time without touching the source again, also when its window is loaded again after
+being evicted (the load reads around the known bad runs). The map keeps at most 1,048,576 merged runs; past that, new
+unreadable sectors are not remembered and are read again when their window is loaded again (slower, with the same results
+and events). A block that lies wholly inside an `Intact` finding whose bytes have all gone through the cache already (the
+detector walked the file) is not read again; its unreadable sectors come from the bad-sector map, so its `Unreadable` events
+are the same. The cache is `Send + Sync`: windows are shared across threads, and a window being loaded by one thread is
+waited for by the others, never read twice at once. Events are the same for any `cache_bytes`.
 
 Events:
 

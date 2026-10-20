@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::EngineError;
+use crate::cache::{CACHE_WINDOW, CachedSource};
 use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
 use crate::source::Source;
 
@@ -69,6 +70,9 @@ pub struct ScanOptions {
     pub sector: u64,
     /// Bytes read per block (rounded down to a whole number of sectors, at least one).
     pub block: usize,
+    /// Bytes of recently read data the scan and the detectors share, so each sector is read from the source once (values
+    /// below 1 MiB are raised to it).
+    pub cache_bytes: usize,
 }
 
 impl Default for ScanOptions {
@@ -76,6 +80,7 @@ impl Default for ScanOptions {
         Self {
             sector: 512,
             block: 4 * 1024 * 1024,
+            cache_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -144,6 +149,20 @@ fn read_block(
     }
 }
 
+/// Per-sector mask of a block at `offset` of `want` bytes from unreadable runs `(start, len)`; `None` when there are none.
+fn bad_mask(runs: &[(u64, u64)], offset: u64, want: usize, sector: u64) -> Option<Vec<bool>> {
+    if runs.is_empty() {
+        return None;
+    }
+    let mut bad = vec![false; (want as u64).div_ceil(sector) as usize];
+    for &(s, l) in runs {
+        let first = ((s - offset) / sector) as usize;
+        let last = ((s + l - offset).div_ceil(sector) as usize).min(bad.len());
+        bad[first..last].fill(true);
+    }
+    Some(bad)
+}
+
 /// Scans `source`, calling `on_event` for each finding, progress step and unreadable region.
 ///
 /// The first format that recognizes a sector start and measures a file there wins. The scan reads every block. After an
@@ -152,7 +171,12 @@ fn read_block(
 /// emitted once the scan has read past its end, so that unreadable sectors inside it are known: they are reported as
 /// `Unreadable` events (before the `Found`), and an `Intact` finding containing any of them is downgraded to `Partial`.
 /// Findings are emitted in the order they were found (by start), so one found inside another is emitted right after it.
-/// `measure` reads the source directly, so files may cross block boundaries.
+/// `measure` reads the whole source (not just the block), so files may cross block boundaries.
+///
+/// The scan and every `measure` read through one [`CachedSource`] of `opts.cache_bytes`, so each sector is read from
+/// `source` once and a sector found unreadable is never read again. A block wholly inside an `Intact` finding whose bytes
+/// have all gone through the cache already (read by `measure`) is not read again: its unreadable sectors come from the
+/// cache's bad map.
 ///
 /// `opts.sector` is raised to at least 16 (the head length) and `opts.block` rounded down to whole sectors, so a head
 /// never straddles two blocks. On cancellation the scan returns `Err(Cancelled)` and findings still pending are dropped.
@@ -166,6 +190,8 @@ pub fn scan(
     let sector = opts.sector.max(HEAD_LEN as u64);
     let block = ((opts.block as u64 / sector).max(1) * sector) as usize;
     let total = source.len();
+    let cache = CachedSource::new(source, sector, opts.cache_bytes.max(CACHE_WINDOW));
+    let source: &dyn Source = &cache;
     let mut summary = ScanSummary::default();
     let mut run: Option<(u64, u64)> = None; // open unreadable run (start, len)
     // Found but not yet emitted, in start order, each with its end rounded up to a whole sector.
@@ -188,8 +214,14 @@ pub fn scan(
             return Err(EngineError::Cancelled);
         }
         let want = (total - pos).min(block as u64) as usize;
-        let (data, bad) = read_block(source, pos, want, sector as usize);
         let block_end = pos + want as u64;
+        let (data, bad) = if block_end <= skip_until && cache.covered(pos, block_end) {
+            // No head is examined here and every sector has been read already: only the bad flags are needed.
+            let runs = cache.bad_runs(pos, block_end);
+            (Vec::new(), bad_mask(&runs, pos, want, sector))
+        } else {
+            read_block(source, pos, want, sector as usize)
+        };
         let mut at = pos;
         while at < block_end {
             while let Some((_, end)) = pending.front()
@@ -259,6 +291,7 @@ pub fn scan(
             at = sector_end;
         }
         pos = block_end;
+        cache.forget_coverage_below(pos);
         on_event(Event::Progress { read: pos, total });
         if cancel.is_cancelled() {
             return Err(EngineError::Cancelled);

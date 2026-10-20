@@ -2,7 +2,8 @@ use revenant_core::formats::{FileKind, Format, Health, IsoBmff, Jpeg, Measuremen
 use revenant_core::source::{FileSource, Source, VolumeId};
 use revenant_core::{CancelToken, EngineError, Event, Fragment, ScanOptions, ScanSummary, scan};
 use revenant_testkit as testkit;
-use testkit::{DiskImage, Mp4Options};
+use std::sync::atomic::{AtomicU64, Ordering};
+use testkit::{DiskImage, Mp4Options, TestExif, TiffRawOptions, TiffVariant};
 
 const MIB: usize = 1024 * 1024;
 
@@ -882,4 +883,277 @@ fn overlapping_pieces_break_the_pieces_contract() {
 #[should_panic(expected = "pieces contract")]
 fn a_piece_past_the_source_breaks_the_pieces_contract() {
     scan_pieces(1500, &[(4096, 1000), (65_400, 500)]);
+}
+
+/// Wraps a source, fails every read that touches any of the `bad` ranges (`[start, end)`) and counts what reaches it.
+struct MultiFailingSource {
+    inner: FileSource,
+    bad: Vec<(u64, u64)>,
+    /// Bytes returned by successful reads.
+    bytes: AtomicU64,
+    /// Read attempts that touched a bad range.
+    bad_attempts: AtomicU64,
+}
+
+impl MultiFailingSource {
+    fn new(path: &std::path::Path, bad: Vec<(u64, u64)>) -> Self {
+        Self {
+            inner: FileSource::open(path).unwrap(),
+            bad,
+            bytes: AtomicU64::new(0),
+            bad_attempts: AtomicU64::new(0),
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::SeqCst)
+    }
+
+    fn bad_attempts(&self) -> u64 {
+        self.bad_attempts.load(Ordering::SeqCst)
+    }
+}
+
+impl Source for MultiFailingSource {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        let end = offset + buf.len() as u64;
+        if self.bad.iter().any(|&(s, e)| offset < e && end > s) {
+            self.bad_attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(EngineError::Read {
+                offset,
+                cause: std::io::Error::other("injected"),
+            });
+        }
+        let n = self.inner.read_at(offset, buf)?;
+        self.bytes.fetch_add(n as u64, Ordering::SeqCst);
+        Ok(n)
+    }
+
+    fn volume(&self) -> Option<VolumeId> {
+        None
+    }
+}
+
+/// A RAW with a JPEG preview (about 2 MiB).
+fn busy_raw() -> Vec<u8> {
+    testkit::tiff_raw(&TiffRawOptions {
+        variant: TiffVariant::Arw,
+        big_endian: false,
+        raw_len: 2 * MIB,
+        seed: 31,
+        preview: Some((160, 120)),
+        preview_sector_aligned: false,
+        exif: TestExif::default(),
+    })
+    .bytes
+}
+
+/// 32 MiB of noise holding 6 JPEGs (at 0, 3, .., 15 MiB), a RAW at 18 MiB and an MP4 at 22 MiB (6 MiB `mdat`).
+fn busy_image() -> (DiskImage, Vec<u8>) {
+    let mut img = DiskImage::noise(32 * MIB, 41);
+    let first = testkit::jpeg(640, 480, 42, 0);
+    img.put(0, &first);
+    for i in 1..6 {
+        img.put(3 * i * MIB, &testkit::jpeg(640, 480, 42 + i as u64, 0));
+    }
+    img.put(18 * MIB, &busy_raw());
+    img.put(
+        22 * MIB,
+        &testkit::mp4(&Mp4Options {
+            mdat_len: 6 * MIB,
+            moov_at_end: true,
+            mov: false,
+            mdat_64bit: false,
+        }),
+    );
+    (img, first)
+}
+
+#[test]
+fn each_byte_is_read_once() {
+    let (img, _) = busy_image();
+    let file = img.save();
+    let source = MultiFailingSource::new(file.path(), Vec::new());
+    let (r, events) = run(&source, &ScanOptions::default());
+    assert_eq!(r.unwrap().found, 8, "{:?}", relevant(&events));
+    let read = source.bytes();
+    assert!(read <= 33 * MIB as u64, "inner bytes read: {read}");
+}
+
+#[test]
+fn big_intact_video_is_read_once() {
+    let video = testkit::mp4(&Mp4Options {
+        mdat_len: 40 * MIB,
+        moov_at_end: true,
+        mov: false,
+        mdat_64bit: false,
+    });
+    let file = DiskImage::noise(48 * MIB, 43).put(MIB, &video).save();
+    let source = MultiFailingSource::new(file.path(), Vec::new());
+    let opts = ScanOptions {
+        cache_bytes: 4 * MIB,
+        ..ScanOptions::default()
+    };
+    let (r, events) = run(&source, &opts);
+    r.unwrap();
+    assert_eq!(
+        findings(&events),
+        vec![(
+            MIB as u64,
+            video.len() as u64,
+            FileKind::Mp4,
+            Health::Intact
+        )]
+    );
+    let read = source.bytes();
+    assert!(read <= 50 * MIB as u64, "inner bytes read: {read}");
+}
+
+#[test]
+fn bad_sector_is_read_once_across_measures() {
+    // A RAW, a JPEG and a video in the same 1 MiB, with one unreadable sector inside the JPEG: the RAW's and the JPEG's
+    // measures and the scan's own block read all load the window holding it.
+    let raw = testkit::tiff_raw(&TiffRawOptions {
+        variant: TiffVariant::Arw,
+        big_endian: false,
+        raw_len: 100_000,
+        seed: 32,
+        preview: Some((160, 120)),
+        preview_sector_aligned: false,
+        exif: TestExif::default(),
+    })
+    .bytes;
+    let jpeg = testkit::jpeg(320, 240, 33, 0);
+    let video = testkit::mp4(&mp4_opts(false));
+    let jpeg_at = 256 * 1024;
+    let video_at = 768 * 1024;
+    assert!(raw.len() < jpeg_at && jpeg_at + jpeg.len() < video_at);
+    let bad = ((jpeg_at + jpeg.len() / 2) / 512 * 512) as u64;
+    let file = DiskImage::noise(4 * MIB, 34)
+        .put(0, &raw)
+        .put(jpeg_at, &jpeg)
+        .put(video_at, &video)
+        .save();
+    let source = MultiFailingSource::new(file.path(), vec![(bad, bad + 512)]);
+    let (r, events) = run(&source, &ScanOptions::default());
+    assert_eq!(r.unwrap().found, 3, "{:?}", relevant(&events));
+    let attempts = source.bad_attempts();
+    assert!(
+        attempts <= 3,
+        "attempts touching the bad sector: {attempts}"
+    );
+}
+
+#[test]
+fn cache_size_does_not_change_events() {
+    let (img, first) = busy_image();
+    let file = img.save();
+    let in_jpeg = ((3 * MIB + first.len() / 2) / 512 * 512) as u64;
+    let in_mdat = (25 * MIB) as u64;
+    let between = (10 * MIB + MIB / 2) as u64;
+    let bad = vec![
+        (in_jpeg, in_jpeg + 512),
+        (in_mdat, in_mdat + 4096),
+        (between, between + 1024),
+    ];
+    let small = MultiFailingSource::new(file.path(), bad.clone());
+    let (r_small, small_events) = run(
+        &small,
+        &ScanOptions {
+            cache_bytes: MIB,
+            ..ScanOptions::default()
+        },
+    );
+    let default = MultiFailingSource::new(file.path(), bad);
+    let (r_default, default_events) = run(&default, &ScanOptions::default());
+    assert_eq!(r_small.unwrap(), r_default.unwrap());
+    assert_eq!(small_events, default_events);
+    assert_eq!(
+        small_events
+            .iter()
+            .filter(|e| matches!(e, Event::Unreadable { .. }))
+            .count(),
+        3
+    );
+}
+
+/// Test-only format: a sector starting with `READALL!` is a `len`-byte `Intact` file whose measure reads all of it
+/// (ignoring read errors), as a detector that walks a file to its end does.
+struct ReadAll {
+    len: u64,
+}
+
+impl Format for ReadAll {
+    fn name(&self) -> &'static str {
+        "read-all"
+    }
+
+    fn recognizes(&self, head: &[u8]) -> bool {
+        head.starts_with(b"READALL!")
+    }
+
+    fn confirms(&self, _source: &dyn Source, _start: u64) -> bool {
+        true
+    }
+
+    fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement> {
+        let mut buf = vec![0u8; 64 * 1024];
+        for at in (start..start + self.len).step_by(buf.len()) {
+            let _ = source.read_at(at, &mut buf);
+        }
+        Some(Measurement {
+            len: self.len,
+            kind: FileKind::Jpeg,
+            health: Health::Intact,
+            fragments: Vec::new(),
+        })
+    }
+}
+
+#[test]
+fn block_not_read_again_still_reports_its_unreadable_sectors() {
+    let bad = 2 * MIB as u64 + 3 * 512;
+    let mut img = DiskImage::zeros(4 * MIB);
+    img.put(0, b"READALL!");
+    let file = img.save();
+    let source = MultiFailingSource::new(file.path(), vec![(bad, bad + 1024)]);
+    let formats: Vec<Box<dyn Format>> = vec![Box::new(ReadAll {
+        len: 3 * MIB as u64,
+    })];
+    let opts = ScanOptions {
+        block: 64 * 1024,
+        ..ScanOptions::default()
+    };
+    let mut events = Vec::new();
+    scan(
+        &source,
+        &formats,
+        &opts,
+        &CancelToken::default(),
+        &mut |e| events.push(e),
+    )
+    .unwrap();
+    assert_eq!(
+        relevant(&events),
+        vec![
+            &Event::Unreadable {
+                start: bad,
+                len: 1024
+            },
+            &Event::Found(revenant_core::Finding {
+                id: 1,
+                start: 0,
+                len: 3 * MIB as u64,
+                kind: FileKind::Jpeg,
+                health: Health::Partial,
+                fragments: Vec::new(),
+            }),
+        ]
+    );
+    // Every sector went through the cache once: the scan did not read the measured file again.
+    assert!(source.bytes() <= 4 * MIB as u64, "{}", source.bytes());
 }
