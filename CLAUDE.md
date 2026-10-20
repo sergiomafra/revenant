@@ -6,11 +6,12 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 
 ## Onde o desenvolvimento está
 
-**19/10/2026.** Módulo 1 (motor), Parte 1.1 (fundação e escultura) mergeada (PR #1, CI verde nas 4 arquiteturas). Parte 1.2
-(RAW e dados da foto) concluída na branch `feat/m1-p2-raw`, aguardando PR/merge; decisões e pendências em
-`docs/superpowers/history/2026-10-19-m1-p2-pendencias.md`. Próxima: 1.3 (arquivos fragmentados e velocidade). Roteiro até a
-1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`. Amostras reais de câmera (CC0,
-nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.
+**20/10/2026.** Módulo 1 (motor): Parte 1.1 (fundação e escultura) mergeada (PR #1, CI verde nas 4 arquiteturas);
+Parte 1.2 (RAW e dados da foto) mergeada (PRs #2 e #3). Parte 1.3 (arquivos fragmentados e velocidade) concluída na
+branch `feat/m1-p3-fragments-speed`, aguardando PR/merge; decisões e pendências em
+`docs/superpowers/history/2026-10-20-m1-p3-pendencias.md`. Próxima: 1.4 (sistemas de arquivos). Roteiro até a 1.0:
+`docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev` (`bench` mede a velocidade).
+Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.
 
 ## Diretrizes fixas
 

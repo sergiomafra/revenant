@@ -239,8 +239,9 @@ fn cut_health(r: &mut Reader, start: u64, scan_start: u64, end: u64) -> Health {
 }
 
 /// Where entropy-coded data found in `[from, end)` stops being a photo's: the start of the first 512-byte sector
-/// starting in that range that is made of one repeated byte value (erased or TRIMmed space, zero-filled slack; real
-/// entropy-coded data never repeats one value over a whole sector), or of the first unreadable sector overlapping it
+/// starting in that range that is made of one repeated byte value (erased or TRIMmed space, zero-filled slack; camera
+/// entropy-coded data very rarely repeats one value over a whole sector, though a large flat area under optimized Huffman
+/// tables could, and the photo would then be cut there), or of the first unreadable sector overlapping it
 /// (clamped to `from`); `end` if there is neither. Reads each sector of the range once (a sector starting before `end` is
 /// read whole). The cut-file health rule and the gap search share it.
 pub(super) fn data_end(r: &mut Reader, from: u64, end: u64) -> u64 {

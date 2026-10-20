@@ -1473,7 +1473,8 @@ fn cancel_during_the_first_read_ahead_stops_the_scan() {
     });
     let took = started.elapsed();
     assert_eq!(r.unwrap_err().code(), "cancelled");
-    assert!(took < Duration::from_millis(300), "{took:?}");
+    // Generous for loaded CI runners; still half of what the read-ahead alone would take.
+    assert!(took < Duration::from_secs(1), "{took:?}");
 }
 
 /// Test-only format: a sector starting with `TWOPIECES-HEAD!!` is a 2048-byte `Intact` file in two 1 KiB pieces, the

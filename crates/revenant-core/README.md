@@ -151,8 +151,8 @@ scan does not wait for it. Memory per search: the luma DC values of the first pi
 (4 bytes per block, about 13 MiB each at 210 megapixels), the window's records (1 MiB), the remembered states (about
 1 MiB) and the first piece's last bytes (1 MiB), held by the measuring thread.
 
-Reading: each sector is read once by the scan and the detectors, except that a JPEG gap search re-reads, through the
-scan's cache: the photo's contiguous bytes (decoded again, scanned for erased sectors, and decoded once more up to an
+Reading: each sector is read once from the source by the scan and the detectors (this is about reading the card; in
+memory the same bytes may be walked several times), except that a JPEG gap search re-reads, through the scan's cache: the photo's contiguous bytes (decoded again, scanned for erased sectors, and decoded once more up to an
 erased sector if there is one: at most 3 × 64 MiB), its 64 MiB window once, at most 64 MiB for the tries and the checks
 of files in the gap, and the two pieces once more to judge the reassembled photo (at most 64 MiB).
 
@@ -161,6 +161,12 @@ Not covered: progressive, arithmetic-coded or 12-bit JPEGs (any frame the decode
 two photos written interleaved (each split in two with the other's pieces in between): they are at most `Partial`, and
 a photo of the same frame glued to the other's tail exactly on a restart marker may even come out `Intact` as a
 contiguous file (the MCU count and restart markers are all right, and a DC step below the seam threshold is not seen).
+More generally, the DC seam test runs only at the joins the search makes, never inside a contiguous file: a cut photo
+immediately followed, with no gap, by the tail of a near-identical photo of the same frame (same camera and settings)
+whose bytes decode exactly to EOI is a valid JPEG and comes out `Intact`. And a photo whose entropy-coded data holds a
+whole 512-byte sector of one repeated byte value is treated as cut there (rulings Q5, C3): camera photos very rarely do
+this, but a large flat area coded with optimized Huffman tables could (all `00`); such a photo is `Partial` and is not
+put back together.
 
 Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`).
 
@@ -216,7 +222,9 @@ scan, such videos are paired with orphan `moov` boxes (`pairing.rs`, crate-priva
 reported as `Event::Updated` (same `id`, 2 pieces).
 
 Collection during the scan: every block the scan reads is searched for `moov` (keeping the last 15 bytes of each window, so
-a header across two windows or blocks is found too). A box start `q` is a candidate when its 16 bytes are a size in
+a header across two windows or blocks is found too). This search runs on the scan thread, the one that reads the source:
+it costs about 10% of the page-cache throughput on images with few files (`noise`, `video` in the benchmark), far above
+what a card reader delivers, so it is accepted; it could move to the measuring threads later if it ever matters. A box start `q` is a candidate when its 16 bytes are a size in
 `[24, MOOV_MAX_LEN + 8]`, `moov`, any 4 bytes and `mvhd`. A candidate is dropped when its header overlaps a piece of a
 finding that was `Intact` when added (rounded to whole sectors: those blocks may never be read, so keeping candidates
 there would depend on timing) or when it lies inside a non-`Damaged` MP4/MOV/CR3/HEIC finding (its own index). At most
@@ -465,8 +473,10 @@ file never hides the rest of the disk; a damaged file may then overlap another f
 (not just the block), so files may cross block boundaries.
 
 Reading once: the scan and every `measure` read through one shared cache (`CachedSource`, crate-private) of
-`ScanOptions::cache_bytes` (default 256 MiB; values below 1 MiB are raised to it). For files that fit in the cache, each
-sector is read once by the scan and the detectors; a JPEG gap search re-reads the photo, its 64 MiB window and at most
+`ScanOptions::cache_bytes` (default 256 MiB; values below 1 MiB are raised to it). "Read once" is about reading the
+source (I/O): bytes already in the cache may be walked several times in memory (a block's heads and its `moov` search, a
+file's measurement, a JPEG decoded again by its gap search). For files that fit in the cache, each sector is read once
+from the source by the scan and the detectors; a JPEG gap search re-reads the photo, its 64 MiB window and at most
 64 MiB for its tries (see "Fragmented JPEG"), the pairing step after the scan reads the headers of the candidate videos,
 the `moov`s it loads (at most 1 GiB) and the samples it checks again (see "Video with a separated index"), and a
 `Partial` or
@@ -527,6 +537,32 @@ every event and while waiting for a measurement. Once it is seen no further even
 callback makes that event the last one), the measuring threads drop their remaining jobs, and `scan` returns
 `EngineError::Cancelled` after every thread has stopped (a measurement already running is finished first, except a JPEG
 gap search, which gives up as soon as it sees the cancel); findings still pending are dropped.
+
+## Performance
+
+Measured with `revenant-dev bench` (release build, 1 GiB images, best of 3 runs; see `crates/revenant-dev/README.md`)
+on the development machine: Intel Core i9-9980HK (8 cores / 16 threads), 32 GB of RAM, macOS, Rust 1.99. The images
+are read from the page cache (the bench has just written them), so these numbers measure the engine, not a disk: they
+are an upper bound for a card reader. "Before" is the start of part 1.3 (commit `e575cd4`: one thread, every detector
+reading on its own); "after" is the end of it (commit `718f1f1`), with the default threads (16 here) and with one.
+MB = 10^6 bytes.
+
+| Image        | Files | Before (MB/s) | After, 16 threads (MB/s) | After, 1 thread (MB/s) |
+| ------------ | ----: | ------------: | -----------------------: | ---------------------: |
+| `noise`      |     0 |         765.6 |                   2381.4 |                 2265.4 |
+| `dense-jpeg` |    95 |          21.8 |                    503.9 |                  102.8 |
+| `dense-raw`  |    37 |         158.1 |                   1576.9 |                  589.5 |
+| `video`      |     3 |         797.2 |                   2296.6 |                 2216.3 |
+| `cut-jpeg`   |    95 |          26.8 |                    419.3 |                   85.6 |
+
+Every placed file is found in every run. What it means for a card: an SD card reader delivers at most about 100 MB/s
+(UHS-I) to about 300 MB/s (UHS-II), so with the default threads the scan keeps up with the reader on every image here,
+the photo-dense ones included (`dense-jpeg` 503.9 and `dense-raw` 1576.9 MB/s, above the 300 MB/s goal). With one
+thread it does not on the photo-dense JPEG images: `dense-jpeg` is 102.8 MB/s and `cut-jpeg` 85.6 MB/s, below 300 MB/s
+(checking JPEGs is CPU work, and one core does it at about that rate). `cut-jpeg` has no speed target: each cut photo
+starts a gap search that may re-read its 64 MiB window. The `moov` search on the scan thread costs about 10% on
+`noise` and `video`. The bench JPEGs are noise-encoded (about 11 MB per 3000x2000 photo, more entropy than a real
+photo), a heavy case; the real camera samples (below) all still come out as one `Intact` finding each.
 
 ## Extract
 

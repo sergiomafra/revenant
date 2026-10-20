@@ -71,10 +71,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The scan and the file detectors share what they read, so each sector of a card is read once (the search for the rest
   of a broken photo re-reads that photo, the 64 MiB after it and at most 64 MiB more), and known unreadable sectors are
   never retried (retrying a bad sector on a failing card can take seconds each time).
-- Scanning uses every core: the card is still read in order, while the files found are checked in parallel (5x faster on
-  the photo-dense benchmark on an 8-core / 16-thread machine). The results are the same, in the same order, whatever the number of
-  threads; cancelling stops the scan without reporting anything more. The JPEG checks share a memory budget (512 MiB at
-  once), so many large photos checked together cannot exhaust memory.
+- Scanning uses every core: the card is still read in order, while the files found are checked in parallel. The results
+  are the same, in the same order, whatever the number of threads; cancelling stops the scan without reporting anything
+  more. The JPEG checks share a memory budget (512 MiB at once), so many large photos checked together cannot exhaust
+  memory.
+- Scanning is much faster. Measured with `revenant-dev bench` (release build, 1 GiB synthetic images read from the page
+  cache, best of 3) on an Intel Core i9-9980HK (8 cores / 16 threads), before → after, in MB/s: photo-dense JPEG
+  21.8 → 503.9, photo-dense RAW 158.1 → 1576.9, cut JPEGs 26.8 → 419.3, videos 797.2 → 2296.6, empty space
+  765.6 → 2381.4. With a single thread: 102.8, 589.5, 85.6, 2216.3 and 2265.4. These are upper bounds for a card
+  reader, which delivers at most about 100 MB/s (UHS-I) to 300 MB/s (UHS-II).
 
 ### Fixed
 

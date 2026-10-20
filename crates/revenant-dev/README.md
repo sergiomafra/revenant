@@ -98,7 +98,8 @@ Images (files go back to back, each at the next 512-byte boundary, the rest is s
   a gap search that may re-read its 64 MiB window); it is only measured and reported.
 
 The numbers are page-cache throughput (the first write leaves the image in the cache): an upper bound for a card reader,
-not a prediction of it.
+not a prediction of it. The measured numbers (before and after part 1.3, and the machine) are in the engine's README,
+[crates/revenant-core](../revenant-core/README.md#performance) ("Performance").
 
 Compare only runs of the same `--size-mib`; the baseline is 1024 MiB. `--runs 1` may under-report, because the first run
 can overlap the writeback of the image. The `dense-jpeg` images are noise-encoded (about 11 MB per 3000x2000 file, more
@@ -106,21 +107,30 @@ entropy than real photos), so cross-check final speed claims with the real sampl
 
 ## Making a card image (read-only)
 
-Work on an image of the card, not on the card itself. Imaging only reads from the card.
+Work on an image of the card, not on the card itself. Imaging only reads from the card. Revenant cannot make the image
+yet (its own bad-sector-tolerant copy comes in a later part); until then we recommend
+[GNU ddrescue](https://www.gnu.org/software/ddrescue/), an external tool (GPL, installed separately, not part of
+Revenant). It copies the easily readable areas first and comes back to the areas around bad sectors at the end, leaves
+only the sectors it could not read as zeros (so every other byte stays at its offset), and keeps a map file, so an
+interrupted copy resumes where it stopped. Do not use `dd bs=4m conv=noerror,sync`: it replaces the whole 4 MiB block
+around each bad sector with zeros.
 
 macOS:
 
-**Double-check the device name with `diskutil list` before running `dd`, and never swap `if` and `of`: `of=` is written to.**
+**Double-check the device name with `diskutil list` before running `ddrescue`, and never swap the two paths: the second
+one is written to.**
 
 ```sh
 diskutil list                          # find the card: /dev/diskN
 diskutil unmountDisk /dev/diskN        # unmount without ejecting
-sudo dd if=/dev/rdiskN of=card.img bs=4m conv=noerror,sync
+sudo ddrescue /dev/rdiskN card.img card.map
 ```
 
-Replace `N` with the card's number. `card.img` must be on a different disk than the card, with enough free space.
-`conv=noerror,sync` keeps `dd` going past unreadable sectors (plain `dd` stops at the first one), padding them with zeros so
-every later byte stays at its offset.
+Replace `N` with the card's number. `card.img` (and `card.map`) must be on a different disk than the card, with enough
+free space. `/dev/rdiskN` is the raw device, which already bypasses the system's cache. On Linux, the same copy is
+`sudo ddrescue -d /dev/sdX card.img card.map` (`-d`: direct disc access, bypassing the cache). Running the same command
+again with the same map file resumes an interrupted copy; adding `-r3` retries the unreadable sectors up to three more
+times.
 
 Windows: use a read-only imaging tool (for example FTK Imager, which can create a raw image of a physical drive) rather than
 `dd`, and save the image to a different drive than the card.
