@@ -138,7 +138,10 @@ crate-private). All positions are absolute 512-byte sector boundaries:
    them (`Intact`, or `Partial` with an unreadable sector in either piece; a pair passes only when the walk reaches EOI,
    so it is never `Damaged`).
 
-Evidence for `Intact` (rulings Q1, Q7): exactly one candidate in the whole window passed, and every candidate was tried.
+Evidence for `Intact` (rulings Q1, Q7, Q15): exactly one candidate in the whole window passed, every candidate was
+tried, and the seam does not fall exactly on a restart marker (the marker ends the first piece, starts the second or is
+split between them: every DC predictor resets there, so any photo of the same frame continues validly and the DC seam
+test carries little evidence; such a join is at most `Partial`).
 A second passing candidate (the search then stops) or hitting a bound makes the reassembled photo at most `Partial`. So
 does an EOI with more than 4 sector starts whose first event it is (not all were tried), unless it is the passing
 continuation's own EOI (the others lie inside it) or those sectors belong to a file in the gap: the last file head before
@@ -173,7 +176,9 @@ whose bytes decode exactly to EOI is a valid JPEG and comes out `Intact`. Likewi
 be the only candidate that passes, and the join comes out `Intact`: uniqueness (Q1) cannot see a tail that is missing. The
 same holds for any photo of the same frame and restart interval whose tail starts in the seam's MCU row: spliced at a
 restart marker, it passes the DC seam test when its rows near the seam look enough like this photo's (3 of 168 such
-splices, built from mirrored or rotated real previews re-encoded with a restart every row, came out `Intact`).
+splices, built from mirrored or rotated real previews re-encoded with a restart every row, came out `Intact`; their seams
+lie inside a restart interval, the foreign data decoding validly for 50 to 108 MCUs up to the next marker, so Q15 does
+not apply to them).
 A photo split inside a band much rougher
 than the rest of the image is not put back together: the DC seam test compares the seam with the whole image's median
 (2 of 56 real preview splits in `tests/real_samples.rs`, both in the EOS Kiss F preview's textured middle, stay
@@ -614,7 +619,8 @@ CC0 from raw.pixls.us, listed with URL and SHA-256 in `samples/samples.toml`, ne
 noise image at a sector start and must come out as exactly one finding of its kind, `Intact`, with the file's length
 (for ARW, trailing zero padding under 64 KiB aside), make and model, and a preview that decodes strictly. A second test
 splits each sample's preview in two at k/10 (k = 2..=8, on a sector boundary) with its own tail 8 MiB further on: it
-must come out joined and `Intact` (except the 2 known `Partial` splits above), and with another sample's tail instead,
+must come out joined and `Intact` (joined but `Partial` when the split falls exactly on a restart marker, Q15: 2 of the
+56; and the 2 known `Partial` splits above), and with another sample's tail instead,
 never `Intact`. Both are ignored by default:
 
 ```sh

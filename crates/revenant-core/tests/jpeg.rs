@@ -711,7 +711,8 @@ fn restart_marker(j: &[u8], k: usize) -> usize {
 #[test]
 fn tail_spliced_at_a_restart_marker_needs_the_dc_seam() {
     // Restart markers every MCU row: DC predictors reset there, so any photo of the same geometry and tables continues
-    // validly at its own k-th marker with the exact MCU count. Only the DC seam tells the photo's own tail from another's.
+    // validly at its own k-th marker with the exact MCU count. The DC seam tells the photo's own tail from this other one,
+    // but a seam right on a restart boundary is never Intact (ruling Q15).
     // Rows of 8191 blocks whose DC alternates by 1600 take about 24 KiB each, so a first piece of one row is long enough
     // to be searched; vertically the DC changes by 3 per row, and photo b sits about 50 above photo a.
     let alt = |bx: u32| if bx.is_multiple_of(2) { 800 } else { -800 };
@@ -737,10 +738,11 @@ fn tail_spliced_at_a_restart_marker_needs_the_dc_seam() {
             }
             m
         };
+        // Q15: the seam falls exactly on a restart boundary, so the photo is joined but at most Partial.
         let own = image(&a[pa..]);
         assert_eq!(
             (own.len, own.health, own.fragments.len()),
-            (a.len() as u64, Health::Intact, 2),
+            (a.len() as u64, Health::Partial, 2),
             "marker {k}"
         );
         let foreign = image(&b[pb..]);

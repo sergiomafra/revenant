@@ -281,6 +281,15 @@ fn split_finding(first: &[u8], tail: &[u8]) -> Option<Finding> {
     findings(&source).into_iter().find(|f| f.start == AT as u64)
 }
 
+/// Whether a split of the JPEG `j` at `c` falls exactly on a restart marker (`FF D0`–`D7` ends the first piece, starts
+/// the second, or is split between them): such a join is at most `Partial` (ruling Q15).
+fn on_restart_marker(j: &[u8], c: usize) -> bool {
+    let rst = |b: u8| (0xD0..=0xD7).contains(&b);
+    (j[c - 2] == 0xFF && rst(j[c - 1]))
+        || (j[c] == 0xFF && rst(j[c + 1]))
+        || (j[c - 1] == 0xFF && rst(j[c]))
+}
+
 /// The first piece's length for a split at `k`/10 of `len`: a whole number of sectors.
 fn split_at(len: usize, k: usize) -> usize {
     (len * k / 10) / 512 * 512
@@ -294,7 +303,8 @@ const KNOWN_PARTIAL: [(&str, usize); 2] =
     [("canon-eos-kiss-f.cr2", 3), ("canon-eos-kiss-f.cr2", 5)];
 
 /// Every sample's preview split at k/10 (k = 2..=8) on a sector boundary, with its own tail [`GAP`] bytes later: the
-/// photo is found joined and `Intact`, pieces exact (except [`KNOWN_PARTIAL`]). The same first piece with the tail of the
+/// photo is found joined and `Intact`, pieces exact (joined but `Partial` when the split falls exactly on a restart
+/// marker, ruling Q15; [`KNOWN_PARTIAL`] aside). The same first piece with the tail of the
 /// next sample's preview (split at the same k) instead: never `Intact`. Every case is checked and every failure listed
 /// before the test fails.
 #[test]
@@ -303,7 +313,7 @@ fn real_previews_split_in_two() {
     let dir = samples_dir();
     let list = samples();
     let previews: Vec<Vec<u8>> = list.iter().map(|s| preview_of(&dir, s)).collect();
-    let (mut own_ok, mut foreign_ok, mut cases) = (0, 0, 0);
+    let (mut own_ok, mut foreign_ok, mut cases, mut on_restart) = (0, 0, 0, 0);
     let mut failures = Vec::new();
     for (i, s) in list.iter().enumerate() {
         let p = &previews[i];
@@ -323,8 +333,15 @@ fn real_previews_split_in_two() {
                     len: (p.len() - c) as u64,
                 },
             ];
+            // Q15: a seam exactly on a restart marker is joined but at most Partial.
+            let health = if on_restart_marker(p, c) {
+                on_restart += 1;
+                Health::Partial
+            } else {
+                Health::Intact
+            };
             let joined = own.as_ref().is_some_and(|f| {
-                f.health == Health::Intact && f.len == p.len() as u64 && f.fragments == expected
+                f.health == health && f.len == p.len() as u64 && f.fragments == expected
             });
             let known = KNOWN_PARTIAL.contains(&(s.name.as_str(), k));
             match (joined, known) {
@@ -353,7 +370,8 @@ fn real_previews_split_in_two() {
         }
     }
     println!(
-        "own tails as expected: {own_ok}/{cases} ({} known Partial); foreign tails not Intact: {foreign_ok}/{cases}",
+        "own tails as expected: {own_ok}/{cases} ({} known Partial, {on_restart} joined Partial on a restart marker); \
+         foreign tails not Intact: {foreign_ok}/{cases}",
         KNOWN_PARTIAL.len()
     );
     for f in &failures {

@@ -194,7 +194,8 @@ pub(crate) fn join(r: &mut Reader, start: u64, scan_start: u64, cut: u64) -> Opt
     // Q7: an EOI whose sectors were not all tried (more than PER_EOI of them) may hide a continuation, unless it is the
     // passing continuation's own (the rest are inside it) or those sectors belong to a file in the gap that is whole on
     // its own and coded differently from this photo.
-    let mut unique = passes == 1 && exhausted;
+    let on_restart = frame.restart_interval > 0 && on_restart_marker(&source, c1, g);
+    let mut unique = passes == 1 && exhausted && !on_restart;
     if unique {
         let mut checked = HashMap::new();
         unique = truncated
@@ -217,6 +218,22 @@ pub(crate) fn join(r: &mut Reader, start: u64, scan_start: u64, cut: u64) -> Opt
         len: fragments[0].len + fragments[1].len,
         unique,
     })
+}
+
+/// Q15: whether the seam between a first piece ending at `c1` and a second piece starting at `g` falls exactly on a
+/// restart marker: the first piece ends with one, the second starts with one, or the marker is split between them. Every
+/// DC predictor resets there, so any photo of the same frame continues validly and the DC seam test carries little
+/// evidence: the join is at most `Partial`.
+fn on_restart_marker(source: &dyn Source, c1: u64, g: u64) -> bool {
+    let (mut before, mut after) = ([0u8; 2], [0u8; 2]);
+    let read = |at: u64, buf: &mut [u8; 2]| source.read_at(at, buf).is_ok_and(|n| n == 2);
+    if !read(c1 - 2, &mut before) || !read(g, &mut after) {
+        return false;
+    }
+    let rst = |b: u8| (0xD0..=0xD7).contains(&b);
+    (before[0] == 0xFF && rst(before[1]))
+        || (after[0] == 0xFF && rst(after[1]))
+        || (before[1] == 0xFF && rst(after[0]))
 }
 
 /// Whether the sectors of the EOI at `e` whose first one is `g0` belong to a file in the gap: the last file head before
