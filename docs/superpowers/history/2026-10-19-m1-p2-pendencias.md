@@ -113,6 +113,9 @@ reproduzem a estrutura:
 - JPEG acima de 64 MiB perde as dimensões na inspeção.
 
 **Menores, sem dono**
+- CR3: bytes que sobrescrevem só o SOI do JPEG de tamanho total (sem formar um cabeçalho reconhecido) tiram esse JPEG dos
+  candidatos, e o CR3 segue Íntegro só pela PRVW. Possível regra futura: exigir um JPEG na primeira trilha quando a entrada
+  de amostra diz que ela é JPEG.
 - Testes que faltam: o ramo do limite de iterações do `iloc`; a guarda `room()`.
   O teste `zero_size` do HEIC aceita qualquer coisa diferente de Íntegro (mais frouxo que Parcial).
 - `random_head_inside_mdat` depende do ruído semeado.

@@ -46,8 +46,8 @@
 //!
 //! An `mdat` head that is exactly a chunk start (CR3: of any track; Motion-JPEG video: of its track) or an extent start
 //! (HEIC) is the file's own data, not another file: see `measure`. A foreign file starting exactly there is
-//! indistinguishable from it. So is a CR3 head inside its own `PRVW` or full-size JPEG while that JPEG still decodes
-//! (ruling P13).
+//! indistinguishable from it. So is a CR3 head inside its own full-size JPEG (in `mdat`) while that JPEG still decodes
+//! (ruling P13); the `PRVW` has no such exemption, as no head is checked inside its box at all (see the CR3 health rule).
 //!
 //! Unreadable sectors read as zeros: inside `moov` the index is unusable -> `Damaged` (the length still covers `moov`, so
 //! extraction keeps it); anywhere else in the file an otherwise `Intact` file becomes `Partial`. A box header that cannot

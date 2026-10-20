@@ -592,8 +592,9 @@ fn file_written_inside_cr3_prvw_is_found() {
     let foreign = testkit::jpeg(8, 8, 77, 0);
     let at = 512;
     let prvw = pos(&v, b"PRVW");
+    let size = u32::from_be_bytes(v[prvw + 16..prvw + 20].try_into().unwrap()) as usize;
     assert!(
-        prvw < at && at + foreign.len() < prvw + 20 + 36_000,
+        prvw < at && at + foreign.len() < prvw + 20 + size,
         "inside the PRVW JPEG"
     );
     let mut v = v;
