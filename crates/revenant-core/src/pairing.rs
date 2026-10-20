@@ -135,18 +135,25 @@ struct Budget {
 /// each with 2 pieces. Takes the [`CachedSource`]: `bad_runs` over both pieces is the only complete record of the
 /// unreadable sectors the scan met (so a piece's health agrees with the `Unreadable` events).
 ///
+/// `starts` holds the start of every finding of the scan, ascending (ruling Q13). The first piece ends by the video
+/// finding's own end (the scan cut it where another file starts), unless that end is one of the video's own Motion-JPEG
+/// frames, and by the first finding inside it that is not one of them. A finding starting inside either piece, other
+/// than the video itself and its own Motion-JPEG frames, makes the pairing at most `Partial` (as it cuts a contiguous
+/// video): its bytes would be claimed twice.
+///
 /// Returns nothing once `cancel` is seen (checked before each `moov` and each pair, and while a pair tries its break
 /// points). A video with two or more passing `moov`s, or a `moov` passing for two or more videos, pairs with none of
-/// them. A reassembled video is `Intact` only when exactly one break point passed and no bound was hit (the load budget,
-/// the sample budget, the pair cap or the step budget: an unchecked pair might have passed too); otherwise at most
-/// `Partial`.
+/// them. A reassembled video is `Intact` only when exactly one break point passed, no bound was hit (the load budget,
+/// the sample budget, the pair cap or the step budget: an unchecked pair might have passed too) and no other file starts
+/// inside its pieces; otherwise at most `Partial`.
 pub(crate) fn pair_videos(
     source: &CachedSource,
     videos: &[Finding],
     moovs: &[(u64, u64)],
+    starts: &[u64],
     cancel: &CancelToken,
 ) -> Vec<Finding> {
-    pair_with(source, videos, moovs, cancel, LIMITS).0
+    pair_with(source, videos, moovs, starts, cancel, LIMITS).0
 }
 
 /// [`pair_videos`] under `limits`; also returns the sample-check steps used.
@@ -154,6 +161,7 @@ fn pair_with(
     source: &CachedSource,
     videos: &[Finding],
     moovs: &[(u64, u64)],
+    starts: &[u64],
     cancel: &CancelToken,
     limits: Limits,
 ) -> (Vec<Finding>, u64) {
@@ -206,7 +214,9 @@ fn pair_with(
             if cancel.is_cancelled() {
                 return (Vec::new(), steps.used);
             }
-            if let Some(finding) = try_pair(source, v, &m, &mut steps, limits.max_breaks, cancel) {
+            if let Some(finding) =
+                try_pair(source, v, &m, starts, &mut steps, limits.max_breaks, cancel)
+            {
                 passed.push(Pass {
                     video: vi,
                     moov: mi,
@@ -435,11 +445,39 @@ fn spaced(range: std::ops::Range<usize>) -> impl Iterator<Item = usize> {
     })
 }
 
+/// Whether file offset `off` is where one of `m`'s Motion-JPEG samples starts (a JPEG the scan finds there is the
+/// video's own frame).
+fn own_frame(m: &Moov, off: u64) -> bool {
+    let i = m.items.partition_point(|it| it.offset < off);
+    m.items[i..]
+        .iter()
+        .take_while(|it| it.offset == off)
+        .any(|it| matches!(it.check, Check::Mjpeg))
+}
+
+/// The findings in `starts` (ascending) at `[from, to)` that are not `m`'s own frames, in a piece holding file offset
+/// `off` at `from`.
+fn foreign_starts<'a>(
+    starts: &'a [u64],
+    m: &'a Moov,
+    from: u64,
+    off: u64,
+    to: u64,
+) -> impl Iterator<Item = u64> + 'a {
+    let i = starts.partition_point(|&x| x < from);
+    starts[i..]
+        .iter()
+        .copied()
+        .take_while(move |&x| x < to)
+        .filter(move |&x| !own_frame(m, x - from + off))
+}
+
 /// Checks video `v` against `moov` `m` (the arithmetic filter already passed) and returns the reassembled finding.
 fn try_pair(
     source: &CachedSource,
     v: &Video,
     m: &Moov,
+    starts: &[u64],
     steps: &mut Steps,
     max_breaks: u64,
     cancel: &CancelToken,
@@ -510,6 +548,14 @@ fn try_pair(
     }
     let &l1 = passing.first()?;
     let ambiguous = passing.len() > 1 || count > max_breaks;
+    // Q13: the first piece ends where the scan cut the video (another file starts there), and by the first other file
+    // inside it; the video's own Motion-JPEG frames are neither.
+    let flen = v.finding.len;
+    if (l1 > flen && !own_frame(m, flen))
+        || foreign_starts(starts, m, s + 1, 1, s + l1).next().is_some()
+    {
+        return None;
+    }
 
     let g = m.q.checked_add(l1)?.checked_sub(v.p)?;
     let second_len = v.p - l1 + m.size;
@@ -527,9 +573,14 @@ fn try_pair(
             len: second_len,
         },
     ];
+    // Q13: another file starting inside the second piece.
+    let foreign = foreign_starts(starts, m, g, l1, g + second_len)
+        .next()
+        .is_some();
     let health = match index_health(&m.payload, v.p + m.size, false) {
         Health::Intact
             if ambiguous
+                || foreign
                 || pieces
                     .iter()
                     .any(|f| !source.bad_runs(f.start, f.start + f.len).is_empty()) =>
@@ -604,12 +655,30 @@ mod tests {
     }
 
     fn run(limits: Limits, moovs: usize) -> (Vec<(u64, Health)>, u64) {
-        let (mem, findings, all) = siblings();
+        run_with(limits, moovs, |_| {}, &[])
+    }
+
+    /// [`run`] with the Damaged findings changed by `edit` and `more` finding starts besides theirs.
+    fn run_with(
+        limits: Limits,
+        moovs: usize,
+        edit: impl FnOnce(&mut Vec<Finding>),
+        more: &[u64],
+    ) -> (Vec<(u64, Health)>, u64) {
+        let (mem, mut findings, all) = siblings();
+        edit(&mut findings);
         let cache = CachedSource::new(&mem, 512, 64 * MIB);
+        let mut starts: Vec<u64> = findings
+            .iter()
+            .map(|f| f.start)
+            .chain(more.iter().copied())
+            .collect();
+        starts.sort_unstable();
         let (out, steps) = pair_with(
             &cache,
             &findings,
             &all[..moovs],
+            &starts,
             &CancelToken::default(),
             limits,
         );
@@ -690,6 +759,63 @@ mod tests {
             run(limits, 2).0,
             vec![(1, Health::Partial), (2, Health::Partial)]
         );
+    }
+
+    /// v1's break point (its first piece's length, which starts at 1 MiB; the second piece starts at 16 MiB).
+    fn v1_l1() -> u64 {
+        let v = video(1, siblings().1[0].len as usize - video(1, 0).moov.start);
+        let pl = &v.mdat_payload;
+        ((pl.start + pl.len() * 2 / 5).div_ceil(512) * 512) as u64
+    }
+
+    #[test]
+    fn the_first_piece_ends_by_the_videos_own_end() {
+        // The scan cut v1 one sector before its break point (another file starts there): no pairing for v1.
+        let l1 = v1_l1();
+        let cut = |f: &mut Vec<Finding>| f[0].len = l1 - 512;
+        assert_eq!(run_with(LIMITS, 2, cut, &[]).0, vec![(2, Health::Intact)]);
+        let at_break = |f: &mut Vec<Finding>| f[0].len = l1;
+        assert_eq!(
+            run_with(LIMITS, 2, at_break, &[]).0,
+            vec![(1, Health::Intact), (2, Health::Intact)]
+        );
+    }
+
+    #[test]
+    fn a_file_inside_the_first_piece_stops_the_pairing() {
+        let l1 = v1_l1();
+        let inside = MIB as u64 + l1 - 512;
+        assert_eq!(
+            run_with(LIMITS, 2, |_| {}, &[inside]).0,
+            vec![(2, Health::Intact)]
+        );
+        // Right after the first piece: not inside it.
+        assert_eq!(
+            run_with(LIMITS, 2, |_| {}, &[MIB as u64 + l1]).0,
+            vec![(1, Health::Intact), (2, Health::Intact)]
+        );
+    }
+
+    #[test]
+    fn a_file_inside_the_second_piece_makes_the_pairing_partial() {
+        let (_, findings, moovs) = siblings();
+        let second = 16 * MIB as u64;
+        let end = moovs[1].0 + moovs[1].1; // v1's moov ends its second piece
+        assert_eq!(findings[0].start, MIB as u64);
+        for at in [second, end - 1] {
+            assert_eq!(
+                run_with(LIMITS, 2, |_| {}, &[at]).0,
+                vec![(1, Health::Partial), (2, Health::Intact)],
+                "{at}"
+            );
+        }
+        for at in [second - 1, end] {
+            assert_eq!(
+                run_with(LIMITS, 2, |_| {}, &[at]).0,
+                vec![(1, Health::Intact), (2, Health::Intact)],
+                "{at}"
+            );
+        }
     }
 
     #[test]

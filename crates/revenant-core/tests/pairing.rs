@@ -318,6 +318,106 @@ fn second_piece_overwritten_inside_is_not_paired() {
     assert!(updated(&events).is_empty(), "{events:?}");
 }
 
+/// A 4000-sample video split at 2/5 (first piece at 1 MiB, the rest at 12 MiB) with a photo written over `n` evenly
+/// spaced places of its second piece (`second`) or of its first piece's samples: the 32 samples checked on each side
+/// miss it at most of them. For each place: the photo's health, the `Damaged` video's length and the `Updated` video.
+fn photo_over_split_video(second: bool, n: usize) -> Vec<(Option<Health>, u64, Option<Finding>)> {
+    let v = avc_video(&AvcOptions {
+        samples: 4000,
+        seed: 1,
+        mov: false,
+        mdat_pad: 0,
+        small_nals: true,
+    });
+    let l1 = cut(&v, 2);
+    let photo = revenant_testkit::jpeg(128, 96, 3, 0);
+    let p = &v.mdat_payload;
+    let (lo, hi) = if second {
+        (12 * MIB, 12 * MIB + p.end - l1 - photo.len())
+    } else {
+        (MIB + p.start + 4096, MIB + l1 - photo.len())
+    };
+    (0..n)
+        .map(|i| {
+            let at = (lo + (hi - lo) * i / (n - 1)) / 512 * 512;
+            let mut img = split_image(&v, l1);
+            img.put(at, &photo);
+            let file = img.save();
+            let (_, events) = run(&Src::new(&file));
+            let f = found(&events);
+            let photo = f.iter().find(|f| f.start == at as u64).map(|f| f.health);
+            let video = f.iter().find(|f| f.start == MIB as u64).expect("the video");
+            assert_eq!(video.health, Health::Damaged);
+            (photo, video.len, updated(&events).pop())
+        })
+        .collect()
+}
+
+#[test]
+fn a_photo_inside_the_second_piece_makes_the_pairing_partial() {
+    // The bytes of both would be claimed twice: extracting the video would copy the photo into it.
+    for (i, (photo, _, u)) in photo_over_split_video(true, 20).into_iter().enumerate() {
+        assert_eq!(photo, Some(Health::Intact), "place {i}");
+        assert!(
+            u.as_ref().is_none_or(|u| u.health != Health::Intact),
+            "place {i}: {u:?}"
+        );
+    }
+}
+
+#[test]
+fn a_photo_inside_the_first_piece_ends_it() {
+    // The scan cut the Damaged video at the photo: the first piece cannot run past it (ruling Q13).
+    for (i, (photo, len, u)) in photo_over_split_video(false, 12).into_iter().enumerate() {
+        assert_eq!(photo, Some(Health::Intact), "place {i}");
+        assert!(
+            u.as_ref()
+                .is_none_or(|u| u.health != Health::Intact && u.fragments[0].len <= len),
+            "place {i}: {u:?}"
+        );
+    }
+}
+
+#[test]
+fn motion_jpeg_frames_inside_the_pieces_are_the_videos_own() {
+    // Every frame starts on a sector, so the scan finds each one as a JPEG, in both pieces (and cuts the Damaged video
+    // at its first frame): those are the video's own frames, not other files.
+    let v = revenant_testkit::mjpeg_video(40, 3);
+    let frames: Vec<usize> = (512..v.moov.start)
+        .step_by(512)
+        .filter(|&o| v.bytes[o..o + 3] == [0xFF, 0xD8, 0xFF])
+        .collect();
+    assert_eq!(frames.len(), 40);
+    let l1 = frames[16]; // a sector boundary between two frames
+    let file = split_image(&v, l1).save();
+    let src = Src::new(&file);
+    let (_, events) = run(&src);
+    let f = found(&events);
+    assert!(
+        f.iter().filter(|f| f.kind == FileKind::Jpeg).count() >= 40,
+        "{f:?}"
+    );
+    let u = updated(&events);
+    assert_eq!(u.len(), 1, "{events:?}");
+    assert_eq!(u[0].health, Health::Intact, "{:?}", u[0]);
+    assert_eq!(u[0].fragments[0].len, l1 as u64);
+    assert_eq!(extracted(&src, &u[0]), v.bytes);
+    // A photo written over frame 20's coded data (its first and last bytes, which the sample check reads, untouched)
+    // is another file: the pairing stands, at most Partial.
+    let photo = revenant_testkit::jpeg(16, 16, 77, 0);
+    let at = 12 * MIB + frames[20] - l1 + 5120;
+    assert!(at + photo.len() < 12 * MIB + frames[21] - l1 - 2);
+    let mut img = split_image(&v, l1);
+    img.put(at, &photo);
+    let file = img.save();
+    let (_, events) = run(&Src::new(&file));
+    let photo = found(&events).into_iter().find(|f| f.start == at as u64);
+    assert_eq!(photo.map(|f| f.health), Some(Health::Intact));
+    let u = updated(&events);
+    assert_eq!(u.len(), 1, "{events:?}");
+    assert_eq!(u[0].health, Health::Partial);
+}
+
 /// A copy of `v`'s first piece at 1 MiB, and the whole `v` at 12 MiB (with an unreadable sector in its `mdat`
 /// padding when `bad`). The whole video's `moov` would pair with the copy, but it is its own.
 fn copy_and_whole(bad: bool) -> (Vec<Event>, Vec<Finding>) {

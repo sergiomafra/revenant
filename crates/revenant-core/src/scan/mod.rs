@@ -86,7 +86,7 @@ const MAX_THREADS: usize = 64;
 /// or a JPEG gap search's DC values, about 3 × 13 MiB at 210 megapixels, plus 3 MiB),
 /// plus about 200 B per recognized sector start in the read-ahead (at most lookahead × block / sector of them), plus the
 /// orphan `moov` candidates and `Damaged` videos kept for pairing (at most 4096 + 4096 per block read ahead, and 4096
-/// findings), and, after the scan, the pairing step's one `moov` and its sample lists (up to about 128 MiB). So with
+/// findings) and the start of every finding (8 B each), and, after the scan, the pairing step's one `moov` and its sample lists (up to about 128 MiB). So with
 /// the defaults on a 16-thread machine, about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
 pub struct ScanOptions {
     /// Granularity of candidate starts and of unreadable-region handling, in bytes. Above 512, the detectors see a sector that
@@ -216,6 +216,9 @@ struct Commit<'a, 's> {
     videos: Vec<Finding>,
     /// A candidate (of either kind) was dropped by a cap: an unchecked one might have paired, so no pairing is `Intact`.
     capped: bool,
+    /// The start of every finding, ascending (one per finding): a file starting inside a paired video's pieces makes
+    /// the pairing at most `Partial` (ruling Q13).
+    starts: Vec<u64>,
 }
 
 impl Commit<'_, '_> {
@@ -280,8 +283,13 @@ impl Commit<'_, '_> {
             return Ok(());
         }
         let cancel = self.shared.cancel;
-        let paired =
-            crate::pairing::pair_videos(&self.shared.cache, &self.videos, &self.moovs, cancel);
+        let paired = crate::pairing::pair_videos(
+            &self.shared.cache,
+            &self.videos,
+            &self.moovs,
+            &self.starts,
+            cancel,
+        );
         if cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
@@ -418,6 +426,7 @@ impl Commit<'_, '_> {
                 );
             }
         }
+        self.starts.push(at);
         let finding = Finding {
             id: self.next_id,
             start: at,
@@ -453,7 +462,9 @@ impl Commit<'_, '_> {
 /// examine, waits for its measurement. The events, ids and summary are the same for any `threads` and `cache_bytes`.
 ///
 /// After every `Found`, `Damaged` MP4/MOV findings without a `moov` (at most 4096) are paired with orphan `moov` boxes
-/// met during the scan (at most 4096, see `pairing`): each video put back together is emitted as an
+/// met during the scan (at most 4096, see `pairing`; the start of every finding is kept for it, ruling Q13: a pairing's
+/// first piece ends where another file starts, and a file starting inside its second piece makes it at most
+/// `Partial`): each video put back together is emitted as an
 /// [`Event::Updated`] with the same id and 2 pieces, then `scan` returns. An orphan `moov` candidate is a box start whose
 /// first 16 bytes are a size in `[24, MOOV_MAX_LEN + 8]`, `moov`, any 4 bytes and `mvhd`, found in every block the scan
 /// reads; one whose header overlaps a committed skip range (those blocks may not be read at all) or lies inside a
@@ -502,6 +513,7 @@ pub fn scan(
             own_moovs: Runs::default(),
             videos: Vec::new(),
             capped: false,
+            starts: Vec::new(),
         };
         let mut finder = MoovFinder::default();
         let mut ahead: VecDeque<Block> = VecDeque::with_capacity(lookahead);

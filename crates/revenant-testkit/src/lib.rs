@@ -506,6 +506,76 @@ pub fn avc_video(opts: &AvcOptions) -> AvcVideo {
     }
 }
 
+/// A camera-style Motion-JPEG video (`mjpa`, `isom` brand): `ftyp`, `mdat` (32-bit size), `moov` at the end. `frames`
+/// samples, each a seeded noise JPEG padded (APP1) to a whole number of 512-byte sectors and starting on a sector
+/// boundary of the file (the first at 512), one sample per chunk: every frame start is a file head a scan finds.
+pub fn mjpeg_video(frames: usize, seed: u64) -> AvcVideo {
+    let mut payload = vec![0u8; 512 - 28];
+    SplitMix64(seed).fill(&mut payload);
+    let mut sizes = Vec::with_capacity(frames);
+    let mut chunks = Vec::with_capacity(frames);
+    for i in 0..frames {
+        let s = seed.wrapping_add(i as u64);
+        // Past the embedded thumbnail, each APP1 byte adds one byte to the file.
+        let base = jpeg(32, 32, s, 4000).len();
+        let frame = jpeg(32, 32, s, 4000 + (512 - base % 512) % 512);
+        assert_eq!(frame.len() % 512, 0);
+        chunks.push((28 + payload.len()) as u32);
+        sizes.push(frame.len() as u32);
+        payload.extend_from_slice(&frame);
+    }
+    let mut ftyp = b"isom".to_vec();
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(b"isom");
+    let ftyp = bmff_box(b"ftyp", &ftyp);
+    let mdat = bmff_box(b"mdat", &payload);
+    assert_eq!(ftyp.len() + 8, 28);
+    let full_box = |kind: &[u8; 4], body: &[u8]| {
+        let mut p = vec![0u8; 4]; // version and flags
+        p.extend_from_slice(body);
+        bmff_box(kind, &p)
+    };
+    let mut stsz = 0u32.to_be_bytes().to_vec();
+    stsz.extend_from_slice(&(sizes.len() as u32).to_be_bytes());
+    sizes
+        .iter()
+        .for_each(|s| stsz.extend_from_slice(&s.to_be_bytes()));
+    let mut stsc = 1u32.to_be_bytes().to_vec();
+    [1u32, 1, 1]
+        .iter()
+        .for_each(|v| stsc.extend_from_slice(&v.to_be_bytes()));
+    let mut stco = (chunks.len() as u32).to_be_bytes().to_vec();
+    chunks
+        .iter()
+        .for_each(|c| stco.extend_from_slice(&c.to_be_bytes()));
+    let stbl = bmff_box(
+        b"stbl",
+        &[
+            stsd_box(b"mjpa"),
+            full_box(b"stsz", &stsz),
+            full_box(b"stsc", &stsc),
+            full_box(b"stco", &stco),
+        ]
+        .concat(),
+    );
+    let mut hdlr = vec![0; 8];
+    hdlr.extend_from_slice(b"vide");
+    hdlr.extend_from_slice(&[0; 13]);
+    let mdia = bmff_box(
+        b"mdia",
+        &[bmff_box(b"hdlr", &hdlr), bmff_box(b"minf", &stbl)].concat(),
+    );
+    let trak = bmff_box(b"trak", &[bmff_box(b"tkhd", &[0; 84]), mdia].concat());
+    let moov = bmff_box(b"moov", &[bmff_box(b"mvhd", &[0; 100]), trak].concat());
+    let bytes = [ftyp, mdat, moov].concat();
+    let moov_at = 28 + payload.len();
+    AvcVideo {
+        mdat_payload: 28..moov_at,
+        moov: moov_at..bytes.len(),
+        bytes,
+    }
+}
+
 /// Which camera family's TIFF flavor [`tiff_raw`] imitates (header magic and default `Make`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TiffVariant {

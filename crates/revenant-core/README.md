@@ -264,12 +264,17 @@ Pairing a video at `s` (the `Found` start) with a candidate at `q`:
    inside its last NAL unit's payload still passes `A`) to the start of sample `k + 1` (or `P`), at least `payload`,
    at most 4096 tried; samples `k − 1` and `k` must pass read across `L1` (bytes before it at `s`, after it at the second
    piece). The pieces are `[s, s + L1)` and `[q − P + L1, … + (P − L1) + moov size)`, inside the source, not
-   overlapping.
+   overlapping. The first piece ends by the `Found` video's own end (the scan cut the video where another file starts,
+   ruling Q13), unless that end is one of the video's own Motion-JPEG frames, and no other finding may start inside it:
+   otherwise the video is not paired.
 7. Uniqueness: a video with two or more passing `moov`s, or a `moov` passing for two or more videos, is not paired.
 
 Health of a reassembled video: what the index says against its length (`P` + the `moov` size), as for a contiguous file
 (`Damaged` or `Partial` stay so); an unreadable sector in either piece (from the scan's bad-sector map, so it agrees with
-the `Unreadable` events) makes it `Partial`; so does more than one passing `L1` (the smallest is kept), or a bound hit
+the `Unreadable` events) makes it `Partial`; so does a finding starting inside the second piece (ruling Q13: its bytes
+would be claimed twice, and a file head cuts a contiguous video the same way; the video's own Motion-JPEG frames, which
+the scan finds as JPEGs, do not count; the scan keeps every finding's start, 8 B each, for this), more than one passing
+`L1` (the smallest is kept), or a bound hit
 anywhere (the per-block or per-scan candidate cap, the video cap, the load budget, the pair cap, more than 4096 break
 points, the sample budget or the step budget below): an unchecked candidate might have passed too. The per-block
 candidate cap does not count in a block wholly inside committed skip ranges (such a block may or may not be read, and
@@ -521,7 +526,8 @@ every scan in the process, plus the decoder's internal buffers), plus what each 
 `moov` of at most 16 MiB, or a JPEG gap search's DC values, about 3 × 13 MiB at 210 megapixels, plus 3 MiB), plus about
 200 B per recognized sector start in the read-ahead (at most
 lookahead × block / sector of them), plus the `moov` candidates (16 B each: at most 4096 per block read ahead, and
-4096 kept) and the `Damaged` videos kept for pairing (at most 4096 findings). After the scan, the pairing step holds one
+4096 kept), the `Damaged` videos kept for pairing (at most 4096 findings) and the start of every finding (8 B each).
+After the scan, the pairing step holds one
 `moov` (at most 16 MiB) and its sample lists (at most 4,000,000 samples, about 32 B each, so up to about 128 MiB). With
 the defaults on a 16-thread machine: about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
 
