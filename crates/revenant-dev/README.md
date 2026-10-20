@@ -141,6 +141,26 @@ Then:
 revenant-dev scan card.img --extract ~/recovered --allow-same-volume   # only if ~/recovered is on the same disk as card.img
 ```
 
+## Checking against real file systems (macOS, opt-in)
+
+The synthetic FAT12/16/32 and exFAT volumes in `revenant-testkit` are checked against the real macOS drivers, so the
+builders cannot drift from what cameras and operating systems write:
+
+```sh
+REVENANT_OS_FS=1 cargo test -p revenant-testkit --test os_builders -- --ignored
+```
+
+For each file system the test builds a volume with a `DCIM/100TEST` folder (a plain name, a long name, a fragmented file,
+a deleted file, a stamped modification time), places it on an MBR disk image in a temp directory, attaches it
+read-only with `hdiutil`, and compares the names, the file bytes and the modification time as the OS reads them. It also
+runs `fsck_msdos -n` / `fsck_exfat -n` on the attached partition. A second test formats an image with the OS itself
+(`hdiutil create`) to check the helper. Without `REVENANT_OS_FS=1`, off macOS, or without `/usr/bin/hdiutil`, the tests
+print `skipped: <reason>` and pass.
+
+It only ever attaches image files it created in a temp directory (`-nobrowse -noverify -noautofsck`, read-only except
+for the helper's own OS-formatted image), detaches only the device `hdiutil attach` printed for them (also on panic),
+and never calls `diskutil`, `sudo` or any real disk, so the "no real disks" rule still holds.
+
 ## Real camera samples
 
 `samples/samples.toml` lists real camera files (one each of CR2, CR3, NEF, ARW, RAF, DNG, ORF, RW2; about 84 MB, all CC0

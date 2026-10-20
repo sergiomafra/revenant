@@ -1,6 +1,7 @@
 //! Synthetic test data for Revenant: deterministic JPEGs and disk images. Nothing here touches real data.
 
 pub mod fs;
+pub mod os_fs;
 
 use std::io::Write;
 

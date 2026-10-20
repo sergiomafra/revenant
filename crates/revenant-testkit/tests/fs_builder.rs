@@ -357,11 +357,36 @@ fn exfat_entry_sets() {
         .into_iter()
         .find(|e| e[0] == 0x82)
         .unwrap();
-    assert_eq!(u64_at(&upcase, 24), 256);
+    let table_len = u64_at(&upcase, 24) as usize;
     let upcase_at = b.cluster_offset(u32_at(&upcase, 20)) as usize;
-    let table = &v[upcase_at..upcase_at + 256];
-    let want: Vec<u8> = (0..128u16).flat_map(u16::to_le_bytes).collect();
-    assert_eq!(table, &want[..], "identity up-case table");
+    let table = &v[upcase_at..upcase_at + table_len];
+    // Decompress (spec 7.2.5: 0xFFFF then a count of identity code units): it must cover the whole BMP, as the
+    // macOS driver demands, with ASCII letters upper-cased and every other unit mapped to itself.
+    let units: Vec<u16> = table
+        .chunks(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let mut full: Vec<u16> = Vec::new();
+    let mut i = 0;
+    while i < units.len() {
+        if units[i] == 0xFFFF {
+            let skip = units[i + 1] as usize;
+            full.extend((full.len()..full.len() + skip).map(|n| n as u16));
+            i += 2;
+        } else {
+            full.push(units[i]);
+            i += 1;
+        }
+    }
+    assert_eq!(full.len(), 0x10000, "up-case table covers the whole BMP");
+    for (c, &u) in full.iter().enumerate() {
+        let want = if (0x61..=0x7A).contains(&c) {
+            c - 0x20
+        } else {
+            c
+        };
+        assert_eq!(u as usize, want, "up-case of {c:#x}");
+    }
     let mut table_sum = 0u32;
     for &byte in table {
         table_sum = (if table_sum & 1 != 0 {
@@ -836,4 +861,25 @@ fn empty_exfat_file_has_no_allocation() {
     assert_eq!(u32_at(&stream, 20), 0);
     assert_eq!(u64_at(&stream, 8), 0);
     assert_eq!(u64_at(&stream, 24), 0);
+}
+
+/// exFAT NameHash is taken over the up-cased name, so "Mixed case.jpg" hashes as "MIXED CASE.JPG" (the macOS driver
+/// rejects the file name otherwise).
+#[test]
+fn exfat_name_hash_uses_the_upper_case_name() {
+    let mut b = FsBuilder::new(FsType::Exfat, 16 << 20, 32768);
+    b.add("Mixed case.jpg", &[1u8; 100]);
+    let v = b.build();
+    let root = (2..b.cluster_count() + 2)
+        .find(|&c| entries(&v, &b, c, 32768).iter().any(|e| e[0] == 0x85))
+        .expect("root directory cluster");
+    let e = entries(&v, &b, root, 32768);
+    let at = e.iter().position(|e| e[0] == 0x85).unwrap();
+    let mut hash = 0u16;
+    for byte in "MIXED CASE.JPG".encode_utf16().flat_map(u16::to_le_bytes) {
+        hash = (if hash & 1 != 0 { 0x8000u16 } else { 0 })
+            .wrapping_add(hash >> 1)
+            .wrapping_add(byte as u16);
+    }
+    assert_eq!(u16_at(&e[at + 1], 4), hash);
 }

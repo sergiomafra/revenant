@@ -13,8 +13,6 @@ const LABEL: &str = "REVENANT";
 const SERIAL: u32 = 0x1234_5678;
 /// Root entries of FAT12/16 (32 sectors).
 const FAT_ROOT_ENTRIES: u64 = 512;
-/// Up-case table entries (identity).
-const UPCASE_ENTRIES: u64 = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FsType {
@@ -351,11 +349,14 @@ fn exfat_sum16(sum: u16, byte: u8) -> u16 {
     sum.rotate_right(1).wrapping_add(byte as u16)
 }
 
-/// The identity up-case table of `UPCASE_ENTRIES` entries.
+/// The compressed up-case table (spec §7.2.5): ASCII letters map to upper case and every other BMP code unit to itself,
+/// with the long identity tail written as the `0xFFFF` marker and a skip count. A table that stops short of the whole
+/// BMP is rejected by the macOS driver ("Upper case translation table is too small").
 fn upcase_table() -> Vec<u8> {
-    (0..UPCASE_ENTRIES as u16)
-        .flat_map(u16::to_le_bytes)
-        .collect()
+    let mut units: Vec<u16> = (0..0x61).collect();
+    units.extend(0x41..=0x5A);
+    units.extend([0xFFFF, 0xFFFF - 0x7B + 1]);
+    units.into_iter().flat_map(u16::to_le_bytes).collect()
 }
 
 /// A FAT boot sector (and, on FAT32, FSInfo and the backup boot record) for `geo`.
@@ -1171,10 +1172,17 @@ impl FsBuilder {
         s[0] = 0xC0;
         s[1] = 0x01 | if node.no_fat_chain { 0x02 } else { 0 };
         s[3] = node.name.len() as u8;
-        // NameHash over the up-cased name; the up-case table is the identity.
+        // NameHash over the up-cased name (the table maps ASCII letters to upper case, see `upcase_table`).
         let hash = node
             .name
             .iter()
+            .map(|&c| {
+                if (0x61..=0x7A).contains(&c) {
+                    c - 0x20
+                } else {
+                    c
+                }
+            })
             .flat_map(|c| c.to_le_bytes())
             .fold(0u16, exfat_sum16);
         put16(s, 4, hash);
