@@ -1,5 +1,7 @@
 use assert_cmd::Command;
-use revenant_testkit::{DiskImage, Mp4Options, jpeg, mp4};
+use revenant_testkit::{
+    DiskImage, Mp4Options, TestExif, TiffRaw, TiffRawOptions, TiffVariant, jpeg, mp4, tiff_raw,
+};
 
 fn image() -> (tempfile::NamedTempFile, Vec<u8>, Vec<u8>) {
     let photo = jpeg(64, 48, 1, 0);
@@ -159,4 +161,155 @@ fn extract_failure_is_reported_per_finding_and_scan_continues() {
     }
     assert_eq!(events.last().unwrap()["event"], "summary");
     assert_eq!(events.last().unwrap()["found"], 2);
+}
+
+fn exif() -> TestExif {
+    TestExif {
+        make: Some("Acme".into()),
+        model: Some("Model X".into()),
+        lens: Some("Lens 50mm f/1.8".into()),
+        serial: Some("SN12345".into()),
+        iso: Some(400),
+        date: Some("2024:05:06 07:08:09".into()),
+    }
+}
+
+/// A CR2 with EXIF and a 320x240 preview at 8192 in a noise image.
+fn raw_image() -> (tempfile::NamedTempFile, TiffRaw) {
+    let raw = tiff_raw(&TiffRawOptions {
+        variant: TiffVariant::Cr2,
+        big_endian: false,
+        raw_len: 20_000,
+        seed: 5,
+        preview: Some((320, 240)),
+        preview_sector_aligned: false,
+        exif: exif(),
+    });
+    let mut img = DiskImage::noise(8192 + raw.bytes.len() + 8192, 11);
+    img.put(8192, &raw.bytes);
+    (img.save(), raw)
+}
+
+#[test]
+fn found_lines_carry_metadata_and_preview() {
+    let (img, raw) = raw_image();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .arg("scan")
+        .arg(img.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events = lines(&out);
+    let found: Vec<_> = events.iter().filter(|e| e["event"] == "found").collect();
+    assert_eq!(found.len(), 1, "{events:?}");
+    let f = found[0];
+    assert_eq!(f["kind"], "cr2");
+    assert_eq!(f["health"], "intact");
+    assert_eq!(f["make"], "Acme");
+    assert_eq!(f["model"], "Model X");
+    assert_eq!(f["lens"], "Lens 50mm f/1.8");
+    assert_eq!(f["serial"], "SN12345");
+    assert_eq!(f["iso"], 400);
+    assert_eq!(f["captured_at"], "2024-05-06T07:08:09");
+    // The photo's size is the raw image's (the SubIFD's 6000x4000), not the preview's.
+    assert_eq!(f["width"], 6000);
+    assert_eq!(f["height"], 4000);
+    let p = raw.preview.clone().unwrap();
+    assert_eq!(
+        f["preview"],
+        serde_json::json!({
+            "start": 8192 + p.start,
+            "len": p.len(),
+            "width": 320,
+            "height": 240,
+        })
+    );
+}
+
+#[test]
+fn unknown_details_are_omitted() {
+    let (img, _, _) = image();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .arg("scan")
+        .arg(img.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events = lines(&out);
+    let video = events.iter().find(|e| e["kind"] == "mp4").unwrap();
+    for key in ["make", "model", "lens", "serial", "iso", "preview"] {
+        assert!(video.get(key).is_none(), "{key} in {video}");
+    }
+    let photo = events.iter().find(|e| e["kind"] == "jpeg").unwrap();
+    assert!(photo.get("make").is_none(), "{photo}");
+    assert_eq!(photo["preview"]["width"], 64);
+}
+
+#[test]
+fn previews_are_written() {
+    let (img, raw) = raw_image();
+    let dest = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .arg("scan")
+        .arg(img.path())
+        .arg("--previews")
+        .arg(dest.path())
+        .arg("--allow-same-volume")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events = lines(&out);
+    let f = events.iter().find(|e| e["event"] == "found").unwrap();
+    let path = f["preview_file"].as_str().expect("preview_file field");
+    assert_eq!(
+        std::path::Path::new(path).file_name().unwrap(),
+        "revenant_000000002000.preview.jpg"
+    );
+    let written = std::fs::read(path).unwrap();
+    assert_eq!(written, raw.bytes[raw.preview.clone().unwrap()]);
+    assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn previews_to_same_volume_are_refused() {
+    let (img, _) = raw_image();
+    let dest = tempfile::tempdir().unwrap();
+    Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .arg("scan")
+        .arg(img.path())
+        .arg("--previews")
+        .arg(dest.path())
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("error: destination_on_source"));
+    assert_eq!(std::fs::read_dir(dest.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn missing_previews_folder_fails_before_scanning() {
+    let (img, _) = raw_image();
+    let dest = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .arg("scan")
+        .arg(img.path())
+        .arg("--previews")
+        .arg(dest.path().join("not-created"))
+        .arg("--allow-same-volume")
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("error: open_failed"))
+        .get_output()
+        .clone();
+    assert!(out.stdout.is_empty());
 }

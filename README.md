@@ -6,9 +6,11 @@ preview of what can be recovered before you commit, and it never writes to the c
 
 ## Status
 
-Under construction. There is no app to download yet. The recovery engine (`revenant-core`) can already find JPEG photos and
-MP4/MOV videos in a disk image (including formatted cards), classify them as intact, partial or damaged, and recover them to
-another folder. More engine work comes next (RAW formats, file systems), then a graphical app.
+Under construction. There is no app to download yet. The recovery engine (`revenant-core`) can already find JPEG photos,
+MP4/MOV videos and camera RAW photos (CR2, CR3, NEF, ARW, RAF, DNG, ORF, RW2) and HEIC in a disk image (including formatted
+cards), classify them as intact, partial or damaged, read their photo details (camera, lens, ISO, capture time) and embedded
+preview, and recover them to another folder. It is tested against real camera files as well as synthetic ones. More engine
+work comes next (speed and fragmented files, file systems, reading cards directly), then a graphical app.
 
 ## Trying the engine (developers)
 
@@ -17,8 +19,8 @@ cargo build --release -p revenant-dev
 target/release/revenant-dev scan card.img --extract ~/recovered
 ```
 
-This prints one JSON line per finding. See [crates/revenant-dev](crates/revenant-dev/README.md) for the output format and how
-to make a read-only image of a card.
+This prints one JSON line per finding, with its photo details and preview. See
+[crates/revenant-dev](crates/revenant-dev/README.md) for the output format and how to make a read-only image of a card.
 
 ## License
 

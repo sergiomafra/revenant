@@ -6,12 +6,16 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 
 ## Onde o desenvolvimento está
 
-**19/10/2026.** Módulo 1 (motor), Parte 1.1 (fundação e escultura) concluída na branch `feat/m1-p1-engine`, aguardando o
-aceite e o merge do Sérgio. Próximo: Parte 1.2 (a spec já cobre; plano a escrever). CLI de desenvolvimento: `revenant-dev`.
+**19/10/2026.** Módulo 1 (motor), Parte 1.1 (fundação e escultura) mergeada (PR #1, CI verde nas 4 arquiteturas). Parte 1.2
+(RAW e dados da foto) concluída na branch `feat/m1-p2-raw`, aguardando PR/merge; decisões e pendências em
+`docs/superpowers/history/2026-10-19-m1-p2-pendencias.md`. Próxima: 1.3 (arquivos fragmentados e velocidade). Roteiro até a
+1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`. Amostras reais de câmera (CC0,
+nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.
 
 ## Diretrizes fixas
 
 - Um módulo por vez: spec → telas → plano → subagentes. O Sérgio decide o merge.
+- Fim de parte = push + PR; o merge é do Sérgio.
 - Código e repositório em inglês (identificadores, comentários, códigos de erro, commits, READMEs, CHANGELOG). Exceções:
   este arquivo e `docs/superpowers/**` (pt-BR).
 - Documentação sempre atualizada e explicando como usar: toda tarefa que muda comportamento atualiza o README do crate e, se
@@ -21,7 +25,8 @@ aceite e o merge do Sérgio. Próximo: Parte 1.2 (a spec já cobre; plano a escr
   GPL/AGPL/LGPL/MPL de terceiros e qualquer código copiado do PhotoRec/TestDisk. O Revenant é GPL-3.0-only.
 - Erros por código: todo erro do motor tem `code() -> &'static str` em `snake_case`; nenhum texto de UI no motor.
 - Rust edição 2024, `rust-version = "1.88"`. Sem `unsafe` fora de `source/windows.rs`, cada bloco com `// SAFETY:`.
-- Testes nunca tocam dados reais nem discos físicos: só imagens sintéticas em `tempfile`. Todo teste novo é visto falhando antes.
+- Testes nunca tocam dados reais nem discos físicos: só imagens sintéticas em `tempfile`. Única exceção: o teste opcional
+  `real_samples`, que só lê as amostras CC0 baixadas para `samples/cache/`. Todo teste novo é visto falhando antes.
 - Commits em Conventional Commits, com o trailer `Co-Authored-By`. Nunca `git add -A`.
 
 ## Ambiente

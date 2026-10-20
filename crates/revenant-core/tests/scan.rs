@@ -646,3 +646,97 @@ fn nested_file_inside_a_damaged_finding_is_reported() {
         .collect();
     assert_eq!(ids, vec![1, 2]);
 }
+
+#[test]
+fn random_head_inside_mdat_does_not_cut() {
+    let video = {
+        let mut v = testkit::mp4(&Mp4Options {
+            mdat_len: 100_000,
+            moov_at_end: false,
+            ..mp4_opts(false)
+        });
+        // A JPEG-looking head (SOI + APP1) followed by bytes that form no valid segment chain, on a sector start.
+        let at = 100 * 512;
+        v[at..at + 4].copy_from_slice(&[0xFF, 0xD8, 0xFF, 0xE1]);
+        v[at + 4..at + 16].copy_from_slice(&[0x5A; 12]);
+        v
+    };
+    let mut img = DiskImage::noise(2 * MIB, 41);
+    img.put(MIB, &video);
+    let events = scan_image(&img);
+    assert_eq!(
+        findings(&events),
+        vec![(
+            MIB as u64,
+            video.len() as u64,
+            FileKind::Mp4,
+            Health::Intact
+        )]
+    );
+}
+
+#[test]
+fn photo_over_motion_jpeg_mdat_is_still_found() {
+    // Motion-JPEG video whose index lists one chunk; a real photo written at a sector start that is not a chunk.
+    let photo = testkit::jpeg(64, 64, 42, 2000);
+    let mut payload = vec![0x11u8; 484];
+    payload.extend_from_slice(&photo);
+    payload.resize(payload.len() + 3000, 0x22);
+    let video = testkit::mp4_with(
+        &Mp4Options {
+            mov: true,
+            ..mp4_opts(true)
+        },
+        b"mjpa",
+        &payload,
+        &[0],
+    );
+    let mut img = DiskImage::noise(2 * MIB, 43);
+    img.put(MIB, &video);
+    let events = scan_image(&img);
+    assert_eq!(
+        findings(&events),
+        vec![
+            (MIB as u64, 512, FileKind::Mov, Health::Damaged),
+            (
+                MIB as u64 + 512,
+                photo.len() as u64,
+                FileKind::Jpeg,
+                Health::Intact
+            ),
+        ]
+    );
+}
+
+#[test]
+fn raw_photo_among_other_files_hides_its_own_preview_only() {
+    let before = testkit::jpeg(64, 64, 21, 0);
+    let raw = testkit::tiff_raw(&testkit::TiffRawOptions {
+        variant: testkit::TiffVariant::Cr2,
+        big_endian: false,
+        raw_len: 200_000,
+        seed: 22,
+        preview: Some((160, 120)),
+        preview_sector_aligned: true,
+        exif: testkit::TestExif::default(),
+    });
+    let after = testkit::jpeg(64, 64, 23, 0);
+    let raw_at = 2 * MIB;
+    let after_at = (raw_at + raw.bytes.len()).div_ceil(512) * 512;
+    let file = DiskImage::noise(4 * MIB, 24)
+        .put(MIB, &before)
+        .put(raw_at, &raw.bytes)
+        .put(after_at, &after)
+        .save();
+    let source = FileSource::open(file.path()).unwrap();
+    let (r, events) = run(&source, &ScanOptions::default());
+    assert_eq!(r.unwrap().found, 3);
+    assert_eq!(
+        found(&events),
+        vec![
+            (MIB as u64, FileKind::Jpeg, Health::Intact),
+            (raw_at as u64, FileKind::Cr2, Health::Intact),
+            (after_at as u64, FileKind::Jpeg, Health::Intact),
+        ]
+    );
+}

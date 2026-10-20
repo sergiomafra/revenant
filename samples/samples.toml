@@ -1,0 +1,66 @@
+# Real camera files for the opt-in real-samples test (crates/revenant-core/tests/real_samples.rs).
+#
+# Every file comes from raw.pixls.us, whose samples are released under CC0 1.0 (public domain dedication); the site marks
+# each sample's license and every one below is marked CC0. These files are test DATA: they are never committed. Run
+# `scripts/fetch-samples.sh` to download them into `samples/cache/` (gitignored); it checks each SHA-256.
+#
+# Fields: `name` = file name in the cache, `kind` = the engine's expected kind (`FileKind::as_str`), `url`, `sha256`,
+# `license`. Keep this file in the simple `key = "value"` form: the script and the test read it without a TOML parser.
+#
+# No HEIC: raw.pixls.us has none, and no other HEIC sample with a verifiable CC0/public-domain license was found.
+
+[[sample]]
+name = "canon-eos-kiss-f.cr2"
+kind = "cr2"
+url = "https://raw.pixls.us/getfile.php/6457/nice/Canon%20-%20EOS%20Kiss%20F%20-%20RAW%20(3:2).CR2"
+sha256 = "12402b46f3cfaa66a671c7b6524c741dd17d6a2add3bc6cc41dcaf1570b0e722"
+license = "CC0 1.0 (raw.pixls.us, https://creativecommons.org/publicdomain/zero/1.0/)"
+
+[[sample]]
+name = "canon-eos-r6.cr3"
+kind = "cr3"
+url = "https://raw.pixls.us/getfile.php/4659/nice/Canon%20-%20EOS%20R6%20-%203:2.CR3"
+sha256 = "74abb0a113d075ad9887a058082f40dd2a938c4813a08474d82356f11a027778"
+license = "CC0 1.0 (raw.pixls.us, https://creativecommons.org/publicdomain/zero/1.0/)"
+
+[[sample]]
+name = "nikon-z6.nef"
+kind = "nef"
+url = "https://raw.pixls.us/getfile.php/3587/nice/Nikon%20-%20Z%206%20-%2012bit%2012bit%20compressed%20(3:2).NEF"
+sha256 = "f0ab08da469ee205f2bc08efd9005778c64cdcb064893cee03768e32e5da1a36"
+license = "CC0 1.0 (raw.pixls.us, https://creativecommons.org/publicdomain/zero/1.0/)"
+
+[[sample]]
+name = "sony-ilce-7s.arw"
+kind = "arw"
+url = "https://raw.pixls.us/getfile.php/1582/nice/Sony%20-%20ILCE-7S%20-%2014bit%2014bit%20compressed%20(3:2).ARW"
+sha256 = "a35ebb2fbec929daa5beb20d1ce5c15a8aac7b1a7a231455387f3df8a7442e07"
+license = "CC0 1.0 (raw.pixls.us, https://creativecommons.org/publicdomain/zero/1.0/)"
+
+[[sample]]
+name = "fujifilm-x-s10.raf"
+kind = "raf"
+url = "https://raw.pixls.us/getfile.php/4190/nice/Fujifilm%20-%20X-S10%20-%2014bit%2014bit%20compressed%20(3:2).RAF"
+sha256 = "9419d1408ebf850395e5dd563beb96309466546252caf541466034c9cb7e9724"
+license = "CC0 1.0 (raw.pixls.us, https://creativecommons.org/publicdomain/zero/1.0/)"
+
+[[sample]]
+name = "pentax-k-r.dng"
+kind = "dng"
+url = "https://raw.pixls.us/getfile.php/8172/nice/Pentax%20-%20K-r%20-%2012bit%20(3:2).DNG"
+sha256 = "adc5c155341543e2e5c6de9c0ce87c86cc4629fe90a0f6e68fdf685dcd531b64"
+license = "CC0 1.0 (raw.pixls.us, https://creativecommons.org/publicdomain/zero/1.0/)"
+
+[[sample]]
+name = "om-system-tg-7.orf"
+kind = "orf"
+url = "https://raw.pixls.us/getfile.php/6946/nice/OM%20System%20-%20TG-7%20-%2016bit%20(4:3).ORF"
+sha256 = "4f7344c67bfcfcfec45f754195ba612fc2ad6312f5fab87812bf04b9e9e7d46a"
+license = "CC0 1.0 (raw.pixls.us, https://creativecommons.org/publicdomain/zero/1.0/)"
+
+[[sample]]
+name = "panasonic-dmc-lx7.rw2"
+kind = "rw2"
+url = "https://raw.pixls.us/getfile.php/7010/nice/Panasonic%20-%20DMC-LX7%20-%203:2.RW2"
+sha256 = "18dfc3877e944020299635a8c2fad61fca2485b1c9b67645a495ee870a86e599"
+license = "CC0 1.0 (raw.pixls.us, https://creativecommons.org/publicdomain/zero/1.0/)"

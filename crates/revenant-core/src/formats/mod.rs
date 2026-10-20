@@ -5,11 +5,15 @@
 //! cannot be read is re-read sector by sector; unreadable sectors read as zeros and are remembered, so a read error never
 //! ends a walk early (only the end of the source does) and the detector can lower the file's health instead.
 
-mod isobmff;
-mod jpeg;
+pub(crate) mod isobmff;
+pub(crate) mod jpeg;
+pub(crate) mod raf;
+mod tiffraw;
 
 pub use isobmff::{IsoBmff, MOOV_MAX_LEN};
 pub use jpeg::{JPEG_MAX_LEN, Jpeg};
+pub use raf::Raf;
+pub use tiffraw::TiffRaw;
 
 use crate::source::Source;
 
@@ -19,15 +23,59 @@ pub enum FileKind {
     Jpeg,
     Mp4,
     Mov,
+    Cr2,
+    Nef,
+    Arw,
+    Dng,
+    Orf,
+    Rw2,
+    /// Fujifilm RAW.
+    Raf,
+    /// Canon CR3 (ISO BMFF with major brand `crx `).
+    Cr3,
+    /// HEIC/HEIF photo (ISO BMFF without a video `moov`).
+    Heic,
+    /// A TIFF that is not a recognizable camera RAW.
+    Tiff,
 }
 
 impl FileKind {
+    /// Stable lowercase identifier (`"jpeg"`, `"mp4"`, `"mov"`, `"cr2"`, ..., `"heic"`, `"tiff"`), for machine-readable
+    /// output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileKind::Jpeg => "jpeg",
+            FileKind::Mp4 => "mp4",
+            FileKind::Mov => "mov",
+            FileKind::Cr2 => "cr2",
+            FileKind::Nef => "nef",
+            FileKind::Arw => "arw",
+            FileKind::Dng => "dng",
+            FileKind::Orf => "orf",
+            FileKind::Rw2 => "rw2",
+            FileKind::Raf => "raf",
+            FileKind::Cr3 => "cr3",
+            FileKind::Heic => "heic",
+            FileKind::Tiff => "tiff",
+        }
+    }
+
     /// Conventional file extension, without the dot.
     pub fn extension(self) -> &'static str {
         match self {
             FileKind::Jpeg => "jpg",
             FileKind::Mp4 => "mp4",
             FileKind::Mov => "mov",
+            FileKind::Cr2 => "cr2",
+            FileKind::Nef => "nef",
+            FileKind::Arw => "arw",
+            FileKind::Dng => "dng",
+            FileKind::Orf => "orf",
+            FileKind::Rw2 => "rw2",
+            FileKind::Raf => "raf",
+            FileKind::Cr3 => "cr3",
+            FileKind::Heic => "heic",
+            FileKind::Tiff => "tif",
         }
     }
 }
@@ -59,6 +107,11 @@ pub trait Format: Send + Sync {
     /// `head`: up to 16 bytes read at a sector start.
     fn recognizes(&self, head: &[u8]) -> bool;
 
+    /// Header-level validation at `start` (cheap, never recursive, never measures the whole file): true when a real file
+    /// of this format plausibly starts here. Used to decide that "another file starts here", so a stray byte pattern
+    /// that merely looks like a signature cannot cut a file.
+    fn confirms(&self, source: &dyn Source, start: u64) -> bool;
+
     /// Measures the file starting at `start`. `None` means "not a file of this format", never "could not read": an
     /// unreadable sector inside a file lowers its health instead (see [`Health`]).
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement>;
@@ -66,7 +119,12 @@ pub trait Format: Send + Sync {
 
 /// Every supported format.
 pub fn all_formats() -> Vec<Box<dyn Format>> {
-    vec![Box::new(Jpeg), Box::new(IsoBmff)]
+    vec![
+        Box::new(Jpeg),
+        Box::new(IsoBmff),
+        Box::new(TiffRaw),
+        Box::new(Raf),
+    ]
 }
 
 /// Bytes of a sector start shown to [`Format::recognizes`].
@@ -166,10 +224,13 @@ impl<'a> Reader<'a> {
         (head, n)
     }
 
-    /// Whether a recognized file of any format starts at `pos`.
+    /// Whether a file of any format starts at `pos`: some format recognizes the head and confirms its header.
     pub(crate) fn file_starts_at(&mut self, formats: &[Box<dyn Format>], pos: u64) -> bool {
         let (head, n) = self.head(pos);
-        formats.iter().any(|f| f.recognizes(&head[..n]))
+        let source = self.source;
+        formats
+            .iter()
+            .any(|f| f.recognizes(&head[..n]) && f.confirms(source, pos))
     }
 
     /// Whether an unreadable sector seen so far overlaps `[start, end)`.
