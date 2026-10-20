@@ -256,9 +256,12 @@ impl Commit<'_, '_> {
     /// Keeps the `moov` candidates of a block just examined (each header ends in it, so every finding that could hold
     /// it has been added): drops those whose header overlaps a committed skip range (those blocks may not have been
     /// read at all, so keeping them would depend on timing) or that lie inside a non-`Damaged` ISO BMFF finding.
-    fn keep_moovs(&mut self, found: Vec<(u64, u64)>, capped: bool) {
-        self.capped |= capped;
+    ///
+    /// The per-block cap counts only for a block that committed skip ranges do not wholly cover: such a block may or may
+    /// not have been read (timing), and every candidate in it is dropped anyway.
+    fn keep_moovs(&mut self, (pos, end): (u64, u64), found: Vec<(u64, u64)>, capped: bool) {
         let skips = pipeline::lock(&self.shared.skips);
+        self.capped |= capped && !skips.covers(pos, end);
         for (q, size) in found {
             if skips.overlaps(q, q + MOOV_HEAD) || self.own_moovs.overlaps(q, q + 1) {
                 continue;
@@ -520,9 +523,10 @@ pub fn scan(
                 break;
             };
             let read = b.end;
-            let (moovs, capped) = (std::mem::take(&mut b.moovs), b.moovs_capped);
+            let (span, moovs, capped) =
+                ((b.pos, b.end), std::mem::take(&mut b.moovs), b.moovs_capped);
             commit.block(b)?;
-            commit.keep_moovs(moovs, capped);
+            commit.keep_moovs(span, moovs, capped);
             // A `moov` header may start up to 15 bytes before the next block: keep the ranges that could still overlap it.
             let keep_from = read.saturating_sub(MOOV_HEAD);
             shared.prune_skips(keep_from);

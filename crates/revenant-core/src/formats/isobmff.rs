@@ -691,11 +691,110 @@ pub(crate) enum Check {
 /// Most samples [`track_samples`] lists for one `moov` (all tracks together).
 pub(crate) const MAX_SAMPLES: usize = 4_000_000;
 
-/// Per track of a `moov` payload: its check (`None` = not checkable: audio, other codecs) and its samples sorted by
-/// offset, from `stsz`/`stsc`/`stco`|`co64`. A `trak` without an `stbl` lists nothing. `None` for the whole `moov` when its
-/// boxes are garbled, a sample table is truncated or inconsistent (the chunks do not hold exactly the samples `stsz`
-/// lists), or there are more than [`MAX_SAMPLES`] samples.
-pub(crate) fn track_samples(moov: &[u8]) -> Option<Vec<(Option<Check>, Vec<Sample>)>> {
+/// The sample tables of one track, validated (present, not truncated, the chunks holding exactly the samples `stsz`
+/// lists) but not expanded: nothing here is allocated by a count read from the file.
+pub(crate) struct IndexTrack<'a> {
+    /// `None` = not checkable (audio, other codecs).
+    pub check: Option<Check>,
+    /// Samples `stsz` lists.
+    pub count: usize,
+    /// Fixed sample size, or 0 for a table.
+    fixed: u64,
+    /// The `stsz` payload.
+    stsz: &'a [u8],
+    /// The `stco`/`co64` payload, its entry count and width.
+    chunks: &'a [u8],
+    n_chunks: usize,
+    wide: bool,
+    /// The `stsc` payload and its entry count.
+    stsc: &'a [u8],
+    runs: usize,
+}
+
+impl IndexTrack<'_> {
+    fn size(&self, i: usize) -> u64 {
+        if self.fixed != 0 {
+            self.fixed
+        } else {
+            u64::from(be32(&self.stsz[12 + 4 * i..]))
+        }
+    }
+
+    fn chunk(&self, i: usize) -> u64 {
+        let e = &self.chunks[8 + if self.wide { 8 } else { 4 } * i..];
+        if self.wide {
+            be64(e)
+        } else {
+            u64::from(be32(e))
+        }
+    }
+
+    fn run(&self, i: usize) -> (u64, u64) {
+        let e = &self.stsc[8 + 12 * i..];
+        (u64::from(be32(e)), u64::from(be32(&e[4..])))
+    }
+
+    /// Calls `f(chunk offset, samples in it)` for every chunk, in table order: `O(chunks + runs)`.
+    fn for_each_chunk(&self, mut f: impl FnMut(u64, u64)) {
+        let mut r = 0usize;
+        for c in 0..self.n_chunks {
+            let n = c as u64 + 1;
+            while r + 1 < self.runs && self.run(r + 1).0 <= n {
+                r += 1;
+            }
+            let per_chunk = if self.runs > 0 && self.run(r).0 <= n {
+                self.run(r).1
+            } else {
+                0
+            };
+            f(self.chunk(c), per_chunk);
+        }
+    }
+
+    /// `(lowest sample offset, highest sample end)`, without listing the samples; `None` for an empty track or an end
+    /// past `u64`. Costs `O(chunks + runs)` with a fixed sample size, else `O(samples)` over the `stsz` table itself.
+    pub(crate) fn bounds(&self) -> Option<(u64, u64)> {
+        let (mut lo, mut hi, mut next, mut ok) = (u64::MAX, 0u64, 0usize, true);
+        self.for_each_chunk(|at, n| {
+            if n == 0 || !ok {
+                return;
+            }
+            let len = if self.fixed != 0 {
+                self.fixed.checked_mul(n)
+            } else {
+                (next..next + n as usize).try_fold(0u64, |acc, i| acc.checked_add(self.size(i)))
+            };
+            next += n as usize;
+            match len.and_then(|l| at.checked_add(l)) {
+                Some(end) => {
+                    lo = lo.min(at);
+                    hi = hi.max(end);
+                }
+                None => ok = false,
+            }
+        });
+        (ok && lo != u64::MAX).then_some((lo, hi))
+    }
+
+    /// The samples, sorted by offset (allocates `count` entries).
+    pub(crate) fn samples(&self) -> Vec<Sample> {
+        let mut samples = Vec::with_capacity(self.count);
+        self.for_each_chunk(|mut at, n| {
+            for _ in 0..n {
+                let size = self.size(samples.len());
+                samples.push(Sample { offset: at, size });
+                at = at.saturating_add(size);
+            }
+        });
+        samples.sort_unstable_by_key(|s| s.offset);
+        samples
+    }
+}
+
+/// The validated sample tables of every track of a `moov` payload (a `trak` without an `stbl` is skipped). `None` for
+/// the whole `moov` when its boxes are garbled, a sample table is missing, truncated or inconsistent, or the tracks
+/// list more than [`MAX_SAMPLES`] samples in total. Allocates one entry per track, never per sample.
+pub(crate) fn index_tracks(moov: &[u8]) -> Option<Vec<IndexTrack<'_>>> {
     let mut garbled = false;
     let mut out = Vec::new();
     let mut total = 0usize;
@@ -715,82 +814,69 @@ pub(crate) fn track_samples(moov: &[u8]) -> Option<Vec<(Option<Check>, Vec<Sampl
         } else {
             None
         };
-        let samples = stbl_samples(stbl, &mut garbled, MAX_SAMPLES - total)?;
-        total += samples.len();
-        out.push((check, samples));
+        let track = stbl_tables(stbl, &mut garbled, check)?;
+        total = total
+            .checked_add(track.count)
+            .filter(|&t| t <= MAX_SAMPLES)?;
+        out.push(track);
     }
     (!garbled).then_some(out)
 }
 
-/// The samples of one `stbl`, sorted by offset; `None` if a table is missing, truncated or inconsistent, or there are
-/// more than `max` samples.
-fn stbl_samples(stbl: &[u8], garbled: &mut bool, max: usize) -> Option<Vec<Sample>> {
+/// Per track of a `moov` payload: its check (`None` = not checkable: audio, other codecs) and its samples sorted by
+/// offset, from `stsz`/`stsc`/`stco`|`co64` (see [`index_tracks`] for when it is `None`). The pairing lists only the
+/// checkable tracks, after its filters, through [`IndexTrack::samples`]; this is the whole listing, for tests.
+#[cfg(test)]
+pub(crate) fn track_samples(moov: &[u8]) -> Option<Vec<(Option<Check>, Vec<Sample>)>> {
+    Some(
+        index_tracks(moov)?
+            .iter()
+            .map(|t| (t.check, t.samples()))
+            .collect(),
+    )
+}
+
+/// The tables of one `stbl`; `None` if one is missing or truncated, or the chunks do not hold exactly the samples
+/// `stsz` lists.
+fn stbl_tables<'a>(
+    stbl: &'a [u8],
+    garbled: &mut bool,
+    check: Option<Check>,
+) -> Option<IndexTrack<'a>> {
     let stsz = child(stbl, b"stsz", garbled)?;
     let fixed = u64::from(be32(stsz.get(4..8)?));
     let count = be32(stsz.get(8..12)?) as usize;
-    if count > max || (fixed == 0 && stsz.len() < 12 + 4 * count) {
+    if count > MAX_SAMPLES || (fixed == 0 && stsz.len() < 12 + 4 * count) {
         return None;
     }
-    let size = |i: usize| {
-        if fixed != 0 {
-            fixed
-        } else {
-            u64::from(be32(&stsz[12 + 4 * i..]))
-        }
-    };
-    let (table, wide) = match child(stbl, b"stco", garbled) {
+    let (chunks, wide) = match child(stbl, b"stco", garbled) {
         Some(p) => (p, false),
         None => (child(stbl, b"co64", garbled)?, true),
     };
-    let entry = if wide { 8 } else { 4 };
-    let chunks = be32(table.get(4..8)?) as usize;
-    if table.len() < 8 + entry * chunks {
+    let n_chunks = be32(chunks.get(4..8)?) as usize;
+    if chunks.len() < 8 + if wide { 8 } else { 4 } * n_chunks {
         return None;
     }
-    let chunk = |i: usize| {
-        let e = &table[8 + entry * i..];
-        if wide { be64(e) } else { u64::from(be32(e)) }
-    };
-    // stsc: (first chunk, samples per chunk, description index), first chunks ascending from 1.
     let stsc = child(stbl, b"stsc", garbled)?;
     let runs = be32(stsc.get(4..8)?) as usize;
     if stsc.len() < 8 + 12 * runs {
         return None;
     }
-    let run = |i: usize| {
-        let e = &stsc[8 + 12 * i..];
-        (u64::from(be32(e)), u64::from(be32(&e[4..])))
+    let t = IndexTrack {
+        check,
+        count,
+        fixed,
+        stsz,
+        chunks,
+        n_chunks,
+        wide,
+        stsc,
+        runs,
     };
-    let mut samples = Vec::with_capacity(count);
-    let mut r = 0usize;
-    for c in 0..chunks {
-        let n = c as u64 + 1;
-        while r + 1 < runs && run(r + 1).0 <= n {
-            r += 1;
-        }
-        let per_chunk = if runs > 0 && run(r).0 <= n {
-            run(r).1
-        } else {
-            0
-        };
-        let mut at = chunk(c);
-        for _ in 0..per_chunk {
-            if samples.len() == count {
-                return None; // the chunks hold more samples than stsz lists
-            }
-            let s = size(samples.len());
-            samples.push(Sample {
-                offset: at,
-                size: s,
-            });
-            at = at.checked_add(s)?;
-        }
-    }
-    if samples.len() != count {
-        return None;
-    }
-    samples.sort_unstable_by_key(|s| s.offset);
-    Some(samples)
+    // The chunks must hold exactly `count` samples (summed without listing them).
+    let mut held = 0u64;
+    t.for_each_chunk(|_, n| held = held.saturating_add(n));
+    (held == count as u64).then_some(t)
 }
 
 /// The check for the first sample entry of an `stsd` payload: `avc1`/`avc3` with an `avcC`, `hvc1`/`hev1` with an `hvcC`
@@ -1155,6 +1241,14 @@ mod tests {
         assert!(s.windows(2).all(|w| w[0].offset + w[0].size == w[1].offset));
         assert_eq!(s[9].offset + s[9].size, v.mdat_payload.end as u64);
         assert!(s.iter().all(|x| (2048..=24 * 1024).contains(&x.size)));
+        // The bounds, from the tables alone, match the listing.
+        let moov = &v.bytes[v.moov.start + 8..v.moov.end];
+        let t = index_tracks(moov).unwrap();
+        assert_eq!(t[0].count, 10);
+        assert_eq!(
+            t[0].bounds(),
+            Some((v.mdat_payload.start as u64, v.mdat_payload.end as u64))
+        );
     }
 
     /// The `moov` payload of `v` with 4 bytes at `delta` past the `kind` box type replaced by `value`.

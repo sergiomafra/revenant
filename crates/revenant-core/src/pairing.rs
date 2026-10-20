@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use crate::cache::{CACHE_WINDOW, CachedSource};
 use crate::formats::isobmff::{
-    Check, MOOV_MAX_LEN, child, index_health, moovless_layout, track_samples,
+    Check, MOOV_MAX_LEN, child, index_health, index_tracks, moovless_layout,
 };
 use crate::formats::{Fragment, Health, Reader, SECTOR};
 use crate::scan::{CancelToken, Finding};
@@ -20,6 +20,9 @@ use crate::source::Source;
 
 /// Most `moov` bytes loaded per scan, counted in whole cache windows (what a load may read from the source).
 pub(crate) const MOOV_LOAD_BUDGET: u64 = 1 << 30;
+/// Most samples listed (allocated and sorted) per scan, all `moov`s together, charged from the `stsz` counts before
+/// listing (ruling Q11).
+pub(crate) const SAMPLE_BUDGET: u64 = 16_000_000;
 /// Most (video, `moov`) pairs that pass the arithmetic filter and are checked.
 const MAX_PAIRS: usize = 256;
 /// Fewest checkable samples an index must list.
@@ -84,15 +87,48 @@ struct Pass {
     finding: Finding,
 }
 
+/// The bounds of one pairing run (the constants above; tests lower some of them).
+#[derive(Clone, Copy)]
+struct Limits {
+    load_budget: u64,
+    sample_budget: u64,
+    max_pairs: usize,
+    max_breaks: u64,
+    max_steps: u64,
+}
+
+const LIMITS: Limits = Limits {
+    load_budget: MOOV_LOAD_BUDGET,
+    sample_budget: SAMPLE_BUDGET,
+    max_pairs: MAX_PAIRS,
+    max_breaks: MAX_BREAKS,
+    max_steps: MAX_STEPS,
+};
+
 /// Work counter shared by the checks of one run.
-struct Steps(u64);
+struct Steps {
+    used: u64,
+    max: u64,
+}
 
 impl Steps {
     /// Counts one step; `false` once the run's budget is spent.
     fn take(&mut self) -> bool {
-        self.0 += 1;
-        self.0 <= MAX_STEPS
+        self.used += 1;
+        self.used <= self.max
     }
+
+    fn spent(&self) -> bool {
+        self.used > self.max
+    }
+}
+
+/// What one run has left of its budgets, and whether a bound was hit.
+struct Budget {
+    load: u64,
+    samples: u64,
+    /// No bound was hit: every candidate the filters let through was checked.
+    complete: bool,
 }
 
 /// Damaged moov-less videos × orphan `moov` boxes (start, declared size, as the scan saw them) → the reassembled findings (same ids, in the order of `videos`),
@@ -102,13 +138,25 @@ impl Steps {
 /// Returns nothing once `cancel` is seen (checked before each `moov` and each pair, and while a pair tries its break
 /// points). A video with two or more passing `moov`s, or a `moov` passing for two or more videos, pairs with none of
 /// them. A reassembled video is `Intact` only when exactly one break point passed and no bound was hit (the load budget,
-/// the pair cap or the step budget: an unchecked pair might have passed too); otherwise at most `Partial`.
+/// the sample budget, the pair cap or the step budget: an unchecked pair might have passed too); otherwise at most
+/// `Partial`.
 pub(crate) fn pair_videos(
     source: &CachedSource,
     videos: &[Finding],
     moovs: &[(u64, u64)],
     cancel: &CancelToken,
 ) -> Vec<Finding> {
+    pair_with(source, videos, moovs, cancel, LIMITS).0
+}
+
+/// [`pair_videos`] under `limits`; also returns the sample-check steps used.
+fn pair_with(
+    source: &CachedSource,
+    videos: &[Finding],
+    moovs: &[(u64, u64)],
+    cancel: &CancelToken,
+    limits: Limits,
+) -> (Vec<Finding>, u64) {
     let mut r = Reader::new(source);
     let vids: Vec<Video> = videos
         .iter()
@@ -125,38 +173,40 @@ pub(crate) fn pair_videos(
         .collect();
     // `(q − P) ≡ 0 (mod 512)` needs only `q` and each video's `P`: candidates no video can take are never loaded.
     let residues: HashSet<u64> = vids.iter().map(|v| v.p % SECTOR).collect();
-    let mut budget = MOOV_LOAD_BUDGET;
-    let mut complete = true;
+    let mut budget = Budget {
+        load: limits.load_budget,
+        samples: limits.sample_budget,
+        complete: true,
+    };
     let mut pairs = 0usize;
-    let mut steps = Steps(0);
+    let mut steps = Steps {
+        used: 0,
+        max: limits.max_steps,
+    };
     let mut passed: Vec<Pass> = Vec::new();
     'moovs: for (mi, &(q, size)) in moovs.iter().enumerate() {
         if cancel.is_cancelled() {
-            return Vec::new();
+            return (Vec::new(), steps.used);
         }
         if !residues.contains(&(q % SECTOR)) {
             continue;
         }
-        let Some(m) = load_moov(source, q, size, &mut budget, &mut complete) else {
+        let Some(m) = load_moov(source, q, size, &vids, &mut budget) else {
             continue;
         };
         for (vi, v) in vids.iter().enumerate() {
-            let fits = q.wrapping_sub(v.p).is_multiple_of(SECTOR)
-                && v.payload <= m.c_min
-                && m.c_min < v.payload + FIRST_CHUNK_SLACK
-                && m.c_end <= v.p;
-            if !fits {
+            if !fits(v, q, m.c_min, m.c_end) {
                 continue;
             }
-            if pairs == MAX_PAIRS || steps.0 > MAX_STEPS {
-                complete = false;
+            if pairs == limits.max_pairs || steps.spent() {
+                budget.complete = false;
                 break 'moovs;
             }
             pairs += 1;
             if cancel.is_cancelled() {
-                return Vec::new();
+                return (Vec::new(), steps.used);
             }
-            if let Some(finding) = try_pair(source, v, &m, &mut steps, cancel) {
+            if let Some(finding) = try_pair(source, v, &m, &mut steps, limits.max_breaks, cancel) {
                 passed.push(Pass {
                     video: vi,
                     moov: mi,
@@ -166,11 +216,9 @@ pub(crate) fn pair_videos(
         }
     }
     if cancel.is_cancelled() {
-        return Vec::new();
+        return (Vec::new(), steps.used);
     }
-    if steps.0 > MAX_STEPS {
-        complete = false;
-    }
+    let complete = budget.complete && !steps.spent();
     let mut out: Vec<(usize, Finding)> = passed
         .iter()
         .filter(|p| {
@@ -186,30 +234,40 @@ pub(crate) fn pair_videos(
         })
         .collect();
     out.sort_by_key(|(v, _)| *v);
-    out.into_iter().map(|(_, f)| f).collect()
+    (out.into_iter().map(|(_, f)| f).collect(), steps.used)
 }
 
-/// Loads and parses the `moov` box at `q` of the declared `size`, charging the cache windows it spans to `budget` (a
-/// candidate past the budget is dropped and clears `complete`). `None` when it is not a usable index: past the source,
-/// unreadable, garbled, without `mvhd` or `trak`, with an unusable sample table, or with fewer than [`MIN_SAMPLES`]
-/// checkable samples.
+/// The arithmetic filter: the second piece starts on a sector boundary, the index's first sample sits within
+/// [`FIRST_CHUNK_SLACK`] of the start of the `mdat` payload and its last one ends by `P`.
+fn fits(v: &Video, q: u64, c_min: u64, c_end: u64) -> bool {
+    q.wrapping_sub(v.p).is_multiple_of(SECTOR)
+        && v.payload <= c_min
+        && c_min < v.payload + FIRST_CHUNK_SLACK
+        && c_end <= v.p
+}
+
+/// Loads and parses the `moov` box at `q` of the declared `size`. The cache windows it spans are charged to the load
+/// budget first, then (only when some video in `vids` passes the arithmetic filter, judged from the tables without
+/// listing a sample) the checkable tracks' sample counts to the sample budget; a candidate past either budget is dropped
+/// and clears `complete`. `None` when it is not a usable index: past the source, unreadable, garbled, without `mvhd` or
+/// `trak`, with an unusable sample table, with fewer than [`MIN_SAMPLES`] checkable samples, or that no video fits.
 fn load_moov(
     source: &CachedSource,
     q: u64,
     size: u64,
-    budget: &mut u64,
-    complete: &mut bool,
+    vids: &[Video],
+    budget: &mut Budget,
 ) -> Option<Moov> {
     if !(24..=MOOV_MAX_LEN + 8).contains(&size) || q.checked_add(size)? > source.len() {
         return None;
     }
     let window = CACHE_WINDOW as u64;
     let cost = (q + size).div_ceil(window) * window - q / window * window;
-    if cost > *budget {
-        *complete = false;
+    if cost > budget.load {
+        budget.complete = false;
         return None;
     }
-    *budget -= cost;
+    budget.load -= cost;
     let mut r = Reader::new(source);
     let payload = r.load_box(q + 8, size - 8);
     if r.bad_in(q, q + size) || !source.bad_runs(q, q + size).is_empty() {
@@ -221,32 +279,40 @@ fn load_moov(
     if garbled || !has_mvhd || !has_trak {
         return None;
     }
-    let tracks = track_samples(&payload)?;
-    let c_min = tracks
+    let tracks = index_tracks(&payload)?;
+    let mut bounds = (u64::MAX, 0u64);
+    for t in &tracks {
+        if t.count > 0 {
+            let (lo, hi) = t.bounds()?;
+            bounds = (bounds.0.min(lo), bounds.1.max(hi));
+        }
+    }
+    let (c_min, c_end) = bounds;
+    let checkable: u64 = tracks
         .iter()
-        .flat_map(|t| t.1.first())
-        .map(|s| s.offset)
-        .min()?;
-    let c_end = tracks
-        .iter()
-        .flat_map(|t| t.1.iter())
-        .map(|s| s.offset.saturating_add(s.size))
-        .max()?;
-    let mut items: Vec<Item> = tracks
-        .iter()
-        .filter_map(|(check, samples)| check.map(|c| (c, samples)))
-        .flat_map(|(check, samples)| {
-            samples.iter().map(move |s| Item {
+        .filter(|t| t.check.is_some())
+        .map(|t| t.count as u64)
+        .sum();
+    if checkable < MIN_SAMPLES as u64 || !vids.iter().any(|v| fits(v, q, c_min, c_end)) {
+        return None;
+    }
+    if checkable > budget.samples {
+        budget.complete = false;
+        return None;
+    }
+    budget.samples -= checkable;
+    let mut items: Vec<Item> = Vec::with_capacity(checkable as usize);
+    for t in &tracks {
+        if let Some(check) = t.check {
+            items.extend(t.samples().iter().map(|s| Item {
                 offset: s.offset,
                 size: u32::try_from(s.size).unwrap_or(u32::MAX),
                 check,
-            })
-        })
-        .collect();
-    if items.len() < MIN_SAMPLES {
-        return None;
+            }));
+        }
     }
     items.sort_unstable_by_key(|i| i.offset);
+    drop(tracks);
     Some(Moov {
         q,
         size,
@@ -375,6 +441,7 @@ fn try_pair(
     v: &Video,
     m: &Moov,
     steps: &mut Steps,
+    max_breaks: u64,
     cancel: &CancelToken,
 ) -> Option<Finding> {
     let s = v.finding.start;
@@ -427,8 +494,8 @@ fn try_pair(
     }
     let count = (last - first) / SECTOR + 1;
     let mut passing = Vec::new();
-    for j in 0..count.min(MAX_BREAKS) {
-        if cancel.is_cancelled() || steps.0 > MAX_STEPS {
+    for j in 0..count.min(max_breaks) {
+        if cancel.is_cancelled() || steps.spent() {
             return None;
         }
         let l1 = first + j * SECTOR;
@@ -442,7 +509,7 @@ fn try_pair(
         }
     }
     let &l1 = passing.first()?;
-    let ambiguous = passing.len() > 1 || count > MAX_BREAKS;
+    let ambiguous = passing.len() > 1 || count > max_breaks;
 
     let g = m.q.checked_add(l1)?.checked_sub(v.p)?;
     let second_len = v.p - l1 + m.size;
@@ -484,6 +551,112 @@ fn try_pair(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::formats::FileKind;
+    use crate::formats::tests::Mem;
+    use revenant_testkit::{AvcOptions, AvcVideo, avc_video};
+
+    const MIB: usize = 1 << 20;
+
+    fn video(seed: u64, mdat_pad: usize) -> AvcVideo {
+        avc_video(&AvcOptions {
+            samples: 120,
+            seed,
+            mov: false,
+            mdat_pad,
+            small_nals: true,
+        })
+    }
+
+    /// Two videos padded so both moovs would sit at the same `P` (each index fits both videos), split at 2/5: first
+    /// pieces at 1 and 4 MiB, second pieces at 10 MiB (v2) and 16 MiB (v1). Returns the image, the two Damaged
+    /// findings and the moov candidates in offset order (v2's, then v1's).
+    fn siblings() -> (Mem, Vec<Finding>, Vec<(u64, u64)>) {
+        let bare = |seed| video(seed, 0).moov.start;
+        let p = bare(1).max(bare(2)) + 512;
+        let (v1, v2) = (video(1, p - bare(1)), video(2, p - bare(2)));
+        let mut image = vec![0u8; 24 * MIB];
+        let mut x = 7u64;
+        for b in image.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        let mut moovs = Vec::new();
+        let mut findings = Vec::new();
+        for (id, v, first, second) in [(1, &v1, MIB, 16 * MIB), (2, &v2, 4 * MIB, 10 * MIB)] {
+            let pl = &v.mdat_payload;
+            let l1 = (pl.start + pl.len() * 2 / 5).div_ceil(512) * 512;
+            image[first..first + l1].copy_from_slice(&v.bytes[..l1]);
+            image[second..second + v.bytes.len() - l1].copy_from_slice(&v.bytes[l1..]);
+            findings.push(Finding {
+                id,
+                start: first as u64,
+                len: p as u64,
+                kind: FileKind::Mp4,
+                health: Health::Damaged,
+                fragments: Vec::new(),
+            });
+            moovs.push(((second + v.moov.start - l1) as u64, v.moov.len() as u64));
+        }
+        moovs.sort_unstable();
+        (Mem(image), findings, moovs)
+    }
+
+    fn run(limits: Limits, moovs: usize) -> (Vec<(u64, Health)>, u64) {
+        let (mem, findings, all) = siblings();
+        let cache = CachedSource::new(&mem, 512, 64 * MIB);
+        let (out, steps) = pair_with(
+            &cache,
+            &findings,
+            &all[..moovs],
+            &CancelToken::default(),
+            limits,
+        );
+        (out.iter().map(|f| (f.id, f.health)).collect(), steps)
+    }
+
+    #[test]
+    fn siblings_pair_intact_within_the_limits() {
+        assert_eq!(
+            run(LIMITS, 2).0,
+            vec![(1, Health::Intact), (2, Health::Intact)]
+        );
+    }
+
+    #[test]
+    fn an_exhausted_sample_budget_makes_a_pairing_partial() {
+        // Room for one moov's 120 samples: the second one is never listed, so v2's pairing cannot be shown unique.
+        let limits = Limits {
+            sample_budget: 120,
+            ..LIMITS
+        };
+        assert_eq!(run(limits, 2).0, vec![(2, Health::Partial)]);
+    }
+
+    #[test]
+    fn an_exhausted_step_budget_makes_a_pairing_partial() {
+        // Exactly the steps the first moov's two pairs need: v2 pairs with it, then the next pair runs out.
+        let (first, steps) = run(LIMITS, 1);
+        assert_eq!(first, vec![(2, Health::Intact)]);
+        let limits = Limits {
+            max_steps: steps,
+            ..LIMITS
+        };
+        assert_eq!(run(limits, 2).0, vec![(2, Health::Partial)]);
+        // One step short for the very last pair (v2 against v1's moov, which fails anyway): both pairings stand, but
+        // a pair was cut short.
+        let (all, total) = run(LIMITS, 2);
+        assert_eq!(all.len(), 2);
+        let limits = Limits {
+            max_steps: total - 1,
+            ..LIMITS
+        };
+        assert_eq!(
+            run(limits, 2).0,
+            vec![(1, Health::Partial), (2, Health::Partial)]
+        );
+    }
 
     #[test]
     fn spaced_takes_both_ends_and_at_most_verify() {

@@ -409,24 +409,157 @@ fn reassembled_video_with_unreadable_sector_is_partial() {
     assert_eq!(u[0].fragments[0].len, l1 as u64);
 }
 
+/// A fake `moov` box header: `size "moov" 0000006C "mvhd"`.
+fn fake_moov(size: u32) -> Vec<u8> {
+    let mut h = size.to_be_bytes().to_vec();
+    h.extend_from_slice(b"moov");
+    h.extend_from_slice(&0x6Cu32.to_be_bytes());
+    h.extend_from_slice(b"mvhd");
+    h
+}
+
+/// The split layout (first piece at 1 MiB, the rest at 92 MiB) plus an 80 MiB Intact MP4 at 8 MiB whose block at
+/// 68 MiB holds 4200 fake `moov` headers: more than a block's cap, but all inside an Intact file. Whether that block is
+/// read or skipped depends on timing; the events must not.
+fn capped_block_image() -> DiskImage {
+    let v = video(1, true, 0);
+    let l1 = cut(&v, 2);
+    let mut whole = revenant_testkit::mp4(&revenant_testkit::Mp4Options {
+        mdat_len: 80 * MIB - 4096,
+        moov_at_end: true,
+        mov: false,
+        mdat_64bit: false,
+    });
+    for i in 0..4200 {
+        let at = 60 * MIB + i * 512 + 100;
+        whole[at..at + 16].copy_from_slice(&fake_moov(4096));
+    }
+    let mut img = DiskImage::noise(100 * MIB, 7);
+    img.put(MIB, &v.bytes[..l1])
+        .put(8 * MIB, &whole)
+        .put(92 * MIB, &v.bytes[l1..]);
+    img
+}
+
 #[test]
 fn pairing_events_do_not_depend_on_threads_or_cache() {
     let v = video(1, true, 0);
     let l1 = cut(&v, 2);
-    let file = split_image(&v, l1).save();
-    let src = Src::new(&file);
-    let base = run_with(&src, &ScanOptions::default(), &CancelToken::default());
-    assert_eq!(updated(&base.1).len(), 1);
-    for (threads, cache) in [(1, 1 << 20), (4, 3 << 20), (16, 256 << 20)] {
-        let opts = ScanOptions {
-            threads,
-            cache_bytes: cache,
-            ..ScanOptions::default()
-        };
-        let other = run_with(&src, &opts, &CancelToken::default());
-        assert_eq!(other.1, base.1, "threads {threads} cache {cache}");
-        assert_eq!(other.0.unwrap(), base.0.as_ref().unwrap().clone());
+    for img in [split_image(&v, l1), capped_block_image()] {
+        let file = img.save();
+        let src = Src::new(&file);
+        let base = run_with(&src, &ScanOptions::default(), &CancelToken::default());
+        let u = updated(&base.1);
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].health, Health::Intact);
+        for (threads, cache) in [(1, 1 << 20), (2, 1 << 20), (8, 1 << 20), (4, 3 << 20)] {
+            let opts = ScanOptions {
+                threads,
+                cache_bytes: cache,
+                ..ScanOptions::default()
+            };
+            let other = run_with(&src, &opts, &CancelToken::default());
+            assert_eq!(other.1, base.1, "threads {threads} cache {cache}");
+            assert_eq!(other.0.unwrap(), base.0.as_ref().unwrap().clone());
+        }
     }
+}
+
+/// The split layout plus `fakes` fake `moov` headers of `size` bytes, 512 bytes apart from 14 MiB on, congruent to the
+/// video's `P` modulo 512 (so the pre-filter loads them) or not. Returns the one `Updated`.
+fn split_with_fakes(fakes: usize, size: u32, congruent: bool) -> Finding {
+    let v = video(1, true, 0);
+    let l1 = cut(&v, 2);
+    let mut img = split_image(&v, l1);
+    let residue = if congruent {
+        v.moov.start % 512
+    } else {
+        (v.moov.start + 100) % 512
+    };
+    for i in 0..fakes {
+        img.put(14 * MIB + i * 512 + residue, &fake_moov(size));
+    }
+    let file = img.save();
+    let (_, events) = run(&Src::new(&file));
+    let u = updated(&events);
+    assert_eq!(u.len(), 1, "{events:?}");
+    assert_eq!(extracted(&Src::new(&file), &u[0]), v.bytes);
+    u[0].clone()
+}
+
+#[test]
+fn more_candidates_than_kept_make_a_pairing_partial() {
+    // 4200 candidates after the real one: some were never looked at, so the pairing cannot be shown unique.
+    assert_eq!(split_with_fakes(4200, 4096, false).health, Health::Partial);
+    // The same layout under the caps stays Intact.
+    assert_eq!(split_with_fakes(1000, 4096, false).health, Health::Intact);
+}
+
+#[test]
+fn an_exhausted_load_budget_makes_a_pairing_partial() {
+    // 1100 candidates the pre-filter keeps, each charged a 1 MiB cache window: the 1 GiB budget runs out after the real
+    // one was loaded.
+    assert_eq!(split_with_fakes(1100, 4096, true).health, Health::Partial);
+    assert_eq!(split_with_fakes(900, 4096, true).health, Health::Intact);
+}
+
+/// A tiny but valid-looking `moov` listing 4,000,000 one-byte H.264 samples in one chunk at file offset 28: about 300
+/// bytes on disk, about 64 MiB once listed.
+fn huge_listing_moov() -> Vec<u8> {
+    fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        out
+    }
+    let words = |w: &[u32]| w.iter().flat_map(|x| x.to_be_bytes()).collect::<Vec<u8>>();
+    let mut avc1 = vec![0u8; 78];
+    avc1.extend(bx(b"avcC", &[1, 0x64, 0, 0x28, 0xFF, 0xE0, 0]));
+    let stsd = [words(&[0, 1]), bx(b"avc1", &avc1)].concat();
+    let stbl = [
+        bx(b"stsd", &stsd),
+        bx(b"stsz", &words(&[0, 1, 4_000_000])),
+        bx(b"stsc", &words(&[0, 1, 1, 4_000_000, 1])),
+        bx(b"stco", &words(&[0, 1, 28])),
+    ]
+    .concat();
+    let mut hdlr = vec![0u8; 8];
+    hdlr.extend_from_slice(b"vide");
+    hdlr.extend_from_slice(&[0; 13]);
+    let mdia = bx(
+        b"mdia",
+        &[bx(b"hdlr", &hdlr), bx(b"minf", &bx(b"stbl", &stbl))].concat(),
+    );
+    bx(
+        b"moov",
+        &[bx(b"mvhd", &[0; 100]), bx(b"trak", &mdia)].concat(),
+    )
+}
+
+#[test]
+fn moovs_listing_millions_of_samples_are_bounded() {
+    // A moov-less video whose mdat declares 64 MiB (so 4,000,000 one-byte samples fit before its P), and 1100 tiny
+    // moovs that pass the arithmetic filter for it, each listing 4,000,000 samples: only 16,000,000 samples per scan are
+    // listed.
+    let v = video(1, true, 0);
+    let l1 = cut(&v, 2);
+    let mut head = v.bytes[..l1].to_vec();
+    head[20..24].copy_from_slice(&(64u32 << 20).to_be_bytes());
+    let p = 20 + (64 << 20);
+    let moov = huge_listing_moov();
+    assert!(moov.len() < 512);
+    let mut img = DiskImage::noise(32 * MIB, 7);
+    img.put(MIB, &head);
+    for i in 0..1100 {
+        img.put(8 * MIB + i * 512 + p % 512, &moov);
+    }
+    let file = img.save();
+    let started = Instant::now();
+    let (_, events) = run(&Src::new(&file));
+    let elapsed = started.elapsed();
+    assert!(updated(&events).is_empty());
+    let bound = if cfg!(debug_assertions) { 60 } else { 5 };
+    assert!(elapsed.as_secs() < bound, "{elapsed:?}");
 }
 
 #[test]

@@ -231,11 +231,14 @@ Pairing a video at `s` (the `Found` start) with a candidate at `q`:
 2. Pre-filter, before loading anything: `(q − P) ≡ 0 (mod 512)` for some video (the second piece must start on a sector
    boundary). Loads are charged by the 1 MiB cache windows they span, at most 1 GiB per scan; a candidate past that is
    dropped.
-3. The `moov` (at most `MOOV_MAX_LEN`) must be readable, not garbled, hold `mvhd` and a `trak`, and list its samples
-   from `stsz`/`stsc`/`stco`|`co64` consistently (at most 4,000,000 samples); the checkable samples (H.264 `avc1`/`avc3`
-   with `avcC`, HEVC `hvc1`/`hev1` with `hvcC`, Motion-JPEG) must be at least 8.
+3. The `moov` (at most `MOOV_MAX_LEN`) must be readable, not garbled, hold `mvhd` and a `trak`, and have consistent
+   `stsz`/`stsc`/`stco`|`co64` tables (present, not truncated, the chunks holding exactly the samples `stsz` lists; at
+   most 4,000,000 samples); the checkable samples (H.264 `avc1`/`avc3` with `avcC`, HEVC `hvc1`/`hev1` with `hvcC`,
+   Motion-JPEG) must be at least 8. This is judged from the tables without listing a sample.
 4. Arithmetic filter: `(q − P) ≡ 0 (mod 512)`, the first sample of any track within 64 KiB after `payload`, and every
-   sample ending by `P`. At most 256 pairs pass it; the rest are dropped.
+   sample ending by `P` (from the chunk table and the sizes, still without listing). Only a `moov` that some video
+   passes is listed: its checkable samples are charged to a budget of 16,000,000 per scan before anything is allocated
+   (ruling Q11; a `moov` past it is dropped). At most 256 pairs pass the filter; the rest are dropped.
 5. Sample checks, never the payload: a NAL sample is walked unit by unit (at most 512): every length at least 1, the
    header's forbidden bit 0, the type 1–23 (H.264) or at most 40 with a non-zero temporal id (HEVC), the units summing
    exactly to the sample size. A Motion-JPEG sample starts `FF D8 FF` and ends `FF D9`. `A(i)` reads sample `i` at
@@ -252,14 +255,20 @@ Health of a reassembled video: what the index says against its length (`P` + the
 (`Damaged` or `Partial` stay so); an unreadable sector in either piece (from the scan's bad-sector map, so it agrees with
 the `Unreadable` events) makes it `Partial`; so does more than one passing `L1` (the smallest is kept), or a bound hit
 anywhere (the per-block or per-scan candidate cap, the video cap, the load budget, the pair cap, more than 4096 break
-points, or the step budget below): an unchecked candidate might have passed too. Otherwise `Intact`. The checks validate
+points, the sample budget or the step budget below): an unchecked candidate might have passed too. The per-block
+candidate cap does not count in a block wholly inside committed skip ranges (such a block may or may not be read, and
+all its candidates are dropped anyway), so the result does not depend on timing. Otherwise `Intact`. The checks validate
 lengths and header bytes, never the payload, so a break point inside one NAL unit's payload cannot be told from one a
 sector away: real H.264/HEVC with large slices (tens of KiB per NAL unit) will usually pair as `Partial` until 1.4
-(the file system's cluster size will narrow `L1`). The kind comes from the `ftyp`.
+(the file system's cluster size will narrow `L1`). So will most real videos with sound: audio samples interleaved
+between video samples `k − 1` and `k` are not checked, so every sector boundary inside them passes too. The kind comes
+from the `ftyp`.
 
 Bounds on hostile input: at most 4096 candidates and 4096 videos, 1 GiB of `moov` loads (one `moov` in memory at a
-time, plus its sample list: at most 4,000,000 samples, about 16 B each, twice), 256 pairs, 4096 break points per pair,
-512 NAL units per sample check, and 2^24 sample-check steps per scan in total (past it no further pair is checked).
+time, plus the list of its checkable samples: at most 4,000,000 per `moov`, about 16 B each, twice that while it is
+built), 16,000,000 samples listed per scan, nothing allocated per sample before the filters pass, 256 pairs, 4096
+break points per pair, 512 NAL units per sample check, and 2^24 sample-check steps per scan in total (past it no
+further pair is checked). Judging a `moov`'s tables costs time in proportion to its bytes (so at most the 1 GiB loaded).
 Cancellation is looked at before each `moov`, each pair and each break point; a cancelled scan returns
 `Err(Cancelled)` without the remaining `Updated` events.
 
