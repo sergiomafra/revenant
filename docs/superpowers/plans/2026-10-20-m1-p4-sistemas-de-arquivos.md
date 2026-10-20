@@ -12,8 +12,8 @@ câmera) e há uma API de agrupamento por sessão, dia, câmera e pasta. Fecha a
 arquivos de foto/vídeo com os pedaços em bytes, só lendo metadados. `scan` roda essa leitura antes da escultura, emite
 um `Event::Volume` por volume e, no laço de commit em ordem, trata cada arquivo do sistema de arquivos no setor onde ele
 começa: o detector mede o arquivo por uma visão `Fragmented` dos pedaços (numa thread de trabalho), e uma regra única
-junta essa medida com a da escultura no mesmo início. `Finding` ganha `origin: Option<FsOrigin>`. Os arquivos vivos
-confiáveis viram faixas puladas antes da busca; o resto da escultura segue igual. Depois da busca, pastas antigas
+junta essa medida com a da escultura no mesmo início. `Finding` ganha `origin: Option<FsOrigin>`. Nada é pulado antes da busca: um
+arquivo do sistema de arquivos só vira faixa pulada quando o achado fundido mede `Intact` (R10); o resto da escultura segue igual. Depois da busca, pastas antigas
 achadas por assinatura dão nome aos achados sem origem (`Updated`). `naming` e `group` são funções puras sobre
 `Finding` + `Metadata`.
 
@@ -47,13 +47,23 @@ deduplicação, agrupamento por sessão e câmera, somente leitura).
   ≤ 16 volumes; ≤ 64 EBR links; ≤ 128 GPT entries; ≤ 262,144 photo/video files listed per scan; ≤ 65,536 directories and
   ≤ 4,000,000 directory entries parsed per volume; depth ≤ 32; a FAT directory ≤ 2 MiB, an exFAT directory ≤ 256 MiB;
   ≤ 4096 pieces per file; volumes with more than 2^28 clusters are reported but not walked; ≤ 65,536 contested clusters;
-  ≤ 65,536 high-word probes of 512 B per scan; ≤ 65,536 old-directory candidates. No loop or allocation driven by an
-  on-disk number without a cap.
+  ≤ 65,536 high-word probes of 512 B per scan (the 16 B check of the low cluster counts as a probe); ≤ 65,536
+  old-directory candidates; ≤ 2^20 pieces in the whole listing (`MAX_PIECES`, a file past it is not listed); ≤ 2^26
+  cluster examinations per volume, shared by `guess`, the old exFAT chain and the bitmap check (`MAX_GUESS_STEPS`,
+  exhausted ⇒ the remaining deleted files are not listed); when the contested set (65,536) fills, every live file of that
+  volume becomes untrusted. No loop or allocation driven by an on-disk number without a cap.
 - **Read once, precisely:** file-system metadata is read through the scan's `CachedSource`; the high-word probes (Task 5)
-  read 512 B each from the source outside the cache, and the later pieces of a fragmented file may be read again when the
-  cache is small. READMEs say exactly that.
+  read 512 B each through a `Probe` over the raw source, outside the cache, and the `Probe` refuses (without reading) any
+  range the cache's bad-sector map already knows; at most 65,536 reads of 512 B (32 MiB) per scan. The later pieces of a
+  fragmented file may be read again when the cache is small, and the old folders of Task 10 are read after the search.
+  READMEs say exactly that.
 - **Determinism:** for a given source, the event sequence is identical for any `threads` and any `cache_bytes`; listings,
-  merges, names and groups never depend on hash-map order or timing.
+  merges, names and groups never depend on hash-map order or timing. The job of a file-system file is never dropped
+  because of a skip range, and every commit path without a worker result (`NotMeasured`, deferred block, `threads 1`)
+  runs the same `fs_job(at)` function as the worker, so the result does not depend on who measured.
+- **Hostile names at parse:** `/` and NUL inside a path component read from the disk become `_` (FAT LFN and exFAT
+  names alike; exFAT names are decoded with `String::from_utf16_lossy`), so `FsOrigin::name()`/`folder()` never split
+  wrongly.
 - **Health semantics (binding):** `Intact` = structure complete AND content verified clean; `Partial` = salvageable but not
   clean; `Damaged` = won't open. **The file system is evidence of placement, never of integrity:** health always comes
   from a detector over the bytes; file-system facts can only lower it (D3, D5, D6). Never `Intact` without evidence.
@@ -71,17 +81,52 @@ deduplicação, agrupamento por sessão e câmera, somente leitura).
 1. **Hostile directories and cluster chains** (a subdirectory pointing at the root or at itself, a FAT chain that cycles,
    two files sharing clusters, a directory chain longer than its cap, an exFAT root of 2^40 bytes): bounded time, each
    directory walked once, no panic, the files involved never `Intact` → `hostile_directory_loop_and_chain_cycle_are_bounded`
-   (Task 4), `hostile_exfat_is_bounded` (Task 6), `hostile_partition_tables_are_bounded` (Task 3).
+   (Task 4), `hostile_exfat_is_bounded` (Task 6), `hostile_partition_tables_are_bounded` (Task 3),
+   `hostile_deleted_entries_are_bounded` and `high_word_probes_are_capped` (Task 5), `piece_cap_bounds_the_listing` and
+   `contested_overflow_makes_the_volume_untrusted` (Task 4).
 2. **A deleted file rebuilt from clusters now owned by another file and called `Intact`** →
    `deleted_file_never_takes_live_clusters` (Task 5), `reused_clusters_make_a_deleted_file_partial` (Task 6),
-   `carved_file_over_live_clusters_is_not_intact` and `photo_written_over_a_raw_preview_is_found` (Task 7).
+   `carved_file_over_live_clusters_is_not_intact`, `forged_live_file_does_not_hide_a_deleted_photo` and
+   `photo_written_over_a_raw_preview_is_found` (Task 7).
 3. **Deduplication hiding a real, distinct file** (a deleted file's guessed clusters hold another photo written later; a
    foreign photo inside a `Partial` RAW) → `dedup_keeps_distinct_files` (Task 7), `partial_raw_hides_its_own_jpegs_only`
    (Task 9).
-4. **Hostile names used when extracting** (`../`, absolute, `C:\`, NUL, `..`, `CON`, lone UTF-16 surrogates, 300 chars) →
-   `sanitize_rules` and `hostile_names_stay_inside_the_destination` (Task 11).
+4. **Hostile names used when extracting** (`../`, absolute, `C:\`, NUL, `..`, `CON` and its variants, lone UTF-16
+   surrogates on FAT and exFAT, 300 chars, bidi controls, trailing dots, case-only collisions) → `sanitize_rules`,
+   `hostile_names_stay_inside_the_destination` and `case_insensitive_names_do_not_overwrite` (Task 11).
 5. **Nondeterminism** (events across threads and caches with file-system findings; groups depending on input order) →
-   `fs_events_identical_across_threads_and_caches` (Task 7), `grouping_is_order_independent` (Task 12).
+   `fs_events_identical_across_threads_and_caches`, `fs_job_is_independent_of_who_measures` and
+   `cancel_inside_the_first_volume_callback` (Task 7), `orphan_events_identical_across_threads_and_caches` (Task 10),
+   `grouping_is_order_independent` (Task 12).
+
+## Decisões do pre-flight (C1–C20, K1–K4)
+
+Cada linha: ruling aceito pelo controlador — custo se estiver errado. O texto de cada tarefa já reflete o ruling.
+
+- **C1** Jobs de arquivo do sistema de arquivos nunca são descartados por `skipped`; `fill` cria um `Head` para cada início mantido; todo caminho de commit sem resultado chama `fs_job(at)` (Task 7) — custo: nenhum (torna explícito o que o texto supunha).
+- **C2** `read(source, cancel)` chama `read_with(meta, probe, cancel)`; o `Probe` lê 512 B da fonte crua e recusa faixas ruins conhecidas; a leitura de 16 B do `lo` conta no teto de 65.536 (Tasks 5, 7) — custo: amplificação de leitura (até 64 GiB) ou releitura de setor ruim num cartão doente.
+- **C3** Candidatos do D10 = `{lo}` (se reconhece e está livre) ∪ `{h ≥ 1 …}`; exatamente um ⇒ usa; o teste usa uma cabeça JPEG livre em 4.564 (Task 5) — custo: um apagado do Windows ambíguo vira nome errado (a saúde segue do detector).
+- **C4** Resolvido pelo K1 (sem pré-pulo de vivos) — custo: ver K1.
+- **C5** `Listing.walked` (faixas de todo diretório percorrido, vivo ou apagado) é criado e preenchido na Task 10 — custo: reprocessar diretórios já lidos (só tempo).
+- **C6** O teste do `ClusterCount 2^30` remenda `ClusterCount`, `FatLength`, `ClusterHeapOffset`, `VolumeLength` e refaz o checksum (Task 6) — custo: o implementador afrouxa a regra da Task 3 para passar.
+- **C7** `MAX_GUESS_STEPS = 2^26` por volume, partilhado por `guess`, cadeia antiga do exFAT e conferência do bitmap (Tasks 5, 6) — custo: num cartão gigante alguns apagados finais perdem o nome (a escultura os acha).
+- **C8** `MAX_PIECES = 1 << 20` na `Listing` (Task 4; frase de memória em `ScanOptions`, Task 7) — custo: OOM num cartão forjado.
+- **C9** `notes.txt` recebe os bytes exatos do JPEG no último cluster, para só o teto D7 poder dar `Partial` (Task 7) — custo: teste verde sem a regra.
+- **C10** Diretório confiável = cadeia termina em `End`, sem ciclo/conflito, ≤ teto (exFAT `NoFatChain`: `DataLength` inteiro reivindicado e marcado no bitmap); a raiz fixa de FAT12/16 não entra em `live` (Task 4) — custo: pular ou deixar de pular um diretório quebrado.
+- **C11** Conjunto contestado cheio ⇒ todo arquivo vivo do volume vira não confiável (Task 4) — custo: num cartão muito cruzado tudo sai no máximo `Partial`.
+- **C12** `exfat-card` entra em `default_values` e na ajuda do `--images`; o pico de memória (= tamanho da imagem) é documentado (Task 8) — custo: `bench` padrão usa 1 GiB de RAM a mais.
+- **C13** `own_files` sai da mesma função de medição em todo caminho; um achado escondido que mede `Intact` ainda adiciona a sua faixa pulada; o `OrphanFinder` copia as regras do `keep_moovs`; teste de eventos iguais na Task 10 (Tasks 9, 10) — custo: `Updated` de órfão dependente de timing.
+- **C14** O builder grava a entrada 0x83 (exFAT) e a de rótulo (FAT); `fat_delete_styles` usa o cluster 70.000 (Task 1) — custo: nenhum.
+- **C15** `/` e NUL de um componente viram `_` no parse; nomes exFAT por `from_utf16_lossy` (Tasks 4, 6) — custo: nenhum.
+- **C16** Pastas de origem `Orphaned` contam como estrutura sobrevivente: "Por pasta" fica ligado quando as únicas pastas são antigas recuperadas (Task 12) — custo: se o Sérgio preferir desligar após formatação, a condição vira "algum item `Live`/`Deleted`" (uma linha).
+- **C17** Testes da Task 12 corrigidos (item 6 às 08:15; `by_camera` ordenado pela chave ⇒ `[B, A, UnknownCamera]`; raiz = `Folder("")`) — custo: nenhum.
+- **C18** O RAW nomeado do teste de nomes se chama `DSC01235.ARW` (Task 11) — custo: nenhum.
+- **C19** `rank(Health)` (Intact 2, Partial 1, Damaged 0) em `scan/fs.rs`; `modified` ausente perde para presente (Tasks 7, 10) — custo: nenhum.
+- **C20** Lista de arquivos da Task 7 completa; `ScanOptions::sector > 512` descarta em silêncio arquivos cujo início não cai no setor (documentado); "lido uma vez" cita as pastas órfãs (Tasks 7, 10); D14 vs spec §3 segue como pendência do Módulo 2 (Task 13) — custo: nenhum.
+- **K1** Sem pré-pulo de vivos: a faixa pulada só entra quando o achado fundido mede `Intact` (R10); vivo de outro tipo: só a cabeça no primeiro cluster é consumida; `Listing.skip` some (Tasks 4, 7) — custo: o portão de desempenho; se `exfat-card` < 0,8 × `dense-jpeg`, reavaliar só para tipos não-foto (Task 8).
+- **K2** Coberto pelo C2 mais `high_word_probes_are_capped` com teto `cfg(test)` em 4 (Task 5) — custo: leitura dobrada ou releitura de setor ruim.
+- **K3** Três testes de determinismo: cancelamento no callback do primeiro `Volume`, eventos iguais da Task 10, `threads 1` com cache de 1 MiB (Tasks 7, 10) — custo: eventos diferentes entre máquinas.
+- **K4** `sanitize` cobre reservados completos (haste até o primeiro `.`, `COM0`/`LPT0`, `¹²³`, `CONIN$`/`CONOUT$`), extensão ≤ 16 B, Cc/Cf → `_`, pontos/espaços finais; testes novos e caso exFAT com surrogate isolado (Task 11) — custo: no pior caso um nome que o Windows recusa (erro de escrita, nunca fuga da pasta).
 
 ## Decisões do pre-flight (D1–D18)
 
@@ -93,29 +138,33 @@ Cada linha: decisão — custo se estiver errada. Decididas pelo Claude, pelo S�
 - **D2** `Finding` ganha `origin: Option<FsOrigin>` (em vez de um evento novo); a linha JSON só ganha chaves quando há
   origem — custo: todo literal de `Finding` muda.
 - **D3** Confiança na posição (`FsFile::trusted`): vivo = cadeia completa, sem ciclo nem cruzamento, `ValidDataLength ==
-  DataLength`; apagado = **um só trecho** de clusters hoje livres (ou o trecho `NoFatChain` gravado no exFAT com todos os
+  DataLength` (diretório: cadeia termina em `End`, sem ciclo/conflito, ≤ teto; conjunto contestado cheio ⇒ nada do volume é confiável); apagado = **um só trecho** de clusters hoje livres (ou o trecho `NoFatChain` gravado no exFAT com todos os
   clusters livres). Sem confiança ⇒ no máximo `Partial` — custo: um arquivo apagado fragmentado, mesmo inteiro, sai `Partial`.
 - **D4** Heurística de contiguidade do apagado: clusters livres a partir do primeiro, **pulando** os alocados (o
   alocador do FAT gravou em volta dos arquivos que já existiam); pular ⇒ sem confiança; primeiro cluster hoje alocado ⇒
   o apagado não é listado (foi sobrescrito) — custo: um apagado cuja cabeça foi sobrescrita não volta pelo nome.
 - **D5** Mesmo início, mesma foto: vivo ⇒ vale a medida pela cadeia; apagado ⇒ vale a da escultura só se for de saúde
-  estritamente melhor, do mesmo tipo e com `len == size` gravado — custo: um apagado com trailer (MPF) cuja escultura é
+  estritamente melhor (Intact > Partial > Damaged), do mesmo tipo e com `len == size` gravado — custo: um apagado com trailer (MPF) cuja escultura é
   melhor fica com a heurística.
 - **D6** Tamanho coerente: o que sobra entre o fim da estrutura e o tamanho gravado tem de ser enchimento (`00`/`FF`) ou
   até 8 arquivos medíveis seguidos (MPF, foto com vídeo anexado); senão no máximo `Partial` — custo: um arquivo com
   trailer desconhecido sai `Partial`.
-- **D7** Arquivo vivo confiável (de qualquer tipo, inclusive `.THM`, `.XML`, diretórios) vira faixa pulada antes da busca;
-  vivo não confiável de foto/vídeo pula só o que o detector explica; qualquer achado sem origem viva que toca clusters
-  vivos sai no máximo `Partial` — custo: um sistema de arquivos forjado pode esconder arquivos dentro de um arquivo vivo falso.
+- **D7** Nada é pulado antes da busca (R10: só um achado `Intact` impede a busca de olhar o que há dentro dele): o
+  arquivo vivo de foto/vídeo é medido pela visão no commit e a faixa dele só entra se o achado fundido sair `Intact`; vivo
+  de outro tipo (`.THM`, `.XML`) consome só a cabeça no primeiro cluster, e a faixa dela entra se a medição sair `Intact`;
+  qualquer achado sem origem viva que toca clusters vivos sai no máximo `Partial` — custo: o desempenho (um `.LRV`/`.XML`
+  grande é varrido por cabeças); um sistema de arquivos forjado não esconde mais fotos apagadas.
 - **D8** FAT32 é reconhecido pela BPB (`FATSz16 == 0`, `RootEntCnt == 0`), não só pela contagem de clusters — custo: nenhum.
 - **D9** Primeira letra de um nome curto apagado: do nome longo (conferida pelo checksum); senão a letra mais comum entre
   nomes curtos com os mesmos bytes 1..4, primeiro na mesma pasta, depois no volume; senão `_` — custo: uma letra errada.
 - **D10** FAT32 apagado pelo Windows (palavra alta do cluster zerada): tenta cada palavra alta, aceita o único candidato
-  cuja cabeça um formato reconhece com o tipo da extensão; até 65.536 sondas de 512 B fora do cache — custo: os ambíguos
-  se perdem; as sondas são exceção ao "lido uma vez".
+  cuja cabeça um formato reconhece com o tipo da extensão (candidatos: o `lo` e cada `h ≥ 1`, desde que livres); até
+  65.536 sondas de 512 B (32 MiB, incluída a conferência de 16 B do `lo`) pela fonte crua, fora do cache, recusando faixas
+  ruins conhecidas — custo: os ambíguos se perdem, e um apagado com cabeça sobrescrita por ruído pode ganhar o nome de outra
+  foto no único candidato; as sondas são exceção ao "lido uma vez".
 - **D11** Pastas antigas (formatação rápida) só **dão nome** a achados da escultura (`Updated`), nunca posicionam dados —
   custo: arquivo sem cabeça reconhecível não volta pelas pastas antigas.
-- **D12** P17 por `Format::own_files`: um RAW `Partial` (TIFF, RAF, CR3) esconde só os JPEGs que ele mesmo referencia; um
+- **D12** P17 por `Format::own_files`: um RAW `Partial` (TIFF, RAF, CR3) esconde só os JPEGs que ele mesmo referencia (e um achado escondido que mede `Intact` ainda adiciona a sua faixa pulada); um
   `Damaged` não esconde nada; quadros de MJPEG ficam de fora — custo: quadros de um vídeo MJPEG `Partial` ainda aparecem.
 - **D13** Pareamento de vídeo na grade de clusters quando o vídeo começa num cluster de um volume achado; nenhum ponto de
   quebra na grade ⇒ volta à grade de 512 B (regras da 1.3) — custo: um cartão reformatado com outro cluster pareia como antes.
@@ -166,13 +215,16 @@ que passa a ter o tamanho de cluster de `Volume`); NTFS/APFS/HFS+ (a escultura s
       pub min: u8, pub sec: u8, pub utc_offset_min: Option<i16> }
   pub struct FsBuilder { .. }
   impl FsBuilder {
-      /// Sector 512. Label "REVENANT", serial 0x1234_5678. FAT12/16: 1 reserved sector, 2 FATs, 512 root entries;
+      /// Sector 512. Label "REVENANT" (FAT: a volume-label entry in the root and the BPB label; exFAT: a 0x83 entry in the
+      /// root), serial 0x1234_5678. FAT12/16: 1 reserved sector, 2 FATs, 512 root entries;
       /// FAT32: 32 reserved sectors, FSInfo at 1, backup boot at 6, 2 FATs, root at cluster 2. exFAT: FAT at sector 128,
       /// 1 FAT, heap aligned to the cluster, bitmap then a 128-entry identity up-case table then the root, boot region
       /// checksums and backup region (sectors 12–23). Panics unless the cluster count fits the type (FAT12 < 4085,
       /// FAT16 4085..=65524, FAT32 ≥ 65525, as the Microsoft spec and macOS require).
       pub fn new(fs: FsType, volume_len: u64, cluster: u32) -> FsBuilder;
-      pub fn mkdir(&mut self, path: &str) -> &mut Self;                 // parents created as needed
+      /// Parents created as needed. A directory's cluster chain grows without a cap other than the free clusters (Task 4's
+      /// `DCIM/BIG` holds 70,000 entries).
+      pub fn mkdir(&mut self, path: &str) -> &mut Self;
       /// `data` in the next free clusters (first fit, ascending); returns its clusters in file order. On exFAT a
       /// contiguous file is NoFatChain. A name that is not an upper-case 8.3 name gets LFN entries (FAT; SFN "XXXXXX~1.EXT").
       pub fn add(&mut self, path: &str, data: &[u8]) -> Vec<u32>;
@@ -187,7 +239,7 @@ que passa a ter o tamanho de cluster de `Volume`); NTFS/APFS/HFS+ (a escultura s
       pub fn delete(&mut self, path: &str, style: DeleteStyle) -> &mut Self;
       pub fn raw_entry(&mut self, dir: &str, entry: [u8; 32]) -> &mut Self;  // appended to `dir`'s entries
       pub fn set_fat(&mut self, cluster: u32, value: u32) -> &mut Self;     // FAT entry override (all FAT copies)
-      pub fn build(&self) -> Vec<u8>;
+      pub fn build(&self) -> Vec<u8>;                      // the whole volume in memory: peak memory = volume length
       /// As after a quick format with the same geometry: fresh boot region(s), FATs zeroed but for the root chain,
       /// empty root at the same first cluster (exFAT: fresh bitmap and up-case table), every other byte untouched.
       pub fn build_quick_formatted(&self) -> Vec<u8>;   // = build() + quick_format_in_place
@@ -221,8 +273,12 @@ que passa a ter o tamanho de cluster de `Volume`); NTFS/APFS/HFS+ (a escultura s
       // v[b.cluster_offset(cs[0]) as usize..][..512] == [7; 512]
   }
   #[test] fn fat_delete_styles() {
-      // add "DSC00002.JPG" (1500 B), delete(Camera): root entry byte 0 == 0xE5, bytes 1..11 == *b"SC00002JPG ", the 3
-      // FAT entries == 0, bytes 20..22 (high word) unchanged; same file with WindowsFat32: bytes 20..22 == [0, 0]
+      // Fat32 48 MiB / 512; add_at "DSC00002.JPG" (1500 B) at clusters 70_000..70_003 (high word 1, non-zero), delete(Camera):
+      // root entry byte 0 == 0xE5, bytes 1..11 == *b"SC00002JPG ", the 3 FAT entries == 0, bytes 20..22 (high word)
+      // == 1u16 LE unchanged; same file with WindowsFat32: bytes 20..22 == [0, 0]
+  }
+  #[test] fn labels_are_written() {
+      // Fat32: a root entry with attr 0x08 and name "REVENANT   "; Exfat: a 0x83 entry in the root with label "REVENANT"
   }
   #[test] fn long_names_get_lfn_entries() {
       // "Long name photo.jpg" → 2 LFN entries (ord 0x42 then 0x01), attr 0x0F, byte 13 == checksum of the SFN's 11 bytes,
@@ -329,7 +385,7 @@ que passa a ter o tamanho de cluster de `Volume`); NTFS/APFS/HFS+ (a escultura s
       pub sector_size: u32,
       pub cluster_size: u64,
       pub heap_offset: u64,     // absolute byte offset of cluster 2
-      pub cluster_count: u32,   // clusters 2 ..= cluster_count + 1
+      pub cluster_count: u32,   // clusters 2 ..= cluster_count + 1; heap end = heap_offset + cluster_count × cluster_size
       pub label: Option<String>,
       pub serial: u32,
       pub from_backup: bool,    // the primary boot sector was unusable; the backup was used
@@ -363,7 +419,8 @@ RsvdSecCnt ≥ 1; NumFATs ∈ {1, 2}; FAT32 by BPB (D8: `FATSz16 == 0`, `RootEnt
 else FAT12/FAT16 by cluster count (< 4085 / < 65525); data region start < total sectors; cluster count ≥ 1. Valid exFAT
 boot: `"EXFAT   "` at 3, bytes 11..64 zero, BytesPerSectorShift 9..=12, SectorsPerClusterShift ≤ 25 − it, NumberOfFats ∈
 {1, 2}, FatOffset ≥ 24, ClusterHeapOffset ≥ FatOffset + FatLength × NumberOfFats, ClusterCount ≥ 1 and ≤ 2^32 − 11,
-heap end ≤ VolumeLength, root cluster in range, `55 AA`. Label: exFAT `0x83` entry in the root's first cluster; FAT: the
+heap end ≤ VolumeLength, root cluster in range, `55 AA` (a test that needs a huge `ClusterCount`, as Task 6's, patches
+`FatLength`, `ClusterHeapOffset` and `VolumeLength` coherently; the rules are not loosened for it). Label: exFAT `0x83` entry in the root's first cluster; FAT: the
 volume-label entry in the root's first 16 entries, else the BPB label; `"NO NAME"` → None.
 
 - [ ] **Step 1: Failing tests** (`fs_volumes.rs`):
@@ -437,7 +494,8 @@ volume-label entry in the root's first 16 entries, else the BPB label; `"NO NAME
   pub struct FsFile {
       pub origin: FsOrigin,
       pub kind: FileKind,            // from the extension
-      /// Absolute pieces in file order, sum = min(size, what the clusters hold and the source holds).
+      /// Absolute pieces in file order, sum = min(size, what the clusters hold and the source holds). The whole
+      /// listing holds at most `MAX_PIECES` (1 << 20) pieces: a file that would pass it is not listed.
       pub pieces: Vec<Fragment>,
       pub trusted: bool,             // D3
   }
@@ -446,10 +504,13 @@ volume-label entry in the root's first 16 entries, else the BPB label; `"NO NAME
       pub volumes: Vec<Volume>,
       /// Photo/video files only (extension known to `FileKind::from_extension`), sorted by (first piece start, volume, path).
       pub files: Vec<FsFile>,
-      /// Merged absolute ranges of every live file and live directory of any kind (D7, D18).
+      /// Merged absolute ranges of every live file and live directory of any kind (D7 cap, `keep_moovs`, orphans, D18);
+      /// the fixed FAT12/16 root region is not in it.
       pub live: Vec<Fragment>,
-      /// Merged absolute ranges of every trusted live file and directory (the scan skips them, D7).
-      pub skip: Vec<Fragment>,
+      /// First piece of every live file that is not a photo/video (any other extension), sorted by start: the scan
+      /// consumes the head there without a finding (Task 7). There is no pre-skip list: nothing is skipped before the
+      /// search (R10).
+      pub others: Vec<Fragment>,
   }
   /// Lists the files of every volume (cancel checked per directory). Never fails.
   pub fn read(source: &dyn Source, cancel: &CancelToken) -> Listing;
@@ -478,7 +539,10 @@ unreadable FAT sector is read from the next FAT copy. Directories claim their cl
 is already claimed is not entered (loop). Every live file (any extension) claims its chain; afterwards each file whose
 pieces hold a contested cluster gets `trusted = false`. A file is `trusted` iff its chain is complete (exactly
 `ceil(size / cluster)` clusters, the last one `End`), no conflict, ≤ 4096 runs. Size-0 files and pieces past the source
-end are dropped.
+end are dropped. A directory is trusted when its chain ends in `End`, has no cycle or conflict and is within the cap
+(exFAT `NoFatChain`: its whole `DataLength` claimed and marked in the bitmap); an untrusted directory is still walked.
+When the contested set (≤ 65,536) fills, the volume is marked and every live file of it is untrusted. In a path
+component read from the disk, `/` and NUL become `_`.
 
 - [ ] **Step 1: Failing tests** (`fs_fat.rs`; `card()` = FAT32 48 MiB / 512 in `Mbr{8192}` + 8 MiB):
   ```rust
@@ -490,7 +554,7 @@ end are dropped.
       // "DCIM/100MSDCF/DSC01234.ARW", name() == "DSC01234.ARW", folder() == "DCIM/100MSDCF", state Live, placement Chain,
       // size == bytes.len(), kind Arw, pieces == [Fragment { start: 8192*512 + b.cluster_offset(first), len: size }], trusted;
       // created == Some(FsTime { local: "2025-12-14T07:12:04".into(), utc_offset_minutes: None }), modified "…07:12:06";
-      // the long name survives; live ⊇ every file's pieces (notes.txt's too); skip == live (all trusted)
+      // the long name survives; live ⊇ every file's pieces (notes.txt's too); others == [notes.txt's first run]
   }
   #[test] fn fat12_and_fat16_roots_are_read() { /* the same 3 photo paths on Fat12 2 MiB/1024 and Fat16 16 MiB/2048 */ }
   #[test] fn fragmented_live_file_follows_its_chain() {
@@ -506,6 +570,10 @@ end are dropped.
   #[test] fn fat_mirror_covers_an_unreadable_fat_sector() { /* source failing the first FAT's sector that holds the ARW's chain → same pieces, trusted */ }
   #[test] fn invalid_dates_are_none() { /* raw entry with month 13 and hour 25 → created None, modified None */ }
   ```
+  More tests (`fs_fat.rs`): `contested_overflow_makes_the_volume_untrusted` (contested cap lowered by `cfg(test)` twin;
+  overflow ⇒ every live file of the volume `trusted == false`), `piece_cap_bounds_the_listing` (`MAX_PIECES` lowered by
+  `cfg(test)`: files past it are not listed, no panic), `hostile_names_with_slash_and_nul_are_flattened` (an LFN with `/`
+  and NUL in a component ⇒ `name()`/`folder()` do not split it), `directories_are_trusted_only_with_a_complete_chain`.
   `alloc.rs` unit: `follow_stops_on_cycles_and_conflicts` (a map with 2→3→2: complete false; a second chain claiming 3:
   conflict true; 5000 one-cluster runs: stops at 4096 runs).
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** suite, clippy, fmt.
@@ -517,7 +585,7 @@ end are dropped.
 ### Task 5: FAT — arquivos e pastas apagados
 
 **Files:**
-- Modify: `crates/revenant-core/src/filesystem/{fat.rs,alloc.rs}`
+- Modify: `crates/revenant-core/src/filesystem/{mod.rs,fat.rs,alloc.rs}`
 - Test: `crates/revenant-core/tests/fs_fat.rs`, unit tests in `alloc.rs`; opt-in `tests/os_filesystems.rs`
 - Docs: core README ("File systems: FAT", deleted files)
 
@@ -525,15 +593,23 @@ end are dropped.
 - Produces (`alloc.rs`, used by Task 6):
   ```rust
   pub(crate) struct Guess { pub runs: Vec<(u32, u32)>, pub skipped: bool, pub short: bool }
-  /// D4. None when `first` is out of range or allocated (overwritten).
-  pub(crate) fn guess(map: &mut dyn ClusterMap, first: u32, need: u64, last: u32) -> Option<Guess>;
+  /// Per-volume budget of cluster examinations (`MAX_GUESS_STEPS = 1 << 26`, `cfg(test)` twin), shared by `guess`, the old
+  /// exFAT chain and the bitmap check; exhausted ⇒ the caller lists no more deleted files of that volume (walk order).
+  pub(crate) struct Budget { .. }
+  /// D4. None when `first` is out of range or allocated (overwritten), or the budget is exhausted.
+  pub(crate) fn guess(map: &mut dyn ClusterMap, budget: &mut Budget, first: u32, need: u64, last: u32) -> Option<Guess>;
+  // filesystem/mod.rs: `pub fn read(source, cancel)` (tests) calls
+  /// `meta` reads metadata (the scan passes its `CachedSource`); `probe` reads 512 B from the RAW source and refuses,
+  /// without reading, any range the cache's bad-sector map already knows. A read error in a probe = "does not recognize".
+  pub(crate) fn read_with(meta: &dyn Source, probe: &dyn Probe, cancel: &CancelToken) -> Listing;
+  pub(crate) trait Probe { fn read512(&self, at: u64) -> Option<[u8; 512]>; }   // `read` uses a Probe over `source` itself
   ```
 Heuristic (D4), exactly:
 ```
 need = ceil(size / cluster); c = first; taken = 0; examined = 0; runs = []; skipped = false
 if allocated(first) != Some(false) → None
 while taken < need && c ≤ last && examined < 2 × need + 1024:
-    examined += 1
+    examined += 1; budget.spend(1) (exhausted ⇒ return None)
     if allocated(c) == Some(false): extend the last run if it ends at c, else push (c, 1); taken += 1
     else if !runs.is_empty(): skipped = true
     c += 1
@@ -544,10 +620,12 @@ restore (D9): if the preceding deleted LFN entries (attr 0x0F, same checksum byt
 name whose first char upper-cased (ASCII) makes the SFN's checksum match, use it and the LFN text; else the most common
 first byte among SFNs with equal bytes 1..4 — live or already restored — in the same directory, then in the whole
 volume (ties: lowest byte); else `_`. Deleted directories are walked like live ones through `guess` (their entries are
-Deleted whatever their own byte 0 says); they never claim. FAT32 high word (D10): a deleted SFN whose high word is 0,
-whose `lo` cluster's first 16 bytes no format recognizes with the extension's kind, gets every `h ≥ 1` with
-`(h << 16) | lo ≤ last` probed (512 B read from the source at the cluster start, at most 65,536 probes per `read`): the
-single candidate a format recognizes with that kind and that is free is used; none or several → not listed. Among
+Deleted whatever their own byte 0 says); they never claim. FAT32 high word (D10): a deleted SFN whose high word is 0 has the candidates `{lo}` (when a format recognizes
+the head there with the extension's kind and the cluster is free) ∪ `{h ≥ 1 : (h << 16) | lo ≤ last}` (same condition on
+`(h << 16) | lo`), at most `last >> 16` per entry. Every head check is a `Probe` read of 512 B (the 16 B check of `lo`
+included) and counts against one cap of 65,536 per `read`; when the cap is spent no more candidates are tried. Exactly
+one candidate → used; none or several → not listed. A cluster's range refused by the probe (known bad sector) is "does
+not recognize". Among
 several entries (live or deleted) with the same first cluster, the listing keeps them all; Task 7 picks one.
 
 - [ ] **Step 1: Failing tests** (`fs_fat.rs`):
@@ -562,13 +640,22 @@ several entries (live or deleted) with the same first cluster, the listing keeps
       // "DSC01235.JPG"; Q1234567.JPG deleted alone in MISC/ with no SFN sharing "123" → "_1234567.JPG"
   }
   #[test] fn deleted_file_never_takes_live_clusters() {
-      // A = 5 clusters at c..c+5, deleted; live L written by add_at into c+2 → A: pieces == clusters {c, c+1} and
+      // A = 5 clusters c..=c+4, deleted; live L written by add_at into c+2 → A: pieces == clusters {c, c+1} and
       // {c+3, c+4, c+5} (skipping c+2), trusted false; no piece of A overlaps L's cluster;
       // a deleted B whose first cluster is then given to a live file → B not listed
   }
   #[test] fn windows_deleted_file_finds_its_high_word() {
       // FAT32 48 MiB/512 (≈ 96k clusters): jpeg at cluster 70_000 (add_at), delete(WindowsFat32) → listed at cluster
-      // 70_000; a second one at 70_100 whose cluster 70_100 − 65_536 = 4_564 also starts with a testkit JPEG head → not listed
+      // 70_000; a second one at 70_100 (deleted, WindowsFat32) whose cluster 70_100 − 65_536 = 4_564 holds a FREE testkit JPEG
+      // head (raw bytes, no entry), so both `lo`-candidates recognize ⇒ not listed because of the ambiguity (not D4)
+  }
+  #[test] fn high_word_probes_are_capped() {
+      // probe cap lowered to 4 by its cfg(test) twin: 5 deleted WindowsFat32 files → the 5th is not listed, no panic;
+      // MultiFailingSource counts ≤ 4 × 512 B read outside the cache windows, and none in a range already known bad
+  }
+  #[test] fn hostile_deleted_entries_are_bounded() {
+      // 10,000 deleted entries of size 4 GiB all pointing at the same free cluster → read() < 5 s, budget exhausted,
+      // no panic, listed files all valid
   }
   #[test] fn deleted_directory_contents_are_listed() {
       // DCIM/100TEST with DSC00001.JPG, DSC00002.JPG; live DCIM/101TEST/DSC00010.JPG; delete DCIM/100TEST (Camera) →
@@ -585,7 +672,7 @@ several entries (live or deleted) with the same first cluster, the listing keeps
   `alloc.rs` unit: `guess_follows_the_rules` (free map, one allocated cluster in the middle, first allocated → None,
   `examined` bound with all allocated after `first` → short).
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** suite, clippy, fmt; opt-in test.
-- [ ] **Step 5:** core README (deleted files, D4, D9, D10 and its reads outside the cache). Commit:
+- [ ] **Step 5:** core README (deleted files, D4, D9, D10 and its up to 65,536 reads of 512 B (32 MiB) outside the cache). Commit:
   `feat(core): list deleted FAT files and folders with their likely clusters`.
 
 ---
@@ -598,7 +685,7 @@ several entries (live or deleted) with the same first cluster, the listing keeps
 - Docs: core README ("File systems: exFAT")
 
 **Interfaces:**
-- Consumes: `ClusterMap`, `Claims`, `follow`, `guess` (Tasks 4–5); `FsFile`, `Listing` (Task 4).
+- Consumes: `ClusterMap`, `Claims`, `follow`, `guess`, `Budget` (Tasks 4–5); `FsFile`, `Listing` (Task 4).
 - Produces: `read` lists exFAT volumes too (no new public item).
 
 Rules: the root (FAT chain from `FirstClusterOfRootDirectory`) holds `0x81` (bitmap: FirstCluster@20, DataLength@24 ≥
@@ -615,7 +702,9 @@ else `follow`. Deleted: NoFatChain → Recorded, the run as recorded, `trusted` 
 cluster allocated → not listed; FAT-chained → the old chain if it has exactly `need` clusters, ends at End and every
 cluster is free (placement Guessed, trusted iff one run), else `guess`. `ValidDataLength < DataLength` ⇒ untrusted.
 No readable bitmap (missing, unreadable, too short) ⇒ `allocated()` answers from the live claims only and every deleted
-file is untrusted. `0x00` ends a directory.
+file is untrusted. `0x00` ends a directory. The old FAT chain, the `guess` and the all-clusters-free bitmap check of a deleted file spend the
+volume's `Budget` (`MAX_GUESS_STEPS`); exhausted ⇒ the following deleted files are not listed. Names are decoded with
+`String::from_utf16_lossy` and `/` and NUL in a component become `_`. A directory is trusted by Task 4's rule.
 
 - [ ] **Step 1: Failing tests** (`fs_exfat.rs`; `card()` = Exfat 16 MiB / 32 KiB in `Mbr{8192}` + 8 MiB):
   ```rust
@@ -641,7 +730,9 @@ file is untrusted. `0x00` ends a directory.
   #[test] fn hostile_exfat_is_bounded() {
       // each < 5 s, no panic: a directory whose FAT chain cycles; a subdirectory entry pointing at the root; root
       // DataLength 2^40 with a 3-cluster chain; bitmap DataLength 2^40 (→ no bitmap: deleted files untrusted);
-      // ClusterCount 2^30 in the boot sector (→ volume listed, no files)
+      // ClusterCount 2^30 with FatLength, ClusterHeapOffset and VolumeLength patched coherently (VolumeLength past the
+      // source's end) and the boot checksum redone (→ volume listed, no files); 10,000 deleted NoFatChain sets of 4 GiB
+      // on one free cluster (bitmap check) < 5 s
   }
   #[test] fn valid_data_length_short_of_data_length_is_not_trusted() { /* raw set with VDL = DL − 4096 → trusted false */ }
   // os_filesystems.rs (opt-in)
@@ -657,9 +748,10 @@ file is untrusted. `0x00` ends a directory.
 
 **Files:**
 - Create: `crates/revenant-core/src/scan/fs.rs` (the merge rules, pure functions); Modify: `src/scan/{mod.rs,pipeline.rs}`,
-  `src/lib.rs` (re-exports), `src/pairing.rs` (literals), `crates/revenant-dev/src/main.rs` (match arm, literals only)
+  `src/lib.rs` (re-exports), `src/pairing.rs` (literals), `src/inspect.rs` (literal), `src/filesystem/mod.rs` (the scan calls
+  `read_with` with a raw `Probe`), `crates/revenant-dev/src/main.rs` (match arm, literals only)
 - Test: `crates/revenant-core/tests/scan_fs.rs` (new), unit tests in `scan/fs.rs`; every `Finding {..}` literal in
-  `crates/` (`grep -rn "Finding {" crates`) gets `origin: None`
+  `crates/` (`grep -rn "Finding {" crates`, including `tests/{scan,pairing,inspect,extract}.rs`) gets `origin: None`
 - Docs: core README ("Scan": file-system findings, "Deduplication"), CHANGELOG
 
 **Interfaces:**
@@ -673,28 +765,41 @@ file is untrusted. `0x00` ends a directory.
   // Event gains, emitted before the first Progress, one per volume in index order:
   Volume(Volume),
   // ScanOptions gains `pub filesystems: bool` (default true; false = the 1.3 scan, no Volume events, no origins).
+  // Docs on ScanOptions: the memory sentence gains "the file-system listing: up to 262,144 files and 2^20 pieces (≈ 60 MiB)";
+  // `sector > 512` silently drops file-system files whose first piece is not sector-aligned.
   // lib.rs: pub use filesystem::{FsOrigin, FsState, FsTime, Placement, Volume};
   // scan/fs.rs (crate-private)
-  pub(crate) struct ViewMeasure { pub m: Option<Measurement>, /** D6 */ pub tail_ok: bool, /** bytes explained */ pub explained: u64 }
+  pub(crate) struct ViewMeasure { pub m: Option<Measurement>, /** D6 */ pub tail_ok: bool }
   /// Detector over Fragmented(f.pieces) at 0, then the D6 tail check.
   pub(crate) fn measure_view(formats: &[Box<dyn Format>], source: &dyn Source, f: &FsFile) -> ViewMeasure;
   pub(crate) struct Merged { pub len: u64, pub kind: FileKind, pub health: Health, pub fragments: Vec<Fragment>, pub origin: FsOrigin }
   pub(crate) fn merge(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement>) -> Merged;
+  /// Health order: Intact 2, Partial 1, Damaged 0; "better" = strictly greater. A missing `modified` loses to a present one.
+  pub(crate) fn rank(h: Health) -> u8;
+  /// The one job of a kept file at sector `at` (view + `carved`), called by the worker AND by every commit path that has
+  /// no worker result (`NotMeasured`, deferred block, `threads 1`).
+  pub(crate) fn fs_job(..., at: u64) -> FsJobResult;
   ```
-Setup (scan thread, before the first block; D1): `listing = filesystem::read(&cache, cancel)`; emit `Volume(v)` for each;
-`skips.add` every `listing.skip` range (D7); per distinct first-piece start keep **one** file: live before deleted, then
-the latest `modified`, then listing order (the others are not reported); a file whose first piece is not sector-aligned
-is dropped. `listing.live` is kept for the overlap cap.
+  `Shared` keeps the kept starts (`Vec<u64>` sorted, plus an index to the `FsFile`) and `listing.others` starts.
+Setup (scan thread, before the first block; D1): `listing = filesystem::read_with(&cache, &raw_probe, cancel)` (the probe over the raw source refuses ranges the cache
+knows are bad); emit `Volume(v)` for each; **nothing is added to `skips`** (R10); per distinct first-piece start keep
+**one** file: live before deleted, then the latest `modified` (absent loses), then listing order (the others are not
+reported); a file whose first piece is not sector-aligned is dropped. `listing.live` is kept for the overlap cap and
+`listing.others` for the head consumption.
 
 Pipeline: a sector start holding a kept file's first piece always gets a job (recognized or not, inside a skip range or
-not, bad or not). The job computes `view = measure_view(..)` and, for a Deleted file only, `carved = measure(at)` when a
+not, bad or not): `fill` creates a `Head` for every kept start in the block, and the worker never drops that job because
+of `skipped`. The job computes `view = measure_view(..)` and, for a Deleted file only, `carved = measure(at)` when a
 format recognizes the head. **Reuse:** for a Deleted file with one piece, if `carved` is contiguous and `carved.len ≤
 size`, `view.m = carved` (same bytes: the walk ended inside the file) and the tail check runs from there; a
-`cfg(test)` switch turns reuse off. A kept file in a deferred block is measured on the scan thread at commit.
+`cfg(test)` switch turns reuse off. Every commit path with no worker result (`NotMeasured`, deferred block, `threads 1`) calls the same `fs_job(at)`.
 
 Commit, at sector `at`, **before** the bad-sector and skip checks: if a kept file starts at `at`, the merged finding is
 added (pending as usual) and the carving head at `at` is consumed; `carved` is passed to `merge` only if `at` is not bad
-and not in a committed skip range at that moment. Then the per-sector loop goes on unchanged.
+and not in a committed skip range at that moment. A start of `listing.others` (live non-photo file): only the head
+exactly at its first cluster is consumed, without a finding; if that measurement is `Intact`, its range is added to the
+skips (R10); other heads inside the file are examined and, by D7, come out at most `Partial`. Then the per-sector loop
+goes on unchanged.
 
 `merge` (D3, D5, D6), exactly:
 ```
@@ -705,13 +810,13 @@ if f.origin.state == Deleted && carved is Some(c) && c.kind == A.kind && c.healt
     → (c.len, c.kind, c.health, c.fragments, origin with placement Carved)
 else → A
 ```
-`tail_ok` / `explained` (D6): structural length `L` over the view of length `S`. `L == S` → ok. `L < S` → loop at most 8
+`tail_ok` (D6): structural length `L` over the view of length `S`. `L == S` → ok. `L < S` → loop at most 8
 times: bytes [L, S) all `00`/`FF` → ok; else a format recognizes the head at view offset `L` and measures `m2` not
-`Damaged` with `L + m2.len ≤ S` → `L += m2.len`, again; else not ok. `explained` = the final `L` (or `S` when ok).
+`Damaged` with `L + m2.len ≤ S` → `L += m2.len`, again; else not ok. 
 
 `add` changes: a finding whose origin is not Live and whose ranges overlap `listing.live` is capped at `Partial` (D7);
-skip ranges: `Intact` findings as today (all pieces); a Live but untrusted finding that is not `Damaged` adds
-`Fragmented(pieces).absolute(0, explained)` (D7). `keep_moovs` also drops candidates inside `listing.live`.
+skip ranges: only a merged finding that measures `Intact` adds its ranges (all pieces), as today (R10); a Live `Partial`
+finding skips nothing (its own previews are hidden by D12, Task 9). `keep_moovs` also drops candidates inside `listing.live`.
 
 - [ ] **Step 1: Failing tests** (`scan_fs.rs`; `card()` = FAT32 48 MiB / 512 in `Mbr{8192}`, unless said):
   ```rust
@@ -730,8 +835,17 @@ skip ranges: `Intact` findings as today (all pieces); a Live but untrusted findi
       // Intact) and the ARW's Found health != Intact
   }
   #[test] fn carved_file_over_live_clusters_is_not_intact() {
-      // raw jpeg bytes (no entry) in free clusters whose last cluster is shared with live MISC/notes.txt (its first
-      // cluster set by add_at onto it) → that carved Found: origin None, health Partial
+      // raw jpeg bytes (no entry) in free clusters; live MISC/notes.txt is written by add_at onto the jpeg's LAST cluster
+      // with exactly the jpeg's own bytes of that cluster (so only the D7 cap can lower the health) → that carved Found:
+      // origin None, health Partial
+  }
+  #[test] fn forged_live_file_does_not_hide_a_deleted_photo() {
+      // live MISC/DATA.BIN whose chain covers a deleted-without-entry JPEG's clusters → the JPEG is still a Found
+      // (nothing is pre-skipped), health Partial by D7
+  }
+  #[test] fn live_non_photo_file_consumes_only_its_head() {
+      // live DCIM/100MSDCF/INFO.THM (a JPEG head) → no Found for it; a jpeg written inside it, not at its first cluster,
+      // is a Found with health Partial (D7)
   }
   #[test] fn dedup_keeps_distinct_files() {
       // deleted D.JPG (6 clusters, guessed one run); then raw bytes of another jpeg X (no entry) over D's clusters 3..6
@@ -757,13 +871,22 @@ skip ranges: `Intact` findings as today (all pieces); a Live but untrusted findi
   }
   #[test] fn fs_events_identical_across_threads_and_caches() {
       // the live_files card + deleted files + 2 bad sectors (inside DSC01235.JPG, inside the FAT) →
-      // events(threads 1) == events(2) == events(8) == events(16) == events(8, cache_bytes 1 MiB); 3 runs at 8 equal
+      // events(threads 1) == events(2) == events(8) == events(16) == events(8, cache_bytes 1 MiB) ==
+      // events(1, cache_bytes 1 MiB); 3 runs at 8 equal
+  }
+  #[test] fn fs_job_is_independent_of_who_measures() {
+      // unit/integration: force the worker result to `Dropped`/`NotMeasured` (cfg(test) switch) → the commit path calls
+      // `fs_job(at)` and the Merged finding equals the one from the worker; also with a deferred block and threads 1
+  }
+  #[test] fn cancel_inside_the_first_volume_callback() {
+      // cancelling inside the callback of the first `Event::Volume` → no event after it and Err(Cancelled)
   }
   #[test] fn filesystems_off_is_the_old_scan() { /* the card with filesystems: false → no Volume, every origin None, Found starts == carving's */ }
   #[test] fn exfat_card_works_the_same() { /* the live_files layout on Exfat 32 MiB / 32 KiB → same paths and health */ }
   // scan/fs.rs unit
   #[test] fn merge_rules() { /* table: Live untrusted Intact view → Partial; Deleted trusted + carved better with len == size → carved;
-                                same with len != size → view; Live + carved better → view; view None → kind from extension, Damaged */ }
+                                same with len != size → view; Live + carved better → view; view None → kind from extension, Damaged;
+                                `rank`: Intact > Partial > Damaged; modified absent loses to present in the choice */ }
   #[test] fn reuse_matches_view_measurement() { /* each testkit kind as a deleted single-run file: finding with reuse == without */ }
   ```
   All existing tests must pass unchanged (noise images have no volume).
@@ -771,7 +894,7 @@ skip ranges: `Intact` findings as today (all pieces); a Live but untrusted findi
   (release, best of 3) on this commit and on `main` (`b5ec340`) built side by side, twice interleaved: within 5%, else
   stop and report.
 - [ ] **Step 5:** core README ("Scan": file-system phase, `Volume` events, origin, the merge, D3/D5/D6/D7, read-once
-  exceptions; new "Deduplication" section), CHANGELOG ("Added": photos and videos keep their name, folder and dates when
+  exceptions; the `ScanOptions` memory sentence and the `sector > 512` note; new "Deduplication" section), CHANGELOG ("Added": photos and videos keep their name, folder and dates when
   the card's file system lists them, deleted ones included; a file found both ways is listed once). Commit:
   `feat(core): file-system findings with names, one finding per file`.
 
@@ -790,7 +913,9 @@ skip ranges: `Intact` findings as today (all pieces); a Live but untrusted findi
   - `found`/`updated` lines with an origin gain `"name"`, `"path"`, `"state"`, `"placement"`, `"volume"`, `"fs_size"`,
     and `"created"`/`"modified"` (FsTime Display) when present.
   - `BenchImage::ExfatCard` (`"exfat-card"`): an exFAT volume in `Mbr{8192}` filling the image, holding the DenseJpeg
-    files as live files in `DCIM/100TEST` (every 4th one deleted); `placed` counts them all.
+    files as live files in `DCIM/100TEST` (every 4th one deleted); `placed` counts them all. It is added to
+    `default_values` of `--images` in `main.rs` and to the help text, so a plain `bench` prints its line. It is built with
+    `FsBuilder::build()`, so peak memory = the image size (1 GiB at the default size): the dev README "Benchmark" says so.
 
 - [ ] **Step 1: Failing tests:**
   ```rust
@@ -801,7 +926,8 @@ skip ranges: `Intact` findings as today (all pieces); a Live but untrusted findi
       // "name":"DSC01234.JPG","path":"DCIM/100MSDCF/DSC01234.JPG","state":"live","placement":"chain","volume":0,
       // "modified":"2025-12-14T07:12:06"; the other found line has none of those keys; summary still last
   }
-  #[test] fn bench_knows_the_exfat_card() { /* bench --size-mib 16 --runs 1 --images exfat-card → one line, found == placed */ }
+  #[test] fn bench_knows_the_exfat_card() { /* bench --size-mib 16 --runs 1 --images exfat-card → one line, found == placed;
+                                              bench --size-mib 16 --runs 1 with no --images → includes an exfat-card line */ }
   // os_filesystems.rs (opt-in)
   #[test] #[ignore] fn os_made_cards_scan_end_to_end() {
       // (Fat32, Mbr, 64), (Exfat, Mbr, 64), (Exfat, Gpt, 64), (Fat16, None, 32): mounted: DCIM/100TEST with 4 testkit
@@ -812,7 +938,8 @@ skip ranges: `Intact` findings as today (all pieces); a Live but untrusted findi
   }
   ```
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** suite, clippy, fmt; opt-in tests; `bench --images
-  dense-jpeg,exfat-card` (release): paste the lines; if `exfat-card` < 0.8 × `dense-jpeg`, stop and report.
+  dense-jpeg,exfat-card` (release): paste the lines; if `exfat-card` < 0.8 × `dense-jpeg`, stop and report (the K1 cost: live non-photo files are scanned by
+  heads; re-evaluate only for non-photo types).
 - [ ] **Step 5:** dev README, CHANGELOG ("Added": `revenant-dev` prints the volumes and each file's name, folder, state
   and dates). Commit: `feat(dev): volumes and file-system origins in the scan output`.
 
@@ -835,10 +962,13 @@ skip ranges: `Intact` findings as today (all pieces); a Live but untrusted findi
   fn own_files(&self, source: &dyn Source, start: u64) -> Vec<Fragment> { Vec::new() }
   // pairing: pair_videos gains `grids: &[(u64, u64, u64)]`  // (heap_offset, cluster_size, heap end) of each volume
   ```
-Rules: the job that measures a `Partial` file with `TiffRaw`, `Raf` or `IsoBmff` (kind Cr3) also returns `own_files`. A
+Rules: the job that measures a `Partial` file with `TiffRaw`, `Raf` or `IsoBmff` (kind Cr3) also returns `own_files`;
+`own_files` comes out of the same measurement function on every path (worker, `NotMeasured`, deferred block, `threads 1`).
+A hidden finding (D12) that measures `Intact` still adds its skip range (R10), so a thumbnail inside an RW2 preview does not
+become a finding. A
 carved finding (no origin) at `at` is not reported (no id) when an earlier finding X is `Partial` at that moment, one of
 X's own files starts at `at`, and the new finding lies wholly inside X's ranges (D12). Own starts are kept ≤ 65,536 and
-pruned below the scan position. `pair_videos`: videos with a Live origin are not candidates; for a video whose start `s`
+pruned below the scan position. `pair_videos` (a grid is `(heap_offset, cluster_size, heap_offset + cluster_count × cluster_size)`): videos with a Live origin are not candidates; for a video whose start `s`
 lies in a grid with `cluster ≥ 4096` and `(s − heap) % cluster == 0`, break points are first only the `L1` with
 `(s + L1 − heap) % cluster == 0` (ambiguity counted among them) and the second piece must start on the grid; if none
 passes, the 1.3 search over 512-byte steps runs as before (D13). An `Updated` video keeps its origin (placement Carved).
@@ -847,10 +977,11 @@ passes, the 1.3 search over 512-byte steps runs as before (D13). An `Updated` vi
   ```rust
   // scan.rs
   #[test] fn partial_raw_hides_its_own_jpegs_only() {
-      // panasonic_rw2 with an unchecked packing (Partial, JpgFromRaw at a sector start) → found == [(rw2, Rw2, Partial)];
+      // panasonic_rw2 with an unchecked packing (a `raw_format`/`bits` combination the detector does not check; Partial, JpgFromRaw at a sector start) → found == [(rw2, Rw2, Partial)];
       // plus a foreign testkit jpeg at another sector start inside the RW2's raw data → that jpeg is still found (Intact)
   }
-  #[test] fn damaged_raw_keeps_its_preview_as_a_finding() { /* Arw with an IFD offset past TIFF_MAX_LEN (Damaged) and a sector-aligned preview → the preview is still a Found */ }
+  #[test] fn own_files_are_the_same_on_every_path() { /* partial RW2 with threads 1, a deferred block and a worker → identical events */ }
+  #[test] fn damaged_raw_keeps_its_preview_as_a_finding() { /* Arw with an IFD offset past TIFF_MAX_LEN (`1 << 30` literal: the constant is crate-private) (Damaged) and a sector-aligned preview → the preview is still a Found */ }
   #[test] fn partial_cr3_hides_its_own_jpegs() { /* testkit cr3 with its PRVW broken (Partial) and the full-size JPEG at a sector start → one Found */ }
   // pairing.rs
   #[test] fn cluster_grid_makes_the_break_point_unique() {
@@ -871,13 +1002,15 @@ passes, the 1.3 search over 512-byte steps runs as before (D13). An `Updated` vi
 
 **Files:**
 - Create: `crates/revenant-core/src/filesystem/orphans.rs`; Modify: `filesystem/{mod.rs,fat.rs,exfat.rs}` (entry parsing
-  shared), `src/scan/{mod.rs,pipeline.rs}`
+  shared; `Listing.walked`), `src/scan/{mod.rs,pipeline.rs}`
 - Test: `crates/revenant-core/tests/scan_fs.rs`; opt-in `tests/os_filesystems.rs`
 - Docs: core README ("File systems: after a quick format"), CHANGELOG
 
 **Interfaces:**
 - Produces (crate-private):
   ```rust
+  // filesystem/mod.rs: Listing gains `pub(crate) walked: Vec<Fragment>` — merged ranges of EVERY directory the FS phase
+  // walked, live or deleted, FAT and exFAT (filled in fat.rs and exfat.rs); kept by the scan with `volumes` and `live`.
   /// Old directory clusters met in the blocks the scan reads: absolute offset and the volume index.
   pub(crate) struct OrphanFinder { .. }  // fed like MoovFinder; ≤ 65,536 candidates (16 B each)
   pub(crate) struct OrphanEntry { pub path: String, pub start: u64, pub size: u64, pub kind: FileKind,
@@ -887,12 +1020,14 @@ passes, the 1.3 search over 512-byte steps runs as before (D13). An `Updated` vi
 Detection (read stage, at each cluster start `p` of a volume inside a read block, not inside `listing.live` nor in a
 directory the FS phase walked): FAT: bytes 0..11 == `".          "`, byte 11 & 0x10, bytes 32..43 == `"..         "`, byte
 43 & 0x10. exFAT: byte 0 ∈ {0x85, 0x05}, SecondaryCount 2..=18, SetChecksum valid (InUse forced) within the cluster.
-Candidates in committed skip ranges are dropped (as `moov` ones). After pairing: each candidate directory is parsed with
+Candidates in committed skip ranges are dropped (as `moov` ones); the `OrphanFinder` copies the `keep_moovs` rules: the
+per-block cap counts only in blocks not covered by skip ranges, the global cap applies in commit order, and a candidate
+inside a skip range is dropped. After pairing: each candidate directory is parsed with
 the Task 4–6 rules (its own cluster, then following clusters while they are not live and still parse, ≤ 2 MiB); paths:
 FAT `..` cluster → the candidate whose entries point at this directory gives its name, up to 32 levels; exFAT the same
 by first-cluster lookup; unknown → `"?"`. Each file entry with a photo/video extension: if a finding without origin
 starts at the entry's cluster offset, with the same kind (Mp4/Mov count as one), it gets `origin { state: Orphaned,
-placement: Carved, .. }`; several entries for one finding → latest `modified`, then lowest candidate offset; health capped
+placement: Carved, .. }`; several entries for one finding → latest `modified` (absent loses), then lowest candidate offset; health capped
 at `Partial` when `finding.len != size` and the D6 tail check over `[finding end, + size − len)` (contiguous) fails, or
 `len > size`. `Updated` events: one per id, merged with a pairing `Updated` of the same id, in id order (D11).
 
@@ -904,6 +1039,10 @@ at `Partial` when `finding.len != size` and the D6 tail check over `[finding end
       //   "?/100MSDCF/DSC01234.JPG" .. }, health unchanged; summary.updated == 3
   }
   #[test] fn quick_formatted_exfat_card_keeps_names() { /* same on exFAT → same paths */ }
+  #[test] fn orphan_events_identical_across_threads_and_caches() {
+      // quick-formatted card with a video pair (moov apart): events(threads 1) == 2 == 8 == 16 == events(8, cache_bytes
+      // 1 MiB), including the `Updated` of orphans
+  }
   #[test] fn orphan_entry_size_mismatch_is_partial() { /* entry size 1.5 × the jpeg with noise after it → Updated health Partial */ }
   #[test] fn orphan_finder_ignores_live_and_noise() {
       // the live (not formatted) card → no Updated; 16 MiB noise with fake "." ".." entries every 512 B and no volume → no Updated
@@ -921,7 +1060,7 @@ at `Partial` when `finding.len != size` and the D6 tail check over `[finding end
   ```
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** suite, clippy, fmt; `bench` (release, `dense-jpeg`, `noise`):
   within 5% of Task 7's lines.
-- [ ] **Step 5:** core README, CHANGELOG ("Added": after a quick format, photos and videos get their old names and
+- [ ] **Step 5:** core README (the "read once" note mentions the old folders read after the search), CHANGELOG ("Added": after a quick format, photos and videos get their old names and
   folders back when the old folders survive). Commit: `feat(core): names from old folders after a quick format`.
 
 ---
@@ -940,10 +1079,12 @@ at `Partial` when `finding.len != size` and the D6 tail check over `[finding end
   /// D14: the sanitized original name; else "YYYY-MM-DD_HH-MM-SS[_<camera>].<EXT>" from `m.captured_at` (or the
   /// origin's modified time), EXT = kind.extension() upper-cased; else "revenant_<start as 12 hex>.<ext>" (1.3's name).
   pub fn file_name(f: &Finding, m: Option<&Metadata>) -> String;
-  /// A safe single file name, or None. Replaces each of / \ : * ? " < > | , control chars (< 0x20, 0x7F) and U+FFFD by
-  /// '_'; trims leading and trailing '.' and ' '; None if empty; prefixes '_' to Windows reserved stems (CON, PRN, AUX,
-  /// NUL, COM1–COM9, LPT1–LPT9, any case, with or without extension); at most 200 bytes, cut on a char boundary,
-  /// keeping the extension.
+  /// A safe single file name, or None. Replaces each of / \ : * ? " < > | , control chars (< 0x20, 0x7F), format controls (U+200B–200F,
+  /// U+202A–202E, U+2066–2069, U+FEFF) and U+FFFD by '_'; trims leading and trailing '.' and ' '; None if empty; prefixes '_' to Windows reserved stems (CON, PRN, AUX,
+  /// NUL, COM0–COM9, LPT0–LPT9 and their superscript forms COM¹²³/LPT¹²³, CONIN$, CONOUT$; any case, with or without
+  /// extension; the stem is what precedes the FIRST '.', with trailing spaces trimmed, so `CON.tar.gz` and `CON .jpg` are
+  /// reserved); at most 200 bytes, cut on a char boundary, keeping the extension (an extension longer than 16 bytes is
+  /// not kept: the whole name is cut as a stem).
   pub fn sanitize(name: &str) -> Option<String>;
   /// Camera part: the model, minus the make's first word when the model starts with it and a space; only ASCII
   /// letters, digits and '-'; at most 24 chars; "" when unknown.
@@ -969,25 +1110,32 @@ at `Partial` when `finding.len != size` and the D6 tail check over `[finding end
   #[test] fn sanitize_rules() {
       // "../../x.jpg" → Some("_.._x.jpg"); "/abs/x.jpg" → Some("_abs_x.jpg"); "C:\\x.jpg" → Some("C__x.jpg");
       // "a\u{0}b.jpg" → Some("a_b.jpg"); ".." → None; "  " → None; "CON.JPG" → Some("_CON.JPG"); "nul" → Some("_nul");
-      // "x\u{FFFD}.jpg" → Some("x_.jpg"); "a".repeat(300) + ".jpg" → 200 bytes ending in ".jpg"; "DSC01234.ARW" unchanged
+      // "x\u{FFFD}.jpg" → Some("x_.jpg"); "a".repeat(300) + ".jpg" → 200 bytes ending in ".jpg"; "DSC01234.ARW" unchanged;
+      // "COM0" → Some("_COM0"); "lpt\u{00B9}" → Some("_lpt\u{00B9}"); "CONIN$" → Some("_CONIN$"); "CON.tar.gz" →
+      // Some("_CON.tar.gz"); "CON .jpg" → Some("_CON .jpg"); "x.jpg." → Some("x.jpg"); "x.jpg " → Some("x.jpg");
+      // "a." + "b".repeat(300) → 200 bytes; "foto\u{202E}gpj.exe" → Some("foto_gpj.exe")
   }
   // tests/extract.rs
   #[test] fn hostile_names_stay_inside_the_destination() {
       // findings with origins named each hostile name above plus one from add_utf16 with a lone surrogate (through a real
-      // FAT32 scan): extract each → every returned path's parent == dest; dest holds exactly that many files; dest's
+      // FAT32 scan and through a real exFAT scan): extract each → every returned path's parent == dest; dest holds exactly that many files; dest's
       // parent dir listing unchanged
+  }
+  #[test] fn case_insensitive_names_do_not_overwrite() {
+      // DSC00001.JPG and dsc00001.jpg (different bytes) → two distinct files with the right bytes each (on a case-insensitive
+      // volume the second becomes DSC00001_2…); the same for NFC/NFD forms of one name
   }
   #[test] fn original_names_collide_with_suffixes() { /* two findings named DSC00001.JPG → "DSC00001.JPG", "DSC00001_2.JPG" */ }
   // cli.rs
   #[test] fn extract_uses_original_and_readable_names() {
       // card with live DSC01234.JPG and a carved jpeg_with_exif (date 2025:12:14 07:12:05, model "ILCE-7M4") → --extract
-      // "file" values end with "/DSC01234.JPG" and "/2025-12-14_07-12-05_ILCE-7M4.JPG"; --previews of a named RAW →
-      // "DSC01234.preview.jpg"
+      // "file" values end with "/DSC01234.JPG" and "/2025-12-14_07-12-05_ILCE-7M4.JPG"; --previews of a named RAW "DSC01235.ARW" →
+      // "DSC01235.preview.jpg"
   }
   ```
   Existing extract/CLI tests on unnamed findings keep their `revenant_…` names unchanged.
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** suite, clippy, fmt.
-- [ ] **Step 5:** docs, CHANGELOG ("Added": recovered files keep their original name, or get a readable one from the
+- [ ] **Step 5:** docs (README "Names" records that a total path over 260 chars on Windows is a write error, never an escape), CHANGELOG ("Added": recovered files keep their original name, or get a readable one from the
   date and camera). Commit: `feat(core): recovered files keep their original or a readable name`.
 
 ---
@@ -1010,7 +1158,9 @@ at `Partial` when `finding.len != size` and the D6 tail check over `[finding end
   pub struct GroupInput { pub id: u64, pub time: Option<String>, pub camera: Option<Camera>, pub folder: Option<String> }
   impl GroupInput {
       /// time (D16): photos → m.captured_at, else origin modified, else created; MP4/MOV → origin modified, else
-      /// created, else m.captured_at. camera: None when make and model are both None. folder: origin.folder().
+      /// created, else m.captured_at. camera: None when make and model are both None. folder: Some(origin.folder()) for
+      /// any origin, `Live`, `Deleted` or `Orphaned` (C16: the old folders recovered after a quick format count as a
+      /// surviving structure, so "Por pasta" stays on); the root is Some("") = `Folder("")`, not `NoFolder`.
       pub fn new(f: &Finding, m: Option<&Metadata>) -> GroupInput;
   }
   #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1039,8 +1189,8 @@ or one `{"event":"group","by":"folder","available":false}`; it keeps each id's l
   // group.rs (unit) — A = (SONY, ILCE-7M4, 111), B = (Canon, EOS R5, 222)
   #[test] fn sessions_split_on_gaps_and_cameras() {
       // 1 A 2025-12-14T08:00:00, 2 A 08:30, 3 A 10:31 (2 h 01 after 08:30), 4 B 09:00, 5 A no time, 6 (SONY, ILCE-7M4,
-      // no serial) 08:45 → [Session{A, "…08:00:00", "…08:45:00"}: [1, 2, 6], Session{B, 09:00, 09:00}: [4],
-      // Session{A, 10:31, 10:31}: [3], UndatedSession{A}: [5]]
+      // no serial) 08:15 → [Session{A, "…08:00:00", "…08:30:00"}: [1, 6, 2], Session{B, 09:00, 09:00}: [4],
+      // Session{A, 10:31, 10:31}: [3], UndatedSession{A}: [5]] (ids by (time, id))
   }
   #[test] fn exactly_two_hours_is_the_same_session() { /* 08:00 and 10:00 → one session */ }
   #[test] fn two_bodies_of_one_model_stay_apart() { /* (SONY, ILCE-7M4, 111) and (…, 333) at 08:00/08:10, a serial-less one at 08:05 → 3 groups */ }
@@ -1049,8 +1199,9 @@ or one `{"event":"group","by":"folder","available":false}`; it keeps each id's l
       // joins A's 08:00 session; without origin → 11:20, its own session
   }
   #[test] fn day_camera_and_folder() {
-      // by_day: ["2025-12-14": …, "2025-12-15": …, Undated]; by_camera: [A, B, UnknownCamera]; by_folder with no origins →
-      // None; with "DCIM/100MSDCF" and "DCIM/101MSDCF" → those two then NoFolder
+      // by_day: ["2025-12-14": …, "2025-12-15": …, Undated]; by_camera ordered by key: [B, A, UnknownCamera]; by_folder
+      // with no origins → None; with "DCIM/100MSDCF" and "DCIM/101MSDCF" → those two then NoFolder; a root file →
+      // Folder(""); only Orphaned origins ("?/100MSDCF") → Some([Folder("?/100MSDCF"), ..])
   }
   #[test] fn grouping_is_order_independent() { /* 500 seeded items (3 cameras, 4 days, 5 folders, some undated), 20 seeded shuffles → each by_* identical */ }
   // cli.rs
@@ -1074,7 +1225,7 @@ or one `{"event":"group","by":"folder","available":false}`; it keeps each id's l
   cargo test -p revenant-core --test real_samples -- --ignored` if `samples/cache` exists, and the opt-in suites with
   `REVENANT_OS_FS=1` (`-p revenant-testkit --test os_builders`, `-p revenant-core --test os_filesystems`, both
   `-- --ignored`); paste the summaries.
-- [ ] **Step 2:** `cargo run --release -p revenant-dev -- bench` (all images, `exfat-card` included); add the
+- [ ] **Step 2:** `cargo run --release -p revenant-dev -- bench` (all images, `exfat-card` included); it relies on `exfat-card` being in the `--images` default (Task 8); add the
   `exfat-card` line to the core README "Performance" table and say whether the other lines moved.
 - [ ] **Step 3: Docs:** root README status (file systems, names, grouping); `CLAUDE.md` "Onde o desenvolvimento está"
   (pt-BR, today's date: 1.3 mergeada (PR #4); 1.4 concluída na branch `feat/m1-p4-filesystems`, aguardando PR/merge;
@@ -1082,11 +1233,12 @@ or one `{"event":"group","by":"folder","available":false}`; it keeps each id's l
   como segunda exceção à regra de dados reais, explicando por que não toca disco físico); roadmap 1.4 marked done with
   what it covers (FAT12/16/32 e exFAT, vivos e apagados, formatação rápida pelos nomes, deduplicação, agrupamento, nomes)
   and what it does not (apagado fragmentado sai `Partial`; NTFS/APFS/HFS+).
-- [ ] **Step 4:** history file (pt-BR, same shape as the 1.3 one): D1–D18 with their costs, decisions taken during
+- [ ] **Step 4:** history file (pt-BR, same shape as the 1.3 one): D1–D18 and the pre-flight rulings C1–C20, K1–K4 with their costs, decisions taken during
   execution, the bench lines, the 1.4 pending items closed (table above) and every item left open with its owner:
   **sem dono** — foto gravada no início de prévia de RAW sem metadados de sistema de arquivos; COUNT corrompido em
   achado só esculpido; **1.6** — apagado fragmentado `Partial` (D3) e cauda quase igual sem metadados; **Módulo 2** —
   a extração plana sem subpastas (D14), nomes comerciais de câmera, vídeo esculpido fora da sessão pelo fuso (D16), o
   motivo exibido quando "Por pasta" está desligado; **sem dono** — quadros de MJPEG de vídeo `Partial` (D12),
-  conferência do Windows contra um driver real (D17).
+  conferência do Windows contra um driver real (D17); o D14 diverge do exemplo da spec §3 (`A7IV`); a leitura do C16 ("Por pasta"
+  fica ligado com pastas antigas recuperadas) para o Módulo 2 confirmar.
 - [ ] **Step 5:** Commit: `docs: part 1.4 status, numbers and pending items`.
