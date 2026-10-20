@@ -81,9 +81,11 @@ const MAX_THREADS: usize = 64;
 ///
 /// Memory: the scan holds at most `cache_bytes` of cached source data, plus for each reading thread (the scan thread
 /// and each measuring thread) one window being loaded (1 MiB) and a pool of at most 4 reader windows (4 MiB) kept
-/// between measurements, plus the validation decodes of every scan in the process (at most 512 MiB at once) and what
-/// each running measurement holds (for example a `moov` of at most 16 MiB). So with the defaults on a 16-thread machine,
-/// about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
+/// between measurements, plus the validation decodes of every scan in the process (the budget counts at most 512 MiB
+/// at once: the JPEG bytes and the 1-byte-per-pixel output; the decoder's internal buffers, such as a progressive
+/// image's coefficients, come on top) and what each running measurement holds (for example a `moov` of at most 16 MiB),
+/// plus about 200 B per recognized sector start in the read-ahead (at most lookahead × block / sector of them). So with
+/// the defaults on a 16-thread machine, about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
 pub struct ScanOptions {
     /// Granularity of candidate starts and of unreadable-region handling, in bytes. Above 512, the detectors see a sector that
     /// failed only in part as wholly unreadable (health stays conservative).
@@ -195,8 +197,12 @@ struct Commit<'a, 's> {
 }
 
 impl Commit<'_, '_> {
-    /// Emits `event`; a cancel seen afterwards stops the scan before anything else is emitted.
+    /// Emits `event` unless the scan is cancelled; a cancel seen afterwards stops the scan before anything else is
+    /// emitted.
     fn emit(&mut self, event: Event) -> Result<(), EngineError> {
+        if self.shared.cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
         (self.on_event)(event);
         if self.shared.cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
@@ -290,7 +296,13 @@ impl Commit<'_, '_> {
 
     /// Turns the measurement at `at` into a pending finding; an `Intact` one adds a skip range per piece.
     fn add(&mut self, at: u64, m: Measurement) {
-        if m.len == 0 || !pieces_ok(at, &m, self.shared.total) {
+        if m.len == 0 {
+            return;
+        }
+        // A detector bug: caught in debug builds, ignored (no finding) in release.
+        let ok = pieces_ok(at, &m, self.shared.total);
+        debug_assert!(ok, "pieces contract broken at {at}: {m:?}");
+        if !ok {
             return;
         }
         let sector = self.shared.sector;
@@ -338,7 +350,8 @@ impl Commit<'_, '_> {
 /// `Found`), and an `Intact` finding with any of them inside one of its pieces is downgraded to `Partial`. Findings are
 /// emitted in the order they were found (by start), so one found inside another is emitted right after it. `measure`
 /// reads the whole source (not just the block), so files may cross block boundaries. A measurement whose pieces break
-/// the [`Finding::fragments`] contract is ignored.
+/// the [`Finding::fragments`] contract is a detector bug: it panics in debug builds and is ignored (no finding) in
+/// release builds.
 ///
 /// Threads: the scan thread reads up to [`ScanOptions::lookahead_blocks`] blocks ahead and queues each recognized head
 /// to `opts.threads` measuring threads; it then takes the blocks in order and, for each head the sequential walk would
@@ -350,9 +363,10 @@ impl Commit<'_, '_> {
 /// cache's bad map.
 ///
 /// `opts.sector` is raised to at least 16 (the head length) and `opts.block` rounded down to whole sectors, so a head
-/// never straddles two blocks. Cancellation is checked before each block, after every event and while waiting for a
-/// measurement: once it is seen no further event is emitted, the measuring threads drop their remaining jobs, and the
-/// scan returns `Err(Cancelled)` after they have all stopped; findings still pending are dropped.
+/// never straddles two blocks. Cancellation is checked before each block examined or read ahead, before and after
+/// every event and while waiting for a measurement: once it is seen no further event is emitted, the measuring threads
+/// drop their remaining jobs, and the scan returns `Err(Cancelled)` after they have all stopped; findings still pending
+/// are dropped.
 pub fn scan(
     source: &dyn Source,
     formats: &[Box<dyn Format>],
@@ -389,6 +403,9 @@ pub fn scan(
                 return Err(EngineError::Cancelled);
             }
             while ahead.len() < lookahead && fill_pos < total {
+                if cancel.is_cancelled() {
+                    return Err(EngineError::Cancelled);
+                }
                 let end = (fill_pos + block).min(total);
                 ahead.push_back(shared.fill(fill_pos, end, workers > 0));
                 fill_pos = end;

@@ -850,18 +850,62 @@ fn a_finding_carries_its_measured_pieces() {
     assert!(scan_pieces(1500, &[])[0].fragments.is_empty());
 }
 
+/// Measurements that break the pieces contract: a single piece, the first piece elsewhere, pieces not summing to `len`,
+/// overlapping pieces, a piece past the source.
+const BROKEN_PIECES: [(u64, &[(u64, u64)]); 5] = [
+    (1000, &[(4096, 1000)]),
+    (1500, &[(4608, 1000), (20_480, 500)]),
+    (1600, &[(4096, 1000), (20_480, 500)]),
+    (1500, &[(4096, 1000), (4596, 500)]),
+    (1500, &[(4096, 1000), (65_400, 500)]),
+];
+
+#[cfg(not(debug_assertions))]
 #[test]
 fn measurements_breaking_the_pieces_contract_are_ignored() {
-    let broken: [(u64, &[(u64, u64)]); 5] = [
-        (1000, &[(4096, 1000)]),                // a single piece
-        (1500, &[(4608, 1000), (20_480, 500)]), // the first piece elsewhere
-        (1600, &[(4096, 1000), (20_480, 500)]), // pieces not summing to len
-        (1500, &[(4096, 1000), (4596, 500)]),   // overlapping pieces
-        (1500, &[(4096, 1000), (65_400, 500)]), // a piece past the source
-    ];
-    for (len, pieces) in broken {
+    for (len, pieces) in BROKEN_PIECES {
         assert!(scan_pieces(len, pieces).is_empty(), "{len} {pieces:?}");
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pieces contract")]
+fn a_single_piece_breaks_the_pieces_contract() {
+    let (len, pieces) = BROKEN_PIECES[0];
+    scan_pieces(len, pieces);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pieces contract")]
+fn a_first_piece_elsewhere_breaks_the_pieces_contract() {
+    let (len, pieces) = BROKEN_PIECES[1];
+    scan_pieces(len, pieces);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pieces contract")]
+fn pieces_not_summing_to_len_break_the_pieces_contract() {
+    let (len, pieces) = BROKEN_PIECES[2];
+    scan_pieces(len, pieces);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pieces contract")]
+fn overlapping_pieces_break_the_pieces_contract() {
+    let (len, pieces) = BROKEN_PIECES[3];
+    scan_pieces(len, pieces);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pieces contract")]
+fn a_piece_past_the_source_breaks_the_pieces_contract() {
+    let (len, pieces) = BROKEN_PIECES[4];
+    scan_pieces(len, pieces);
 }
 
 /// Wraps a source, fails every read that touches any of the `bad` ranges (`[start, end)`) and counts what reaches it.
@@ -1363,8 +1407,8 @@ fn no_event_after_cancel() {
     assert_eq!(found(&events).len(), 1);
 }
 
-/// Wraps a source and sleeps 2 ms in every read.
-struct SlowSource(FileSource);
+/// Wraps a source and sleeps for the given time in every read.
+struct SlowSource(FileSource, std::time::Duration);
 
 impl Source for SlowSource {
     fn len(&self) -> u64 {
@@ -1372,7 +1416,7 @@ impl Source for SlowSource {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        std::thread::sleep(self.1);
         self.0.read_at(offset, buf)
     }
 
@@ -1385,7 +1429,10 @@ impl Source for SlowSource {
 fn cancel_from_another_thread_stops_the_scan() {
     use std::time::{Duration, Instant};
     let file = DiskImage::noise(64 * MIB, 44).save();
-    let source = SlowSource(FileSource::open(file.path()).unwrap());
+    let source = SlowSource(
+        FileSource::open(file.path()).unwrap(),
+        Duration::from_millis(2),
+    );
     let cancel = CancelToken::default();
     let cancelled_at = std::sync::Mutex::new(None);
     let r = std::thread::scope(|s| {
@@ -1404,6 +1451,29 @@ fn cancel_from_another_thread_stops_the_scan() {
         "{:?}",
         returned - at
     );
+}
+
+#[test]
+fn cancel_during_the_first_read_ahead_stops_the_scan() {
+    use std::time::{Duration, Instant};
+    // 16 blocks of 4 MiB read ahead at 30 ms per 1 MiB window would take about 2 s.
+    let file = DiskImage::noise(64 * MIB, 45).save();
+    let source = SlowSource(
+        FileSource::open(file.path()).unwrap(),
+        Duration::from_millis(30),
+    );
+    let cancel = CancelToken::default();
+    let started = Instant::now();
+    let r = std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            cancel.cancel();
+        });
+        scan(&source, &all_formats(), &threads(8), &cancel, &mut |_| {})
+    });
+    let took = started.elapsed();
+    assert_eq!(r.unwrap_err().code(), "cancelled");
+    assert!(took < Duration::from_millis(300), "{took:?}");
 }
 
 /// Test-only format: a sector starting with `TWOPIECES-HEAD!!` is a 2048-byte `Intact` file in two 1 KiB pieces, the
@@ -1519,8 +1589,50 @@ fn fragmented_measurements_skip_only_their_pieces() {
     );
 }
 
+#[cfg(not(debug_assertions))]
 #[test]
 fn inconsistent_fragments_are_ignored() {
     let (events, _) = scan_two_pieces(1023, Vec::new());
     assert!(found(&events).iter().all(|f| f.0 != 4096), "{events:?}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pieces contract")]
+fn inconsistent_fragments_break_the_pieces_contract() {
+    scan_two_pieces(1023, Vec::new());
+}
+
+/// Test-only format: every sector start is a candidate whose `measure` panics.
+struct Panics;
+
+impl Format for Panics {
+    fn name(&self) -> &'static str {
+        "panics"
+    }
+
+    fn recognizes(&self, head: &[u8]) -> bool {
+        head.starts_with(b"PANIC!!!")
+    }
+
+    fn confirms(&self, _source: &dyn Source, _start: u64) -> bool {
+        true
+    }
+
+    fn measure(&self, _source: &dyn Source, _start: u64) -> Option<Measurement> {
+        panic!("detector panicked");
+    }
+}
+
+#[test]
+#[should_panic(expected = "detector panicked")]
+fn a_panicking_detector_panics_the_scan_without_hanging() {
+    let mut img = DiskImage::zeros(16 * MIB);
+    for at in (0..16 * MIB).step_by(MIB / 2) {
+        img.put(at + 4096, b"PANIC!!!");
+    }
+    let file = img.save();
+    let source = FileSource::open(file.path()).unwrap();
+    let formats: Vec<Box<dyn Format>> = vec![Box::new(Panics)];
+    let _ = run_with(&source, &formats, &threads(8));
 }

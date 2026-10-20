@@ -270,8 +270,8 @@ it). `Fragment { start, len }` (re-exported as `revenant_core::Fragment`) is one
 and `Preview` carry `fragments: Vec<Fragment>` with one contract: empty for a contiguous file; otherwise at least 2 pieces
 in file order, the first starting at `start`, their lengths summing to `len`, no two overlapping. `start` is always the
 first piece's start and `len` the total length. `Finding::ranges()` and `Preview::ranges()` give `[Fragment { start, len }]`
-for a contiguous file, else the pieces. The scan ignores a measurement that breaks this contract (or has a piece
-outside the source): it gives no finding. No detector produces pieces yet (reassembly comes later in this part); the scan
+for a contiguous file, else the pieces. A measurement that breaks this contract (or has a piece outside the
+source) is a detector bug: debug builds assert on it, release builds ignore it (no finding). No detector produces pieces yet (reassembly comes later in this part); the scan
 copies a measurement's `fragments` into its finding. After an `Intact` finding in pieces, the scan skips heads only inside
 its pieces (each rounded out to whole sectors), so files in the gaps between them are still found.
 
@@ -338,13 +338,15 @@ sector start some format recognizes. It then examines the blocks in order exactl
 inside a skip range committed meanwhile is ignored (its result is thrown away), and for every other head it waits for that
 head's measurement. Because a measurement depends only on the source's bytes and unreadable sectors, the events, their
 order, the ids and `ScanSummary` are the same for any `threads` and any `cache_bytes`. A JPEG validation decode holds
-part of a process-wide budget of 512 MiB (its bytes plus one byte per pixel) while it runs, so concurrent decodes never
-hold more than that.
+part of a process-wide budget of 512 MiB (its bytes plus one byte per pixel of the grayscale output) while it runs. The
+budget counts only those: the decoder's internal buffers (for example a progressive JPEG's coefficients) come on top.
 
 Memory: at most `cache_bytes` of cached windows, plus for each reading thread (the scan thread and every measuring
 thread) one window being loaded (1 MiB) and its reader pool (at most 4 MiB), plus the decode budget (512 MiB, shared by
-every scan in the process), plus what each running measurement holds (for example a `moov` of at most 16 MiB). With the
-defaults on a 16-thread machine: about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
+every scan in the process, plus the decoder's internal buffers), plus what each running measurement holds (for example a
+`moov` of at most 16 MiB), plus about 200 B per recognized sector start in the read-ahead (at most
+lookahead × block / sector of them). With the defaults on a 16-thread machine: about 256 MiB + 17 × 5 MiB + 512 MiB,
+plus the measurements' own buffers.
 
 Events:
 
@@ -357,7 +359,7 @@ Events:
   sectors (also across blocks) is one event and counts in `ScanSummary::unreadable_bytes`. A run is split where a finding
   ends. The scan then continues.
 
-`CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block, after
+`CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block examined and each block read ahead, before and after
 every event and while waiting for a measurement. Once it is seen no further event is emitted (a cancel from inside the
 callback makes that event the last one), the measuring threads drop their remaining jobs, and `scan` returns
 `EngineError::Cancelled` after every thread has stopped (a measurement already running is finished first); findings still
