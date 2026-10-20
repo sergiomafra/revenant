@@ -124,6 +124,8 @@ fn try_decode(data: &[u8], strict: bool) -> Option<bool> {
 thread_local! {
     /// Strict `zune-jpeg` decodes attempted on this thread.
     pub(super) static ZUNE_STRICT_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Lenient `zune-jpeg` decodes attempted on this thread.
+    pub(super) static ZUNE_LENIENT_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Health of a complete JPEG (the `len` bytes at `start`, holding its EOI), the one rule every caller uses (a plain
@@ -132,14 +134,25 @@ thread_local! {
 /// - A frame Revenant's entropy decoder covers ([`jpeg_entropy::frame`]: sequential Huffman, 8-bit, one interleaved
 ///   scan): `Intact` iff that decoder walks every MCU (the exact count, restart markers in sequence) with EOI right after
 ///   the last one. `zune-jpeg`'s strict mode is not used for these: it zero-fills past an early EOI and does not count
-///   MCUs. Otherwise the lenient `zune-jpeg` decode separates `Partial` (it succeeds, or the image is too large to
-///   decode) from `Damaged`.
+///   MCUs. If the walk fails before completing one row of MCUs, `Damaged` (ruling Q9: nothing of the photo would show,
+///   as for a cut file; the lenient decode is skipped). Otherwise the lenient `zune-jpeg` decode separates `Partial` (it
+///   succeeds, or the image is too large to decode) from `Damaged`.
 /// - Any other frame (progressive, arithmetic, 12-bit, a header that does not parse): strict `zune-jpeg` decode ->
 ///   `Intact`; only the lenient one -> `Partial`; neither -> `Damaged`; too large to decode -> `Partial`.
 ///
 /// With unreadable sectors (read as zeros) inside, a success of either kind gives at most `Partial`.
 pub(super) fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
     verify(r, start, len).0
+}
+
+/// How our entropy decoder's walk of a covered frame ended.
+enum Walk {
+    /// Every MCU, then EOI; the end of the JPEG's data (just past `FF D9`).
+    ToEoi(u64),
+    /// It failed before completing one row of MCUs.
+    UnderOneRow,
+    /// It failed later.
+    Failed,
 }
 
 /// [`decode_health`], with where the JPEG's data ends when our decoder walked it to its EOI (just past `FF D9`, which
@@ -150,14 +163,18 @@ fn verify(r: &mut Reader, start: u64, len: u64) -> (Health, Option<u64>) {
         let frame = jpeg_entropy::frame(r, start, header.scan_start)?;
         let run = jpeg_entropy::decode(r, &frame, frame.start(header.scan_start), end, false);
         Some(match run.end {
-            jpeg_entropy::End::Eoi { at } => Some(at + 2),
-            _ => None,
+            jpeg_entropy::End::Eoi { at } => Walk::ToEoi(at + 2),
+            // Q9: less than one full row of MCUs before the failure: nothing of the photo would show (as for a cut
+            // file), and the lenient decode of a frame declared huge would be the costliest step.
+            _ if run.mcus < u64::from(frame.mcus_x) => Walk::UnderOneRow,
+            _ => Walk::Failed,
         })
     });
     match walked {
-        Some(Some(eoi)) if r.bad_in(start, end) => (Health::Partial, Some(eoi)),
-        Some(Some(eoi)) => (Health::Intact, Some(eoi)),
-        Some(None) => (zune_health(r, start, len, false), None),
+        Some(Walk::ToEoi(eoi)) if r.bad_in(start, end) => (Health::Partial, Some(eoi)),
+        Some(Walk::ToEoi(eoi)) => (Health::Intact, Some(eoi)),
+        Some(Walk::UnderOneRow) => (Health::Damaged, None),
+        Some(Walk::Failed) => (zune_health(r, start, len, false), None),
         None => (zune_health(r, start, len, true), None),
     }
 }
@@ -184,6 +201,8 @@ pub(super) fn zune_health(r: &mut Reader, start: u64, len: u64, strict: bool) ->
             Health::Intact
         };
     }
+    #[cfg(test)]
+    ZUNE_LENIENT_DECODES.with(|c| c.set(c.get() + 1));
     match try_decode(&data, false) {
         Some(true) | None => Health::Partial, // None: too large to decode, content not verifiable
         Some(false) => Health::Damaged,
@@ -612,6 +631,40 @@ mod tests {
             // A frame our decoder covers never goes through zune-jpeg's strict mode.
             assert_eq!(strict_decodes(), before, "{name}");
         }
+    }
+
+    #[test]
+    fn a_walk_under_one_row_is_damaged_without_the_lenient_decode() {
+        // A flat 16384×12800 frame (rows of 2048 MCUs, 1536 bytes) with 1 KiB of its data, then zeros and an EOI: the
+        // lenient decode would fill 210 megapixels from that; our walk fails before the first row ends (Q9).
+        let flat = revenant_testkit::jpeg_flat_with_restarts(16384, 12800, 0);
+        let scan_start = {
+            let src = Mem(flat.clone());
+            walk_header(&mut Reader::new(&src), 0, JPEG_MAX_LEN)
+                .unwrap()
+                .scan_start as usize
+        };
+        let lenient = || ZUNE_LENIENT_DECODES.with(std::cell::Cell::get);
+        let mut short = flat[..scan_start + 1024].to_vec();
+        short.extend_from_slice(&[0; 510]);
+        short.extend_from_slice(&[0xFF, 0xD9]);
+        let src = Mem(short.clone());
+        let before = lenient();
+        assert_eq!(
+            decode_health(&mut Reader::new(&src), 0, short.len() as u64),
+            Health::Damaged
+        );
+        assert_eq!(lenient(), before, "no lenient decode");
+        // Past the first row the lenient decode still decides (a smaller frame, so the test stays quick).
+        let (_, forged) = early_eoi_cases();
+        let (_, zeros) = &forged[0];
+        let src = Mem(zeros.clone());
+        let before = lenient();
+        assert_eq!(
+            decode_health(&mut Reader::new(&src), 0, zeros.len() as u64),
+            Health::Partial
+        );
+        assert_eq!(lenient(), before + 1);
     }
 
     #[test]

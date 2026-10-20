@@ -83,7 +83,9 @@ not end the file; DAC and JPG markers count as segments, and `FF` fill bytes bef
   Also `Partial`: the structure is complete but the declared size is over 210 megapixels, so it is not decoded ("not fully
   verifiable").
   Also `Partial`: a DAC segment (arithmetic coding) with complete structure, which `zune-jpeg` cannot decode.
-- `Damaged`: EOI found but neither decode succeeds. The length is still exact. Also `Damaged`: a cut file (no EOI, as
+- `Damaged`: EOI found but neither decode succeeds; or EOI found, the frame is one Revenant's entropy decoder covers, and
+  that decoder fails before completing one row of MCUs (ruling Q9, as for a cut file: nothing of the photo would show;
+  the lenient `zune-jpeg` decode, the costliest step for a frame declared huge, is then not run). The length is still exact. Also `Damaged`: a cut file (no EOI, as
   above) whose entropy-coded data does not hold one full row of MCUs before its first error, the cut, or the first
   512-byte sector of one repeated byte value or unreadable sector, such as a JPEG cut right after its header and followed
   by erased (zero-filled) space: nothing of the photo would show. Zeros decode as valid blocks under the standard
