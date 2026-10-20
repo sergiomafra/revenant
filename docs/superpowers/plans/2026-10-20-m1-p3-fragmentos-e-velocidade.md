@@ -3,7 +3,8 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A busca passa a correr no ritmo do leitor de cartão (≥ 300 MB/s medidos, do cache de páginas, em imagens densas de
-JPEG e de RAW), nunca lê duas vezes o mesmo setor nem relê um setor ruim já conhecido, e remonta os dois casos de fragmentação
+JPEG e de RAW), lê cada setor uma só vez na varredura e nos detectores (a busca de lacuna de um JPEG pode reler até a sua
+janela de 64 MiB) e nunca relê um setor ruim já conhecido (até 1.048.576 trechos ruins lembrados), e remonta os dois casos de fragmentação
 mais comuns em cartão de câmera: o JPEG partido em dois pedaços e o vídeo cujo `moov` ficou separado do `mdat`. Fecha as
 pendências com dono 1.3.
 
@@ -35,13 +36,23 @@ leitura", estado Íntegro/Parcial/Danificado).
 - **Errors by code** (`code() -> &'static str`, snake_case); no UI text in the engine.
 - **Rust:** edition 2024, `rust-version = "1.88"`. Dev machine: Intel Mac (8 cores/16 threads), Homebrew Rust; never
   `brew install/upgrade` toolchains. No `unsafe` outside `source/windows.rs`.
-- **Bounded everything:** cache ≤ `ScanOptions::cache_bytes` (default 256 MiB), lookahead ≤ 16 blocks, concurrent decodes ≤ the
-  512 MiB decode budget, JPEG gap window ≤ 64 MiB and ≤ 64 join attempts, orphan `moov` candidates ≤ 4096, `moov` in memory
-  ≤ `MOOV_MAX_LEN` (16 MiB). No loop or allocation driven by an on-disk number without a cap.
+- **Bounded everything:** cache ≤ `ScanOptions::cache_bytes` (default 256 MiB), lookahead = `min(16, max(1, cache_bytes /
+  (2 × block)))` blocks (so the read-ahead always fits in the cache), concurrent decodes ≤ the 512 MiB decode budget, JPEG gap
+  window ≤ 64 MiB and ≤ 4096 join attempts (`MAX_JOIN_TRIES`; exhaustive search makes the cap a correctness bound, see Health
+  semantics), shared bad-sector map ≤ 1,048,576 merged runs (past it, new bad sectors are not remembered: they are retried,
+  with the same results and events), orphan `moov` candidates ≤ 4096 and ≤ 1 GiB of `moov` bytes loaded per scan, `moov` in
+  memory ≤ `MOOV_MAX_LEN` (16 MiB). No loop or allocation driven by an on-disk number without a cap.
+- **Read once, precisely:** each sector is read once by the scan and the detectors; a JPEG gap search may re-read up to its
+  64 MiB window. READMEs and the Goal must say exactly that, never "never reads twice" without the exception.
 - **Determinism:** for a given source, the event sequence is identical for any `threads` and any `cache_bytes`.
 - **Health semantics (binding, from 1.1/1.2):** `Intact` = structure complete AND content verified clean; `Partial` = salvageable
   but not clean; `Damaged` = won't open. Never `Intact` without evidence. A reassembled file is `Intact` only with the evidence
   its task lists; otherwise `Partial`.
+  - **Q1 (JPEG):** a JPEG joined from two pieces is `Intact` only if exactly one candidate continuation in the whole window
+    passes (and every candidate was tried: no cap or budget hit). With two or more passing candidates it takes the closest
+    and is at most `Partial`.
+  - **Video pairing:** more than one passing break point `L1` → the smallest, `Partial`. Real H.264/HEVC (large slices) will
+    usually pair as `Partial` until 1.4 (file-system cluster size narrows `L1`); this is accepted and must be recorded.
 - **Docs in the same commit [Sérgio]:** each task updates the READMEs it affects and `CHANGELOG.md` `[Unreleased]` for anything
   user-visible.
 - **Commit trailer, always:** `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Conventional Commits. Never
@@ -57,14 +68,32 @@ leitura", estado Íntegro/Parcial/Danificado).
    candidates → `hostile_moov_candidates_are_bounded` (Task 9).
 2. **Two different photos glued into one "Intact" JPEG** (the real continuation is gone and another photo's data sits after
    the gap): must not come out `Intact` → `glued_halves_of_two_photos_are_not_intact`, `seam_check_rejects_a_glued_dc_grid`
-   (Task 8).
+   (Task 8); two passing continuations or a search cut short by the cap must be `Partial` → `two_passing_continuations_are_partial`,
+   `search_cut_short_by_the_cap_is_partial` (Task 8).
 3. **Parallelism reordering events or racing the cancel**: identical events for 1, 2, 8 and 16 threads; no event after the one
    during which `cancel()` was called; workers joined before `scan` returns → `parallel_scan_matches_sequential_events`,
    `no_event_after_cancel`, `cancel_from_another_thread_stops_the_scan` (Task 6).
 4. **The cache serving an unreadable sector as good data (zeros), or a different answer after eviction** →
    `known_bad_sector_is_never_served_as_data` and `cache_size_does_not_change_events` (Task 4).
 5. **A `moov` paired with the wrong video** (two recordings from the same camera, or two copies of the same first half) →
-   `moov_pairs_with_its_own_mdat_not_a_sibling`, `moov_matching_two_videos_is_not_paired` (Task 9).
+   `moov_pairs_with_its_own_mdat_not_a_sibling`, `moov_matching_two_videos_is_not_paired` (Task 9); an ambiguous break point is `Partial` → `ambiguous_break_point_is_partial`
+   (Task 9).
+
+## Decisões do pre-flight (Q1, C1–C10)
+
+Cada linha: decisão — custo se estiver errada. Detalhes no preflight (`.superpowers/sdd/2026-10-20-m1-p3-fragmentos-e-velocidade/preflight.md`).
+
+- **Q1** JPEG de dois pedaços só é `Intact` com exatamente um candidato aprovado na janela; senão no máximo `Partial` — custo: algumas junções reais saem `Partial`.
+- **C1** `MAX_JOIN_TRIES` = 4096, busca exaustiva, estouro de teto/orçamento ⇒ `unique = false`; a tentativa aborta na linha de MCUs após a emenda — custo: mais decodificação por JPEG cortado (limitada pelo teto e pelo orçamento).
+- **C2** resolvido pelo teto de C1; registrar o número de tentativas de cada teste — custo: nenhum além do de C1.
+- **C3** `x` = menor entre `Error`, `cut` e o primeiro setor de um byte repetido — custo: foto com 512 bytes uniformes nos dados de entropia não é junta (fica `Partial`).
+- **C4** mantém "mais de um `L1` aprovado → `Partial`"; testes `Intact` usam NAL pequenas; teste de ambiguidade novo — custo: a maioria dos vídeos reais remontados sai `Partial` (tocam, no máximo um quadro estragado) até a 1.4.
+- **C5** `pair_videos` recebe `&CachedSource` e usa `bad_runs` nos dois pedaços — custo: pequeno acoplamento ao tipo do cache.
+- **C6** read-ahead = `min(16, max(1, cache_bytes / (2 × block)))`; o teste da Tarefa 4 é re-baselinado na Tarefa 6 — custo: menos sobreposição com cache minúsculo.
+- **C7** `video_split_in_three_is_not_paired` com cortes em 2/5 e 3/5; peça do meio < 1/32 das amostras não é detectada — custo: vídeo raro de 3 pedaços com meio minúsculo é pareado.
+- **C8** filtro `(q − P) ≡ 0 (mod 512)` antes de carregar o `moov` e orçamento de 1 GiB de `moov` por varredura — custo: com enxurrada de `moov` órfãos, alguns pares reais se perdem.
+- **C9** recarregar janela lê em volta dos trechos ruins conhecidos; mapa limitado a 1.048.576 trechos — custo: cartão com milhões de setores ruins espalhados é relido acima do teto.
+- **C10** "cada setor lido uma vez" vale para varredura e detectores; a busca de lacuna pode reler a janela de 64 MiB; `cut-jpeg` sem meta, só medido — custo: nenhum (documentação passa a ser exata).
 
 ## Pendências herdadas com dono 1.3
 
@@ -135,7 +164,9 @@ pedaços; segundo pedaço antes do primeiro no disco (JPEG); reparo de vídeo co
 - [ ] **Step 2:** run → FAIL (no `bench` subcommand). **Step 3:** implement. **Step 4:** `cargo test --workspace`, clippy, fmt.
 - [ ] **Step 5: Baseline.** `cargo run --release -p revenant-dev -- bench` on the dev Mac; paste the 5 lines in the report and in
   the commit body (they are the "before" numbers Task 10 compares against). README: how to run it, what each image is, that
-  numbers are page-cache throughput (an upper bound for a card reader). Commit: `feat(dev): scan throughput benchmark`.
+  numbers are page-cache throughput (an upper bound for a card reader). Note in the README that `cut-jpeg` has no speed target
+  (after Task 8 each cut JPEG starts a gap search that may re-read its 64 MiB window); it is only measured and reported.
+  Commit: `feat(dev): scan throughput benchmark`.
 
 ---
 
@@ -190,7 +221,9 @@ Rules:
 
 **Files:**
 - Modify: `crates/revenant-core/src/formats/mod.rs` (`Fragment`, `Measurement`), `src/scan.rs` (`Finding`), `src/inspect.rs`
-  (`Preview`, fragmented inspection), `src/extract.rs`, `src/lib.rs`
+  (`Preview`, fragmented inspection; `inspect::jpeg` borrows `preview` once `Copy` is gone), `src/extract.rs`, `src/lib.rs`
+- Modify: `crates/revenant-core/src/formats/{jpeg,isobmff,raf,tiffraw}.rs` (every `Measurement {..}` literal there gets
+  `fragments: Vec::new()`: 2 in `jpeg.rs`, 2 in `isobmff.rs`, 1 in `raf.rs`, 1 in `tiffraw.rs`)
 - Create: `crates/revenant-core/src/source/fragmented.rs`; Modify: `src/source/mod.rs`
 - Modify: `crates/revenant-dev/src/main.rs`
 - Test: `crates/revenant-core/tests/{source.rs,extract.rs,inspect.rs}`, unit test in `revenant-dev/src/main.rs`, and every
@@ -235,7 +268,8 @@ Rules:
   #[test] fn fragmented_view_maps_reads_and_errors() {
       // pieces [(100, 10), (50, 20)] over a 4 KiB image: len() == 30; read_at(5, 10 bytes) == src[105..110] ++ src[50..55];
       // read_at(30, ..) == Ok(0); absolute(5, 10) == [Fragment{start:105,len:5}, Fragment{start:50,len:5}];
-      // over a source failing reads in [60, 61): read_at(0, 30 bytes) → Err(Read { offset: 60, .. })
+      // over a source failing reads in [60, 61) whose error reports the FIRST BAD BYTE as its offset (not the request offset):
+      // read_at(0, 30 bytes) → Err(Read { offset: 60, .. }) (the inner error offset, made absolute)
   }
   // extract.rs
   #[test] fn extracts_a_fragmented_finding_in_file_order() {
@@ -260,8 +294,10 @@ Rules:
 
 **Files:**
 - Create: `crates/revenant-core/src/cache.rs` (crate-private); Modify: `src/lib.rs`, `src/scan.rs`
-- Test: unit tests in `cache.rs`; `crates/revenant-core/tests/scan.rs` (update the 5 `ScanOptions {..}` literals with
-  `..ScanOptions::default()`)
+- Test: unit tests in `cache.rs`; `crates/revenant-core/tests/scan.rs` (the existing `ScanOptions {..}` literals already use
+  `..ScanOptions::default()`: nothing to update there). This task defines, in `tests/scan.rs`, the shared test source
+  `MultiFailingSource { inner, bad: Vec<(u64, u64)>, reads: AtomicU64 counters }`: fails reads touching any bad range and counts
+  inner bytes read and attempts that touch a bad range. Tasks 4 and 6 both use it.
 
 **Interfaces:**
 - Produces:
@@ -275,18 +311,23 @@ Rules:
       pub(crate) fn covered(&self, start: u64, end: u64) -> bool;
       /// Unreadable runs `(start, len)` inside [start, end), merged, ascending.
       pub(crate) fn bad_runs(&self, start: u64, end: u64) -> Vec<(u64, u64)>;
+      /// The scan tells the cache its position: coverage runs entirely below `pos` are pruned (keeps ≤ 65,536 runs).
+      pub(crate) fn forget_coverage_below(&self, pos: u64);
   }
   impl Source for CachedSource<'_>
   // ScanOptions gains: pub cache_bytes: usize  (default 256 MiB; values below CACHE_WINDOW are raised to it)
   ```
 Behavior (exactly that of the inner source, memoized):
 - Window = aligned `CACHE_WINDOW` bytes, loaded with one inner read; if that fails, resolved once sector by sector: failing
-  sectors become zeros in the window and enter the shared bad map (merged runs). Loaded windows are kept up to `capacity` bytes
-  (LRU). A window being loaded by one thread is waited for (Condvar) by the others, never read twice concurrently.
+  sectors become zeros in the window and enter the shared bad map (merged runs, at most 1,048,576 runs; past the cap new bad
+  sectors are not remembered, so they are retried: slower, same results and events; the README says so). Loaded windows are
+  kept up to `capacity` bytes (LRU). **(Re)loading a window, including one that was evicted, reads around the known bad runs
+  and never touches them again** (it skips them, no "one inner read, then sector by sector" over a known bad sector). A window
+  being loaded by one thread is waited for (Condvar) by the others, never read twice concurrently.
 - `read_at` over a range that overlaps a known bad sector returns `Err(EngineError::Read { offset: <first bad sector>, cause:
   io::Error::other("unreadable sector") })` **every time**, without touching the inner source again; otherwise copies.
   `Reader`'s per-sector fallback then gets the good sectors from the cache and the bad ones as errors.
-- Coverage = merged runs of windows fully resolved; runs below the scan position may be pruned (keep ≤ 65,536 runs).
+- Coverage = merged runs of windows fully resolved; `scan` calls `forget_coverage_below(pos)` as it advances (keep ≤ 65,536 runs).
 - `scan` wraps its source in a `CachedSource` (granularity = normalized `opts.sector`) and passes `&cached` to every
   `measure`. Its block read goes through the cache. A block that is entirely inside the skip range of an `Intact` finding and
   `covered` is **not read again**: its sectors' bad flags come from `bad_runs`, and its `Unreadable` events are the same as if it
@@ -302,10 +343,15 @@ Behavior (exactly that of the inner source, memoized):
       // bad_runs(0, 4 MiB) == [(1 MiB + 4096, 512)]; inner attempts touching the bad sector ≤ 2 in total
   }
   #[test] fn concurrent_readers_load_each_window_once() { /* 8 threads read all of a 16 MiB source → inner window reads == 16 */ }
+  #[test] fn evicted_window_does_not_retry_a_known_bad_sector() {
+      // capacity 2 MiB; inner fails [1 MiB + 4096, + 512), counting attempts touching it; read the bad window, read 8 MiB
+      // elsewhere (evicts it), read the bad window again → attempts touching the bad sector ≤ 2 in total, same bytes/errors
+  }
+  #[test] fn bad_map_is_capped() { /* inner failing every other sector over 4 MiB with the cap lowered by a cfg(test) knob → runs remembered ≤ cap; results identical to an uncapped cache */ }
   #[test] fn memory_is_bounded() { /* capacity 8 MiB, read 64 MiB sequentially → resident bytes ≤ 8 MiB (cfg(test) accessor) */ }
   // scan.rs
   #[test] fn each_byte_is_read_once() { /* counting source; 32 MiB noise with 6 JPEGs, a RAW, an MP4 → inner bytes read ≤ 32 MiB + 1 MiB */ }
-  #[test] fn big_intact_video_is_read_once() { /* cache_bytes 4 MiB; testkit mp4 mdat_len 40 MiB in a 48 MiB image → inner bytes ≤ 50 MiB; finding Intact */ }
+  #[test] fn big_intact_video_is_read_once() { /* cache_bytes 4 MiB; testkit mp4 mdat_len 40 MiB in a 48 MiB image → inner bytes ≤ 50 MiB; finding Intact (Task 6 re-baselines this bound once read-ahead exists) */ }
   #[test] fn bad_sector_is_read_once_across_measures() { /* JPEG + RAW + video around one bad sector inside the JPEG → inner attempts touching it ≤ 3 */ }
   #[test] fn cache_size_does_not_change_events() {
       // the busy image of `each_byte_is_read_once` plus 3 bad ranges (inside the JPEG, inside mdat, between files):
@@ -313,8 +359,9 @@ Behavior (exactly that of the inner source, memoized):
   }
   ```
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** suite, clippy, fmt; `bench` (release): paste the 5 lines.
-- [ ] **Step 5:** core README ("Scan": the cache, `cache_bytes`, what is never read twice), CHANGELOG ("Changed": known
-  unreadable sectors are never retried). Commit: `perf(core): read each sector once and remember unreadable ones`.
+- [ ] **Step 5:** core README ("Scan": the cache, `cache_bytes`, "each sector is read once by the scan and the detectors; a
+  JPEG gap search may re-read up to its 64 MiB window" (Task 8), the 1,048,576-run cap on remembered bad runs and what happens
+  past it), CHANGELOG ("Changed": known unreadable sectors are never retried). Commit: `perf(core): read each sector once and remember unreadable ones`.
 
 ---
 
@@ -339,7 +386,7 @@ Changes (behavior identical; every existing test keeps passing unchanged):
 - [ ] **Step 1: Failing tests:**
   ```rust
   // formats/mod.rs
-  #[test] fn reader_reuses_its_window() { /* 1000 × Reader::new + read + drop on one thread → fresh window allocations == 1 (cfg(test) counter) */ }
+  #[test] fn reader_reuses_its_window() { /* 1000 × Reader::new + read + drop on one thread → fresh window allocations == 1 (cfg(test) counter, THREAD-LOCAL: unit tests run in parallel threads) */ }
   #[test] fn builtin_formats_are_built_once() { /* std::ptr::eq(builtin(), builtin()) */ }
   // formats/jpeg.rs
   #[test] fn vouch_for_scales_with_touching_ranges() { /* 65,536 touching 512-byte ranges over zeros, 65,536 queries at positions between range starts → < 2 s in debug, and the members examined per query ≤ 2 (cfg(test) counter) */ }
@@ -359,7 +406,7 @@ Changes (behavior identical; every existing test keeps passing unchanged):
 **Files:**
 - Move `crates/revenant-core/src/scan.rs` → `src/scan/mod.rs` (public types, `scan`, the in-order commit loop); Create
   `src/scan/pipeline.rs` (read stage, job queue, workers) and `src/budget.rs` (decode budget)
-- Modify: `src/formats/jpeg.rs` (`decode_health` acquires the budget), `crates/revenant-dev/src/{main.rs,bench.rs}` (`--threads`)
+- Modify: `crates/revenant-core/src/lib.rs` (`mod budget;`), `src/formats/jpeg.rs` (`decode_health` acquires the budget), `crates/revenant-dev/src/{main.rs,bench.rs}` (`--threads`)
 - Test: `crates/revenant-core/tests/scan.rs`, unit test in `budget.rs`, `crates/revenant-dev/tests/cli.rs`
 
 **Interfaces:**
@@ -385,6 +432,8 @@ scan = std::thread::scope {
                             result = formats.iter().filter(|f| f.recognizes(head)).find_map(|f| f.measure(&cached, at));
                             job.slot.fill(result) }
   read stage (scan thread) keeps `ahead`: VecDeque<Block> of at most LOOKAHEAD_BLOCKS = 16:
+    LOOKAHEAD_BLOCKS = min(16, max(1, cache_bytes / (2 × block))): the read-ahead must fit in the cache, or the cache would
+    evict blocks before commit and double-read. Events do not depend on it, so determinism is kept.
     Block { pos, len, bad: per-sector flags, heads: Vec<(at, Slot)>, deferred: bool }
     fill: if the block is `covered` and entirely inside a COMMITTED Intact skip range → deferred (flags from bad_runs, no heads)
           else read it through the cache, flag bad sectors, and dispatch one job per sector start whose 16-byte head some
@@ -406,7 +455,12 @@ scan = std::thread::scope {
 
 - [ ] **Step 1: Failing tests:**
   ```rust
-  // scan.rs — MultiFailingSource { inner, bad: Vec<(u64, u64)> }
+  // scan.rs — MultiFailingSource { inner, bad: Vec<(u64, u64)>, counters } (defined in Task 4; reuse it, do not redefine)
+  #[test] fn big_intact_video_is_read_once() {
+      // Task 4's test, re-baselined: cache_bytes 4 MiB, block = 1 MiB, same 48 MiB image (mdat_len 40 MiB), finding Intact;
+      // inner bytes ≤ image size + (lookahead + 1) × block. Replace the old ≤ 50 MiB bound by this one and record the measured value.
+  }
+  #[test] fn lookahead_fits_the_cache() { /* cache_bytes 2 MiB, block 1 MiB → resolved lookahead == 1; cache_bytes default → 16; events equal for both */ }
   #[test] fn parallel_scan_matches_sequential_events() {
       // 48 MiB noise (seed 42): 6 JPEGs, 2 cut JPEGs, an MP4 (moov at end), a Motion-JPEG MOV, an ARW with a sector-aligned
       // preview, a RAF, a CR3, a HEIC, a JPEG inside a Damaged video; bad ranges inside a JPEG, inside an mdat, between files.
@@ -440,6 +494,7 @@ scan = std::thread::scope {
 
 **Files:**
 - Create: `crates/revenant-core/src/formats/jpeg_entropy.rs` (crate-private); Modify: `formats/mod.rs`, `formats/jpeg.rs`
+  (`MAX_DECODE_PIXELS` becomes `pub(super)` so `jpeg_entropy::frame` can use it)
 - Modify: `crates/revenant-testkit/src/lib.rs`
 - Test: unit tests in `jpeg_entropy.rs`; `crates/revenant-core/tests/jpeg.rs`
 
@@ -448,12 +503,16 @@ scan = std::thread::scope {
   ```rust
   /// Grayscale baseline JPEG of a flat gray image, standard luminance Huffman tables, DRI = `interval` MCUs, built
   /// byte by byte (every block: DC diff 0, EOB; RSTn every `interval` MCUs, byte-aligned with 1-bits). Strict-decodable.
+  /// `interval == 0` means no DRI segment and no RST markers.
   pub fn jpeg_flat_with_restarts(width: u32, height: u32, interval: u16) -> Vec<u8>;
   ```
 - Produces (core, crate-private):
   ```rust
   pub(crate) struct Frame { pub mcus_x: u32, pub mcus_y: u32, pub restart_interval: u16, .. } // Huffman tables, components, sampling
   impl Frame {
+      /// Task 8's `seam_ok` unit tests need a Frame without a JPEG: build it with `jpeg_flat_with_restarts(512, 384, 0)`
+      /// (64×48 blocks) and `(512, 24, 0)` (64×3 blocks) through `frame()`, or add this `#[cfg(test)]` constructor.
+      #[cfg(test)] pub(crate) fn for_test(mcus_x: u32, mcus_y: u32, luma_hv: (u32, u32)) -> Frame;
       pub(crate) fn total_mcus(&self) -> u64;
       pub(crate) fn luma_blocks_per_mcu(&self) -> (u32, u32);   // (h, v) of component 0
       pub(crate) fn start(&self, scan_start: u64) -> Cursor;
@@ -521,7 +580,8 @@ before its first error or the cut; otherwise `Damaged` (nothing of the photo wou
 - Produces (core):
   ```rust
   pub(crate) const JPEG_GAP_MAX: u64 = 64 << 20;
-  pub(crate) struct Joined { pub fragments: [Fragment; 2], pub len: u64 }
+  /// `unique` = exactly one candidate passed AND every candidate in the window was tried (no cap or budget hit).
+  pub(crate) struct Joined { pub fragments: [Fragment; 2], pub len: u64, pub unique: bool }
   /// Bifragment gap carving for the baseline JPEG at `start` (entropy data from `scan_start`) whose contiguous walk ended at
   /// `cut` without an Intact result.
   pub(crate) fn join(r: &mut Reader, start: u64, scan_start: u64, cut: u64) -> Option<Joined>;
@@ -531,14 +591,19 @@ before its first error or the cut; otherwise `Damaged` (nothing of the photo wou
   ```
 `Jpeg::measure`: when the contiguous result is not `Intact`, `frame` is `Some` and the contiguous `decode` does not reach
 `Eoi` with every MCU, call `join`. On `Some`, the measurement is the two pieces, with health = `decode_health` over a
-`Fragmented` view (strict → `Intact`, lenient → `Partial`; neither → ignore the join and keep the contiguous result). No unreadable
-sector may lie in either piece for `Intact` (as for any file). On `None`, the contiguous result stands (Task 7 rules).
+`Fragmented` view (strict → `Intact`, lenient → `Partial`; neither → ignore the join and keep the contiguous result), **then
+capped at `Partial` unless `joined.unique` (Q1: a join is `Intact` only if exactly one candidate in the whole window passed)**.
+No unreadable sector may lie in either piece for `Intact` (as for any file). On `None`, the contiguous result stands (Task 7 rules).
 
-Algorithm of `join` (constants: `BREAK_BACK = 4` sectors, `PER_EOI = 4`, `MAX_JOIN_TRIES = 64`, continuation bytes decoded
-≤ 256 MiB in total, all candidate positions absolute and 512-aligned):
+Algorithm of `join` (constants: `BREAK_BACK = 4` sectors, `PER_EOI = 4`, `MAX_JOIN_TRIES = 4096` (exhaustive search: the cap is a
+correctness bound, a hit means `unique = false`), continuation bytes decoded ≤ 256 MiB in total (same: a hit means
+`unique = false`), all candidate positions absolute and 512-aligned):
 ```
 1. run0 = decode(r, frame, frame.start(scan_start), cut, keep_dc = true).
-   x = match run0.end { Error{at} => at, _ => cut }.        // first sign that the data stopped being this photo
+   x = min(Error{at} if run0.end is an Error, cut, start of the first sector after scan_start made of one repeated byte
+   value).  // first sign that the data stopped being this photo; zero-filled free space decodes as valid blocks under the
+             // standard Huffman tables, so `run0` would run on through the zeros: the uniform-sector test (the same one the
+             // window pass uses) ends it near the real break. Real entropy data never fills 512 bytes with one value.
    C1 = sector boundaries c with scan_start < c ≤ x and c > x − BREAK_BACK × 512, latest first
         (a cut by another file's head gives x == cut, so C1 = {cut, cut − 512, cut − 1024, cut − 1536}).
 2. Window: sector starts g in (min(C1), min(min(C1) + JPEG_GAP_MAX, source end)). One forward pass records, per g,
@@ -547,13 +612,17 @@ Algorithm of `join` (constants: `BREAK_BACK = 4` sectors, `PER_EOI = 4`, `MAX_JO
    (Bounded memory: one small record per sector, ≤ 131,072.)
 3. Candidates: for each distinct Eoi(e), the first PER_EOI sector starts g (ascending) with outcome(g) == Eoi(e).
    Try pairs (c1, g) ordered by g ascending then c1 latest first, with g > c1 and (c1 − start) + (e + 2 − g) ≤ JPEG_MAX_LEN,
-   until MAX_JOIN_TRIES or the byte budget:
+   until the candidates run out, MAX_JOIN_TRIES or the byte budget (abort a try as soon as the MCU row after the seam is
+   decoded and fails the seam test, `V_base` taken from the rows above the seam, so a try on another photo's tail costs about
+   2 MCU rows instead of half a photo):
      cur = the last cursor in run0.resume with pos ≤ c1 (none → skip this c1); seam_mcu = cur.mcu.
      view = Fragmented[(start, c1 − start), (g, e + 2 − g)];  run = decode(view reader, frame, cur.shifted_back(start), view.len(), true)
      pass ⇔ run.end == Eoi { at: view.len() − 2 } (so every MCU, exact count, EOI right after)
             ∧ seam_ok(frame, run0.dc[..seam_mcu × blocks_per_mcu] ++ run.dc, seam_mcu)
-     first pass → Some(Joined { fragments: [(start, c1 − start), (g, e + 2 − g)], len: view.len() }).
-4. None.
+     keep the FIRST pass (the closest: smallest g, then latest c1, the order above) as the result and keep trying.
+     A second pass sets unique = false and may stop the search early (the result is already Partial at most).
+     Hitting MAX_JOIN_TRIES or the byte budget before the candidates run out also sets unique = false.
+4. first pass → Some(Joined { fragments: [(start, c1 − start), (g, e + 2 − g)], len: view.len(), unique }); no pass → None.
 ```
 `seam_ok`: build the luma DC grid (blocks_x × blocks_y). With seam MCU at MCU row R, column C: seam pairs are, for block columns
 of MCU columns ≥ C, (top block row of MCU row R, the block row above it) and, for MCU columns < C, (top block row of MCU row
@@ -565,7 +634,9 @@ every other block-row boundary of its mean |ΔDC|. Pass iff the image has ≥ 4 
   ```rust
   // jpeg_join.rs (unit)
   #[test] fn seam_check_rejects_a_glued_dc_grid() {
-      // synthetic Frame 64×48 blocks: a smooth gradient grid → true at any seam; rows < 24 from gradient A and ≥ 24 from a
+      // frames built from `jpeg_flat_with_restarts(512, 384, 0)` (64×48 blocks) and `(512, 24, 0)` (64×3 blocks) through
+      // `jpeg_entropy::frame` (or the #[cfg(test)] `Frame::for_test` of Task 7), since Frame's fields are private:
+      // a smooth gradient grid → true at any seam; rows < 24 from gradient A and ≥ 24 from a
       // different gradient B (seam_mcu at row 24) → false; a seeded noise grid → true; a 64×3-block grid → false
   }
   // tests/jpeg.rs — a = jpeg_smooth(1024, 768, 1); c = first 512-multiple ≥ (a.len() / 2); start = 64 KiB
@@ -575,7 +646,15 @@ every other block-row boundary of its mean |ΔDC|. Pass iff the image has ≥ 4 
       //     fragments: vec![Fragment { start, len: c }, Fragment { start: 3 MiB, len: a.len() − c }] }
   }
   #[test] fn fragment_followed_by_noise_is_reassembled() { /* as above without the small JPEG → same Measurement */ }
-  #[test] fn fragment_followed_by_zeros_is_reassembled() { /* gap filled with zeros (image zeros, a's pieces put) → same Measurement */ }
+  #[test] fn fragment_followed_by_zeros_is_reassembled() { /* gap filled with zeros (image zeros, a's pieces put) → same Measurement (needs the uniform-sector bound on `x`) */ }
+  #[test] fn two_passing_continuations_are_partial() {
+      // a[..c] at start; noise; a[c..] at 3 MiB AND a[c..] again at 5 MiB → fragments point at 3 MiB (the closest),
+      // health == Partial (not Intact: two candidates pass)
+  }
+  #[test] fn search_cut_short_by_the_cap_is_partial() {
+      // a window with more candidates than MAX_JOIN_TRIES (lowered by a cfg(test) knob) ahead of the real tail
+      // → Some, health == Partial (the search did not run out of candidates)
+  }
   #[test] fn glued_halves_of_two_photos_are_not_intact() {
       // b = jpeg_smooth(1024, 768, 2); a[..c] at start; b whole at start + c; noise after (a's second piece is gone)
       // → measure(start).health != Intact; scan finds b at start + c, Intact, contiguous
@@ -593,10 +672,15 @@ every other block-row boundary of its mean |ΔDC|. Pass iff the image has ≥ 4 
   }
   ```
   The existing `lenient_only_decode_is_partial` and `corrupted_scan_data_is_damaged` (in-place corruption) must still pass
-  unchanged: a join that skips bytes never gives the exact MCU count.
-- [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** suite, clippy, fmt; `bench` (release): paste the 5 lines (watch
-  `cut-jpeg`).
-- [ ] **Step 5:** core README ("Formats: JPEG" → "Fragmented JPEG": the algorithm, bounds, the `Intact` evidence, what is not
+  unchanged: a join that skips bytes is expected never to give the exact MCU count (likely, not certain; for testkit *noise*
+  JPEGs `seam_ok` always passes, so only the MCU count and the strict decode protect them). If either flips to `Intact`
+  through a join, stop and report instead of loosening the test. Record the number of join tries of each test in the report.
+- [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** suite, clippy, fmt; `bench` (release): paste the 5 lines and report
+  the `cut-jpeg` number against the Task 1 baseline (no target: each cut JPEG now starts a gap search that may re-read its
+  64 MiB window).
+- [ ] **Step 5:** core README ("Formats: JPEG" → "Fragmented JPEG": the algorithm, bounds, the `Intact` evidence — exactly one
+  passing candidate in the whole window, otherwise at most `Partial` —, "each sector is read once by the scan and the detectors;
+  a JPEG gap search may re-read up to its 64 MiB window", what is not
   covered: progressive, 3+ pieces, second piece before the first), dev README (example with `fragments`), CHANGELOG ("Added":
   a photo split in two pieces on the card is put back together). Commit: `feat(core): reassemble JPEGs split in two pieces`.
 
@@ -613,12 +697,15 @@ every other block-row boundary of its mean |ΔDC|. Pass iff the image has ≥ 4 
 **Interfaces:**
 - Produces (testkit):
   ```rust
-  pub struct AvcOptions { pub samples: usize, pub seed: u64, pub mov: bool, /** bytes of padding at the end of mdat */ pub mdat_pad: usize }
+  pub struct AvcOptions { pub samples: usize, pub seed: u64, pub mov: bool, /** bytes of padding at the end of mdat */ pub mdat_pad: usize,
+      /** true: NAL payloads of 64–448 bytes (1–3 per sample, sample sizes follow), so every 512-byte step of a wrong break point
+          crosses a NAL header and the correct `L1` is unique; false: the sizes below (large NAL units, ambiguous `L1`) */
+      pub small_nals: bool }
   pub struct AvcVideo { pub bytes: Vec<u8>, pub mdat_payload: std::ops::Range<usize>, pub moov: std::ops::Range<usize> }
   /// ftyp, mdat, moov (moov at the end, mdat with a 32-bit size). One video trak: `avc1` entry with an `avcC`
   /// (lengthSizeMinusOne = 3), `stsz` per sample, `stsc` 4 samples per chunk, `stco`. Each sample: 1–3 NAL units
   /// (4-byte big-endian length, header byte 0x65 for the first sample of a chunk else 0x41, seeded random payload),
-  /// sample sizes in [2 KiB, 24 KiB] from `seed`.
+  /// sample sizes in [2 KiB, 24 KiB] from `seed` (with `small_nals`, NAL payloads in [64, 448] bytes instead).
   pub fn avc_video(opts: &AvcOptions) -> AvcVideo;
   ```
 - Produces (core):
@@ -636,22 +723,26 @@ every other block-row boundary of its mean |ΔDC|. Pass iff the image has ≥ 4 
   pub(crate) fn track_samples(moov: &[u8]) -> Option<Vec<(Option<Check>, Vec<Sample>)>>;
   // pairing.rs
   /// Damaged moov-less videos × orphan moov box starts → the reassembled findings (same ids), each with 2 pieces.
-  pub(crate) fn pair_videos(source: &dyn Source, videos: &[Finding], moovs: &[u64], cancel: &CancelToken) -> Vec<Finding>;
+  /// Takes the `CachedSource` (not `&dyn Source`): `bad_runs` over both pieces is the only complete record of unreadable sectors.
+  pub(crate) fn pair_videos(source: &CachedSource, videos: &[Finding], moovs: &[u64], cancel: &CancelToken) -> Vec<Finding>;
   ```
 - CLI: an `updated` line `{"event":"updated", …same fields as found…}`; with `--extract`/`--previews` the updated finding is
   written again (new name with `_2`); the summary line gains `"updated":n`.
 
 Collection during the scan: the read stage searches every block it reads (and every deferred block read lazily at commit) for
 `moov` with `memchr::memmem` (with a 15-byte overlap across blocks); a hit at box start `q` is a candidate when
-`be32(q) ∈ [24, MOOV_MAX_LEN + 8]` and bytes `q+12..q+16 == "mvhd"`. At the end, candidates inside any `Intact` finding's piece or
-inside a non-`Damaged` MP4/MOV/CR3/HEIC finding are dropped; at most 4096 are kept (the first ones; the rest are dropped). Videos
-= `Damaged` findings of kind Mp4/Mov (≤ 4096).
+`be32(q) ∈ [24, MOOV_MAX_LEN + 8]` and bytes `q+12..q+16 == "mvhd"`. At the end, candidates inside any piece of a finding whose skip
+range was committed (`Intact` at commit time, regardless of a later downgrade: those blocks were never read, so it is
+deterministic) or inside a non-`Damaged` MP4/MOV/CR3/HEIC finding are dropped; at most 4096 are kept (the first ones; the rest
+are dropped). Videos = `Damaged` findings of kind Mp4/Mov (≤ 4096).
 
 Algorithm of `pair_videos`:
 ```
 For each video V (start s): L = moovless_layout(s)? ; P = (L.mdat_at − s) + L.declared   // where moov would sit in the file
   payload = L.mdat_at − s + L.header_len
-For each candidate M at q: moov = load(q+8 .. q+be32(q)) (≤ MOOV_MAX_LEN), not garbled, has mvhd and ≥ 1 trak; tracks = track_samples(moov)?
+Pre-filter, BEFORE loading any moov (needs only q and each video's P): keep the candidate only if some video has
+  (q − P) ≡ 0 (mod 512) [signed]. Total moov bytes loaded per scan ≤ 1 GiB; candidates past that budget are dropped.
+For each surviving candidate M at q: moov = load(q+8 .. q+be32(q)) (≤ MOOV_MAX_LEN), not garbled, has mvhd and ≥ 1 trak; tracks = track_samples(moov)?
   S = all samples of checkable tracks, sorted by offset; need |S| ≥ 8; c_min = min offset over all tracks; c_end = max(offset+size).
 Pair filter (arithmetic only): (q − P) ≡ 0 (mod 512) [signed]; payload ≤ c_min < payload + 64 KiB; c_end ≤ P.
 At most 256 pairs pass the filter (the rest are dropped). For each:
@@ -664,12 +755,15 @@ At most 256 pairs pass the filter (the rest are dropped). For each:
     keep those where sample k (if any), read piecewise (bytes < L1 at A, ≥ L1 at B), passes. None → no pair.
   Pieces: [s, s + L1) and [g, g + (P − L1) + moov box size) with g = q − P + L1; both inside the source, not overlapping.
 Uniqueness: a video with 2+ passing moovs, or a moov passing for 2+ videos, pairs with none of them.
-Health: index_health(moov, P + moov box size) (Damaged/Partial as it says); an unreadable sector in either piece → Partial;
-  more than one passing L1 → the smallest, Partial; else Intact. Kind from the ftyp (as the walk decides).
+Health: index_health(moov, P + moov box size, false) (Damaged/Partial as it says; the third argument is `fragmented`, pass
+  `false`); an unreadable sector in either piece (`source.bad_runs(piece)` over both pieces, so it agrees with the
+  Unreadable events) → Partial; more than one passing L1 → the smallest, Partial; else Intact. Kind from the ftyp (as the walk
+  decides). The NAL check validates lengths and header bytes, never payload: that is why an ambiguous L1 is only Partial.
 ```
 Cancel is checked between pairs; `scan` returns `Err(Cancelled)` without the remaining `Updated` events.
 
-- [ ] **Step 1: Failing tests** (`tests/pairing.rs`; `v = avc_video(samples 120, seed 1)`, `l1` = first 512-multiple ≥
+- [ ] **Step 1: Failing tests** (`tests/pairing.rs`; `v = avc_video(samples 120, seed 1, small_nals: true)` in the two `Intact`
+  tests and in all tests below unless said otherwise, so `L1` is unique; `l1` = first 512-multiple ≥
   `mdat_payload.start + mdat_payload.len() × 2 / 5`):
   ```rust
   #[test] fn split_video_is_reassembled_intact() {
@@ -678,25 +772,32 @@ Cancel is checked between pairs; `scan` returns `Err(Cancelled)` without the rem
       //   Updated(Finding { id: 1, start: 1 MiB, len: v.bytes.len(), kind: Mp4, health: Intact,
       //            fragments: [(1 MiB, l1), (12 MiB, len − l1)] }); extract(updated) == v.bytes; summary.updated == 1
   }
-  #[test] fn split_just_before_moov_is_reassembled() { /* l1 = moov.start rounded down to 512 → Updated, Intact */ }
+  #[test] fn split_just_before_moov_is_reassembled() { /* small_nals: true; l1 = moov.start rounded down to 512 → Updated, Intact */ }
+  #[test] fn ambiguous_break_point_is_partial() {
+      // the split_video layout with the DEFAULT large NAL units (small_nals: false), where l1 ± 512 also passes the NAL check
+      // → an Updated with the smallest passing L1 and health Partial (never Intact)
+  }
   #[test] fn moov_pairs_with_its_own_mdat_not_a_sibling() {
       // v1 (seed 1), v2 (seed 2, mdat_pad chosen so both moov positions P are equal mod 512); first pieces at 1 and 4 MiB,
       // second pieces at 10 MiB (v2) and 16 MiB (v1) → 2 Updated; extracted bytes == v1.bytes and v2.bytes respectively
   }
   #[test] fn moov_matching_two_videos_is_not_paired() { /* v.bytes[..l1] at 1 MiB and at 5 MiB, v.bytes[l1..] at 12 MiB → no Updated; 2 Found Damaged */ }
-  #[test] fn video_split_in_three_is_not_paired() { /* 3 pieces at 1, 6, 12 MiB → no Updated */ }
+  #[test] fn video_split_in_three_is_not_paired() { /* cuts at 2/5 and 3/5 of the mdat payload (the middle piece holds ~24 of 120 samples, well above 1/32); 3 pieces at 1, 6, 12 MiB → no Updated */ }
   #[test] fn orphan_moov_alone_is_not_reported() { /* only v.bytes[l1..] at 1 MiB → no Mp4 Found, no Updated */ }
-  #[test] fn reassembled_video_with_unreadable_sector_is_partial() { /* split_video layout, a bad sector inside the second piece's mdat part → Updated health Partial */ }
+  #[test] fn reassembled_video_with_unreadable_sector_is_partial() { /* split_video layout, a bad sector inside the second piece's mdat part, placed where NO sampled sample falls (the downgrade comes from `bad_runs`, not from sampling) → Updated health Partial */ }
   #[test] fn hostile_moov_candidates_are_bounded() {
       // 32 MiB noise; 10,000 fake headers [00 00 10 00]"moov"[00 00 00 6C]"mvhd" at seeded offsets; one real orphan moov
-      // whose stsz and stco counts are 0xFFFF_FFFF with truncated tables; one Damaged moov-less video
+      // whose stsz and stco counts are 0xFFFF_FFFF with truncated tables; one Damaged moov-less video; the fake headers also
+      // declare sizes of 16 MiB (so the arithmetic pre-filter and the 1 GiB moov load budget are exercised: counting source,
+      // inner bytes read for moov candidates ≤ 1 GiB + the image)
       // → Ok, no Updated, elapsed < 10 s (debug)
   }
   // cli.rs
   #[test] fn updated_lines_follow_found_lines() { /* split_video image → a "found" line id 1 damaged, then an "updated" line id 1 intact with 2 fragments; summary has "updated":1 */ }
   ```
 - [ ] **Step 2:** FAIL. **Step 3:** implement. **Step 4:** suite, clippy, fmt; `bench` (release): paste the 5 lines.
-- [ ] **Step 5:** core README ("Formats: MP4/MOV" → "Video with a separated index": the algorithm, bounds, `Updated`), dev
+- [ ] **Step 5:** core README ("Formats: MP4/MOV" → "Video with a separated index": the algorithm, bounds, `Updated`, and that real H.264/HEVC with large slices will usually
+  pair as `Partial` until 1.4), dev
   README (`updated` line), CHANGELOG ("Added": a camera video whose index ended up elsewhere on the card is put back
   together). Commit: `feat(core): pair camera videos with their separated moov`.
 
@@ -723,5 +824,13 @@ Cancel is checked between pairs; `scan` returns `Err(Cancelled)` without the rem
   (JPEG and video in two pieces; 3+ pieces and RAW fragmentation not covered).
 - [ ] **Step 4:** history file (pt-BR, same shape as the 1.2 one): decisions taken during execution (each with its cost if
   wrong), the before/after table, the pending items with owner — including those this plan deferred (table "Pendências
-  herdadas") and anything new.
+  herdadas") and anything new. It must record, each with its cost if wrong: **Q1** (JPEG de dois pedaços só `Intact` com
+  exatamente um candidato aprovado; teto de 4096 tentativas), **C3** (limite de setor uniforme em `x`), **C4** (vídeos reais
+  com fatias grandes saem `Partial` até a 1.4, quando o tamanho de cluster estreita o `L1`), **C7** (peça do meio com menos
+  de 1/32 das amostras não é detectada), **C8** (orçamento de 1 GiB de `moov`), **C9** (limite do mapa de setores ruins),
+  **C10** (a busca de lacuna relê a janela; número de `cut-jpeg` medido, sem meta), **M14** (o CHANGELOG fica em inglês, regra
+  do dono posterior à spec §8, que o pedia em pt-BR). **Pending items with an owner:** arquivos em 3+ pedaços e fragmentação
+  de RAW (a spec §5 pede 2+ pedaços) ficam sem dono de parte hoje — atribuir a uma parte futura do módulo 1 (proposta: pós-1.4,
+  quando houver tamanho de cluster) e escrever o dono escolhido.
+  Core README "Fragmented JPEG" states the Q1 uniqueness rule and the new bounds.
 - [ ] **Step 5:** Commit: `docs: part 1.3 performance numbers, status and pending items`.
