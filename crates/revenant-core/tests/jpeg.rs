@@ -712,7 +712,7 @@ fn restart_marker(j: &[u8], k: usize) -> usize {
 fn tail_spliced_at_a_restart_marker_needs_the_dc_seam() {
     // Restart markers every MCU row: DC predictors reset there, so any photo of the same geometry and tables continues
     // validly at its own k-th marker with the exact MCU count. The DC seam tells the photo's own tail from this other one,
-    // but a seam right on a restart boundary is never Intact (ruling Q15).
+    // but a photo with restart markers is never joined Intact (ruling Q16).
     // Rows of 8191 blocks whose DC alternates by 1600 take about 24 KiB each, so a first piece of one row is long enough
     // to be searched; vertically the DC changes by 3 per row, and photo b sits about 50 above photo a.
     let alt = |bx: u32| if bx.is_multiple_of(2) { 800 } else { -800 };
@@ -738,7 +738,7 @@ fn tail_spliced_at_a_restart_marker_needs_the_dc_seam() {
             }
             m
         };
-        // Q15: the seam falls exactly on a restart boundary, so the photo is joined but at most Partial.
+        // Q16: the photo has restart markers, so it is joined but at most Partial.
         let own = image(&a[pa..]);
         assert_eq!(
             (own.len, own.health, own.fragments.len()),
@@ -749,6 +749,21 @@ fn tail_spliced_at_a_restart_marker_needs_the_dc_seam() {
         assert!(foreign.fragments.is_empty(), "marker {k}: {foreign:?}");
         assert_ne!(foreign.health, Health::Intact, "marker {k}: {foreign:?}");
     }
+}
+
+#[test]
+fn a_photo_with_restart_markers_is_joined_partial() {
+    // Ruling Q16: with restart markers, another photo of the same frame can continue validly after the next marker, so
+    // a join is at most Partial wherever its seam falls (here in the middle of a restart interval).
+    let alt = |bx: u32| if bx.is_multiple_of(2) { 800 } else { -800 };
+    let dc = |bx: u32, by: u32| alt(bx) + by as i16 * 3 - 50;
+    let a = testkit::jpeg_gray_dc(65528, 256, 8191, &dc);
+    let c = restart_marker(&a, 16) / 512 * 512 - 8 * 512;
+    assert!(c > restart_marker(&a, 15) + 2);
+    let mut img = DiskImage::noise(8 * MIB, 5);
+    img.put(START, &a[..c]).put(3 * MIB, &a[c..]);
+    let m = measure_at_start(&img);
+    assert_eq!(m, reassembled(&a, c, 3 * MIB, Health::Partial));
 }
 
 #[test]

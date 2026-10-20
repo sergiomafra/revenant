@@ -103,15 +103,16 @@ em `.superpowers/sdd/2026-10-20-m1-p3-fragmentos-e-velocidade/preflight.md`.
   fronteiras logo acima da emenda as juntaria (56/56), mas colou uma cauda alheia de mesmo quadro a mais (4 em vez de 3
   de 168, sondagem abaixo). Fica registrado: essas 2 divisões saem `Partial` contíguo, e o teste `real_samples` as lista
   como exceção conhecida. Custo: uma foto partida numa faixa muito mais áspera que o resto da imagem não é remontada.
-- **Q15 (depois da rodada final):** um JPEG de dois pedaços cuja emenda cai exatamente num marcador de restart (o
-  marcador fecha o primeiro pedaço, abre o segundo ou fica partido entre os dois) sai no máximo `Partial`: ali todo
-  preditor de DC zera, e qualquer foto do mesmo quadro continua válida. Emenda no meio de um intervalo (ou sem DRI)
-  segue as regras de antes. Custo: 2 das 56 divisões reais (Pentax K-r em 3/10 e 4/10, DRI de 4 MCUs) passam de
-  `Intact` para `Partial`. **Não fecha a sondagem de mesmo quadro:** as 3 colagens `Intact` das 168 têm a emenda no meio
-  do intervalo (resto 92, 68 e 208 MCUs; a cauda alheia decodifica válida por 108, 52 e 60 MCUs, 1–2 KB, até o próximo
-  marcador), então seguem 3 de 168 `Intact` com o Q15. Medido também: tratar como no máximo `Partial` toda junção de
-  JPEG com DRI zera as 168 (0 `Intact`), mas derruba 21 das 56 divisões reais (todas as da Fuji X-S10, OM TG-7 e
-  Pentax K-r, que usam DRI 4) para `Partial` (33 de 56 `Intact`). Fica para o Sérgio decidir.
+- **Q15 (depois da rodada final, substituída pelo Q16):** emenda exatamente num marcador de restart ⇒ no máximo
+  `Partial`. Não pegava as 3 colagens `Intact` de mesmo quadro (emenda no meio do intervalo: a cauda alheia decodifica
+  válida por 108, 52 e 60 MCUs até o próximo marcador, onde os preditores zeram). Ficou redundante com o Q16 e saiu do
+  código.
+- **Q16:** toda junção de dois pedaços de um JPEG com marcadores de restart (DRI > 0) sai no máximo `Partial`; sem DRI,
+  as regras de antes. Por quê: com restart, outra foto do mesmo quadro continua válida depois do próximo marcador, e só o
+  teste de DC as separa; um falso `Intact` (duas fotos coladas) é o que não pode acontecer, e `Partial` ainda entrega o
+  arquivo remontado. Resultado: colagens de mesmo quadro 3 de 168 `Intact` → 0 de 168. Custo: 21 das 56 divisões reais
+  (todas as da Fujifilm X-S10, OM TG-7 e Pentax K-r, que usam DRI 4) saem `Partial` embora o arquivo venha inteiro;
+  33 de 56 seguem `Intact` (as câmeras sem restart), mais as 2 da Kiss F `Partial`.
 - **Desvios aceitos da Tarefa 9:** a faixa de pontos de quebra começa no início da amostra `k − 1` (não no fim), e as
   amostras `k − 1` e `k` são conferidas através do `L1`; os candidatos levam o tamanho declarado lido na varredura e o
   orçamento de 1 GiB é cobrado pelas janelas de 1 MiB que um `moov` ocupa; teto extra de 2^24 passos de conferência de
@@ -158,8 +159,8 @@ diferença além da variação entre rodadas. Sondas hostis da Tarefa 8 refeitas
 dois binários, duas rodadas): P1 64–67 ms → 64–67 ms; P2 391–405 ms → 425 ms; 16 cabeças com 33 KiB 214–238 ms →
 235–278 ms; 64 cabeças com 2 KiB 51–53 ms → 68–71 ms. Os limites do Q8 seguem valendo. O teste `real_samples` com as
 divisões: 54 de 56 juntadas `Intact` (eram 45 de 56 com estas imagens antes da rodada; 47 depois da correção do `FF`),
-as 2 da EOS Kiss F `Partial`, e 0 de 56 caudas alheias `Intact`; com o Q15, 52 `Intact` e as 2 da K-r juntadas
-`Partial` (emenda num marcador de restart).
+as 2 da EOS Kiss F `Partial`, e 0 de 56 caudas alheias `Intact`; com o Q16, 33 `Intact` e as 21 das câmeras com
+restart juntadas `Partial`.
 
 ## Pendências da 1.1 e da 1.2 fechadas nesta parte
 
@@ -209,8 +210,8 @@ As outras pendências da 1.1 e da 1.2 com dono 1.4, 1.5, Módulo 2 ou sem dono s
   (`-flip vertical`, `-flip horizontal`, `-rotate 180`) começando na mesma linha de MCUs da emenda: 3 de 168 colagens
   saem `Intact` (OM TG-7 girada, LX7 espelhada, K-r girada), com o código desta rodada (o teste final de emenda não
   mudou nela). O teste de DC é a única defesa nesse caso (o README já diz que é ele que rejeita a cauda colada num
-  restart). Precisa de decisão do Sérgio: é o mesmo risco da rajada acima, mas com fotos diferentes do mesmo quadro. O
-  Q15 não as pega (emenda no meio do intervalo; ver Q15).
+  restart). Resolvido pelo Q16 (junção de JPEG com restart sai no máximo `Partial`): 0 de 168 `Intact`. Sem restart,
+  a rajada acima continua valendo.
 
 **Parte 1.5 (disco de verdade)**
 - Setor de varredura maior que 512 bytes: os detectores veem como ilegível o setor inteiro quando o aparelho falhou só

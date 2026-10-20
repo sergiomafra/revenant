@@ -127,7 +127,7 @@ crate-private). All positions are absolute 512-byte sector boundaries:
    piece and the DC seam test holds. The DC seam test compares the mean `|ΔDC|` between the luma blocks on both sides of the
    seam with the median of the other block-row boundaries: it passes iff the image has at least 4 block rows and the seam
    is at most 3 × that median + 4 (it is what rejects another photo's tail spliced at a restart marker, where the MCU count
-   alone would pass; not always, see "Not covered"). A try stops after the MCU row below the seam when the seam is already sure to fail (ruling Q14):
+   alone would pass; not always, which is why a photo with restart markers is never joined `Intact`). A try stops after the MCU row below the seam when the seam is already sure to fail (ruling Q14):
    rougher than 3 × the `⌊n/2⌋`-th smallest (from 0) of the boundary means above it + 4, `n` being the number of
    boundaries off the seam (their median, the final base, is at most that); with the seam in the upper half of the image
    there is no such bound (the rows below could be rougher than those above, as under a sky) and the try runs on. It also
@@ -138,10 +138,11 @@ crate-private). All positions are absolute 512-byte sector boundaries:
    them (`Intact`, or `Partial` with an unreadable sector in either piece; a pair passes only when the walk reaches EOI,
    so it is never `Damaged`).
 
-Evidence for `Intact` (rulings Q1, Q7, Q15): exactly one candidate in the whole window passed, every candidate was
-tried, and the seam does not fall exactly on a restart marker (the marker ends the first piece, starts the second or is
-split between them: every DC predictor resets there, so any photo of the same frame continues validly and the DC seam
-test carries little evidence; such a join is at most `Partial`).
+Evidence for `Intact` (rulings Q1, Q7, Q16): exactly one candidate in the whole window passed, every candidate was
+tried, and the photo uses no restart markers (no `DRI`, or an interval of 0). With restart markers every DC predictor
+resets at each marker, so another photo of the same frame continues validly after the next marker past the seam, and
+only the DC seam test would tell the two apart; such a join is still made (the file is recovered whole) but is at most
+`Partial`. Many cameras use restart markers (of the real samples: Fujifilm X-S10, OM System TG-7, Pentax K-r).
 A second passing candidate (the search then stops) or hitting a bound makes the reassembled photo at most `Partial`. So
 does an EOI with more than 4 sector starts whose first event it is (not all were tried), unless it is the passing
 continuation's own EOI (the others lie inside it) or those sectors belong to a file in the gap: the last file head before
@@ -173,14 +174,10 @@ More generally, the DC seam test runs only at the joins the search makes, never 
 immediately followed, with no gap, by the tail of a near-identical photo of the same frame (same camera and settings)
 whose bytes decode exactly to EOI is a valid JPEG and comes out `Intact`. Likewise, when a photo's own tail is gone
 (overwritten) and its window holds the orphan tail of a near-identical photo of the same frame (a burst), that tail may
-be the only candidate that passes, and the join comes out `Intact`: uniqueness (Q1) cannot see a tail that is missing. The
-same holds for any photo of the same frame and restart interval whose tail starts in the seam's MCU row: spliced at a
-restart marker, it passes the DC seam test when its rows near the seam look enough like this photo's (3 of 168 such
-splices, built from mirrored or rotated real previews re-encoded with a restart every row, came out `Intact`; their seams
-lie inside a restart interval, the foreign data decoding validly for 50 to 108 MCUs up to the next marker, so Q15 does
-not apply to them).
-A photo split inside a band much rougher
-than the rest of the image is not put back together: the DC seam test compares the seam with the whole image's median
+be the only candidate that passes, and the join comes out `Intact`: uniqueness (Q1) cannot see a tail that is missing.
+This holds only for photos without restart markers: with them, another same-frame photo's tail spliced at a marker
+passed the DC seam test in 3 of 168 splices built from mirrored or rotated real previews, so such joins are at most
+`Partial` (ruling Q16). A photo split inside a band much rougher than the rest of the image is not put back together: the DC seam test compares the seam with the whole image's median
 (2 of 56 real preview splits in `tests/real_samples.rs`, both in the EOS Kiss F preview's textured middle, stay
 `Partial`; comparing with the rows next to the seam would join them, but would also glue one more same-frame foreign
 tail in the set that was tried). And a photo whose entropy-coded data holds a
@@ -619,8 +616,9 @@ CC0 from raw.pixls.us, listed with URL and SHA-256 in `samples/samples.toml`, ne
 noise image at a sector start and must come out as exactly one finding of its kind, `Intact`, with the file's length
 (for ARW, trailing zero padding under 64 KiB aside), make and model, and a preview that decodes strictly. A second test
 splits each sample's preview in two at k/10 (k = 2..=8, on a sector boundary) with its own tail 8 MiB further on: it
-must come out joined and `Intact` (joined but `Partial` when the split falls exactly on a restart marker, Q15: 2 of the
-56; and the 2 known `Partial` splits above), and with another sample's tail instead,
+must come out joined and `Intact`, or joined and `Partial` for the previews that use restart markers (Q16: 21 of the
+56, all of the X-S10, TG-7 and K-r splits), the 2 known `Partial` splits above aside; and with another sample's tail
+instead,
 never `Intact`. Both are ignored by default:
 
 ```sh

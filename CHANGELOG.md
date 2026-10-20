@@ -40,8 +40,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   are unchanged.
 - A photo split in two pieces on the card (another file was written in the middle of it) is put back together: the rest of
   the photo is searched for in the next 64 MiB, and the photo is recovered whole, its pieces in order. It is reported
-  intact only when exactly one continuation fits, every possible one was tried and the split does not fall exactly on a
-  restart marker; otherwise it is partial (for example two photos from one camera written interleaved). The search is bounded (a first piece of at least 16 KiB, at most
+  intact only when exactly one continuation fits, every possible one was tried and the photo has no restart markers;
+  otherwise it is partial, though still recovered whole (for example a photo from a camera that writes restart markers,
+  or two photos from one camera written interleaved). The search is bounded (a first piece of at least 16 KiB, at most
   4096 tries reading at most 64 MiB) and stops at once when the scan is cancelled.
 - A camera video whose index ended up elsewhere on the card (its `moov`, written last, landed away from the frames) is put
   back together after the scan: the damaged video is reported again, whole, with its two pieces in order (a new
