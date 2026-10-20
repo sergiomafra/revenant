@@ -546,11 +546,13 @@ Events:
   `ScanSummary::updated`. Today: a video put back together with its separated `moov` (see "Video with a separated
   index").
 
-`CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block examined and each block read ahead, before and after
-every event and while waiting for a measurement. Once it is seen no further event is emitted (a cancel from inside the
-callback makes that event the last one), the measuring threads drop their remaining jobs, and `scan` returns
-`EngineError::Cancelled` after every thread has stopped (a measurement already running is finished first, except a JPEG
-gap search, which gives up as soon as it sees the cancel); findings still pending are dropped.
+`CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block
+examined and each block read ahead, before and after every event and while waiting for a measurement. Once it is seen no
+further event is emitted (a cancel from inside the callback makes that event the last one), the measuring threads drop
+their remaining jobs, and `scan` returns `EngineError::Cancelled` after every thread has stopped (a measurement already
+running is finished first, except a JPEG gap search, which gives up as soon as it sees the cancel, and a `zune-jpeg`
+validation decode, which is skipped when the cancel is seen before waiting for the decode budget or once the budget is
+granted); findings still pending are dropped.
 
 ## Performance
 

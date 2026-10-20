@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 
 use super::{
-    FileKind, Format, Health, Measurement, Reader, SECTOR, builtin, jpeg_entropy, jpeg_join,
+    FileKind, Format, Health, Measurement, Reader, SECTOR, builtin, cancelled, jpeg_entropy,
+    jpeg_join,
 };
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
@@ -181,13 +182,21 @@ fn verify(r: &mut Reader, start: u64, len: u64) -> (Health, Option<u64>) {
 }
 
 /// Health from `zune-jpeg`: with `strict`, a strict decode gives `Intact`; a lenient-only decode (or an image too large
-/// to decode) gives `Partial`; neither, `Damaged`. Unreadable sectors inside cap a success at `Partial`.
+/// to decode) gives `Partial`; neither, `Damaged`. Unreadable sectors inside cap a success at `Partial`. A cancelled scan
+/// (looked at before waiting for the decode budget and again once it is granted) decodes nothing: `Partial`, which the
+/// scan drops anyway.
 pub(super) fn zune_health(r: &mut Reader, start: u64, len: u64, strict: bool) -> Health {
+    if cancelled() {
+        return Health::Partial;
+    }
     // The bytes plus the 1-byte-per-pixel output; a size the header does not give counts as the largest decoded.
     let pixels = sof_pixels(r, start, len)
         .unwrap_or(MAX_DECODE_PIXELS)
         .min(MAX_DECODE_PIXELS);
     let _budget = DECODE_BUDGET.acquire(len.saturating_add(pixels));
+    if cancelled() {
+        return Health::Partial;
+    }
     let mut data = vec![0u8; len as usize];
     r.read(start, &mut data);
     let unreadable = r.bad_in(start, start + len);
@@ -566,6 +575,44 @@ mod tests {
     use super::*;
     use crate::formats::tests::Mem;
     use std::time::Instant;
+
+    #[test]
+    fn a_cancelled_scan_does_not_decode() {
+        use crate::formats::CancelScope;
+        use crate::scan::CancelToken;
+        let j = revenant_testkit::jpeg(64, 64, 1, 0);
+        let decodes = || {
+            ZUNE_STRICT_DECODES.with(std::cell::Cell::get)
+                + ZUNE_LENIENT_DECODES.with(std::cell::Cell::get)
+        };
+        // Cancelled before: no wait for the budget, no decode.
+        let token = CancelToken::default();
+        token.cancel();
+        let before = decodes();
+        {
+            let _scope = CancelScope::enter(&token);
+            let h = zune_health(&mut Reader::new(&Mem(j.clone())), 0, j.len() as u64, true);
+            assert_ne!(h, Health::Intact);
+        }
+        assert_eq!(decodes(), before);
+        // Cancelled while waiting for the budget (all of it held here): no decode once it gets it.
+        let token = CancelToken::default();
+        let held = DECODE_BUDGET.acquire(u64::MAX);
+        let waiter = {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                let _scope = CancelScope::enter(&token);
+                let h = zune_health(&mut Reader::new(&Mem(j.clone())), 0, j.len() as u64, true);
+                (h, decodes())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        token.cancel();
+        drop(held);
+        let (h, n) = waiter.join().unwrap();
+        assert_ne!(h, Health::Intact);
+        assert_eq!(n, 0, "decoded after the scan was cancelled");
+    }
 
     fn noise(len: usize) -> Vec<u8> {
         let mut x = 7u64;
