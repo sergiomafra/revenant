@@ -70,8 +70,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - Half a photo followed by zeros, by another photo's data or by its own data with a gap, then an end-of-image marker, was
-  reported intact (the decoder used for the check fills in what is missing). It is now partial, and put back together when
-  the rest of the photo is found.
+  reported intact (the decoder used for the check fills in what is missing), as a file of its own or as a RAW's preview.
+  Common JPEGs are now verified by Revenant's own decoder, which checks every block is there (and is faster); such a
+  photo is partial, and put back together when the rest of it is found.
 
 - A small file written inside a Canon CR3's `PRVW` preview was hidden and the CR3 reported intact; a CR3 is now intact only
   if both its preview and its full-size JPEG decode, so the file inside is found.

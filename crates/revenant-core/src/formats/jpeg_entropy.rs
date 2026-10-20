@@ -157,6 +157,9 @@ pub(crate) fn frame(r: &mut Reader, start: u64, scan_start: u64) -> Option<Frame
     // Tables by class (0 = DC, 1 = AC) and id; a later DHT replaces an earlier one.
     let mut defined: [[Option<Huffman>; 4]; 2] = Default::default();
     let mut sof: Option<(u32, u32, Vec<SofComponent>)> = None;
+    // Quantization tables each frame component uses, and those a DQT defined.
+    let mut sof_tq: Vec<u8> = Vec::new();
+    let mut quant = [false; 4];
     let mut restart_interval = 0u16;
     // Each step moves `pos` forward by at least one byte, and it stays below `scan_start`.
     while pos + 4 <= scan_start {
@@ -178,7 +181,12 @@ pub(crate) fn frame(r: &mut Reader, start: u64, scan_start: u64) -> Option<Frame
             (r.read(pos + 4, &mut p) == p.len()).then_some(p)
         };
         match marker {
-            0xC0 | 0xC1 if sof.is_none() => sof = Some(parse_sof(&payload(r)?)?),
+            0xC0 | 0xC1 if sof.is_none() => {
+                let p = payload(r)?;
+                sof = Some(parse_sof(&p)?);
+                sof_tq = p[6..].as_chunks::<3>().0.iter().map(|c| c[2]).collect();
+            }
+            0xDB => parse_dqt(&payload(r)?, &mut quant)?,
             // Only SOF0/SOF1 (sequential, Huffman) are decoded; a second SOF is not a valid frame either.
             m if is_sof(m) => return None,
             0xC4 => parse_dht(&payload(r)?, &mut defined)?,
@@ -195,6 +203,13 @@ pub(crate) fn frame(r: &mut Reader, start: u64, scan_start: u64) -> Option<Frame
                     return None;
                 }
                 let (width, height, comps) = sof?;
+                // Every quantization table a component uses must be defined (the pixels could not be computed).
+                if !sof_tq
+                    .iter()
+                    .all(|&t| quant.get(usize::from(t)) == Some(&true))
+                {
+                    return None;
+                }
                 return build(
                     width,
                     height,
@@ -238,6 +253,21 @@ fn parse_sof(p: &[u8]) -> Option<(u32, u32, Vec<SofComponent>)> {
         comps.push((c[0], h, v));
     }
     Some((width, height, comps))
+}
+
+/// One DQT payload (one or more tables): marks each table id as defined. `None` for an id over 3, a precision other
+/// than 8 or 16 bits, or a payload that does not hold whole tables.
+fn parse_dqt(mut p: &[u8], defined: &mut [bool; 4]) -> Option<()> {
+    while let Some((&pq_tq, rest)) = p.split_first() {
+        let (precision, id) = (pq_tq >> 4, usize::from(pq_tq & 0x0F));
+        if precision > 1 || id > 3 {
+            return None;
+        }
+        let size = 64 * (1 + usize::from(precision));
+        p = rest.get(size..)?;
+        defined[id] = true;
+    }
+    Some(())
 }
 
 /// One DHT payload (one or more tables) into `defined`.
@@ -745,7 +775,7 @@ fn mcu(
 mod tests {
     use super::*;
     use crate::formats::Health;
-    use crate::formats::jpeg::{JPEG_MAX_LEN, decode_health, walk_header};
+    use crate::formats::jpeg::{JPEG_MAX_LEN, walk_header, zune_health};
     use crate::formats::tests::Mem;
     use revenant_testkit as testkit;
 
@@ -839,7 +869,7 @@ mod tests {
         let j = testkit::jpeg_flat_with_restarts(256, 128, 4);
         let src = Mem(j.clone());
         assert_eq!(
-            decode_health(&mut Reader::new(&src), 0, j.len() as u64),
+            zune_health(&mut Reader::new(&src), 0, j.len() as u64, true),
             Health::Intact
         );
     }
@@ -1079,7 +1109,7 @@ mod tests {
             let j = testkit::jpeg(w, h, 40 + i as u64, 0);
             let src = Mem(j.clone());
             assert_eq!(
-                decode_health(&mut Reader::new(&src), 0, j.len() as u64),
+                zune_health(&mut Reader::new(&src), 0, j.len() as u64, true),
                 Health::Intact
             );
             let (f, run) = decode_from_start(&j, j.len() as u64, true);
@@ -1179,7 +1209,7 @@ mod tests {
             let j = testkit::jpeg_flat_ycbcr(33, 17, luma, interval);
             let src = Mem(j.clone());
             assert_eq!(
-                decode_health(&mut Reader::new(&src), 0, j.len() as u64),
+                zune_health(&mut Reader::new(&src), 0, j.len() as u64, true),
                 Health::Intact,
                 "{luma:?}/{interval}"
             );

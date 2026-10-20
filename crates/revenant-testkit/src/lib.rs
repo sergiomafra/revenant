@@ -966,6 +966,47 @@ pub fn jpeg_flat_ycbcr(width: u32, height: u32, luma: (u8, u8), interval: u16) -
     flat_jpeg(width, height, &[luma, (1, 1), (1, 1)], interval, &|_, _| 0)
 }
 
+/// Progressive (SOF2) grayscale JPEG of a flat mid-gray image, built byte by byte with the standard luminance tables: a
+/// DC scan (every block: DC difference 0), then an AC scan of bands 1–63 (every block: end of band). Decodable by any
+/// progressive decoder; for testing what happens to a frame Revenant's own entropy decoder does not cover.
+pub fn jpeg_progressive_flat(width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (
+        u16::try_from(width).expect("width fits a SOF"),
+        u16::try_from(height).expect("height fits a SOF"),
+    );
+    assert!(w > 0 && h > 0);
+    let mut out = vec![0xFF, 0xD8];
+    out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+    out.extend_from_slice(&[1; 64]);
+    out.extend_from_slice(&[0xFF, 0xC2, 0x00, 0x0B, 0x08]);
+    out.extend_from_slice(&h.to_be_bytes());
+    out.extend_from_slice(&w.to_be_bytes());
+    out.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+    for (class, bits, vals) in [
+        (0x00, &STD_LUMA_DC_BITS, &STD_LUMA_DC_VALS[..]),
+        (0x10, &STD_LUMA_AC_BITS, &STD_LUMA_AC_VALS[..]),
+    ] {
+        out.extend_from_slice(&[0xFF, 0xC4]);
+        out.extend_from_slice(&((2 + 1 + 16 + vals.len()) as u16).to_be_bytes());
+        out.push(class);
+        out.extend_from_slice(bits);
+        out.extend_from_slice(vals);
+    }
+    let blocks = u32::from(w.div_ceil(8)) * u32::from(h.div_ceil(8));
+    // (Ss, Se, the code of each block): DC difference 0 is `00`; end of band (EOB0, symbol 0x00) is `1010`.
+    for (ss, se, code, len) in [(0u8, 0u8, 0b00, 2), (1, 63, 0b1010, 4)] {
+        out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, ss, se, 0x00]);
+        let mut data = BitWriter::default();
+        for _ in 0..blocks {
+            data.bits(code, len);
+        }
+        data.align();
+        out.extend(data.out);
+    }
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
 /// Code of each DC category (0..=11) of the typical luminance DC table: `(code, length)`, canonical (T.81 Annex C).
 fn std_dc_codes() -> [(u32, u32); 12] {
     let mut codes = [(0, 0); 12];
@@ -1496,6 +1537,25 @@ mod gray_dc_tests {
             }
         }
         assert!(jpeg_gray_dc(64, 16, 4, &|_, _| 0) == jpeg_flat_with_restarts(64, 16, 4));
+    }
+}
+
+#[cfg(test)]
+mod progressive_jpeg_tests {
+    use super::*;
+
+    #[test]
+    fn progressive_flat_jpeg_decodes_to_mid_gray() {
+        for (w, h) in [(64, 48), (33, 17)] {
+            let bytes = jpeg_progressive_flat(w, h);
+            assert_eq!(bytes[2..4], [0xFF, 0xDB]);
+            assert!(bytes.windows(2).any(|m| m == [0xFF, 0xC2]));
+            let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+                .expect("decodes")
+                .to_luma8();
+            assert_eq!(img.dimensions(), (w, h));
+            assert!(img.pixels().all(|p| p.0[0] == 128), "{w}x{h}");
+        }
     }
 }
 
