@@ -85,9 +85,10 @@ pub(crate) fn join(r: &mut Reader, start: u64, scan_start: u64, cut: u64) -> Opt
     }
     // The first sign that the data stopped being this photo: a decode error, the cut, or a uniform (erased) sector,
     // which the decoder would walk through as valid blocks. The decode is redone up to such a sector, so its resume
-    // points lie right before it.
+    // points lie right before it. An error is reported at a marker's `FF`, whose next byte may be the first one that is
+    // not this photo's: the photo may break right after the `FF`.
     let mut x = match run0.end {
-        End::Error { at } => at.min(cut),
+        End::Error { at } => (at + 1).min(cut),
         _ => cut,
     };
     let used = run0.pos.saturating_add(2).min(cut);

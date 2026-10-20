@@ -112,8 +112,9 @@ searches for where the photo's data continues and puts the photo back together f
 crate-private). All positions are absolute 512-byte sector boundaries:
 
 1. The contiguous data is decoded (keeping each block's luma DC value). The break `x` is the first sign that the data
-   stopped being this photo: the decode error, the cut, or the first sector of one repeated byte value (erased space,
-   which would otherwise decode as valid blocks). The first piece may end at any of the 4 sector boundaries at or before
+   stopped being this photo: the byte after the decode error (an error is reported at a marker's `FF`, and the byte after
+   it may be the first one that is not this photo's), the cut, or the first sector of one repeated byte value (erased
+   space, which would otherwise decode as valid blocks). The first piece may end at any of the 4 sector boundaries at or before
    `x` (`c1`) that leave it at least 16 KiB long (ruling Q8: a few sectors of a photo hold too little to recover, and every
    header could otherwise start a search), each resumed from the decoder's last state at or before it.
 2. One forward pass over the window of `JPEG_GAP_MAX` (64 MiB) after the earliest `c1` records, for each sector start `g`,

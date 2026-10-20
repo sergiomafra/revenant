@@ -576,6 +576,31 @@ fn fragment_followed_by_zeros_is_reassembled() {
 }
 
 #[test]
+fn a_first_piece_ending_in_ff_is_reassembled() {
+    // The first piece's last byte is an `FF` whose stuffed `00` starts the tail: the decoder reports the break at that
+    // `FF` (one byte before the sector boundary where the photo really breaks), and that boundary must still be tried.
+    let (a, c) = (1..64)
+        .find_map(|seed| {
+            let a = testkit::jpeg(640, 480, seed, 0);
+            let from = (scan_data_start(&a) + 16 * KIB).next_multiple_of(512);
+            let c = (from..a.len() - 4096)
+                .step_by(512)
+                .find(|&c| a[c - 1] == 0xFF)?;
+            Some((a, c))
+        })
+        .expect("a photo with an FF right before a sector boundary");
+    let mut img = DiskImage::noise(8 * MIB, 5);
+    // The gap's first byte makes `FF` + it an impossible marker.
+    img.put(START, &a[..c])
+        .put(START + c, &[0x5A])
+        .put(3 * MIB, &a[c..]);
+    assert_eq!(
+        measure_at_start(&img),
+        reassembled(&a, c, 3 * MIB, Health::Intact)
+    );
+}
+
+#[test]
 fn two_passing_continuations_are_partial() {
     let (mut img, a, c) = split_photo_image();
     img.put(5 * MIB, &a[c..]);
