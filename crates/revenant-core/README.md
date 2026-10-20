@@ -76,20 +76,22 @@ not end the file; DAC and JPG markers count as segments, and `FF` fill bytes bef
   "Fragmented JPEG"). For any other frame (progressive, arithmetic, 12-bit, a header the decoder cannot parse), the
   evidence is a strict `zune-jpeg` decode. This one rule (`decode_health`) judges every JPEG: a plain JPEG, a RAW's, RAF's
   or CR3's preview, the own-JPEG check that lets a file head inside a RAW's preview count as the RAW's own data, and a
-  reassembled photo. Below, "decodes strictly" means passing it, and "decodes leniently" means the lenient `zune-jpeg` decode.
+  reassembled photo. Below, "decodes strictly" means passing it; "decodes leniently" means a result of `Partial` by it.
 - `Partial`: no EOI before the end of the source, `JPEG_MAX_LEN`, or a 512-byte sector that starts another recognized file
-  (the length stops there), and something of the photo would show (below); or EOI found and only the lenient decode succeeds; or EOI found, the file contains unreadable
-  sectors and a decode (strict or lenient) of the zero-filled bytes succeeds. The length never exceeds `JPEG_MAX_LEN`.
-  Also `Partial`: the structure is complete but the declared size is over 210 megapixels, so it is not decoded ("not fully
-  verifiable").
-  Also `Partial`: a DAC segment (arithmetic coding) with complete structure, which `zune-jpeg` cannot decode.
-- `Damaged`: EOI found but neither decode succeeds; or EOI found, the frame is one Revenant's entropy decoder covers, and
-  that decoder fails before completing one row of MCUs (ruling Q9, as for a cut file: nothing of the photo would show;
-  the lenient `zune-jpeg` decode, the costliest step for a frame declared huge, is then not run). The length is still exact. Also `Damaged`: a cut file (no EOI, as
-  above) whose entropy-coded data does not hold one full row of MCUs before its first error, the cut, or the first
-  512-byte sector of one repeated byte value or unreadable sector, such as a JPEG cut right after its header and followed
-  by erased (zero-filled) space: nothing of the photo would show. Zeros decode as valid blocks under the standard
-  Huffman tables, so they are not counted as the photo's data. The length is still where the file was cut.
+  (the length stops there), and something of the photo would show (below). Or EOI found, with a frame Revenant's entropy
+  decoder covers, and that decoder completes at least one row of MCUs before it fails (ruling Q10, as for a cut file:
+  that much of the photo shows; `zune-jpeg` is not run for these frames at all), or walks to EOI but the file contains
+  unreadable sectors. Or EOI found, with any other frame, and only the lenient `zune-jpeg` decode succeeds, or the file
+  contains unreadable sectors and a decode (strict or lenient) of the zero-filled bytes succeeds, or the declared size is
+  over 210 megapixels so it is not decoded ("not fully verifiable"), or a DAC segment (arithmetic coding) makes it one
+  `zune-jpeg` cannot decode. The length never exceeds `JPEG_MAX_LEN`.
+- `Damaged`: EOI found, with a frame the entropy decoder covers, and that decoder fails before completing one row of MCUs
+  (ruling Q9: nothing of the photo would show); or EOI found, with any other frame, and neither `zune-jpeg` decode
+  succeeds. The length is still exact. Also `Damaged`: a cut file (no EOI, as above) whose entropy-coded data does not
+  hold one full row of MCUs before its first error, the cut, or the first 512-byte sector of one repeated byte value or
+  unreadable sector, such as a JPEG cut right after its header and followed by erased (zero-filled) space: nothing of the
+  photo would show. Zeros decode as valid blocks under the standard Huffman tables, so they are not counted as the
+  photo's data. The length is still where the file was cut.
 
 A cut file is judged by Revenant's own entropy decoder (`formats/jpeg_entropy.rs`, written from ITU-T T.81): it covers
 sequential Huffman JPEGs (SOF0/SOF1, 8-bit, 1–4 components all in one scan, sampling factors ≤ 2, at most 210 megapixels,
@@ -129,8 +131,8 @@ crate-private). All positions are absolute 512-byte sector boundaries:
    failed try with the same EOI passed through: from there it reads the same bytes and fails the same way (up to 16,384
    states are remembered).
 4. The first passing pair is the result: the measurement is the two pieces, with the JPEG health rule above applied to
-   them (`Intact`; `Partial` when only the lenient `zune-jpeg` decode succeeds; neither → the join is dropped and the
-   contiguous result stands), an unreadable sector in either piece making it at most `Partial`.
+   them (`Intact`, or `Partial` with an unreadable sector in either piece; a pair passes only when the walk reaches EOI,
+   so it is never `Damaged`).
 
 Evidence for `Intact` (rulings Q1, Q7): exactly one candidate in the whole window passed, and every candidate was tried.
 A second passing candidate (the search then stops) or hitting a bound makes the reassembled photo at most `Partial`. So

@@ -222,13 +222,15 @@ fn jpeg_cut_by_end_of_source_is_partial() {
     assert_eq!(m.len, cut as u64);
 }
 
-// Health tiers depend on how zune-jpeg 0.5.x treats corrupt input: strict mode rejects what the default (lenient) mode
-// tolerates. Re-verify these two tests when upgrading zune-jpeg.
+// A baseline JPEG is judged by Revenant's entropy decoder (rulings Q6, Q9, Q10): corrupt entropy-coded data after the
+// first row of MCUs is `Partial` (that much of the photo shows), within the first row `Damaged`. zune-jpeg is not run for
+// these (it used to decide: lenient-only → `Partial`, rejected by both modes → `Damaged`).
 #[test]
 fn lenient_only_decode_is_partial() {
     let mut j = testkit::jpeg(640, 480, 8, 0);
     let mid = j.len() / 2;
-    // Invalid markers in the entropy-coded data: lenient zune-jpeg 0.5.x still decodes, strict mode rejects.
+    // Invalid markers in the middle of the entropy-coded data (zune-jpeg 0.5.x decodes it leniently, strict mode
+    // rejects it): about half the rows show.
     j[mid..mid + 8].copy_from_slice(&[0xFF, 0x01, 0xFF, 0x01, 0xFF, 0x01, 0xFF, 0x01]);
     let img = DiskImage::zeros(1 << 20).put(4096, &j).save();
     let m = measure(&img, 4096).unwrap();
@@ -236,19 +238,33 @@ fn lenient_only_decode_is_partial() {
     assert_eq!(m.health, Health::Partial);
 }
 
-#[test]
-fn corrupted_scan_data_is_damaged() {
+/// `jpeg(640, 480, 8, 0)` with 64 bytes of stray DHT markers at `at` (zune-jpeg rejects that stream in both modes).
+fn with_stray_dht(at: usize) -> Measurement {
     let mut j = testkit::jpeg(640, 480, 8, 0);
-    let mid = j.len() / 2;
-    // Stray DHT markers in the middle of the entropy-coded data: the structure still reaches EOI, but zune-jpeg
-    // rejects the stream in both modes.
-    for pair in j[mid..mid + 64].as_chunks_mut::<2>().0 {
+    for pair in j[at..at + 64].as_chunks_mut::<2>().0 {
         *pair = [0xFF, 0xC4];
     }
     let img = DiskImage::zeros(1 << 20).put(4096, &j).save();
     let m = measure(&img, 4096).unwrap();
     assert_eq!(m.len, j.len() as u64);
-    assert_eq!(m.health, Health::Damaged);
+    m
+}
+
+#[test]
+fn corrupted_scan_data_is_damaged() {
+    // Within the first row of MCUs (80 MCUs, about 9.5 KB): nothing of the photo would show (Q9).
+    let j = testkit::jpeg(640, 480, 8, 0);
+    assert_eq!(
+        with_stray_dht(scan_data_start(&j) + 200).health,
+        Health::Damaged
+    );
+}
+
+#[test]
+fn corrupted_scan_data_after_the_first_row_is_partial() {
+    // In the middle: the rows above it show (Q10). This layout was `Damaged` while zune-jpeg decided.
+    let j = testkit::jpeg(640, 480, 8, 0);
+    assert_eq!(with_stray_dht(j.len() / 2).health, Health::Partial);
 }
 
 #[test]

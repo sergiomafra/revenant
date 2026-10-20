@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::jpeg::{JPEG_MAX_LEN, Jpeg, contiguous, data_end, walk_header};
 use super::jpeg_entropy::{self, Cursor, End, Frame};
-use super::{Format, Fragment, Health, Reader, SECTOR, builtin, cancelled};
+use super::{Format, Fragment, HEAD_LEN, Health, Reader, SECTOR, builtin, cancelled};
 use crate::EngineError;
 use crate::source::{Fragmented, Source, VolumeId};
 
@@ -311,6 +311,7 @@ fn window(r: &mut Reader, lowest: u64) -> Option<Window> {
     let sectors = (end - first).div_ceil(SECTOR) as usize;
     let mut rec = vec![NONE; sectors];
     let formats = builtin();
+    let mut bytes = [0u8; SECTOR as usize];
     // One forward sweep, so the reader loads each window once.
     for (i, rec) in rec.iter_mut().enumerate() {
         if (i as u64).is_multiple_of(SECTORS_PER_CANCEL_CHECK) && cancelled() {
@@ -318,9 +319,15 @@ fn window(r: &mut Reader, lowest: u64) -> Option<Window> {
         }
         let s = first + i as u64 * SECTOR;
         let next = s + SECTOR;
+        // The sector, read once (the byte after it only when an `FF` ends the sector, so the reader moves forward).
+        let n = r.read(s, &mut bytes);
         // Events at the sector's start come first: another file's head, or an erased or unreadable sector (`r` reads
         // the disk itself, so the sector alignment is absolute).
-        if r.file_starts_at(formats, s) {
+        let head = &bytes[..n.min(HEAD_LEN)];
+        if formats
+            .iter()
+            .any(|f| f.recognizes(head) && f.confirms(r.source, s))
+        {
             heads.push(s);
             *rec = BAD;
             continue;
@@ -329,13 +336,19 @@ fn window(r: &mut Reader, lowest: u64) -> Option<Window> {
             *rec = BAD;
             continue;
         }
-        let mut p = s;
-        while let Some(f) = r.find_ff(p, next) {
-            match r.byte(f + 1) {
+        let data = &bytes[..n];
+        let mut p = 0;
+        while let Some(k) = memchr::memchr(0xFF, &data[p..]) {
+            let f = p + k;
+            let following = match data.get(f + 1) {
+                Some(&b) => Some(b),
+                None => r.byte(next),
+            };
+            match following {
                 None => break,
                 Some(0x00 | 0xD0..=0xD7 | 0xFF) => p = f + 1,
                 Some(0xD9) => {
-                    *rec = f;
+                    *rec = s + f as u64;
                     break;
                 }
                 Some(_) => {

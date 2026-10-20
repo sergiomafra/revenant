@@ -134,9 +134,9 @@ thread_local! {
 /// - A frame Revenant's entropy decoder covers ([`jpeg_entropy::frame`]: sequential Huffman, 8-bit, one interleaved
 ///   scan): `Intact` iff that decoder walks every MCU (the exact count, restart markers in sequence) with EOI right after
 ///   the last one. `zune-jpeg`'s strict mode is not used for these: it zero-fills past an early EOI and does not count
-///   MCUs. If the walk fails before completing one row of MCUs, `Damaged` (ruling Q9: nothing of the photo would show,
-///   as for a cut file; the lenient decode is skipped). Otherwise the lenient `zune-jpeg` decode separates `Partial` (it
-///   succeeds, or the image is too large to decode) from `Damaged`.
+///   MCUs. If the walk fails before completing one row of MCUs, `Damaged` (ruling Q9: nothing of the photo would show);
+///   if it fails later, `Partial` (ruling Q10: at least one row shows). Both as for a cut file; `zune-jpeg` is not run
+///   for these frames at all.
 /// - Any other frame (progressive, arithmetic, 12-bit, a header that does not parse): strict `zune-jpeg` decode ->
 ///   `Intact`; only the lenient one -> `Partial`; neither -> `Damaged`; too large to decode -> `Partial`.
 ///
@@ -151,7 +151,7 @@ enum Walk {
     ToEoi(u64),
     /// It failed before completing one row of MCUs.
     UnderOneRow,
-    /// It failed later.
+    /// It failed after completing at least one row.
     Failed,
 }
 
@@ -174,7 +174,8 @@ fn verify(r: &mut Reader, start: u64, len: u64) -> (Health, Option<u64>) {
         Some(Walk::ToEoi(eoi)) if r.bad_in(start, end) => (Health::Partial, Some(eoi)),
         Some(Walk::ToEoi(eoi)) => (Health::Intact, Some(eoi)),
         Some(Walk::UnderOneRow) => (Health::Damaged, None),
-        Some(Walk::Failed) => (zune_health(r, start, len, false), None),
+        // Q10: a row or more shows, whatever comes after (as for a cut file).
+        Some(Walk::Failed) => (Health::Partial, None),
         None => (zune_health(r, start, len, true), None),
     }
 }
@@ -251,7 +252,8 @@ pub(super) fn data_end(r: &mut Reader, from: u64, end: u64) -> u64 {
         if r.bad_in(s, s + SECTOR) {
             return s.max(from);
         }
-        if s >= from && n == sector.len() && sector.iter().all(|&b| b == sector[0]) {
+        // One repeated value: each byte equals the next (one memcmp, vectorized).
+        if s >= from && n == sector.len() && sector[1..] == sector[..sector.len() - 1] {
             return s;
         }
         if n < sector.len() {
@@ -655,7 +657,7 @@ mod tests {
             Health::Damaged
         );
         assert_eq!(lenient(), before, "no lenient decode");
-        // Past the first row the lenient decode still decides (a smaller frame, so the test stays quick).
+        // Past the first row it is Partial, still without the lenient decode (Q10).
         let (_, forged) = early_eoi_cases();
         let (_, zeros) = &forged[0];
         let src = Mem(zeros.clone());
@@ -664,7 +666,37 @@ mod tests {
             decode_health(&mut Reader::new(&src), 0, zeros.len() as u64),
             Health::Partial
         );
-        assert_eq!(lenient(), before + 1);
+        assert_eq!(lenient(), before);
+    }
+
+    #[test]
+    fn a_crafted_huge_frame_is_partial_without_the_lenient_decode() {
+        // P1 of the Q8 probes: a flat 16384×12800 frame (210 megapixels) with 32 KiB of its data (about 21 rows), then
+        // 64 MiB of sectors `[00; 510] FF D9`. The lenient decode would fill 210 megapixels (about 1.1 s in release).
+        let flat = revenant_testkit::jpeg_flat_with_restarts(16384, 12800, 0);
+        let scan_start = {
+            let src = Mem(flat.clone());
+            walk_header(&mut Reader::new(&src), 0, JPEG_MAX_LEN)
+                .unwrap()
+                .scan_start as usize
+        };
+        let c = (scan_start + 32 * 1024).next_multiple_of(512);
+        let mut img = flat[..c].to_vec();
+        let mut sector = [0u8; 512];
+        sector[510..].copy_from_slice(&[0xFF, 0xD9]);
+        while img.len() < c + (64 << 20) {
+            img.extend_from_slice(&sector);
+        }
+        let src = Mem(img);
+        let (lenient, strict) = (
+            || ZUNE_LENIENT_DECODES.with(std::cell::Cell::get),
+            strict_decodes,
+        );
+        let before = (lenient(), strict());
+        let m = Jpeg.measure(&src, 0).expect("a JPEG");
+        assert_eq!(m.health, Health::Partial, "{m:?}");
+        assert_eq!((lenient(), strict()), before, "no zune-jpeg decode");
+        // Its time is pinned by `tests/jpeg_timing.rs`, a test binary of its own (nothing else runs beside it).
     }
 
     #[test]
