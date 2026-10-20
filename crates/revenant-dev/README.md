@@ -34,7 +34,8 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
 {"event":"summary","found":1,"unreadable_bytes":4096}
 ```
 
-- `kind`: `jpeg`, `mp4`, `mov`, `cr2`, `nef`, `arw`, `dng`, `orf`, `rw2`, `raf`, `cr3`, `heic` or `tiff`. `health`: `intact`, `partial` or `damaged`.
+- `kind`: `jpeg`, `mp4`, `mov`, `cr2`, `nef`, `arw`, `dng`, `orf`, `rw2`, `raf`, `cr3`, `heic` or `tiff`.
+  `health`: `intact`, `partial` or `damaged`.
 - `health` follows the engine: a file containing unreadable sectors is never `intact`. Files inside a `partial` or
   `damaged` finding are reported as findings of their own, so their ranges may overlap.
 - With `--extract`, a `found` line gets `"file":"<path>"`. If extracting that one finding fails (for example

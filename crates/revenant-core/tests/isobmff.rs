@@ -630,15 +630,66 @@ fn heic_extent_past_end_is_partial() {
     );
 }
 
+/// Offset of the length field of the second iloc extent (the Exif item, which ends at the end of the file).
+fn second_extent_len_at(v: &[u8]) -> usize {
+    // After the tag: version/flags (4), sizes (2), count (2), the 16-byte first item, then id, method, reference, count
+    // (8 bytes), offset (4), length.
+    pos(v, b"iloc") + 4 + 4 + 2 + 2 + 16 + 8 + 4
+}
+
 #[test]
-fn heic_extent_ending_exactly_at_the_end_is_intact_one_byte_more_is_partial() {
+fn heic_extent_ending_exactly_at_the_end_is_intact() {
+    let v = testkit::heic(60_000, 5, &exif());
+    let at = second_extent_len_at(&v);
+    let off_at = at - 4;
+    let end = u32::from_be_bytes(v[off_at..off_at + 4].try_into().unwrap())
+        + u32::from_be_bytes(v[at..at + 4].try_into().unwrap());
+    assert_eq!(end as usize, v.len(), "the Exif extent ends the file");
+    assert_eq!(measure(&place(&v)).unwrap().health, Health::Intact);
+}
+
+#[test]
+fn heic_extent_one_byte_past_the_end_is_partial() {
     let mut v = testkit::heic(60_000, 5, &exif());
-    // The second extent (the Exif item) ends at the end of the file: stretch it by one byte.
-    let tail = pos(&v, b"iloc") + 4 + 4 + 2 + 2 + 16; // the second item starts 16 bytes after the first
-    let len_at = tail + 2 + 2 + 2 + 2 + 4;
-    let len = u32::from_be_bytes(v[len_at..len_at + 4].try_into().unwrap());
-    v[len_at..len_at + 4].copy_from_slice(&(len + 1).to_be_bytes());
+    let at = second_extent_len_at(&v);
+    let len = u32::from_be_bytes(v[at..at + 4].try_into().unwrap());
+    v[at..at + 4].copy_from_slice(&(len + 1).to_be_bytes());
     assert_eq!(measure(&place(&v)).unwrap().health, Health::Partial);
+}
+
+#[test]
+fn avif_major_with_mif1_is_not_heic() {
+    let mut v = testkit::heic(60_000, 5, &exif());
+    v[8..12].copy_from_slice(b"avif");
+    v[16..24].copy_from_slice(b"mif1miaf");
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!(m.kind, FileKind::Mp4);
+}
+
+#[test]
+fn heic_with_mif1_major_and_heic_compatible_is_heic() {
+    let mut v = testkit::heic(60_000, 5, &exif());
+    v[8..12].copy_from_slice(b"mif1");
+    v[16..24].copy_from_slice(b"heicheic");
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!((m.kind, m.health), (FileKind::Heic, Health::Intact));
+    // A HEIC brand only in the compatible list is enough too.
+    v[8..12].copy_from_slice(b"test");
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!((m.kind, m.health), (FileKind::Heic, Health::Intact));
+}
+
+#[test]
+fn cr3_preview_size_running_past_its_box_is_partial() {
+    let mut v = testkit::cr3(7, &exif());
+    let at = pos(&v, b"PRVW") + 16;
+    let size = u32::from_be_bytes(v[at..at + 4].try_into().unwrap());
+    v[at..at + 4].copy_from_slice(&(size + 1000).to_be_bytes());
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!(
+        (m.kind, m.len, m.health),
+        (FileKind::Cr3, v.len() as u64, Health::Partial)
+    );
 }
 
 #[test]
@@ -771,4 +822,28 @@ fn cr3_cut_by_a_foreign_jpeg_inside_mdat_keeps_the_cut() {
         found[0],
         (AT as u64, (cut - AT) as u64, FileKind::Cr3, Health::Partial)
     );
+}
+
+#[test]
+fn zero_size_iloc_fields_are_bounded() {
+    // offset, length and index sizes of 0: every extent takes 0 bytes, so 65,535 items x 65,535 extents would be 4
+    // billion iterations out of a 525 KB table.
+    let mut iloc = vec![1, 0, 0, 0, 0x00, 0x00];
+    iloc.extend_from_slice(&0xFFFFu16.to_be_bytes());
+    for id in 0..0xFFFFu16 {
+        iloc.extend_from_slice(&id.to_be_bytes());
+        iloc.extend_from_slice(&[0, 0, 0, 0]); // construction method, data reference
+        iloc.extend_from_slice(&0xFFFFu16.to_be_bytes()); // extent count
+    }
+    let mut meta = vec![0u8; 4];
+    meta.extend(bx(b"iloc", &iloc));
+    let mut v = bx(b"ftyp", b"heic\0\0\0\0mif1");
+    v.extend(bx(b"meta", &meta));
+    v.extend(bx(b"mdat", &[7u8; 1000]));
+    let img = place(&v);
+    let t = std::time::Instant::now();
+    let m = measure(&img).unwrap();
+    assert!(t.elapsed().as_secs_f32() < 1.0, "took {:?}", t.elapsed());
+    assert_eq!(m.kind, FileKind::Heic);
+    assert_ne!(m.health, Health::Intact);
 }

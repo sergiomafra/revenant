@@ -163,3 +163,26 @@ fn unreadable_sector_in_the_raw_data_is_partial() {
     let m = Raf.measure(&source, AT as u64).unwrap();
     assert_eq!((m.len, m.health), (raf.len() as u64, Health::Partial));
 }
+
+#[test]
+fn raf_block_starting_with_a_jpeg_at_a_sector_start_is_not_cut() {
+    // Move the embedded JPEG to offset 512: its head is then a sector-aligned "JPEG starts here", but it is the
+    // RAF's own.
+    let raf = testkit::raf(120_000, 7, &exif());
+    let jpeg_len = u32::from_be_bytes(raf[0x58..0x5C].try_into().unwrap()) as usize;
+    let shift = 512 - 0x94;
+    let mut moved = raf[..0x94].to_vec();
+    moved.resize(512, 0);
+    moved.extend_from_slice(&raf[0x94..]);
+    for at in [0x54, 0x5C, 0x64] {
+        let off = u32::from_be_bytes(moved[at..at + 4].try_into().unwrap());
+        put_field(&mut moved, at, off + shift as u32);
+    }
+    assert_eq!(&moved[512..514], &[0xFF, 0xD8]);
+    assert!(jpeg_len > 0);
+    let img = DiskImage::noise(1 << 20, 3).put(AT, &moved).save();
+    assert_eq!(
+        scan_image(&img),
+        vec![(AT as u64, moved.len() as u64, FileKind::Raf, Health::Intact)]
+    );
+}

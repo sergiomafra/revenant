@@ -1,5 +1,5 @@
-//! ISO BMFF (MP4/MOV, Canon CR3, HEIC): walks the top-level boxes by their declared sizes to measure the file, then judges its health
-//! from the chunk and sample tables inside `moov`.
+//! ISO BMFF (MP4/MOV, Canon CR3, HEIC): walks the top-level boxes by their declared sizes to measure the file, then
+//! judges its health from the chunk and sample tables inside `moov`.
 //!
 //! Health rules:
 //! - no `mdat` -> not a video (`None`); no `moov` -> `Damaged` (the media data is there but the index is not);
@@ -21,25 +21,28 @@
 //!
 //! Only the first `moov` is parsed, and only if it is at most [`MOOV_MAX_LEN`] (larger -> `Damaged`).
 //!
-//! Kind from the `ftyp` brands: major brand `crx ` is a CR3, `qt  ` a MOV; a HEIC brand (`heic heix heim heis mif1 msf1`,
-//! as the major or a compatible brand, but not with an `avif`/`avis` major brand) with no `moov` in the file is a HEIC
-//! (an MP4 that merely lists `mif1` has a `moov` and stays an MP4); anything else is an MP4.
+//! Kind from the `ftyp` brands: major brand `crx ` is a CR3, `qt  ` a MOV; a HEIC brand (`heic heix heim heis mif1
+//! msf1`, as the major or a compatible brand, but not with an `avif`/`avis` major brand) with no `moov` in the file is
+//! a HEIC (an MP4 that merely lists `mif1` has a `moov` and stays an MP4); anything else is an MP4.
 //!
 //! CR3 follows the rules above (it has `trak`s), and in addition its `PRVW` preview JPEG (in the top-level `uuid`
 //! `eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16`) must decode strictly, else the file is at best `Partial` (a missing or
-//! oversized preview too). The `PRVW` layout (after the 16-byte uuid and 8 bytes: the box with 4+2 reserved bytes, width,
-//! height, a 1, the JPEG size, then the JPEG) is from public format notes and the testkit; not yet checked on real files.
+//! oversized preview too). The `PRVW` layout (after the 16-byte uuid and 8 bytes: the box with 4+2 reserved bytes,
+//! width, height, a 1, the JPEG size, then the JPEG) is from public format notes and the testkit; not yet checked on
+//! real files.
 //!
-//! HEIC has no `moov` or `mdat` rule: it needs a `meta` (at most [`MOOV_MAX_LEN`]) whose `iloc` lists the items' extents.
-//! Every extent (construction method 0 and data reference 0: offsets absolute in the file, plus the item's base offset)
-//! must end inside the measured file, else `Partial`; no `meta` (with an `mdat`), a garbled `meta`, no `iloc` or an `iloc`
-//! without extents is `Damaged`. Extents the engine cannot check (construction method 1 or 2, an external data
-//! reference, a zero length, an `iloc` version above 2, more than 65,536 items or 262,144 extents) make the file at best
-//! `Partial`. The pixel data is HEVC (or similar) and is never decoded: `Intact` means the structure is complete and every
-//! extent lies inside the file. `mdat` may be absent (data in `idat`), but then the extents are method 1: `Partial`.
+//! HEIC has no `moov` or `mdat` rule: it needs a `meta` (at most [`MOOV_MAX_LEN`]) whose `iloc` lists the items'
+//! extents. Every extent (construction method 0 and data reference 0: offsets absolute in the file, plus the item's
+//! base offset) must end inside the measured file, else `Partial`; no `meta` (with an `mdat`), a garbled `meta`, no
+//! `iloc` or an `iloc` without extents is `Damaged`. Extents the engine cannot check (construction method 1 or 2, an
+//! external data reference, a zero length, zero-size offset and length fields, an `iloc` version above 2, more than
+//! 65,536 items or 262,144 extents) make the file at best `Partial`. The pixel data is HEVC (or similar) and is never
+//! decoded: `Intact` means the structure is complete and every extent lies inside the file. `mdat` may be absent (data
+//! in `idat`), but then the extents are method 1: `Partial`.
 //!
 //! An `mdat` head that is exactly a chunk start (CR3: of any track; Motion-JPEG video: of its track) or an extent start
-//! (HEIC) is the file's own data, not another file: see `measure`.
+//! (HEIC) is the file's own data, not another file: see `measure`. A foreign file starting exactly there is
+//! indistinguishable from it.
 //!
 //! Unreadable sectors read as zeros: inside `moov` the index is unusable -> `Damaged` (the length still covers `moov`, so
 //! extraction keeps it); anywhere else in the file an otherwise `Intact` file becomes `Partial`. A box header that cannot
@@ -545,6 +548,12 @@ fn parse_iloc(payload: &[u8]) -> Option<Iloc> {
     {
         return None;
     }
+    if offset_size == 0 && length_size == 0 {
+        // Every extent is "the whole resource" and takes no bytes: nothing to check, and nothing bounds a loop.
+        out.unverifiable = true;
+        return Some(out);
+    }
+    let mut iterations = 0usize;
     let count = if version < 2 { c.uint(2)? } else { c.uint(4)? } as u32;
     if count > ILOC_MAX_ITEMS {
         out.unverifiable = true;
@@ -556,6 +565,11 @@ fn parse_iloc(payload: &[u8]) -> Option<Iloc> {
         let base = c.uint(base_size)?;
         let extent_count = c.uint(2)?;
         for _ in 0..extent_count {
+            iterations += 1;
+            if iterations > ILOC_MAX_EXTENTS {
+                out.unverifiable = true;
+                return Some(out);
+            }
             c.uint(index_size)?;
             let offset = c.uint(offset_size)?;
             let length = c.uint(length_size)?;
@@ -617,7 +631,8 @@ fn judge_heic(r: &mut Reader, start: u64, w: &Walk) -> Option<Measurement> {
     })
 }
 
-/// Starts (relative to the file) of the data the file itself keeps in `mdat`: for a HEIC its extents, for a CR3 the chunks
+/// Starts (relative to the file) of the data the file itself keeps in `mdat`: for a HEIC its extents, for a CR3 the
+/// chunks
 /// of every track, for an MP4/MOV only the chunks of Motion-JPEG video tracks (`hdlr` `vide` whose first sample entry
 /// is `mjpa`, `mjpb` or `jpeg`).
 fn own_starts(r: &mut Reader, w: &Walk) -> Vec<u64> {

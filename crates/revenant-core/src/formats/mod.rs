@@ -40,7 +40,8 @@ pub enum FileKind {
 }
 
 impl FileKind {
-    /// Stable lowercase identifier (`"jpeg"`, `"mp4"`, `"mov"`, `"cr2"`, ..., `"heic"`, `"tiff"`), for machine-readable output.
+    /// Stable lowercase identifier (`"jpeg"`, `"mp4"`, `"mov"`, `"cr2"`, ..., `"heic"`, `"tiff"`), for machine-readable
+    /// output.
     pub fn as_str(self) -> &'static str {
         match self {
             FileKind::Jpeg => "jpeg",
