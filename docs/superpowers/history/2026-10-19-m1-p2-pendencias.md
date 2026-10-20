@@ -27,17 +27,23 @@ Cada decisão traz o custo se estiver errada.
   tamanho do RAW é o fim da estrutura, nunca "tudo o que sobra". Custo: nenhum.
 - **P12:** um só `SOF_SEGMENTS = 64` para saúde e inspeção. Custo: nenhum.
 
-**Tarefa 6 (amostras reais), aguardando revisão.** As amostras reais acharam três defeitos de verdade, corrigidos com testes
-sintéticos que reproduzem a estrutura:
+**Tarefa 6 (amostras reais).** As amostras reais acharam três defeitos de verdade, corrigidos com testes sintéticos que
+reproduzem a estrutura:
 - **RW2 da Panasonic:** o StripOffsets é um marcador (`0xFFFFFFFF`) e os dados brutos começam na tag 0x0118, sem tamanho. O
-  tamanho vem do sensor (tags 0x0002/0x0003) e do empacotamento (pacotes de 16 bytes com 14 pixels no formato 4, 10 ou 9 no
-  formato 5, em blocos de 0x4000). Conferido em 6 arquivos de 5 câmeras. Outro formato fica Parcial. Custo: um corpo novo com outro
-  empacotamento aparece Parcial até ser conferido.
+  tamanho vem do sensor (tags 0x0002/0x0003) e do empacotamento (pacotes de 16 bytes, em blocos de 0x4000), com aritmética
+  verificada e no máximo 10^9 pixels; tamanho hostil ou estouro dá tamanho desconhecido (Parcial).
 - **ORF da Olympus/OM System:** a miniatura e a prévia ficam dentro do MakerNote e começavam em setor, cortando o arquivo.
   Agora o MakerNote é lido (cabeçalhos `OLYMPUS` e `OM SYSTEM`). Custo: o MakerNote antigo `OLYMP` (E-10 e afins) não é lido.
-- **Miniatura dentro da prévia:** uma cabeça de JPEG dentro de um JPEG do próprio RAW não corta mais o RAW. Custo: um
-  arquivo gravado por cima de um JPEG menor do RAW é tomado como parte dele (sobre a prévia maior, a decodificação falha e o
-  arquivo continua aparecendo).
+- **P13 (estreitada na revisão):** uma cabeça de JPEG dentro de um JPEG do próprio RAW (a miniatura EXIF dentro da prévia)
+  não corta o RAW só se todo JPEG próprio que a contém (até `JPEG_MAX_LEN`) ainda decodifica no modo rigoroso; uma
+  decodificação por JPEG, guardada. Se não decodifica, corta, e o arquivo de dentro aparece sozinho. Custo: nenhum além de
+  uma decodificação a mais quando há cabeça dentro de um JPEG próprio.
+- **P14:** só valem os empacotamentos da Panasonic conferidos em arquivo real: formato 4 com 12 bits, 14 pixels por pacote
+  (DMC-FZ28, DMC-GF1, DMC-LX7 duas vezes, DC-G100) e formato 5 com 14 bits, 9 pixels (DC-GH5S). Qualquer outro, inclusive o
+  formato 5 com 12 bits, dá tamanho desconhecido: o RW2 sai Parcial e medido até a estrutura conhecida. Custo: um corpo com
+  outro empacotamento aparece Parcial até ser conferido.
+- **P15:** `tiff.rs` usa o mesmo limite de 64 segmentos de marcador (`jpeg::SOF_SEGMENTS`) para achar o SOF; a tolerância
+  de zeros no fim do teste de amostras reais vale só para ARW. Custo: nenhum.
 - **Preenchimento do ARW:** a Sony completa alguns ARW com zeros depois dos dados (até múltiplo de 4 KiB ou 64 KiB). Nada
   aponta para esses zeros, então o achado termina no último byte referenciado, e o teste aceita até 64 KiB de zeros no fim.
   Custo: o arquivo recuperado fica sem esse enchimento (abre igual).
@@ -50,10 +56,11 @@ sintéticos que reproduzem a estrutura:
 - `all_formats()` é reconstruído a cada `measure`.
 - Um COUNT ou tamanho corrompido num offset válido ainda é cortado no limite; numa origem menor que 1 GiB o achado pode ir
   até o fim dela (Parcial). Os comentários de `claim()`/`TiffInfo.data` devem dizer que o corte vale para toda faixa.
-- `tiff.rs` ainda olha 16 segmentos atrás do SOF (`MAX_SEGMENTS`), contra 64 no resto (P12).
 - O ARW da Sony DSLR-A100 (2006) sai Danificado: o ponteiro de SubIFD aponta para dados embaralhados. Pede tratamento por
   modelo.
-- RW2 com formato de empacotamento diferente de 4 e 5 (corpos mais novos) sai Parcial; conferir com amostras quando houver.
+- RW2 com empacotamento não conferido sai Parcial (P14): o formato 5 com 12 bits (seriam 10 pixels por pacote) e os
+  formatos 6 e 7 dos corpos mais novos. Conferir com amostras reais quando houver.
+- O MakerNote antigo `OLYMP\0` da Olympus (E-10 e afins, offsets relativos ao TIFF) não é lido.
 - Não há HEIC real: nenhuma amostra com licença CC0/domínio público verificável foi achada.
 
 **Parte 1.4 (sistemas de arquivos)**

@@ -170,17 +170,21 @@ and
   a strip that starts inside the source is kept up to its end, while one that starts beyond it is not counted (a
   corrupted offset never claims the rest of the source). The file is cut at the first 512-aligned sector inside it where
   another file starts, except at the starts of its own embedded previews and raw strips/tiles (a lossless-JPEG tile
-  legitimately begins with FF D8) and anywhere inside its own embedded JPEGs (the EXIF thumbnail in a preview's APP1),
-  and at the end of the source; either makes it `Partial`. A file written exactly at one of those starts, or over a
-  smaller embedded JPEG, is indistinguishable from the RAW's own data and does not cut it (one written over the largest
-  preview breaks its decode, so the RAW is not `Intact` and that file is still reported).
+  legitimately begins with FF D8) and inside its own embedded JPEGs (the EXIF thumbnail in a preview's APP1) as long as
+  every own JPEG containing that head (at most `JPEG_MAX_LEN` long) still decodes strictly, and at the end of the
+  source; either makes it `Partial`. A file written over part of an own JPEG breaks that decode, so it cuts the RAW and
+  is reported on its own. A file written exactly at one of those starts is indistinguishable from the RAW's own data
+  and does not cut it.
 - Vendor layouts (checked against real files from raw.pixls.us). Panasonic RW2: StripOffsets is a placeholder
   (`0xFFFFFFFF`, its StripByteCounts 0 or an unpacked size) and is ignored; the raw data starts at tag 0x0118 and has no
   length tag, so its length comes from the sensor size (tags 0x0002/0x0003) and packing: 16-byte packets of 14 pixels
-  (RawFormat 4, 12-bit), 10 (RawFormat 5, 12-bit) or 9 (RawFormat 5, 14-bit), rounded up to 0x4000-byte blocks. Another
-  RawFormat leaves the length unknown: the file is measured up to its known structure and is `Partial`. The preview is
-  tag 0x002E (JpgFromRaw). Olympus/OM System ORF: the thumbnail and the preview live in the MakerNote (see the TIFF
-  reader below).
+  (RawFormat 4, 12-bit: DMC-FZ28, DMC-GF1, DMC-LX7, DC-G100) or 9 (RawFormat 5, 14-bit: DC-GH5S), rounded up to
+  0x4000-byte blocks. Only packings checked against real files are used: any other (RawFormat 5 at 12 bits included), a
+  sensor over 10^9 pixels or an overflowing size leaves the length unknown, and the file is measured up to its known
+  structure and is `Partial`. The preview is tag 0x002E (JpgFromRaw). Olympus/OM System ORF: the thumbnail and the
+  preview live in the MakerNote (see the TIFF reader below); the old `OLYMP\0` MakerNote (E-10 era, offsets relative to
+  the TIFF) is not read, so those files keep only their other previews.
+- Known misread: the Sony DSLR-A100 (2006) ARW comes out `Damaged`, because its SubIFD pointer leads to scrambled data.
 - Sony pads some ARW files with zeros after the raw data (to a 4 KiB or 64 KiB multiple). Nothing references that
   padding, so the finding ends at the last referenced byte; the recovered file opens like the original.
 - Health: `Damaged` when the IFD structure is malformed (a cycle, an unknown type, and so on). `Partial` when cut, when
@@ -218,7 +222,8 @@ once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 
 
 Vendor data it reads: in an RW2 (`IIU\0`) IFD0, Panasonic's tags 0x0002/0x0003 (sensor size), 0x000A (bits per sample),
 0x002D (raw format), 0x002E (JpgFromRaw, a lossy JPEG goes to `jpegs`) and 0x0118 (raw data offset; the length is computed
-as described under TIFF-based RAW, an unknown packing sets `truncated`; StripOffsets/StripByteCounts are then ignored). In
+with checked arithmetic as described under TIFF-based RAW, an unknown packing or size sets `truncated`;
+StripOffsets/StripByteCounts are then ignored). In
 an Exif IFD, a MakerNote (0x927C) that starts with `OLYMPUS\0` (IFD at +12) or `OM SYSTEM\0\0\0` (IFD at +16), in the byte
 order its header names and with offsets relative to the MakerNote: its thumbnail (0x0100) and the preview of its
 CameraSettings IFD (0x2020 → 0x0101 start, 0x0102 length) go to `jpegs` when they lie inside the MakerNote and are lossy
@@ -288,7 +293,7 @@ nothing is ever overwritten; after 10,000 attempts it fails with `write_failed`)
 `tests/real_samples.rs` runs the engine over real camera files (one each of CR2, CR3, NEF, ARW, RAF, DNG, ORF, RW2; all
 CC0 from raw.pixls.us, listed with URL and SHA-256 in `samples/samples.toml`, never committed). Each is embedded in a
 noise image at a sector start and must come out as exactly one finding of its kind, `Intact`, with the file's length
-(trailing zero padding under 64 KiB aside), make and model, and a preview that decodes strictly. It is ignored by default:
+(for ARW, trailing zero padding under 64 KiB aside), make and model, and a preview that decodes strictly. It is ignored by default:
 
 ```sh
 scripts/fetch-samples.sh

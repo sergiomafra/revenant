@@ -38,6 +38,8 @@ jobs:
   samples:
     name: real camera samples
     runs-on: ubuntu-latest
+    # Downloads from raw.pixls.us: an outage of that site must not fail the build.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

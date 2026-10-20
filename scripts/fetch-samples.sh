@@ -35,7 +35,7 @@ fetch() {
         return
     fi
     echo "downloading $name"
-    curl --fail --location --silent --show-error --retry 3 --proto '=https' --output "$dest.part" "$url"
+    curl --fail --location --silent --show-error --retry 3 --proto '=https' --proto-redir '=https' --output "$dest.part" "$url"
     local got
     got="$(sha256 "$dest.part")"
     if [[ "$got" != "$sum" ]]; then

@@ -451,12 +451,12 @@ fn rw2_with_strip_len(
 }
 
 /// Real RW2s (DMC-LX7, DC-G100, DC-GH5S) give no strip length: StripOffsets is 0xFFFFFFFF, the raw data starts at tag
-/// 0x0118 and runs to the end of the file in 16-byte packets of 14 (format 4), 10 (format 5, 12-bit) or 9 (format 5,
-/// 14-bit) pixels, rounded up to 0x4000-byte blocks. The preview (tag 0x002E) sits on a sector start.
+/// 0x0118 and runs to the end of the file in 16-byte packets of 14 (format 4, 12-bit) or 9 (format 5, 14-bit) pixels,
+/// rounded up to 0x4000-byte blocks. The preview (tag 0x002E) sits on a sector start.
 #[test]
 fn panasonic_rw2_raw_length_comes_from_the_sensor_size() {
     // 280 x 200 = 56000 pixels.
-    for (format, bits, raw_len) in [(4, 12, 65_536), (5, 12, 98_304), (5, 14, 114_688)] {
+    for (format, bits, raw_len) in [(4, 12, 65_536), (5, 14, 114_688)] {
         let f = rw2(format, bits, raw_len);
         let mut img = DiskImage::noise(8192 + f.bytes.len() + 8192, 21);
         img.put(8192, &f.bytes);
@@ -479,6 +479,54 @@ fn panasonic_rw2_ignores_the_placeholder_strip() {
         scan_image(&img.save()),
         vec![(8192, f.bytes.len() as u64, FileKind::Rw2, Health::Intact)]
     );
+}
+
+/// Packings not checked against a real file (ruling P14), here format 5 at 12 bits (it would be 10 pixels per packet,
+/// 98,304 bytes), give an unknown length.
+#[test]
+fn panasonic_rw2_with_an_unverified_packing_is_partial() {
+    let f = rw2(5, 12, 98_304);
+    let mut img = DiskImage::noise(8192 + f.bytes.len() + 8192, 21);
+    img.put(8192, &f.bytes);
+    let found = scan_image(&img.save());
+    assert_eq!((found[0].0, found[0].2), (8192, FileKind::Rw2), "{found:?}");
+    assert_eq!(found[0].3, Health::Partial, "{found:?}");
+    assert!(found[0].1 <= f.raw.start as u64, "{found:?}");
+}
+
+/// Overwrites tag `tag` of the little-endian IFD at `ifd` with a LONG holding `value`.
+fn patch_long(bytes: &mut [u8], ifd: usize, tag: u16, value: u32) {
+    let n = u16::from_le_bytes([bytes[ifd], bytes[ifd + 1]]) as usize;
+    for i in 0..n {
+        let e = ifd + 2 + 12 * i;
+        if u16::from_le_bytes([bytes[e], bytes[e + 1]]) == tag {
+            bytes[e + 2..e + 4].copy_from_slice(&4u16.to_le_bytes());
+            bytes[e + 4..e + 8].copy_from_slice(&1u32.to_le_bytes());
+            bytes[e + 8..e + 12].copy_from_slice(&value.to_le_bytes());
+            return;
+        }
+    }
+    panic!("tag {tag:#x} not found");
+}
+
+/// Hostile sensor sizes (LONG 0xFFFFFFFF, or a product past any real sensor) must not overflow: the length is unknown.
+#[test]
+fn panasonic_rw2_with_a_hostile_sensor_size_is_partial() {
+    for (w, h) in [(u32::MAX, u32::MAX), (100_000, 100_000)] {
+        let mut f = rw2(4, 12, 65_536);
+        let ifd0 = u32::from_le_bytes(f.bytes[4..8].try_into().unwrap()) as usize;
+        patch_long(&mut f.bytes, ifd0, 0x0002, w);
+        patch_long(&mut f.bytes, ifd0, 0x0003, h);
+        let mut img = DiskImage::noise(8192 + f.bytes.len() + 8192, 21);
+        img.put(8192, &f.bytes);
+        let found = scan_image(&img.save());
+        assert_eq!(
+            (found[0].0, found[0].2),
+            (8192, FileKind::Rw2),
+            "{w}x{h}: {found:?}"
+        );
+        assert_eq!(found[0].3, Health::Partial, "{w}x{h}: {found:?}");
+    }
 }
 
 #[test]
@@ -515,6 +563,43 @@ fn olympus_makernote_jpegs_do_not_cut_the_orf() {
             "om_system {om_system}"
         );
     }
+}
+
+/// A JPEG written inside one of the RAW's own smaller JPEGs (here the MakerNote thumbnail, clear of the preview) breaks
+/// that JPEG: it is another file, so it cuts the ORF and is found on its own (ruling P13, narrowed).
+#[test]
+fn foreign_jpeg_inside_an_own_thumbnail_cuts_the_orf() {
+    let mut f = testkit::olympus_orf(false, 50_000, 4, &TestExif::default());
+    // The thumbnail is the testkit's 64x48 JPEG for this seed, the first JPEG on a sector start in the file.
+    let thumb_len = testkit::jpeg(64, 48, 4, 0).len();
+    let thumb = (0..f.bytes.len())
+        .step_by(512)
+        .find(|&p| f.bytes[p..].starts_with(&[0xFF, 0xD8, 0xFF]))
+        .unwrap();
+    let foreign = testkit::jpeg(8, 8, 77, 0);
+    let at = thumb + 512;
+    assert!(
+        at + foreign.len() < thumb + thumb_len,
+        "fits inside the thumbnail"
+    );
+    f.bytes[at..at + foreign.len()].copy_from_slice(&foreign);
+    let mut img = DiskImage::noise(8192 + f.bytes.len() + 8192, 22);
+    img.put(8192, &f.bytes);
+    let found = scan_image(&img.save());
+    assert_eq!(
+        found[0],
+        (8192, at as u64, FileKind::Orf, Health::Partial),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&(
+            (8192 + at) as u64,
+            foreign.len() as u64,
+            FileKind::Jpeg,
+            Health::Intact
+        )),
+        "{found:?}"
+    );
 }
 
 /// A preview inside the MakerNote that does not decode cleanly makes the ORF partial: the MakerNote preview is the

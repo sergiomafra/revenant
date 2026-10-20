@@ -92,4 +92,6 @@ REVENANT_SAMPLES=samples/cache cargo test -p revenant-core --test real_samples -
 target/release/revenant-dev scan samples/cache/nikon-z6.nef --previews /tmp/previews --allow-same-volume
 ```
 
-The script only downloads and checks files; nothing in them is ever executed.
+The script only downloads (over https only, redirects included) and checks files; nothing in them is ever executed.
+Known limits the samples do not cover: the old Olympus `OLYMP\0` MakerNote is not read, and the Sony DSLR-A100 ARW comes
+out `damaged` (see `crates/revenant-core/README.md`).

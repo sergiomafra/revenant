@@ -12,8 +12,8 @@
 //! HEIC) a preview whose JPEG decodes in strict mode. Every sample is checked and every failure listed before the test
 //! fails.
 //!
-//! One allowance on the length: the finding may stop before the end of the file when everything after it is zero
-//! padding shorter than [`MAX_PADDING`]. Sony pads ARW files with zeros after the raw strip, to a 64 KiB (ILCE-7S) or
+//! One allowance on the length, for ARW only: the finding may stop before the end of the file when everything after it
+//! is zero padding shorter than [`MAX_PADDING`]. Sony pads ARW files with zeros after the raw strip, to a 64 KiB (ILCE-7S) or
 //! 4 KiB (ILCE-7M5) multiple; no IFD references those bytes, so the recovered file opens exactly like the original, and on
 //! a card the engine cannot tell that padding from zeroed free space after the file.
 
@@ -139,7 +139,7 @@ fn check(dir: &Path, s: &Sample) -> (Vec<String>, String) {
     let padding = usize::try_from(f.len)
         .ok()
         .and_then(|l| bytes.get(l..))
-        .filter(|tail| tail.len() < MAX_PADDING && tail.iter().all(|&b| b == 0));
+        .filter(|tail| s.kind == "arw" && tail.len() < MAX_PADDING && tail.iter().all(|&b| b == 0));
     match padding {
         _ if f.len == bytes.len() as u64 => {}
         Some(tail) => note = format!(" (+{} bytes of trailing zero padding)", tail.len()),

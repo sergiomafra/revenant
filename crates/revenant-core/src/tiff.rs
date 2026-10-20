@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 
 use crate::formats::Reader;
+use crate::formats::jpeg::SOF_SEGMENTS;
 
 /// Largest TIFF extent accepted (offsets past it are structural errors).
 pub(crate) const TIFF_MAX_LEN: u64 = 1 << 30;
@@ -24,8 +25,6 @@ const STRIP_BUDGET: u64 = 262_144;
 const MAX_SUBIFDS: u64 = 16;
 /// Bytes read of a string tag.
 const MAX_STRING: u64 = 256;
-/// Marker segments inspected looking for the SOF of a JPEG.
-const MAX_SEGMENTS: usize = 16;
 /// Panasonic raw data is stored in blocks of this many bytes.
 const PANASONIC_BLOCK: u64 = 0x4000;
 
@@ -68,7 +67,7 @@ pub(crate) struct TiffInfo {
     /// start with FF D8 and whose first SOF is SOF0, SOF1 or SOF2 (baseline, extended, progressive), and the same kind
     /// of JPEG in vendor places: Panasonic's JpgFromRaw (RW2 tag 0x002E) and the thumbnail and preview of an Olympus
     /// MakerNote. Lossless JPEG (SOF3, as in CR2 raw slices and lossless DNG) lands in `data`, as does a JPEG whose SOF
-    /// is not found in the first 16 marker segments.
+    /// is not found in the first [`SOF_SEGMENTS`] (64) marker segments.
     pub jpegs: Vec<(u64, u64)>,
     /// Other strip/tile ranges (raw data), and Panasonic's raw data (RW2 tag 0x0118, length from the sensor size).
     pub data: Vec<(u64, u64)>,
@@ -144,18 +143,27 @@ struct PanasonicTags {
     raw_offset: Option<u64>,
 }
 
-/// Length of Panasonic packed raw data: 16-byte packets of 14 pixels (raw format 4, 12-bit), 10 (format 5, 12-bit) or 9
-/// (format 5, 14-bit), the whole rounded up to [`PANASONIC_BLOCK`]. Checked against real DMC-FZ28, DMC-GF1, DMC-LX7 (two),
-/// DC-G100 (format 4) and DC-GH5S (format 5, 14-bit) files. `None` for other formats or a zero size.
+/// Largest sensor accepted for a Panasonic raw length (far above any real camera).
+const PANASONIC_MAX_PIXELS: u64 = 1_000_000_000;
+
+/// Length of Panasonic packed raw data: 16-byte packets of `n` pixels, the whole rounded up to [`PANASONIC_BLOCK`]. Only
+/// packings checked against real files are known (ruling P14): raw format 4 at 12 bits, 14 pixels per packet (DMC-FZ28,
+/// DMC-GF1, DMC-LX7 twice, DC-G100), and raw format 5 at 14 bits, 9 pixels per packet (DC-GH5S). `None` (length unknown)
+/// for any other packing, a zero size or more than [`PANASONIC_MAX_PIXELS`].
 fn panasonic_raw_len(t: &PanasonicTags) -> Option<u64> {
     let per_packet: u64 = match (t.format?, t.bits?) {
         (4, 12) => 14,
-        (5, 12) => 10,
         (5, 14) => 9,
         _ => return None,
     };
-    let pixels = u64::from(t.width?) * u64::from(t.height?);
-    (pixels > 0).then(|| (pixels.div_ceil(per_packet) * 16).next_multiple_of(PANASONIC_BLOCK))
+    let pixels = u64::from(t.width?).checked_mul(u64::from(t.height?))?;
+    if pixels == 0 || pixels > PANASONIC_MAX_PIXELS {
+        return None;
+    }
+    pixels
+        .div_ceil(per_packet)
+        .checked_mul(16)?
+        .checked_next_multiple_of(PANASONIC_BLOCK)
 }
 
 /// Walks the TIFF whose header is at absolute `base` (offsets are relative to `base`). `limit` caps every offset
@@ -510,7 +518,7 @@ impl Walker<'_, '_> {
             return false;
         }
         let mut pos = 2u64;
-        for _ in 0..MAX_SEGMENTS {
+        for _ in 0..SOF_SEGMENTS {
             if pos.saturating_add(4) > len {
                 return false;
             }

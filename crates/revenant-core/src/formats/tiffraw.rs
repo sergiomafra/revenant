@@ -9,9 +9,9 @@
 //! huge legitimate DNG), no preview, a preview that only decodes leniently or not at all (the raw data may still be fine).
 //! `Damaged`: the IFD structure is malformed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use super::jpeg::preview_health;
+use super::jpeg::{JPEG_MAX_LEN, decode_health, preview_health};
 use super::{FileKind, Format, HEAD_LEN, Health, Measurement, Reader, SECTOR, all_formats};
 use crate::source::Source;
 use crate::tiff::{TIFF_MAX_LEN, TiffInfo, type_size, walk};
@@ -120,27 +120,42 @@ impl Format for TiffRaw {
             .chain(&info.data)
             .map(|&(o, _)| start + o)
             .collect();
-        // Nor is a JPEG inside one of its own JPEGs (the EXIF thumbnail in a preview's APP1, as in a Panasonic
-        // JpgFromRaw). A file written over the largest preview breaks its decode, so this file is not `Intact` and that
-        // file is still reported on its own; one written over a smaller embedded JPEG is taken as part of this file, as
-        // one written exactly at a strip start is.
-        let inside = merged(
-            info.jpegs
-                .iter()
-                .map(|&(o, l)| (start + o, start + o + l))
-                .collect(),
-        );
-        let in_own_jpeg = |pos: u64| {
-            let i = inside.partition_point(|&(s, _)| s < pos);
-            i > 0 && pos < inside[i - 1].1
-        };
+        // Nor, usually, is a JPEG inside one of its own JPEGs (the EXIF thumbnail in a preview's APP1, as in a Panasonic
+        // JpgFromRaw): such a head is skipped while every own JPEG containing it is at most JPEG_MAX_LEN long and still
+        // decodes strictly (ruling P13). A
+        // file written over part of an own JPEG breaks that decode, so it cuts the RAW and is reported on its own. One
+        // decode per containing JPEG, cached; only done when a head is found inside one.
+        let mut jpegs: Vec<(u64, u64)> = info
+            .jpegs
+            .iter()
+            .map(|&(o, l)| (start + o, start + o + l))
+            .collect();
+        jpegs.sort_unstable();
+        let inside = merged(jpegs.clone());
+        let mut decodes: HashMap<(u64, u64), bool> = HashMap::new();
         let formats = all_formats();
         let mut pos = (start / SECTOR + 1) * SECTOR;
         while pos < start + len {
-            if !own.contains(&pos) && !in_own_jpeg(pos) && r.file_starts_at(&formats, pos) {
-                len = pos - start;
-                cut = true;
-                break;
+            if !own.contains(&pos) && r.file_starts_at(&formats, pos) {
+                let i = inside.partition_point(|&(s, _)| s < pos);
+                let in_own_jpeg = i > 0 && pos < inside[i - 1].1;
+                let parents_decode = in_own_jpeg
+                    && jpegs
+                        .iter()
+                        .take_while(|&&(s, _)| s < pos)
+                        .filter(|&&(_, e)| pos < e)
+                        .all(|&(s, e)| {
+                            // Over the JPEG size cap it is not decoded, so it cannot vouch for the head.
+                            *decodes.entry((s, e)).or_insert_with(|| {
+                                e - s <= JPEG_MAX_LEN
+                                    && decode_health(&mut r, s, e - s) == Health::Intact
+                            })
+                        });
+                if !parents_decode {
+                    len = pos - start;
+                    cut = true;
+                    break;
+                }
             }
             pos += SECTOR;
         }
