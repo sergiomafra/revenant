@@ -144,11 +144,8 @@ fn os_made_fat_lists_live_and_deleted() {
                 .filter(|f| {
                     f.origin.state == FsState::Deleted
                         && f.origin.folder() == Some("DCIM/100TEST")
-                        && if n.len() > 12 {
-                            f.origin.name() == n
-                        } else {
-                            f.origin.name()[1..] == n[1..]
-                        }
+                        // The long name exactly; DSC00003's first letter from its live siblings DSC0000x.
+                        && f.origin.name() == n
                 })
                 .collect();
             assert_eq!(

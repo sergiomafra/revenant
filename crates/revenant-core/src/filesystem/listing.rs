@@ -217,6 +217,11 @@ pub(super) struct Budget {
 }
 
 impl Budget {
+    /// Photo/video slots left.
+    pub(super) fn files_left(&self) -> usize {
+        self.files
+    }
+
     /// Takes `pieces` (and a photo/video slot when `photo`); false, taking nothing and marking the listing truncated,
     /// when either would run out.
     fn take(&mut self, pieces: usize, photo: bool) -> bool {
@@ -318,18 +323,18 @@ impl<'a> Collector<'a> {
         });
     }
 
-    /// A deleted photo/video of `kind` and its guessed clusters (ruling D4); never in `live`, never claiming. Returns
-    /// its index for [`Collector::name_mut`], or `None` when it has no cluster or the budget runs out. As for a live
-    /// file, a path past the path cap drops the folder.
+    /// A deleted photo/video of `kind` and its guessed clusters (ruling D4); never in `live`, never claiming. Not
+    /// listed when it has no cluster or the budget runs out. As for a live file, a path past the path cap drops the
+    /// folder.
     pub(super) fn deleted(
         &mut self,
         budget: &mut Budget,
         mut origin: FsOrigin,
         kind: FileKind,
         guess: Guess,
-    ) -> Option<usize> {
+    ) {
         if guess.runs.is_empty() || !budget.take(guess.runs.len(), true) {
-            return None;
+            return;
         }
         if let Some(f) = &origin.folder
             && f.len() + 1 + origin.name.len() > budget.path_bytes
@@ -345,12 +350,6 @@ impl<'a> Collector<'a> {
             runs: guess.runs,
             live: false,
         });
-        Some(self.files.len() - 1)
-    }
-
-    /// The name of pending file `i` (a deleted one whose first letter is settled later, ruling D9).
-    pub(super) fn name_mut(&mut self, i: usize) -> Option<&mut String> {
-        self.files.get_mut(i)?.origin.as_mut().map(|o| &mut o.name)
     }
 
     /// A live directory's chain (its ranges are kept when the budget allows and it turns out trusted).

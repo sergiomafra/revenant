@@ -95,6 +95,22 @@ impl Claims {
         self.overflow
     }
 
+    /// How many clusters in a row from `from` (up to `to`, inclusive, at most the last cluster) are claimed
+    /// (`claimed`) or not (`!claimed`), 64 at a time.
+    pub(crate) fn run_len(&self, from: u32, to: u32, claimed: bool) -> u64 {
+        let (from, to) = (from as u64, to.min(self.last) as u64);
+        let mut c = from;
+        while c <= to {
+            let w = self.bits[(c / 64) as usize];
+            let differs = (if claimed { !w } else { w }) >> (c % 64);
+            if differs != 0 {
+                return (c + differs.trailing_zeros() as u64).min(to + 1) - from;
+            }
+            c = (c / 64 + 1) * 64;
+        }
+        to + 1 - from
+    }
+
     /// Whether any cluster of `runs` is contested.
     pub(crate) fn touches_contested(&self, runs: &[(u32, u32)]) -> bool {
         runs.iter().any(|&(first, n)| {
@@ -167,6 +183,49 @@ pub(crate) fn follow(
     chain
 }
 
+/// The allocation as the deleted-file guesses must see it once the live walk is done (ruling R10): a cluster any live
+/// chain claims is in use, even when its FAT entry reads free (a chain broken there, or cross-linked into it).
+pub(crate) struct Unclaimed<'m> {
+    pub map: &'m mut dyn ClusterMap,
+    pub claims: &'m Claims,
+}
+
+impl ClusterMap for Unclaimed<'_> {
+    fn entry(&mut self, c: u32) -> Entry {
+        self.map.entry(c)
+    }
+
+    fn allocated(&mut self, c: u32) -> Option<bool> {
+        if self.claims.is_claimed(c) {
+            return Some(true);
+        }
+        self.map.allocated(c)
+    }
+
+    fn count(&mut self, from: u32, to: u32, free: bool) -> u64 {
+        if free {
+            match self.map.count(from, to, true) {
+                0 => 0,
+                n => self.claims.run_len(from, from + (n - 1) as u32, false),
+            }
+        } else {
+            let mut c = from as u64;
+            while c <= to as u64 {
+                c += self.map.count(c as u32, to, false);
+                if c > to as u64 {
+                    break;
+                }
+                let claimed = self.claims.run_len(c as u32, to, true);
+                if claimed == 0 {
+                    break;
+                }
+                c += claimed;
+            }
+            c - from as u64
+        }
+    }
+}
+
 /// Per-volume budget of cluster examinations ([`super::MAX_GUESS_STEPS`]), shared by [`guess`], the old exFAT chain
 /// and the bitmap check; once exhausted the caller lists no more deleted files of that volume (walk order, ruling C7).
 pub(crate) struct Budget {
@@ -196,7 +255,7 @@ impl Budget {
         self.exhausted
     }
 
-    fn left(&self) -> u64 {
+    pub(crate) fn left(&self) -> u64 {
         if self.exhausted { 0 } else { self.left }
     }
 }
@@ -499,6 +558,70 @@ mod tests {
         assert_eq!(g.runs.len(), MAX_RUNS);
         assert!(g.runs.iter().all(|&(_, n)| n == 1));
         assert!(g.short && g.skipped);
+    }
+
+    #[test]
+    fn claimed_clusters_are_in_use_for_the_guesses() {
+        // FAT: 20..=29 free but 23 (End); claims: 25 and 130..=200 (a live chain whose FAT entries read free).
+        let mut map = used([23]);
+        let mut claims = Claims::new(1000, 16);
+        let mut fat = Map(HashMap::from([(25, Entry::End)]));
+        follow(&mut fat, &mut claims, 25, 1);
+        let mut long = Map((130..=200)
+            .map(|c| {
+                (
+                    c,
+                    if c == 200 {
+                        Entry::End
+                    } else {
+                        Entry::Next(c + 1)
+                    },
+                )
+            })
+            .collect());
+        follow(&mut long, &mut claims, 130, 71);
+        assert_eq!(claims.run_len(130, 1000, true), 71);
+        assert_eq!(claims.run_len(126, 1000, false), 4);
+        assert_eq!(claims.run_len(26, 60, false), 35);
+        assert_eq!(claims.run_len(131, 140, true), 10);
+        let mut u = Unclaimed {
+            map: &mut map,
+            claims: &claims,
+        };
+        assert_eq!(u.allocated(25), Some(true));
+        assert_eq!(u.allocated(24), Some(false));
+        assert_eq!(u.count(20, 100, true), 3);
+        assert_eq!(u.count(23, 100, false), 1);
+        assert_eq!(u.count(24, 100, true), 1);
+        assert_eq!(u.count(25, 100, false), 1);
+        assert_eq!(u.count(129, 300, false), 0);
+        assert_eq!(u.count(130, 300, false), 71);
+        // Against one cluster at a time.
+        struct One<'a, 'm>(&'a mut Unclaimed<'m>);
+        impl ClusterMap for One<'_, '_> {
+            fn entry(&mut self, c: u32) -> Entry {
+                self.0.entry(c)
+            }
+            fn allocated(&mut self, c: u32) -> Option<bool> {
+                self.0.allocated(c)
+            }
+        }
+        for from in 2..260 {
+            for to in [from, from + 3, from + 70, 300] {
+                for free in [true, false] {
+                    let fast = u.count(from, to, free);
+                    assert_eq!(
+                        fast,
+                        One(&mut u).count(from, to, free),
+                        "{from}..={to} {free}"
+                    );
+                }
+            }
+        }
+        // A guess steps over the claimed clusters.
+        let g = guess(&mut u, &mut Budget::new(1000), 24, 3, 1000).unwrap();
+        assert_eq!(g.runs, vec![(24, 1), (26, 2)]);
+        assert!(g.skipped);
     }
 
     #[test]

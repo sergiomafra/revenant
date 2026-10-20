@@ -7,9 +7,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use super::alloc::{Budget as Steps, Claims, ClusterMap, Cursor, Entry, follow, guess};
+use super::alloc::{Budget as Steps, Claims, ClusterMap, Cursor, Entry, Unclaimed, follow, guess};
 use super::boot::{self, Layout, Root};
-use super::fat_deleted::{FirstBytes, Gone, Probes, high_word, key, pack, set_first};
+use super::fat_deleted::{FirstBytes, Gone, Probes, high_words, key, pack, set_first};
 use super::listing::{
     Budget, Collector, FsOrigin, FsState, FsTime, Listing, Placement, component, extension,
 };
@@ -71,6 +71,7 @@ pub(super) fn walk(
         names: FirstBytes::default(),
         unsettled: Vec::new(),
         waiting: Vec::new(),
+        later: Vec::new(),
         seen: BTreeSet::new(),
     };
     let root = match layout.root {
@@ -86,7 +87,8 @@ pub(super) fn walk(
     if whole {
         w.deleted();
     }
-    let Walk { col, claims, .. } = w;
+    w.place();
+    let (col, claims) = w.into_parts();
     col.finish(&claims, out);
 }
 
@@ -118,6 +120,8 @@ struct Walk<'a, 'b, 'p> {
     unsettled: Vec<Unsettled>,
     /// Deleted directories met in live directories, in walk order.
     waiting: Vec<Dir>,
+    /// Deleted photos/videos, in walk order, placed by [`Walk::place`] once the live walk is done.
+    later: Vec<Later>,
     /// First clusters of the deleted directories walked (a deleted tree has no claims to stop a loop).
     seen: BTreeSet<u32>,
 }
@@ -129,14 +133,28 @@ struct Unsettled {
     what: Waiting,
 }
 
+/// A deleted photo/video waiting to be placed.
+struct Later {
+    folder: Option<Arc<str>>,
+    child: Child,
+    kind: FileKind,
+}
+
 enum Waiting {
-    /// Pending file `i` of the collector.
+    /// Deleted file `i` of [`Walk::later`].
     File(usize),
     /// Waiting directory `i`, whose name starts at byte `at` of its folder.
     Dir(usize, usize),
 }
 
-impl Walk<'_, '_, '_> {
+impl<'a> Walk<'a, '_, '_> {
+    /// The collector and the claims; everything else (the first-letter tables, the FAT cache) is freed before
+    /// `finish` builds the listing.
+    fn into_parts(self) -> (Collector<'a>, Claims) {
+        let Walk { col, claims, .. } = self;
+        (col, claims)
+    }
+
     /// The live tree; false when the walk of the volume must stop there (cancelled, or the entry cap reached).
     fn live(&mut self, root: Region) -> bool {
         let mut stack = vec![Dir {
@@ -174,8 +192,13 @@ impl Walk<'_, '_, '_> {
                 } else if ch.size > 0 {
                     let need = (ch.size as u64).div_ceil(self.v.cluster_size);
                     let chain = follow(&mut self.map, &mut self.claims, ch.first, need);
-                    let origin = self.origin(&d, ch, FsState::Live, Placement::Chain);
+                    let origin = self.origin(d.folder.clone(), ch, FsState::Live, Placement::Chain);
                     self.col.file(self.budget, origin, chain);
+                    // Live files take the caps first: a deleted file waiting past the photo slots left is dropped.
+                    while self.later.len() > self.budget.files_left() {
+                        self.later.pop();
+                        self.budget.truncated = true;
+                    }
                 }
             }
             if read.capped {
@@ -199,8 +222,8 @@ impl Walk<'_, '_, '_> {
             self.names.add(u.key, first);
             match u.what {
                 Waiting::File(i) => {
-                    if let Some(name) = self.col.name_mut(i) {
-                        set_first(name, first, u.lower);
+                    if let Some(f) = self.later.get_mut(i) {
+                        set_first(&mut f.child.name, first, u.lower);
                     }
                 }
                 Waiting::Dir(i, at) => {
@@ -297,7 +320,7 @@ impl Walk<'_, '_, '_> {
     }
 
     /// A deleted entry of directory `d`. A directory waits (`subdirs: None`, the live tree) or is walked next
-    /// (`subdirs`); a photo/video is placed and listed; anything else is dropped.
+    /// (`subdirs`); a photo/video waits for [`Walk::place`]; anything else is dropped.
     fn deleted_child(&mut self, ch: Child, d: &Dir, subdirs: Option<&mut Vec<Dir>>) {
         if ch.dir {
             if !self.claims.in_heap(ch.first) {
@@ -345,54 +368,93 @@ impl Walk<'_, '_, '_> {
         if ch.size == 0 {
             return;
         }
-        if self.steps.exhausted() {
+        // Placed once the live walk is done (ruling R10): never more waiting than photo slots are left.
+        if self.later.len() >= self.budget.files_left() {
             self.budget.truncated = true;
             return;
         }
-        let Some(first) = self.first_cluster(&ch, kind) else {
-            return;
-        };
-        let need = (ch.size as u64).div_ceil(self.v.cluster_size);
-        let Some(g) = guess(&mut self.map, &mut self.steps, first, need, self.last) else {
-            if self.steps.exhausted() {
-                self.budget.truncated = true;
-            }
-            return;
-        };
-        let (pending, k, lower) = (ch.pending(), key(&ch.key_bytes()), ch.lower());
-        let origin = self.origin(d, ch, FsState::Deleted, Placement::Guessed);
-        if let Some(i) = self.col.deleted(self.budget, origin, kind, g)
-            && pending
-        {
+        if ch.pending() && subdirs.is_none() {
             self.unsettled.push(Unsettled {
-                key: k,
-                lower,
-                what: Waiting::File(i),
+                key: key(&ch.key_bytes()),
+                lower: ch.lower(),
+                what: Waiting::File(self.later.len()),
             });
         }
-    }
-
-    /// The first cluster of a deleted file: as recorded, or found by the FAT32 high-word check (ruling D10) when the
-    /// recorded high word is 0 on a volume with clusters past 0xFFFF.
-    fn first_cluster(&mut self, ch: &Child, kind: FileKind) -> Option<u32> {
-        if !(self.fat32 && ch.first >> 16 == 0 && self.last > 0xFFFF) {
-            return Some(ch.first);
-        }
-        let v = self.v;
-        high_word(
-            &mut self.map,
-            self.probes,
-            |c| v.cluster_offset(c),
-            ch.first,
-            self.last,
+        self.later.push(Later {
+            folder: d.folder.clone(),
+            child: ch,
             kind,
-        )
+        });
     }
 
-    fn origin(&self, d: &Dir, ch: Child, state: FsState, placement: Placement) -> FsOrigin {
+    /// Ruling R10: the deleted photos/videos, placed once every live chain of the volume has claimed its clusters (a
+    /// claimed cluster is in use for the guesses, whatever its FAT entry says) and the live files took their share of
+    /// the listing's caps. First the FAT32 high-word checks (ruling D10, all at once), then a guess each, in walk order,
+    /// until the step budget runs out.
+    fn place(&mut self) {
+        let later = std::mem::take(&mut self.later);
+        let high = |f: &Later| self.fat32 && f.child.first >> 16 == 0 && self.last > 0xFFFF;
+        let asks: Vec<(u32, FileKind)> = later
+            .iter()
+            .filter(|f| high(f))
+            .map(|f| (f.child.first, f.kind))
+            .collect();
+        let v = self.v;
+        let mut answers = high_words(
+            &mut Unclaimed {
+                map: &mut self.map,
+                claims: &self.claims,
+            },
+            self.probes,
+            &mut self.steps,
+            self.cancel,
+            |c| v.cluster_offset(c),
+            self.last,
+            &asks,
+        )
+        .into_iter();
+        for (k, f) in later.into_iter().enumerate() {
+            let first = if high(&f) {
+                answers.next().flatten()
+            } else {
+                Some(f.child.first)
+            };
+            if k % 1024 == 0 && self.cancel.is_cancelled() {
+                return;
+            }
+            if self.steps.exhausted() {
+                self.budget.truncated = true;
+                return;
+            }
+            let Some(first) = first else {
+                continue;
+            };
+            let need = (f.child.size as u64).div_ceil(v.cluster_size);
+            let mut map = Unclaimed {
+                map: &mut self.map,
+                claims: &self.claims,
+            };
+            let Some(g) = guess(&mut map, &mut self.steps, first, need, self.last) else {
+                continue;
+            };
+            let origin = self.origin(f.folder, f.child, FsState::Deleted, Placement::Guessed);
+            self.col.deleted(self.budget, origin, f.kind, g);
+        }
+        if self.steps.exhausted() {
+            self.budget.truncated = true;
+        }
+    }
+
+    fn origin(
+        &self,
+        folder: Option<Arc<str>>,
+        ch: Child,
+        state: FsState,
+        placement: Placement,
+    ) -> FsOrigin {
         FsOrigin {
             volume: self.v.index,
-            folder: d.folder.clone(),
+            folder,
             name: ch.name,
             state,
             placement,
@@ -480,11 +542,14 @@ impl Walk<'_, '_, '_> {
             }
             Region::Guessed { first } => {
                 is_dir = false;
-                if let Some(mut cursor) =
-                    Cursor::new(&mut self.map, first, self.dir_clusters, self.last)
+                let mut map = Unclaimed {
+                    map: &mut self.map,
+                    claims: &self.claims,
+                };
+                if let Some(mut cursor) = Cursor::new(&mut map, first, self.dir_clusters, self.last)
                 {
                     for k in 0..self.dir_clusters {
-                        let Ok(Some((c, _))) = cursor.run(&mut self.map, &mut self.steps, 1) else {
+                        let Ok(Some((c, _))) = cursor.run(&mut map, &mut self.steps, 1) else {
                             break;
                         };
                         let Some(at) = v.cluster_offset(c) else {
@@ -1551,6 +1616,79 @@ mod tests {
         assert_eq!((read, bad_reads), (4 * 512, 0));
     }
 
+    fn deleted_entry(name: &[u8; 11], first: u32, size: u32) -> [u8; 32] {
+        let mut e = [0u8; 32];
+        e[..11].copy_from_slice(name);
+        e[0] = 0xE5;
+        e[11] = 0x20;
+        e[20..22].copy_from_slice(&((first >> 16) as u16).to_le_bytes());
+        e[26..28].copy_from_slice(&(first as u16).to_le_bytes());
+        e[28..32].copy_from_slice(&size.to_le_bytes());
+        e
+    }
+
+    /// Ruling R10: each high-word candidate looked up costs a step, and the checks are memoized per (lo, format).
+    #[test]
+    fn high_word_checks_spend_steps_and_are_memoized() {
+        use revenant_testkit::{fs::DeleteStyle, jpeg};
+        // 200 entries, high word 0, both candidates of each in use: 400 lookups, no probe.
+        let mut b = card();
+        b.add_at(
+            "F1.BIN",
+            &[1; 1001 * 512],
+            &(4000..5001).collect::<Vec<_>>(),
+        );
+        b.add_at(
+            "F2.BIN",
+            &[1; 401 * 512],
+            &(69_800..70_201).collect::<Vec<_>>(),
+        );
+        for i in 0..200u32 {
+            let name: [u8; 11] = format!("H{i:07}JPG").as_bytes().try_into().unwrap();
+            b.raw_entry("H", deleted_entry(&name, 4400 + i, 512));
+        }
+        let l = list(&b, &Limits::DEFAULT);
+        assert!(l.files.iter().all(|f| f.origin.state == FsState::Live));
+        assert!(!l.truncated);
+        let l = list(
+            &b,
+            &Limits {
+                guess_steps: 399,
+                ..Limits::DEFAULT
+            },
+        );
+        assert!(l.truncated, "the lookups spend steps");
+        // Two entries with the same `lo` and format: one probe answers both.
+        let mut b = card();
+        b.add_at(
+            "F1.BIN",
+            &[1; 1001 * 512],
+            &(4000..5001).collect::<Vec<_>>(),
+        );
+        let photo = jpeg(160, 120, 1, 0);
+        let n = (photo.len() as u32).div_ceil(512);
+        b.add_at(
+            "W/W1.JPG",
+            &photo,
+            &(70_000..70_000 + n).collect::<Vec<_>>(),
+        );
+        b.delete("W/W1.JPG", DeleteStyle::WindowsFat32);
+        b.raw_entry(
+            "W",
+            deleted_entry(b"W2      JPG", 70_000 - 65_536, photo.len() as u32),
+        );
+        let l = list(
+            &b,
+            &Limits {
+                probes: 1,
+                ..Limits::DEFAULT
+            },
+        );
+        let starts: Vec<u64> = l.files.iter().map(|f| f.pieces[0].start).collect();
+        assert_eq!(starts, [VOL + b.cluster_offset(70_000); 2]);
+        assert!(!l.truncated);
+    }
+
     #[test]
     fn deleted_directories_are_bounded() {
         use revenant_testkit::{fs::DeleteStyle, jpeg};
@@ -1733,6 +1871,16 @@ mod tests {
             std::mem::size_of::<Child>() <= 48,
             "{}",
             std::mem::size_of::<Child>()
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_waiting_to_be_placed_is_small() {
+        // Up to 262,144 wait at once (README): the entry, its folder and kind; the name is the one later listed.
+        assert!(
+            std::mem::size_of::<Later>() <= 72,
+            "{}",
+            std::mem::size_of::<Later>()
         );
     }
 

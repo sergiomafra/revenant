@@ -598,6 +598,12 @@ A deleted entry (byte 0 `0xE5`) keeps its size, times and first cluster; its cha
 photos/videos (by extension) of size > 0 are listed, with `state` `deleted` and `placement` `guessed`; they claim
 nothing and never enter `live` or `others`.
 
+They are placed only once the volume's live walk is done (ruling R10): every live chain has claimed its clusters by
+then, and a claimed cluster is in use for the guesses whatever its FAT entry says (a live chain broken or cross-linked
+there). And the live files take the listing's caps first (photo slots, pieces): a deleted file is listed only with
+what they left, so deleted entries never push a live file out of `files` or `live`. While the live tree is walked,
+the deleted photos/videos wait, never more than the photo slots left (a later live photo drops the last one waiting).
+
 - **First letter (ruling D9).** Byte 0 of the short name is lost. The deleted long-name parts right before the short
   entry (attribute `0x0F`, byte 0 also `0xE5`, so their ordinals are lost too) that carry the nearest part's checksum
   are taken nearest first, at most 20, and read up to the first `0x0000`; when their first character, upper-cased
@@ -606,6 +612,9 @@ nothing and never enter `live` or `others`.
   live ones, or deleted ones already restored — first in the same directory, then in the whole volume (ties: the
   lowest byte), formatted like the rest of the 8.3 name; otherwise it is `_`. The volume-wide count is taken once the
   live tree is walked (so a later folder's names count), and the names still unknown are settled then, in walk order.
+  A long name whose first character is not the short name's byte 0 (a name starting with `.`, `+`, a space or an
+  accented letter, all of which the 8.3 name replaces or drops) fails the checksum, so its text is not used: the
+  file gets its 8.3 name, first letter from the sibling rule.
 - **Placement (ruling D4).** `need = ceil(size / cluster)`. Nothing is listed when the first cluster is outside the
   heap or allocated today (overwritten). From it, clusters free today are taken in order, allocated (or unreadable)
   ones stepped over, until `need` were taken, the heap ends, `2 × need + 1024` clusters were examined, or 4096 runs.
@@ -616,7 +625,10 @@ nothing and never enter `live` or `others`.
   `h << 16 | lo` (`h ≥ 1`) inside the heap (at most `last >> 16`, ≤ 4096); a candidate counts when it is free today and
   the format of the extension's kind (JPEG; ISO BMFF for mp4/mov/cr3/heic; TIFF RAW for cr2/nef/arw/dng/orf/rw2/tif;
   RAF) recognizes the first 16 bytes of its head. Exactly one candidate: it is the first cluster. None or several:
-  the file is not listed. Every head check is one read of 512 bytes through the `Probe` (outside the scan's cache);
+  the file is not listed. Files with the same `lo` and format share one answer (ruling R10). The checks run by high
+  word, every open question in one round, so a round looks at one 256 KiB stretch of the FAT and the FAT is read
+  once, in order; each candidate looked up costs a step of the volume's budget (below), paid before the round, and
+  cancel is checked before each round and every 1024 lookups. Every head check is one read of 512 bytes through the `Probe` (outside the scan's cache);
   the probe refuses, without reading, a range the cache already knows to be unreadable, and a refused or failed read
   recognizes nothing. At most 65,536 checks per listing (32 MiB); once spent, no more candidates are tried and a file
   whose candidates were not all checked is not listed. Cost (D10): a camera-deleted file whose head was overwritten
@@ -624,13 +636,15 @@ nothing and never enter `live` or `others`.
 - **Deleted folders.** A deleted directory met in the live tree waits (at most 65,536 per volume) until the live walk
   ends; then each is walked depth first, in the order met. Its clusters are the D4 guess for 2 MiB (read as needed,
   up to its end-of-directory entry), and it is read only when its first cluster starts with its own `.` entry (for a
-  FAT32 directory whose recorded high word is 0 only `lo` is tried). Every entry in it is deleted, whatever its byte
+  FAT32 directory whose recorded high word is 0 only `lo` is tried, so a folder Windows deleted on FAT32 past cluster
+  65,535 is lost, with the files in it; the scan still finds them without names). Every entry in it is deleted, whatever its byte
   0 says; deleted directories inside it are walked too (never twice the same first cluster). It never claims and never
   enters `live`. The directory, depth and entry caps apply as for live ones; a waiting directory counts against the
   directory cap once it is walked, so deleted folders never take room from the live tree.
-- **Step budget (ruling C7).** Every cluster examined by the guesses of a volume (files and deleted folders) costs
-  one step of 2^26; once spent, the volume's remaining deleted files are not listed and no further deleted folder is
-  read (walk order). The allocation is read a FAT block at a time, so 2^26 steps take well under a second.
+- **Step budget (ruling C7, R10).** Every cluster examined by the guesses of a volume (deleted folders, then the
+  high-word candidates, then the files) costs one step of 2^26; once spent, the volume's remaining deleted files are
+  not listed and no further deleted folder is read (in that order, each in walk order). The allocation is read a FAT
+  block at a time, so 2^26 steps take well under a second.
 
 Bounds (each lowerable in unit tests): per volume at most 65,536 directories, 4,000,000 directory entries (every
 32-byte slot read counts, the end marker included), depth 32 (the root is 0), 2 MiB per directory, 65,536 contested
@@ -667,17 +681,27 @@ consumed and its origin moved into the listing, never copied, so every name is h
   - the claims bitmap: ≤ 32 MiB at 2^28 clusters;
   - the contested set: ≤ 65,536 clusters, ≈ 1.5 MiB;
   - the FAT cache: ≤ 8 MiB;
-  - deleted entries: the first-letter count of the live tree, 4 B per known short name while walking (≤ 32 MiB at
-    4,000,000 entries with the vector's growth), then 8 B per distinct (bytes 1–3, byte 0) pair (≤ 32 MiB; the first
-    is freed once the second is built, at the end of the live walk); names counted later in deleted folders, ≈ 16 B each (≤ 64 MiB at the entry
-    cap, only with millions of entries inside deleted folders); the deleted folders waiting (≤ 65,536 × 56 B ≈
-    3.5 MiB) and those walked (≤ 65,536 first clusters); the names still to settle (16 B each, at most one per listed
-    deleted file or waiting folder); one directory's restored-name count (≤ 65,536 × 8 B); a deleted file's guess
-    (≤ 4096 runs, 64 KiB) until it is listed or dropped.
+  - deleted entries (all freed before `finish`, never at the same time as the listing being built):
+    - the first-letter count (D9): while the live tree is walked, 4 B per known short name (≤ 16 MiB at
+      4,000,000 entries, ≤ 32 MiB of capacity), then 8 B per distinct (bytes 1–3, byte 0) pair (≤ 32 MiB), the
+      first freed once the second is built; names counted inside deleted folders, ≈ 16 B each. The entry cap is
+      shared, so the whole count is ≤ ≈ 64 MiB;
+    - the deleted photos/videos waiting to be placed: 72 B each besides their names, ≤ 262,144 of them with the
+      live photos (≤ 18 MiB; their names count among the 262,144 names above, not on top);
+    - the high-word questions: ≤ ≈ 100 B per deleted file whose high word reads 0 (≤ 25 MiB);
+    - the deleted folders waiting (≤ 65,536 × 56 B ≈ 3.5 MiB) and those walked (≤ 65,536 first clusters); the
+      names still to settle (16 B each); one directory's count (≤ 65,536 × 8 B); one guess (≤ 4096 runs, 64 KiB).
 
-Combined worst case at the default caps: ≈ 355 MiB retained. The peak, which adds every transient above at once
-(including the brief overlap of the old and new buffers while `files` grows, ≈ 19 MiB, and while `live` is merged,
-≈ 16 MiB), is ≈ 535 MiB. Before origins were moved, the names alone were held twice at the end of each volume
+    Measured with a counting allocator (peak heap growth during `read`, release build, a throwaway probe binary):
+    4,000,000 live short names with distinct bytes 1–3: 47.5 MiB; 4,000,000 entries inside 62 deleted folders:
+    65.4 MiB; 190,000 deleted JPEGs with 255-character long names, high word 0 (probe cap reached): 77.9 MiB; the
+    same deleted by a camera, 174,805 listed: 110.2 MiB peak, 92.4 MiB retained.
+
+Combined worst case at the default caps: ≈ 355 MiB retained (deleted files share the photo and piece caps, so they
+add nothing). The peak, which adds every transient above at once (including the brief overlap of the old and new
+buffers while `files` grows, ≈ 19 MiB, and while `live` is merged, ≈ 16 MiB, and the deleted-entry tables,
+≤ 64 + 18 + 25 ≈ 107 MiB), is ≈ 640 MiB. It is a sum no card reaches: the deleted-entry tables are freed before
+`finish` builds the listing, and the entry cap keeps the first-letter count and 262,144 long names from coexisting. Before origins were moved, the names alone were held twice at the end of each volume
 (+195 MiB).
 
 Reads: metadata, through the given source: the boot sector again (to locate the FATs and the root), the FATs in

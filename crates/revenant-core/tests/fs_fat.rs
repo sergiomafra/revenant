@@ -1142,3 +1142,98 @@ fn deleted_directory_contents_are_listed() {
     );
     assert_eq!(l.files.len(), 3, "{:?}", paths(&l));
 }
+
+#[test]
+fn deleted_file_never_takes_a_claimed_cluster() {
+    // Live L over c..=c+3 whose FAT entry for c+1 reads free: L's chain ends there, but c+1 is L's. A deleted file met
+    // earlier in walk order, first cluster c+1, one cluster: it must not be placed on L.
+    let mut b = card();
+    let c = 80_000;
+    let mut e = short_entry(b"XDELETEDJPG", 0x20, c + 1, 512);
+    e[0] = 0xE5;
+    b.raw_entry("A", e);
+    b.add_at(
+        "Z/L.JPG",
+        &small_jpeg_of_len(4 * 512, 3),
+        &[c, c + 1, c + 2, c + 3],
+    );
+    b.set_fat(c + 1, 0);
+    let l = listing(&placed(&b));
+    assert!(deleted(&l).is_empty(), "{:?}", paths(&l));
+    let live = file(&l, "Z/L.JPG");
+    assert!(!live.trusted);
+    for f in &l.files {
+        for p in &f.pieces {
+            if f.origin.state == FsState::Deleted {
+                assert!(!overlaps(&live.pieces, p.start, p.len));
+            }
+        }
+    }
+}
+
+#[test]
+fn deleted_entries_never_push_live_files_out_of_the_caps() {
+    // 262,144 deleted JPEG entries in early folders, then one live photo: the live photo is listed (and in `live`).
+    let mut b = card();
+    let per = 65_000u32;
+    for i in 0..262_144u32 {
+        let mut name: [u8; 11] = format!("D{i:07}JPG").as_bytes().try_into().unwrap();
+        name[0] = 0xE5;
+        b.raw_entry(
+            &format!("A{}", i / per),
+            short_entry(&name, 0x20, 70_000, 512),
+        );
+    }
+    let photo = jpeg(160, 120, 1, 0);
+    let at = b.add("Z/LIVE.JPG", &photo);
+    let l = listing(&placed(&b));
+    let f = file(&l, "Z/LIVE.JPG");
+    assert_eq!(f.origin.state, FsState::Live);
+    assert!(covered(&l.live, &f.pieces[0]));
+    assert!(l.truncated);
+    assert_eq!(l.files.len(), 262_144);
+    assert_eq!(f.pieces[0].start, VOL + b.cluster_offset(at[0]));
+}
+
+#[test]
+fn hostile_high_word_entries_are_bounded() {
+    // Every cluster allocated (one live file over the whole heap but the directories), and 65,000 deleted entries whose
+    // high word reads 0, each `lo` different: every candidate is in use, nothing is probed or listed, quickly.
+    let mut b = card();
+    for i in 0..65_000u32 {
+        let mut name: [u8; 11] = format!("H{i:07}JPG").as_bytes().try_into().unwrap();
+        name[0] = 0xE5;
+        b.raw_entry("DCIM/HOSTILE", short_entry(&name, 0x20, 2 + i, 512));
+    }
+    // FILL's one cluster holds `.`, `..`, PROBE and F: nothing grows once the free clusters are counted.
+    b.mkdir("FILL");
+    let probe = b.add("FILL/PROBE.TXT", &[1; 512])[0];
+    let rest: Vec<u32> = (probe + 1..b.cluster_count() + 2).collect();
+    b.add_at("FILL/F.BIN", &vec![7; rest.len() * 512], &rest);
+    let bytes = placed(&b);
+    let t = Instant::now();
+    let l = listing(&bytes);
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        t.elapsed()
+    );
+    assert!(deleted(&l).is_empty());
+}
+
+#[test]
+fn first_letters_and_waiting_folders_are_settled_from_the_whole_volume() {
+    let mut b = card();
+    // DCIM/A is walked before DCIM/B: only B's live DSC00009 gives DSC00001 its letter.
+    b.add("DCIM/A/DSC00001.JPG", &jpeg(160, 120, 1, 0));
+    b.add("DCIM/B/DSC00009.JPG", &jpeg(160, 120, 2, 0));
+    // A deleted folder in the root whose only sibling by bytes 1–3 is a live folder inside Z.
+    b.add("FOLD0001/PIC00001.JPG", &jpeg(160, 120, 3, 0));
+    b.add("Z/FOLD0002/PIC00002.JPG", &jpeg(160, 120, 4, 0));
+    b.delete("DCIM/A/DSC00001.JPG", DeleteStyle::Camera);
+    b.delete("FOLD0001", DeleteStyle::Camera);
+    let l = listing(&placed(&b));
+    for p in ["DCIM/A/DSC00001.JPG", "FOLD0001/PIC00001.JPG"] {
+        assert_eq!(file(&l, p).origin.state, FsState::Deleted, "{p}");
+    }
+}

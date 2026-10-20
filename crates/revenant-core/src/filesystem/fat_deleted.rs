@@ -7,10 +7,11 @@
 use std::collections::BTreeMap;
 
 use super::Probe;
-use super::alloc::ClusterMap;
+use super::alloc::{Budget as Steps, ClusterMap};
 use super::fat::{LFN_UNITS, checksum, sfn_char};
 use super::u16_at;
 use crate::formats::{FileKind, builtin};
+use crate::scan::CancelToken;
 
 /// Most deleted long-name parts read before one short entry (255 characters).
 const MAX_PARTS: usize = 20;
@@ -175,15 +176,14 @@ impl<'a> Probes<'a> {
         self.ran_out
     }
 
-    /// Whether the 512 bytes at `at` start a file of `kind` (its format recognizes the first 16 bytes); `None` when the
+    /// Whether the 512 bytes at `at` start a file of format `family` (it recognizes the first 16 bytes); `None` when the
     /// cap is spent. A check the probe refuses or cannot read counts and recognizes nothing.
-    fn recognizes(&mut self, at: u64, kind: FileKind) -> Option<bool> {
+    fn recognizes(&mut self, at: u64, family: &str) -> Option<bool> {
         if self.left == 0 {
             self.ran_out = true;
             return None;
         }
         self.left -= 1;
-        let family = family(kind);
         Some(self.probe.read512(at).is_some_and(|head| {
             builtin()
                 .iter()
@@ -208,32 +208,98 @@ fn family(kind: FileKind) -> &'static str {
     }
 }
 
-/// Ruling D10 (with C3): the first cluster of a deleted FAT32 file of `kind` whose high word reads 0, on a volume
-/// whose clusters `2 ..= last` pass 0xFFFF. The candidates are `lo` and each `h << 16 | lo` up to `last` (`h ≥ 1`, at
-/// most `last >> 16` of them); one counts when it is free today and its head is recognized as `kind`. Exactly one
-/// candidate is the answer; none, several, or the probe cap running out before all were checked give `None`.
-pub(super) fn high_word(
+/// Ruling D10 (with C3) for every deleted FAT32 file whose recorded high word is 0, on a volume whose clusters
+/// `2 ..= last` pass 0xFFFF: `asks` holds each one's `lo` and kind, the answer is its first cluster or `None`.
+///
+/// The candidates are `lo` and each `h << 16 | lo` up to `last` (`h ≥ 1`); one counts when `map` says it is free and
+/// its head is recognized by the format of the kind. Exactly one candidate is the answer; none, several, the probe cap
+/// running out before all were checked, the step budget running out or a cancel give `None`. Files with the same `lo`
+/// and format share one answer (ruling R10). The checks run by high word, each round over every open question, so one
+/// round looks at one 256 KiB stretch of the FAT and the FAT is read once in order; each lookup costs a step, paid for
+/// the whole round before it starts. Cancel is checked before each round and every 1024 lookups.
+pub(super) fn high_words(
     map: &mut dyn ClusterMap,
     probes: &mut Probes<'_>,
+    steps: &mut Steps,
+    cancel: &CancelToken,
     offset: impl Fn(u32) -> Option<u64>,
-    lo: u32,
     last: u32,
-    kind: FileKind,
-) -> Option<u32> {
-    let highs = (1..=last >> 16)
-        .map(move |h| h << 16 | lo)
-        .take_while(move |&c| c <= last);
-    let mut found = None;
-    for c in std::iter::once(lo).chain(highs) {
-        if map.allocated(c) != Some(false) {
+    asks: &[(u32, FileKind)],
+) -> Vec<Option<u32>> {
+    struct Question {
+        lo: u32,
+        family: &'static str,
+        found: Option<u32>,
+        open: bool,
+    }
+    let mut questions: Vec<Question> = Vec::new();
+    let mut index: BTreeMap<(u32, &'static str), usize> = BTreeMap::new();
+    let of: Vec<usize> = asks
+        .iter()
+        .map(|&(lo, kind)| {
+            let family = family(kind);
+            *index.entry((lo, family)).or_insert_with(|| {
+                questions.push(Question {
+                    lo,
+                    family,
+                    found: None,
+                    open: true,
+                });
+                questions.len() - 1
+            })
+        })
+        .collect();
+    drop(index);
+    let close_all = |questions: &mut Vec<Question>| {
+        for q in questions.iter_mut().filter(|q| q.open) {
+            q.open = false;
+            q.found = None;
+        }
+    };
+    let mut looked = 0u64;
+    'rounds: for h in 0..=last >> 16 {
+        let base = h << 16;
+        let due = questions
+            .iter()
+            .filter(|q| q.open && base | q.lo <= last)
+            .count() as u64;
+        if due == 0 {
             continue;
         }
-        let at = offset(c)?;
-        if probes.recognizes(at, kind)? && found.replace(c).is_some() {
-            return None;
+        if cancel.is_cancelled() || !steps.spend(due) {
+            close_all(&mut questions);
+            break;
+        }
+        for i in 0..questions.len() {
+            let q = &mut questions[i];
+            let c = base | q.lo;
+            if !q.open || c > last {
+                continue;
+            }
+            looked += 1;
+            if looked.is_multiple_of(1024) && cancel.is_cancelled() {
+                close_all(&mut questions);
+                break 'rounds;
+            }
+            let q = &mut questions[i];
+            if map.allocated(c) != Some(false) {
+                continue;
+            }
+            let Some(at) = offset(c) else {
+                continue;
+            };
+            match probes.recognizes(at, q.family) {
+                Some(false) => {}
+                Some(true) if q.found.is_none() => q.found = Some(c),
+                // Several candidates, or the probe cap spent before every candidate was checked.
+                _ => {
+                    q.open = false;
+                    q.found = None;
+                }
+            }
         }
     }
-    found
+    of.iter().map(|&i| questions[i].found).collect()
 }
 
 #[cfg(test)]
