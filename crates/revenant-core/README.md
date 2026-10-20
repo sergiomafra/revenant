@@ -594,10 +594,35 @@ examines each cluster of a volume at most once.
 
 Paths (ruling R6): a photo/video whose path (folder, `/`, name) would pass `MAX_PATH_BYTES` (4096 bytes) keeps its name
 and loses its folder, and so do the files under a directory whose own path would pass it. Folder strings are held once
-per directory and shared by its files and subdirectory walk; the listing pays for each from a 64 MiB budget, and once
-that runs out new directories get no folder (their files are listed without one). A name is at most 255 UTF-16 units
-(765 UTF-8 bytes), so the names of the at most 262,144 listed photo/videos take at most about 192 MiB; other files keep
-no name. While a directory is read its entries are held at once (at most 65,536, about 50 MiB of names at worst).
+per directory and shared by its files; the listing pays for each from a 64 MiB budget, and once that runs out new
+directories get no folder (their files are listed without one).
+
+Memory (64-bit sizes, allocator overhead not counted). A name is at most 20 long-name parts of 13 UTF-16 units, each
+decoded to at most 3 UTF-8 bytes: 780 bytes, allocated exactly. When a volume's walk ends, each pending file is
+consumed and its origin moved into the listing, never copied, so every name is held once.
+
+- **Retained, per listed photo/video:** the `FsFile` (152 B) plus its name (≤ 780 B), two time strings (19 B each)
+  and 16 B per piece. At the 262,144-file cap: ≤ 780 B × 262,144 ≈ 195 MiB of names, ≈ 242.5 MiB in all.
+- **Retained, per other file:** 16 B in `others` plus its ranges in `live`; it keeps no name or path.
+- **Per piece:** the 2^20 piece budget bounds the pieces and `others` together (≤ 16 MiB) and `live` (≤ 16 MiB).
+- **Folders:** ≤ 64 MiB, plus a 16 B shared-string header per folder (≤ 16 MiB).
+- **While a volume is walked, per pending file:** 48 B, plus 8 B per run (Vec capacity, so up to 16 B). A photo/video
+  also has a boxed origin of 120 B that holds its (retained) name. With at most 2^20 pending entries: ≤ 48 MiB + 16 MiB
+  + 30 MiB.
+- **While a directory is read:** its entries are held at once, 48 B each plus the name. With long names that is at
+  most 3,120 entries (21 slots each in 2 MiB): ≈ 2.5 MiB. With short names, 65,535 entries of ≤ 12-byte names:
+  ≈ 3.8 MiB. On top of that, one cluster (≤ 512 KiB) or the FAT12/16 root region (≤ 2 MiB) is read at a time.
+- **The walk itself:**
+  - each directory waiting on the stack keeps only its folder, depth and (first cluster, cluster count), 56 B, so
+    65,536 of them take ≈ 3.5 MiB; its chain is followed again through the FAT when it is read;
+  - the claims bitmap: ≤ 32 MiB at 2^28 clusters;
+  - the contested set: ≤ 65,536 clusters, ≈ 1.5 MiB;
+  - the FAT cache: ≤ 8 MiB.
+
+Combined worst case at the default caps: ≈ 355 MiB retained. The peak, which adds every transient above at once
+(including the brief overlap of the old and new buffers while `files` grows, ≈ 19 MiB, and while `live` is merged,
+≈ 16 MiB), is ≈ 535 MiB. Before origins were moved, the names alone were held twice at the end of each volume
+(+195 MiB).
 
 Reads: only metadata, through the given source: the boot sector again (to locate the FATs and the root), the FATs in
 32 KiB blocks cached up to 8 MiB (a block whose read fails is read again sector by sector, from each copy in turn; a

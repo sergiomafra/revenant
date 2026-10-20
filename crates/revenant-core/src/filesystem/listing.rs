@@ -229,9 +229,10 @@ impl Budget {
     }
 }
 
-/// A file waiting for the end of its volume's walk. Only a photo/video keeps its origin.
+/// A file waiting for the end of its volume's walk. Only a photo/video keeps its origin, boxed, so another file costs
+/// only this struct and its runs.
 struct Pending {
-    origin: Option<FsOrigin>,
+    origin: Option<Box<FsOrigin>>,
     kind: Option<FileKind>,
     size: u64,
     runs: Vec<(u32, u32)>,
@@ -281,7 +282,7 @@ impl<'a> Collector<'a> {
                 origin.folder = None;
                 budget.truncated = true;
             }
-            origin
+            Box::new(origin)
         });
         self.files.push(Pending {
             origin,
@@ -305,6 +306,7 @@ impl<'a> Collector<'a> {
 
     /// Settles trust (no contested cluster, the contested set not overflowed: ruling C11, which marks the listing
     /// truncated) and adds everything to `out`. A directory's ranges enter `live` only when it is trusted (ruling R8).
+    /// Each pending file is consumed and its origin moved (never copied), so a name is held once.
     pub(super) fn finish(self, claims: &Claims, out: &mut Listing) {
         if claims.overflowed() {
             out.truncated = true;
@@ -312,21 +314,28 @@ impl<'a> Collector<'a> {
         let trusted = |ok: bool, runs: &[(u32, u32)]| {
             ok && !claims.overflowed() && !claims.touches_contested(runs)
         };
-        for d in &self.dirs {
+        let Collector {
+            volume,
+            source_len,
+            files,
+            dirs,
+        } = self;
+        for d in dirs {
             if trusted(d.chain_ok, &d.runs) {
-                out.live.extend(self.pieces(&d.runs, u64::MAX));
+                out.live
+                    .extend(pieces(volume, source_len, &d.runs, u64::MAX));
             }
         }
-        for f in &self.files {
-            let pieces = self.pieces(&f.runs, f.size);
+        for f in files {
+            let pieces = pieces(volume, source_len, &f.runs, f.size);
             let Some(&first) = pieces.first() else {
                 continue;
             };
             out.live.extend_from_slice(&pieces);
-            match (f.kind, &f.origin) {
+            match (f.kind, f.origin) {
                 (Some(kind), Some(origin)) => out.files.push(FsFile {
                     trusted: trusted(f.chain_ok, &f.runs),
-                    origin: origin.clone(),
+                    origin: *origin,
                     kind,
                     pieces,
                 }),
@@ -334,32 +343,30 @@ impl<'a> Collector<'a> {
             }
         }
     }
+}
 
-    /// Absolute pieces of `runs`, the first `size` bytes, without what lies past the source's end.
-    fn pieces(&self, runs: &[(u32, u32)], size: u64) -> Vec<Fragment> {
-        let mut left = size;
-        let mut out = Vec::new();
-        for &(first, n) in runs {
-            if left == 0 {
-                break;
-            }
-            let Some(start) = self.volume.cluster_offset(first) else {
-                break;
-            };
-            let len = (n as u64)
-                .saturating_mul(self.volume.cluster_size)
-                .min(left);
-            left -= len;
-            let end = start.saturating_add(len).min(self.source_len);
-            if end > start {
-                out.push(Fragment {
-                    start,
-                    len: end - start,
-                });
-            }
+/// Absolute pieces of `runs` of `volume`, the first `size` bytes, without what lies past `source_len`.
+fn pieces(volume: &Volume, source_len: u64, runs: &[(u32, u32)], size: u64) -> Vec<Fragment> {
+    let mut left = size;
+    let mut out = Vec::with_capacity(runs.len());
+    for &(first, n) in runs {
+        if left == 0 {
+            break;
         }
-        out
+        let Some(start) = volume.cluster_offset(first) else {
+            break;
+        };
+        let len = (n as u64).saturating_mul(volume.cluster_size).min(left);
+        left -= len;
+        let end = start.saturating_add(len).min(source_len);
+        if end > start {
+            out.push(Fragment {
+                start,
+                len: end - start,
+            });
+        }
     }
+    out
 }
 
 /// The text after the last '.' of a name, if any.
@@ -373,9 +380,13 @@ pub(super) fn component(raw: &str) -> String {
     if raw.is_empty() {
         return "_".to_string();
     }
-    raw.chars()
-        .map(|c| if c == '/' || c == '\0' { '_' } else { c })
-        .collect()
+    // Same length out as in ('/' and NUL are one byte, as is '_'), allocated exactly once.
+    let mut out = String::with_capacity(raw.len());
+    out.extend(
+        raw.chars()
+            .map(|c| if c == '/' || c == '\0' { '_' } else { c }),
+    );
+    out
 }
 
 /// Sorted, with overlapping or touching ranges joined.
@@ -398,11 +409,98 @@ fn merged(mut ranges: Vec<Fragment>) -> Vec<Fragment> {
 mod tests {
     use super::*;
 
+    fn volume() -> Volume {
+        Volume {
+            index: 0,
+            fs: FsKind::Fat32,
+            offset: 0,
+            len: 1 << 20,
+            sector_size: 512,
+            cluster_size: 512,
+            heap_offset: 0,
+            cluster_count: 1000,
+            label: None,
+            serial: 0,
+            from_backup: false,
+            scheme: super::super::Scheme::None,
+        }
+    }
+
+    fn chain(first: u32) -> Chain {
+        Chain {
+            runs: vec![(first, 1)],
+            complete: true,
+            conflict: false,
+            ended: true,
+        }
+    }
+
+    /// The peak-memory rule (fix round 2): a name is held once. `finish` moves each photo's origin into the listing, so
+    /// the name and folder in the output are the very buffers the walk allocated (a copy would be a new allocation),
+    /// and a file of another kind keeps no origin at all.
+    #[test]
+    fn finish_moves_origins_instead_of_copying_them() {
+        let v = volume();
+        let mut budget = Budget {
+            files: 10,
+            pieces: 10,
+            path_bytes: 4096,
+            paths: 1 << 20,
+            truncated: false,
+        };
+        let folder: Arc<str> = Arc::from("DCIM");
+        let origin = |name: &str| FsOrigin {
+            volume: 0,
+            folder: Some(folder.clone()),
+            name: component(&format!("{}{name}", "\u{FFFD}".repeat(250))),
+            state: FsState::Live,
+            placement: Placement::Chain,
+            size: 512,
+            created: None,
+            modified: None,
+        };
+        let photo = origin("A.JPG");
+        let other = origin("B.TXT");
+        let name_at = photo.name.as_ptr();
+        let mut col = Collector::new(&v, 1 << 20);
+        col.file(&mut budget, photo, chain(2));
+        col.file(&mut budget, other, chain(3));
+        assert!(col.files[0].origin.is_some());
+        assert!(
+            col.files[1].origin.is_none(),
+            "another kind keeps no origin"
+        );
+        let claims = Claims::new(1000, 16);
+        let mut out = Listing::default();
+        col.finish(&claims, &mut out);
+        assert_eq!(out.files.len(), 1);
+        assert_eq!(out.others.len(), 1);
+        let o = &out.files[0].origin;
+        assert_eq!(o.name.as_ptr(), name_at, "the name was copied");
+        assert!(Arc::ptr_eq(o.folder.as_ref().unwrap(), &folder));
+        // Retained strings are allocated exactly.
+        assert_eq!(o.name.capacity(), o.name.len());
+        assert_eq!(out.files[0].pieces.capacity(), out.files[0].pieces.len());
+    }
+
+    #[test]
+    fn a_pending_file_of_another_kind_is_small() {
+        // Its origin is boxed (one pointer) and only for photos/videos; the rest is the runs, size, kind and trust.
+        assert!(
+            std::mem::size_of::<Pending>() <= 48,
+            "{}",
+            std::mem::size_of::<Pending>()
+        );
+        assert!(std::mem::size_of::<FsOrigin>() > 48);
+    }
+
     #[test]
     fn components_never_hold_a_separator() {
         assert_eq!(component("a/b\0c"), "a_b_c");
         assert_eq!(component(""), "_");
         assert_eq!(component("DSC01234.ARW"), "DSC01234.ARW");
+        let long = component(&"\u{FFFD}".repeat(260));
+        assert_eq!((long.len(), long.capacity()), (780, 780));
     }
 
     #[test]

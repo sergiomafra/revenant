@@ -51,14 +51,7 @@ pub(super) fn walk(
             len: entries * 32,
             sector_size: layout.sector_size,
         },
-        Root::Cluster(c) => Region::Runs(dir_chain(
-            &mut map,
-            &mut claims,
-            &mut col,
-            budget,
-            c,
-            dir_clusters,
-        )),
+        Root::Cluster(c) => dir_chain(&mut map, &mut claims, &mut col, budget, c, dir_clusters),
     };
     let mut stack = vec![Dir {
         folder: Some(Arc::from("")),
@@ -71,8 +64,15 @@ pub(super) fn walk(
         if cancel.is_cancelled() {
             break;
         }
-        let (children, capped) =
-            read_dir(source, v, &d.region, fat32, &mut entries, limits.entries);
+        let (children, capped) = read_dir(
+            source,
+            &mut map,
+            v,
+            &d.region,
+            fat32,
+            &mut entries,
+            limits.entries,
+        );
         let mut subdirs = Vec::new();
         for ch in children {
             if ch.dir {
@@ -84,7 +84,7 @@ pub(super) fn walk(
                     continue;
                 }
                 dirs += 1;
-                let runs = dir_chain(
+                let region = dir_chain(
                     &mut map,
                     &mut claims,
                     &mut col,
@@ -95,7 +95,7 @@ pub(super) fn walk(
                 subdirs.push(Dir {
                     folder: budget.subfolder(d.folder.as_ref(), &ch.name),
                     depth: d.depth + 1,
-                    region: Region::Runs(runs),
+                    region,
                 });
             } else if ch.size > 0 {
                 let need = (ch.size as u64).div_ceil(v.cluster_size);
@@ -107,8 +107,8 @@ pub(super) fn walk(
                     state: FsState::Live,
                     placement: Placement::Chain,
                     size: ch.size as u64,
-                    created: ch.created,
-                    modified: ch.modified,
+                    created: fat_time(ch.created.0, ch.created.1, Some(ch.created.2)),
+                    modified: fat_time(ch.modified.0, ch.modified.1, None),
                 };
                 col.file(budget, origin, chain);
             }
@@ -124,7 +124,8 @@ pub(super) fn walk(
 }
 
 /// Follows a directory's chain for at most `dir_clusters` clusters and hands it to the collector; a chain that goes on
-/// past that cap marks the listing truncated.
+/// past that cap to a cluster no chain holds yet marks the listing truncated (one that goes on to a claimed cluster, a
+/// cycle or a cross-link, would have stopped there anyway).
 fn dir_chain(
     map: &mut FatMap<'_>,
     claims: &mut Claims,
@@ -132,18 +133,22 @@ fn dir_chain(
     budget: &mut Budget,
     first: u32,
     dir_clusters: u64,
-) -> Vec<(u32, u32)> {
+) -> Region {
     let chain = follow(map, claims, first, dir_clusters);
     let taken: u64 = chain.runs.iter().map(|&(_, n)| n as u64).sum();
     if !chain.ended
         && taken == dir_clusters
         && let Some(&(start, n)) = chain.runs.last()
-        && matches!(map.entry(start + n - 1), Entry::Next(_))
+        && let Entry::Next(next) = map.entry(start + n - 1)
+        && !claims.is_claimed(next)
     {
         budget.truncated = true;
     }
     col.dir(budget, &chain);
-    chain.runs
+    Region::Chain {
+        first,
+        clusters: taken,
+    }
 }
 
 /// A directory waiting to be read.
@@ -162,8 +167,9 @@ enum Region {
         len: u64,
         sector_size: u64,
     },
-    /// Cluster runs, in order.
-    Runs(Vec<(u32, u32)>),
+    /// A chain already followed (and claimed): `clusters` clusters from `first`, followed again through the FAT when
+    /// the directory is read, so a directory waiting on the walk's stack holds no run list.
+    Chain { first: u32, clusters: u64 },
 }
 
 /// A live entry of a directory.
@@ -174,8 +180,9 @@ struct Child {
     dir: bool,
     first: u32,
     size: u32,
-    created: Option<FsTime>,
-    modified: Option<FsTime>,
+    /// Creation (date, time, 10 ms count) and modification (date, time) words, formatted only for a file.
+    created: (u16, u16, u8),
+    modified: (u16, u16),
 }
 
 /// The live entries of a directory, up to the end-of-directory entry or the volume's entry budget, and whether that
@@ -183,6 +190,7 @@ struct Child {
 /// long name across it is not used).
 fn read_dir(
     source: &dyn Source,
+    map: &mut FatMap<'_>,
     v: &Volume,
     region: &Region,
     fat32: bool,
@@ -217,16 +225,19 @@ fn read_dir(
                 }
             }
         },
-        Region::Runs(ref runs) => {
-            'runs: for &(first, n) in runs {
-                for c in first..first + n {
-                    let Some(at) = v.cluster_offset(c) else {
-                        break 'runs;
-                    };
-                    let cluster = read_exact(source, at, v.cluster_size as usize);
-                    if !r.feed(cluster.as_deref()) {
-                        break 'runs;
-                    }
+        Region::Chain { first, clusters } => {
+            let mut c = first;
+            for k in 0..clusters {
+                let Some(at) = v.cluster_offset(c) else {
+                    break;
+                };
+                let cluster = read_exact(source, at, v.cluster_size as usize);
+                if !r.feed(cluster.as_deref()) || k + 1 == clusters {
+                    break;
+                }
+                match map.entry(c) {
+                    Entry::Next(n) => c = n,
+                    _ => break,
                 }
             }
         }
@@ -284,8 +295,8 @@ impl DirReader<'_> {
                 dir: attr & 0x10 != 0,
                 first,
                 size: u32_at(e, 28),
-                created: fat_time(u16_at(e, 16), u16_at(e, 14), Some(e[13])),
-                modified: fat_time(u16_at(e, 24), u16_at(e, 22), None),
+                created: (u16_at(e, 16), u16_at(e, 14), e[13]),
+                modified: (u16_at(e, 24), u16_at(e, 22)),
             });
         }
         true
@@ -407,8 +418,10 @@ fn fat_time(date: u16, time: u16, centis: Option<u8>) -> Option<FsTime> {
         }
         sec += c as u32 / 100;
     }
+    let mut local = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}");
+    local.shrink_to_fit();
     Some(FsTime {
-        local: format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}"),
+        local,
         utc_offset_minutes: None,
     })
 }
@@ -787,6 +800,25 @@ mod tests {
         );
         assert_eq!(l.files.len(), 30);
         assert!(!l.truncated);
+        // Past the cap the chain goes on to a claimed cluster (the root's, then its own first): it would have stopped
+        // there anyway, so nothing is truncated.
+        for to_claimed in [b.clusters("")[0], d[0]] {
+            let mut b = card();
+            for i in 0..40 {
+                b.add(&format!("D/F{i:02}.JPG"), &[1; 512]);
+            }
+            let d = b.clusters("D");
+            b.set_fat(d[1], to_claimed);
+            let l = list(
+                &b,
+                &Limits {
+                    fat_dir_bytes: 1024,
+                    ..Limits::DEFAULT
+                },
+            );
+            assert_eq!(l.files.len(), 30);
+            assert!(!l.truncated, "{to_claimed}");
+        }
         // Three clusters, the chain broken (free) at the second: it stops at the cap but nothing lies past it.
         let mut b = card();
         for i in 0..40 {
@@ -918,6 +950,26 @@ mod tests {
         e[..11].copy_from_slice(name);
         e[12] = case;
         e
+    }
+
+    #[test]
+    fn a_directory_entry_waiting_to_be_walked_is_small() {
+        // Up to 65,536 per directory read: its name and a few words, no formatted times.
+        assert!(
+            std::mem::size_of::<Child>() <= 48,
+            "{}",
+            std::mem::size_of::<Child>()
+        );
+    }
+
+    #[test]
+    fn a_waiting_directory_is_constant_size() {
+        // The walk's stack holds up to 65,536 of these: no run list, only the first cluster and the count.
+        assert!(
+            std::mem::size_of::<Dir>() <= 64,
+            "{}",
+            std::mem::size_of::<Dir>()
+        );
     }
 
     #[test]
