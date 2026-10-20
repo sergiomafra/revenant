@@ -54,8 +54,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (at most 4096 candidates, 1 GiB of indexes loaded, 256 pairs checked) and stops when the scan is cancelled.
 - Real camera samples: an opt-in test (and CI job) runs the engine over real CR2, CR3, NEF, ARW, RAF, DNG, ORF and RW2
   files (CC0, from raw.pixls.us), downloaded on demand by `scripts/fetch-samples.sh` and checked by SHA-256.
-- FAT and exFAT volumes are found on MBR (including logical partitions), GPT and unpartitioned media, also with a damaged
-  boot sector (the backup boot sector is used) or a lost partition table (the usual partition starts are probed).
+- FAT and exFAT volumes are found on MBR (including logical partitions and disks with 4096-byte sectors), GPT and
+  unpartitioned media, also with a damaged boot sector (the backup boot sector is used) or a lost partition table (the
+  usual partition starts are probed).
 
 ### Changed
 

@@ -18,7 +18,7 @@ const EXFAT_LABEL_SCAN: u64 = 4096;
 const FAT_LABEL_ENTRIES: u64 = 16;
 
 /// Where the root directory starts.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Root {
     /// FAT12/16: the fixed root region, at this sector of the volume, holding this many entries.
     Fixed { sector: u64, entries: u64 },
@@ -27,12 +27,16 @@ enum Root {
 }
 
 /// The geometry a valid boot sector gives (sectors are of `bps` bytes, relative to the volume start).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Boot {
     fs: FsKind,
     bps: u64,
     spc: u64,
     total: u64,
+    /// First sector of the first FAT.
+    fat_start: u64,
+    /// The media byte FAT entry 0 starts with (exFAT: always `0xF8`).
+    media: u8,
     heap: u64,
     count: u32,
     root: Root,
@@ -84,8 +88,13 @@ fn fat_fields(s: &[u8]) -> Option<Boot> {
     let root_cluster = u32_at(s, 44);
     // Ruling D8: FAT32 is told by its BPB.
     let fat32 = fat16_len == 0 && root_entries == 0 && fat32_len > 0 && root_cluster >= 2;
-    let fat_len = if fat16_len != 0 { fat16_len } else { fat32_len };
-    if total == 0 || fat_len == 0 {
+    // fatgen103: FAT12/16 have a 16-bit FAT size and a fixed root; without either the BPB is neither FAT12/16 nor a
+    // FAT32 one (a FAT32 with a corrupt RootClus, say), so its backup is tried instead.
+    if !fat32 && (fat16_len == 0 || root_entries == 0) {
+        return None;
+    }
+    let fat_len = if fat32 { fat32_len } else { fat16_len };
+    if total == 0 {
         return None;
     }
     let root_sectors = (root_entries * 32).div_ceil(bps);
@@ -132,6 +141,8 @@ fn fat_fields(s: &[u8]) -> Option<Boot> {
         bps,
         spc,
         total,
+        fat_start: reserved,
+        media: s[21],
         heap,
         count,
         root,
@@ -178,6 +189,8 @@ fn exfat_fields(s: &[u8]) -> Option<Boot> {
         bps: 1 << bps_shift,
         spc: 1 << spc_shift,
         total: volume_len,
+        fat_start: fat_offset,
+        media: 0xF8,
         heap,
         count,
         root: Root::Cluster(root),
@@ -230,18 +243,70 @@ fn backup(source: &dyn Source, offset: u64) -> Option<(Boot, bool)> {
     fallback
 }
 
-/// The volume whose first sector is at `offset`: its primary boot sector, else a backup. An exFAT primary whose fields
-/// are valid but whose boot checksum does not match gives way to a backup whose checksum does.
-pub(super) fn parse(source: &dyn Source, offset: u64, scheme: Scheme) -> Option<Volume> {
-    let (boot, from_backup) = match boot_at(source, offset) {
+/// The boot sector of the volume whose first sector is at `offset`, as `(boot, from_backup)`: its primary boot sector,
+/// else a backup. An exFAT primary whose fields are valid but whose boot checksum does not match gives way to an exFAT
+/// backup whose checksum does.
+fn choose(source: &dyn Source, offset: u64) -> Option<(Boot, bool)> {
+    Some(match boot_at(source, offset) {
         Some(p) if p.fs != FsKind::Exfat || exfat_checksum_ok(source, offset, p.bps) => (p, false),
         Some(p) => match backup(source, offset) {
-            Some((b, true)) => (b, true),
+            Some((b, true)) if b.fs == p.fs => (b, true),
             _ => (p, false),
         },
         None => (backup(source, offset)?.0, true),
-    };
+    })
+}
+
+/// The volume whose first sector is at `offset` (see [`choose`]), refused when `sector_size` is given and its boot
+/// sector declares another.
+pub(super) fn parse(
+    source: &dyn Source,
+    offset: u64,
+    scheme: Scheme,
+    sector_size: Option<u32>,
+) -> Option<Volume> {
+    let (boot, from_backup) = choose(source, offset)?;
+    if sector_size.is_some_and(|s| boot.bps != s as u64) {
+        return None;
+    }
     volume(source, offset, boot, from_backup, scheme)
+}
+
+/// As [`parse`] at a probed offset (scheme `None`), guarding against a backup boot sector read as a primary: when the
+/// primary at `offset` is a FAT32 or exFAT boot sector that would also be the backup (sector 6 or 12) of a volume
+/// starting that many sectors earlier, with the same geometry, that earlier volume is the one reported when its primary
+/// is there too, or when its FAT starts where the boot sector says and this one's does not.
+pub(super) fn probe(source: &dyn Source, offset: u64) -> Option<Volume> {
+    let (boot, from_backup) = choose(source, offset)?;
+    let back = match boot.fs {
+        FsKind::Fat32 => FAT_BACKUP_SECTOR,
+        FsKind::Exfat => EXFAT_BACKUP_SECTOR,
+        _ => 0,
+    } * boot.bps;
+    if !from_backup
+        && back > 0
+        && let Some(earlier) = offset.checked_sub(back)
+        && let Some((other, other_from_backup)) = choose(source, earlier)
+        && other == boot
+        && (!other_from_backup
+            || (fat_starts(source, earlier, &other) && !fat_starts(source, offset, &boot)))
+    {
+        return volume(source, earlier, other, other_from_backup, Scheme::None);
+    }
+    volume(source, offset, boot, from_backup, Scheme::None)
+}
+
+/// Whether FAT entry 0 at the volume's first FAT holds the media byte followed by set bits (fatgen103 §4; exFAT §4.1:
+/// `0xFFFFFFF8`).
+fn fat_starts(source: &dyn Source, offset: u64, b: &Boot) -> bool {
+    let Some(at) = b
+        .fat_start
+        .checked_mul(b.bps)
+        .and_then(|x| x.checked_add(offset))
+    else {
+        return false;
+    };
+    read_exact(source, at, 512).is_some_and(|f| f[0] == b.media && f[1] == 0xFF && f[2] == 0xFF)
 }
 
 fn volume(

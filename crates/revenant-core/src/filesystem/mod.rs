@@ -8,6 +8,7 @@ mod boot;
 mod partitions;
 
 use crate::source::Source;
+use partitions::Candidate;
 
 /// Most volumes reported for one source (the lowest offsets are kept).
 pub(crate) const MAX_VOLUMES: usize = 16;
@@ -89,16 +90,12 @@ impl Volume {
 }
 
 /// Every FAT/exFAT volume of the source, in offset order (at most [`MAX_VOLUMES`]). Reads a bounded amount: the
-/// partition tables (at most [`MAX_EBR_LINKS`] EBRs, GPT headers and at most [`MAX_GPT_ENTRIES`] entries of ≤ 1 KiB),
-/// then a few sectors per candidate offset.
+/// partition tables (at most [`MAX_EBR_LINKS`] EBRs, 6 GPT headers with at most [`MAX_GPT_ENTRIES`] entries of ≤ 1 KiB),
+/// then a few sectors per candidate offset; at most 1,362 reads and 16,588,800 bytes in all (core README).
 pub fn volumes(source: &dyn Source) -> Vec<Volume> {
     let mut found = parse_all(source, partitions::candidates(source));
     if found.is_empty() {
-        let probes = PROBE_LBAS
-            .iter()
-            .map(|&lba| (lba * 512, Scheme::None))
-            .collect();
-        found = parse_all(source, probes);
+        found = probe(source);
     }
     for (i, v) in found.iter_mut().enumerate() {
         v.index = i as u32;
@@ -106,21 +103,41 @@ pub fn volumes(source: &dyn Source) -> Vec<Volume> {
     found
 }
 
-/// Parses each distinct candidate offset inside the source, lowest first, until [`MAX_VOLUMES`] volumes are found.
-fn parse_all(source: &dyn Source, mut cands: Vec<(u64, Scheme)>) -> Vec<Volume> {
+/// Parses each distinct candidate offset inside the source, lowest first, until [`MAX_VOLUMES`] volumes are found. At
+/// an offset given both with and without a required sector size, the one without is kept.
+fn parse_all(source: &dyn Source, mut cands: Vec<Candidate>) -> Vec<Volume> {
     let len = source.len();
-    cands.retain(|&(o, _)| o < len);
-    cands.sort_by_key(|&(o, _)| o);
-    cands.dedup_by_key(|&mut (o, _)| o);
+    cands.retain(|c| c.offset < len);
+    cands.sort_by_key(|c| (c.offset, c.sector_size.is_some()));
+    cands.dedup_by_key(|c| c.offset);
     let mut out = Vec::new();
-    for (o, scheme) in cands {
+    for c in cands {
         if out.len() == MAX_VOLUMES {
             break;
         }
-        if let Some(v) = boot::parse(source, o, scheme) {
+        if let Some(v) = boot::parse(source, c.offset, c.scheme, c.sector_size) {
             out.push(v);
         }
     }
+    out
+}
+
+/// The volumes at the probe offsets (scheme `None`), one per offset, in offset order.
+fn probe(source: &dyn Source) -> Vec<Volume> {
+    let mut out: Vec<Volume> = Vec::new();
+    for lba in PROBE_LBAS {
+        let o = lba * 512;
+        if o >= source.len() {
+            continue;
+        }
+        if let Some(v) = boot::probe(source, o)
+            && !out.iter().any(|w| w.offset == v.offset)
+        {
+            out.push(v);
+        }
+    }
+    out.sort_by_key(|v| v.offset);
+    out.truncate(MAX_VOLUMES);
     out
 }
 

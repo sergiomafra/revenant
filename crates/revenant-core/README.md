@@ -476,20 +476,29 @@ Layouts, tried from sector 0:
 - **GPT:** an MBR entry of type `0xEE`. The header at LBA 1 (512-byte blocks, else at byte 4096 for 4096-byte blocks)
   must have the signature, its own LBA, a header CRC32 that holds, at most 128 entries of 128..=1024 bytes (a multiple of
   128) and an entry-array CRC32 that holds; otherwise the backup header at the primary's AlternateLBA, then at the last
-  LBA, is checked the same way. Every entry with a non-zero type GUID and first LBA ≤ last LBA is a candidate.
+  LBA, is checked the same way. Every entry with a non-zero type GUID and first LBA ≤ last LBA is a candidate. When no
+  header checks out (both damaged) and the MBR is a hybrid one, its other (non-`0xEE`) entries are read as an MBR.
 - **MBR:** each of the 4 entries with a non-zero type, start and size; an extended entry (`0x05`, `0x0F`, `0x85`) is
   followed through its EBR chain (logical partitions relative to their EBR, links relative to the extended start). A link
-  already seen, outside the source, unreadable or without `55 AA` ends a chain; at most 64 EBRs are read in all.
+  already seen, outside the source, unreadable or without `55 AA` ends a chain; at most 64 EBRs are read in all. LBAs are
+  read as 512-byte sectors, and again as 4096-byte sectors (a 4Kn disk; ruling R3): a partition found that second way
+  (also through its EBRs) is kept only when its boot sector declares 4096-byte sectors, and an offset found both ways is
+  read the first way.
 - **Probe:** when no candidate gave a volume (table destroyed, or no table), the sectors 0, 63, 128, 2048, 8192, 32768 and
-  65536 are tried (scheme `none`).
+  65536 are tried (scheme `none`). A probe can land on a volume's backup: sector 6 of a FAT32 (a FAT32 partition at 2042)
+  or the backup region at 12 of an exFAT, both valid boot sectors of the same geometry. So when the primary at a probe
+  is FAT32 or exFAT and the volume that many sectors earlier (6 or 12, in its own sector size) has the same boot sector
+  (its primary, or this one as its backup), the earlier volume is reported if its primary is there, or if its first FAT
+  starts where its boot sector says (FAT entry 0 = the media byte then `FF FF`) and the probed one's does not.
 
 The partition's own record of where the volume sits (FAT `BPB_HiddSec`, exFAT `PartitionOffset`) is never used for
 placement: a volume is where its table entry (or probe) points.
 
 A FAT boot sector is valid with `55 AA` at 510, a jump (`EB ?? 90` or `E9`), BytsPerSec 512/1024/2048/4096, SecPerClus a
 power of two ≤ 128, RsvdSecCnt ≥ 1, NumFATs 1 or 2, a data region starting before the end, and at least one cluster. It
-is FAT32 by its BPB (FATSz16 = 0, RootEntCnt = 0, FATSz32 > 0, RootClus ≥ 2, and RootClus inside the heap), otherwise
-FAT12 below 4085 clusters, FAT16 below 65525, and refused above. An exFAT boot sector is valid with `"EXFAT   "` at 3,
+is FAT32 by its BPB (FATSz16 = 0, RootEntCnt = 0, FATSz32 > 0, RootClus ≥ 2, and RootClus inside the heap); otherwise it
+needs FATSz16 ≠ 0 and RootEntCnt ≠ 0 (fatgen103: a FAT12/16 BPB has both, so a FAT32 with a corrupt RootClus is refused,
+not read as FAT16, and its backup is used) and is FAT12 below 4085 clusters, FAT16 below 65525, and refused above. An exFAT boot sector is valid with `"EXFAT   "` at 3,
 bytes 11..64 zero, `55 AA`, BytesPerSectorShift 9..=12, SectorsPerClusterShift ≤ 25 − that, NumberOfFats 1 or 2,
 FatOffset ≥ 24, ClusterHeapOffset ≥ FatOffset + FatLength × NumberOfFats, ClusterCount 1..=2^32 − 11, the heap ending
 within VolumeLength, and the root cluster inside the heap.
@@ -497,17 +506,25 @@ within VolumeLength, and the root cluster inside the heap.
 Backups: when the primary boot sector is not valid, the exFAT backup boot sector (sector 12) and the FAT32 one (sector 6)
 are tried, for 512- and then 4096-byte sectors, each only with its own sector size (`from_backup: true`); an exFAT
 backup whose boot checksum (sector 23) holds is preferred. An exFAT primary whose fields are valid but whose boot
-checksum (sector 11) does not hold is replaced by a backup whose checksum holds, and kept when there is none.
+checksum (sector 11) does not hold is replaced by an exFAT backup whose checksum holds, and kept when there is none.
 
 Label: FAT, the volume-label entry among the root's first 16 entries, else the BPB label (only with the extended boot
 signature `0x29`, which also gives the serial); printable ASCII is kept, any other byte becomes `_`, trailing spaces are
 dropped. exFAT, the `0x83` entry among the first 4 KiB of the root's first cluster (up to the end-of-directory entry).
 An empty label or `"NO NAME"` is `None`.
 
-Bounds: at most 16 volumes, 64 EBRs, 128 GPT entries (128 KiB of entries per header, at most 6 headers tried), 128
-candidate offsets from a table (68 from an MBR) and 7 probes. A candidate that is not a volume costs at most five 512-byte reads; a volume adds its boot checksum
-region (12 sectors) and one label read (≤ 4 KiB). No read is larger than 128 KiB, and none is allocated before it is
-known to lie inside the source.
+Bounds: at most 16 volumes, 64 EBRs, 128 GPT entries. One call makes at most 1,362 reads of at most 16,588,800 bytes in
+all (a test counts them on every hostile case):
+
+- tables: sector 0, at most 6 GPT headers each with its entry array (≤ 128 KiB), 64 EBRs: 77 reads, 833,536 bytes;
+- at most 128 candidate offsets from a table (72 from an MBR), each at most 9 reads and 111,104 bytes: the primary, its
+  exFAT checksum region (12 sectors of ≤ 4 KiB), 4 backup boot sectors and 2 backup checksum regions, then one label read
+  (≤ 4 KiB). An offset that is not a volume costs five 512-byte reads (only a valid exFAT field set costs a checksum
+  region), and one refused for its sector size skips the label read;
+- when probing, 7 offsets, each at most 19 reads and 219,136 bytes (the offset and the one 6 or 12 sectors earlier, the
+  two FAT entry-0 sectors, a label).
+
+No read is larger than 128 KiB, and none is allocated before it is known to lie inside the source.
 
 ## Inspect
 

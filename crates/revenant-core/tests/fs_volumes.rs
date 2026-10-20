@@ -1,10 +1,12 @@
 //! Volume detection: MBR (with EBR chains), GPT, superfloppy, backup boot sectors, probing, hostile tables.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use revenant_core::EngineError;
 use revenant_core::filesystem::{FsKind, Scheme, Volume, volumes};
-use revenant_core::source::FileSource;
+use revenant_core::source::{FileSource, Source, VolumeId};
 use revenant_testkit::fs::{
     FsBuilder, FsType, HiddenSectors, Partitioning, crc32, disk, disk_with, mbr_disk,
 };
@@ -25,16 +27,51 @@ fn found(bytes: &[u8]) -> Vec<Volume> {
     volumes(&src)
 }
 
-/// `volumes` on `bytes`, which must finish within a second.
+/// A source that counts the reads made through it and the bytes they asked for.
+struct Counting {
+    inner: FileSource,
+    reads: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl Source for Counting {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
+        self.inner.read_at(offset, buf)
+    }
+
+    fn volume(&self) -> Option<VolumeId> {
+        self.inner.volume()
+    }
+}
+
+/// The core README's bounds on what one `volumes` call reads ("File systems: volumes", Bounds).
+const MAX_READS: u64 = 1362;
+const MAX_BYTES: u64 = 16_588_800;
+
+/// `volumes` on `bytes`, within the README's read bounds (and, generously, 10 s).
 fn found_quickly(bytes: &[u8]) -> Vec<Volume> {
-    let (_file, src) = source(bytes);
+    let (_file, inner) = source(bytes);
+    let src = Counting {
+        inner,
+        reads: AtomicU64::new(0),
+        bytes: AtomicU64::new(0),
+    };
     let t = Instant::now();
     let v = volumes(&src);
     assert!(
-        t.elapsed() < Duration::from_secs(1),
+        t.elapsed() < Duration::from_secs(10),
         "took {:?}",
         t.elapsed()
     );
+    let (reads, read) = (src.reads.into_inner(), src.bytes.into_inner());
+    assert!(reads <= MAX_READS, "{reads} reads");
+    assert!(read <= MAX_BYTES, "{read} bytes read");
     assert!(v.len() <= 16);
     v
 }
@@ -58,14 +95,19 @@ fn put64(v: &mut [u8], at: usize, x: u64) {
 
 /// Rewrites the exFAT boot checksum sector (11) of the boot region at `v[0..]` (512-byte sectors), from the spec.
 fn exfat_checksum(v: &mut [u8]) {
+    exfat_checksum_with(v, 512);
+}
+
+/// The same with `bps`-byte sectors.
+fn exfat_checksum_with(v: &mut [u8], bps: usize) {
     let mut sum = 0u32;
-    for (i, &b) in v[..11 * 512].iter().enumerate() {
+    for (i, &b) in v[..11 * bps].iter().enumerate() {
         if i != 106 && i != 107 && i != 112 {
             sum = sum.rotate_right(1).wrapping_add(b as u32);
         }
     }
-    for i in 0..128 {
-        put32(v, 11 * 512 + 4 * i, sum);
+    for i in 0..bps / 4 {
+        put32(v, 11 * bps + 4 * i, sum);
     }
 }
 
@@ -617,4 +659,296 @@ fn noise_and_photos_are_not_volumes() {
     let file = img.save();
     let src = FileSource::open(file.path()).unwrap();
     assert_eq!(volumes(&src), []);
+}
+
+/// A FAT32 boot sector (and FSInfo-less reserved area, FAT entries 0..2 and the backup at sector 6) of 16 MiB in
+/// 4096-byte sectors: 32 reserved sectors, 2 FATs of 4 sectors, one sector per cluster, root at cluster 2.
+fn fat32_4k() -> Vec<u8> {
+    const BPS: usize = 4096;
+    let mut v = vec![0u8; 16 * MIB];
+    let b = &mut v[..512];
+    b[..3].copy_from_slice(&[0xEB, 0x58, 0x90]);
+    b[3..11].copy_from_slice(b"REVENANT");
+    b[11..13].copy_from_slice(&(BPS as u16).to_le_bytes());
+    b[13] = 1;
+    b[14] = 32;
+    b[16] = 2;
+    b[21] = 0xF8;
+    put32(b, 32, 4096);
+    put32(b, 36, 4);
+    put32(b, 44, 2);
+    b[48] = 1;
+    b[50] = 6;
+    b[64] = 0x80;
+    b[66] = 0x29;
+    put32(b, 67, 0x0BAD_F00D);
+    b[71..82].copy_from_slice(b"FOURK      ");
+    b[82..90].copy_from_slice(b"FAT32   ");
+    b[510] = 0x55;
+    b[511] = 0xAA;
+    v.copy_within(0..512, 6 * BPS);
+    for fat in [32, 36] {
+        let at = fat * BPS;
+        v[at..at + 12].copy_from_slice(&[
+            0xF8, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF, 0xFF, 0x0F, 0xFF, 0xFF, 0xFF, 0x0F,
+        ]);
+    }
+    v
+}
+
+/// An exFAT boot region (main and backup, checksums set) of 16 MiB in 4096-byte sectors: FAT at 24 (4 sectors),
+/// heap at 32, one sector per cluster, 4064 clusters, root at cluster 2 (empty, so no label).
+fn exfat_4k() -> Vec<u8> {
+    const BPS: usize = 4096;
+    let mut v = vec![0u8; 16 * MIB];
+    let b = &mut v[..512];
+    b[..3].copy_from_slice(&[0xEB, 0x76, 0x90]);
+    b[3..11].copy_from_slice(b"EXFAT   ");
+    put64(b, 72, 4096);
+    put32(b, 80, 24);
+    put32(b, 84, 4);
+    put32(b, 88, 32);
+    put32(b, 92, 4064);
+    put32(b, 96, 2);
+    put32(b, 100, 0x0BAD_F00D);
+    b[104..106].copy_from_slice(&0x0100u16.to_le_bytes());
+    b[108] = 12;
+    b[109] = 0;
+    b[110] = 1;
+    b[111] = 0x80;
+    b[112] = 0xFF;
+    b[510] = 0x55;
+    b[511] = 0xAA;
+    for s in 1..=8 {
+        put32(&mut v, s * BPS + BPS - 4, 0xAA55_0000);
+    }
+    exfat_checksum_with(&mut v, BPS);
+    v.copy_within(0..12 * BPS, 12 * BPS);
+    v[24 * BPS..24 * BPS + 8].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    v
+}
+
+/// What `volumes` reports for `fat32_4k` / `exfat_4k` at `offset`.
+fn expected_4k(fs: FsKind, offset: u64, scheme: Scheme) -> Volume {
+    let (heap, count, label) = match fs {
+        FsKind::Fat32 => (40, 4056, Some("FOURK".to_string())),
+        _ => (32, 4064, None),
+    };
+    Volume {
+        index: 0,
+        fs,
+        offset,
+        len: 16 * MIB as u64,
+        sector_size: 4096,
+        cluster_size: 4096,
+        heap_offset: offset + heap * 4096,
+        cluster_count: count,
+        label,
+        serial: 0x0BAD_F00D,
+        from_backup: false,
+        scheme,
+    }
+}
+
+/// `volume` at LBA 2048 of a 24 MiB disk (512-byte MBR sectors), entry type `kind`.
+fn in_mbr_2048(volume: &[u8], kind: u8) -> Vec<u8> {
+    let mut d = vec![0u8; 24 * MIB];
+    entry(&mut d[..512], 0, kind, 2048, (volume.len() / 512) as u32);
+    sign(&mut d[..512]);
+    d[MIB..MIB + volume.len()].copy_from_slice(volume);
+    d
+}
+
+#[test]
+fn backups_of_4096_byte_sector_volumes() {
+    for (fs, volume, kind) in [
+        (FsKind::Fat32, fat32_4k(), 0x0C),
+        (FsKind::Exfat, exfat_4k(), 0x07),
+    ] {
+        let d = in_mbr_2048(&volume, kind);
+        let mut want = expected_4k(fs, MIB as u64, Scheme::Mbr);
+        assert_eq!(found(&d), [want.clone()], "{fs:?}");
+        want.from_backup = true;
+        let mut zeroed = d.clone();
+        zeroed[MIB..MIB + 512].fill(0);
+        assert_eq!(found(&zeroed), [want.clone()], "{fs:?} zeroed");
+        if fs == FsKind::Exfat {
+            // Only the main region's checksum disagrees: the backup (checksum over 4096-byte sectors) replaces it.
+            let mut flipped = d.clone();
+            flipped[MIB + 3 * 4096 + 7] ^= 0xFF;
+            assert_eq!(found(&flipped), [want.clone()], "checksum mismatch");
+        }
+    }
+}
+
+/// Ruling R3: an MBR on a disk of 4096-byte sectors counts its LBAs in those sectors.
+#[test]
+fn mbr_on_a_4096_byte_sector_disk() {
+    let (fat32, exfat) = (fat32_4k(), exfat_4k());
+    let mut d = vec![0u8; 40 * MIB];
+    // FAT32 at LBA 256 (1 MiB); extended at LBA 4352 (17 MiB), its EBR's logical exFAT 16 sectors further (LBA 4368).
+    entry(&mut d[..512], 0, 0x0C, 256, 4096);
+    entry(&mut d[..512], 1, 0x0F, 4352, 4096 + 16);
+    sign(&mut d[..512]);
+    let ebr = &mut d[4352 * 4096..4352 * 4096 + 512];
+    entry(ebr, 0, 0x07, 16, 4096);
+    sign(ebr);
+    d[256 * 4096..256 * 4096 + fat32.len()].copy_from_slice(&fat32);
+    d[4368 * 4096..4368 * 4096 + exfat.len()].copy_from_slice(&exfat);
+    let mut second = expected_4k(FsKind::Exfat, 4368 * 4096, Scheme::Mbr);
+    second.index = 1;
+    assert_eq!(
+        found_quickly(&d),
+        [expected_4k(FsKind::Fat32, MIB as u64, Scheme::Mbr), second]
+    );
+    // A 512-byte-sector volume where `start × 4096` points is not the MBR's: only the probe finds it.
+    let fat16 = FsBuilder::new(FsType::Fat16, 16 * MIB as u64, 2048).build();
+    let mut d = vec![0u8; 24 * MIB];
+    entry(&mut d[..512], 0, 0x0E, 256, 4096);
+    sign(&mut d[..512]);
+    d[MIB..MIB + fat16.len()].copy_from_slice(&fat16);
+    let v = found_quickly(&d);
+    let got: Vec<(u64, Scheme)> = v.iter().map(|v| (v.offset, v.scheme)).collect();
+    assert_eq!(got, [(MIB as u64, Scheme::None)]);
+}
+
+/// fatgen103: a BPB with FATSz16 = 0 or RootEntCnt = 0 is no FAT12/16 one. A small FAT32 (12,092 clusters, under the
+/// FAT16 limit) whose primary RootClus is corrupt is read from its backup, not as a FAT16.
+#[test]
+fn fat32_with_a_corrupt_root_cluster_uses_its_backup() {
+    let b = FsBuilder::new(FsType::Fat32, 48 * MIB as u64, 512);
+    let mut d = disk(Partitioning::Mbr { first_lba: 2048 }, &b.build(), 56 * MIB);
+    let at = 2048 * 512;
+    for boot in [at, at + 6 * 512] {
+        d[boot + 13] = 8;
+    }
+    put32(&mut d, at + 44, 0);
+    let v = found(&d);
+    assert_eq!(v.len(), 1);
+    assert_eq!(
+        (v[0].fs, v[0].from_backup, v[0].cluster_count),
+        (FsKind::Fat32, true, 12_092)
+    );
+}
+
+/// An exFAT primary with a bad checksum gives way only to an exFAT backup, never to a FAT32 boot sector at sector 6.
+#[test]
+fn exfat_primary_never_gives_way_to_a_fat_backup() {
+    let b = FsBuilder::new(FsType::Exfat, 16 * MIB as u64, 32 * 1024);
+    let mut d = disk(Partitioning::Mbr { first_lba: 2048 }, &b.build(), 24 * MIB);
+    let fat32 = FsBuilder::new(FsType::Fat32, 48 * MIB as u64, 512).build();
+    let at = 2048 * 512;
+    d[at + 6 * 512..at + 7 * 512].copy_from_slice(&fat32[..512]);
+    d[at + 12 * 512..at + 13 * 512].fill(0);
+    assert_eq!(
+        found(&d),
+        [expected(
+            FsType::Exfat,
+            &b,
+            16 * MIB,
+            32 * 1024,
+            at as u64,
+            Scheme::Mbr
+        )]
+    );
+}
+
+/// A probe that lands on a volume's backup boot sector (sector 6 of a FAT32, the backup region at 12 of an exFAT)
+/// reports the volume where it starts, not at the probe.
+#[test]
+fn probe_does_not_misplace_a_volume_on_its_backup() {
+    for (fs, len, cluster, back) in [
+        (FsType::Fat32, 48 * MIB, 512u32, 6u64),
+        (FsType::Exfat, 16 * MIB, 32 * 1024, 12),
+    ] {
+        let b = FsBuilder::new(fs, len as u64, cluster);
+        let lba = 2048 - back;
+        let mut d = disk(
+            Partitioning::Mbr {
+                first_lba: lba as u32,
+            },
+            &b.build(),
+            len + 4 * MIB,
+        );
+        d[..512].fill(0);
+        // Table gone, primary intact: found at its start, from its primary.
+        let want = expected(fs, &b, len, cluster, lba * 512, Scheme::None);
+        assert_eq!(found_quickly(&d), std::slice::from_ref(&want), "{fs:?}");
+        // The same with its first FAT sector damaged: the primary alone still places it.
+        let fat = (lba as usize + if fs == FsType::Fat32 { 32 } else { 128 }) * 512;
+        let mut damaged = d.clone();
+        damaged[fat..fat + 512].fill(0);
+        assert_eq!(
+            found_quickly(&damaged),
+            std::slice::from_ref(&want),
+            "{fs:?} with a damaged FAT"
+        );
+        // Table and primary gone: found at its start, from its backup.
+        d[lba as usize * 512..lba as usize * 512 + 512].fill(0);
+        let mut want = want;
+        want.from_backup = true;
+        assert_eq!(found_quickly(&d), [want], "{fs:?} without its primary");
+    }
+}
+
+/// A hybrid MBR whose GPT headers both fail: its own (non-0xEE) entries are used before probing.
+#[test]
+fn hybrid_mbr_falls_back_to_its_entries() {
+    let b = FsBuilder::new(FsType::Fat16, 16 * MIB as u64, 2048);
+    let mut d = disk(Partitioning::Gpt { first_lba: 2048 }, &b.build(), 24 * MIB);
+    let last = d.len() / 512 - 1;
+    d[512 + 40] ^= 1;
+    d[last * 512 + 40] ^= 1;
+    entry(&mut d[..512], 1, 0x0E, 2048, 32_768);
+    assert_eq!(
+        found_quickly(&d),
+        [expected(
+            FsType::Fat16,
+            &b,
+            16 * MIB,
+            2048,
+            2048 * 512,
+            Scheme::Mbr
+        )]
+    );
+}
+
+/// A GPT header must hold its own LBA (MyLBA), even with a matching CRC.
+#[test]
+fn gpt_header_at_the_wrong_lba_is_refused() {
+    let b = FsBuilder::new(FsType::Fat16, 16 * MIB as u64, 2048);
+    let mut d = disk(Partitioning::Gpt { first_lba: 2048 }, &b.build(), 24 * MIB);
+    let last = d.len() / 512 - 1;
+    for lba in [1, last] {
+        let h = &mut d[lba * 512..lba * 512 + 512];
+        put64(h, 24, lba as u64 + 5);
+        put32(h, 16, 0);
+        let crc = crc32(&h[..92]);
+        put32(h, 16, crc);
+    }
+    let v = found_quickly(&d);
+    let got: Vec<(u64, Scheme)> = v.iter().map(|v| (v.offset, v.scheme)).collect();
+    assert_eq!(got, [(2048 * 512, Scheme::None)]);
+}
+
+/// A volume genuinely at a probe offset stays there, even when the sector where an earlier volume's FAT would start
+/// (its own reserved sector 26) happens to look like one.
+#[test]
+fn probe_keeps_a_volume_whose_fat_is_where_it_says() {
+    let b = FsBuilder::new(FsType::Fat32, 48 * MIB as u64, 512);
+    let mut d = disk(Partitioning::Mbr { first_lba: 2048 }, &b.build(), 56 * MIB);
+    d[..512].fill(0);
+    let s26 = (2048 + 26) * 512;
+    d[s26..s26 + 4].copy_from_slice(&[0xF8, 0xFF, 0xFF, 0x0F]);
+    assert_eq!(
+        found_quickly(&d),
+        [expected(
+            FsType::Fat32,
+            &b,
+            48 * MIB,
+            512,
+            2048 * 512,
+            Scheme::None
+        )]
+    );
 }

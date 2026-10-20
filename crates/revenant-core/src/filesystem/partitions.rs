@@ -4,8 +4,9 @@
 use super::{MAX_EBR_LINKS, MAX_GPT_ENTRIES, Scheme, boot, crc32, read_exact, u32_at, u64_at};
 use crate::source::Source;
 
-/// MBR LBAs are counted in 512-byte sectors.
-const MBR_SECTOR: u64 = 512;
+/// The logical sector sizes MBR/EBR LBAs are read with: 512, then 4096 (a 4Kn disk). A partition found with 4096 is
+/// kept only when its boot sector declares 4096-byte sectors.
+const MBR_SECTOR_SIZES: [u64; 2] = [512, 4096];
 /// Logical block sizes a GPT is looked for with (its header sits at LBA 1).
 const GPT_BLOCK_SIZES: [u64; 2] = [512, 4096];
 const GPT_PROTECTIVE: u8 = 0xEE;
@@ -41,72 +42,125 @@ fn signed(sector: &[u8]) -> bool {
     sector[510..512] == [0x55, 0xAA]
 }
 
-/// Byte offsets where a volume may start, with the scheme that gave them: sector 0 itself when it is a boot sector,
-/// else the GPT's or the MBR's partitions. Empty when sector 0 is neither.
-pub(super) fn candidates(source: &dyn Source) -> Vec<(u64, Scheme)> {
+/// Where a volume may start.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Candidate {
+    pub(super) offset: u64,
+    pub(super) scheme: Scheme,
+    /// The sector size the volume's boot sector must declare (an MBR read with 4096-byte sectors).
+    pub(super) sector_size: Option<u32>,
+}
+
+fn at(offset: u64, scheme: Scheme) -> Candidate {
+    Candidate {
+        offset,
+        scheme,
+        sector_size: None,
+    }
+}
+
+/// Where a volume may start: sector 0 itself when it is a boot sector, else the GPT's partitions, else (no GPT, or a
+/// hybrid MBR whose GPT headers both fail) the MBR's. Empty when sector 0 is neither.
+pub(super) fn candidates(source: &dyn Source) -> Vec<Candidate> {
     let Some(s0) = read_exact(source, 0, 512) else {
         return Vec::new();
     };
     if boot::valid(&s0) {
-        return vec![(0, Scheme::None)];
+        return vec![at(0, Scheme::None)];
     }
     if !signed(&s0) {
         return Vec::new();
     }
     let entries: Vec<Entry> = (0..4).map(|i| entry(&s0, i)).collect();
     if entries.iter().any(|e| e.kind == GPT_PROTECTIVE) {
-        gpt(source).into_iter().map(|o| (o, Scheme::Gpt)).collect()
-    } else {
-        mbr(source, &entries)
+        if let Some(found) = gpt(source) {
+            return found.into_iter().map(|o| at(o, Scheme::Gpt)).collect();
+        }
+        let rest: Vec<Entry> = entries
             .into_iter()
-            .map(|o| (o, Scheme::Mbr))
-            .collect()
+            .filter(|e| e.kind != GPT_PROTECTIVE)
+            .collect();
+        return mbr(source, &rest);
     }
+    mbr(source, &entries)
 }
 
-/// The primary partitions, and the logical ones of every extended partition (at most [`MAX_EBR_LINKS`] EBRs read in
-/// all).
-fn mbr(source: &dyn Source, entries: &[Entry]) -> Vec<u64> {
+/// The primary partitions, and the logical ones of every extended partition, read with 512- then 4096-byte sectors (at
+/// most [`MAX_EBR_LINKS`] EBRs read in all).
+fn mbr(source: &dyn Source, entries: &[Entry]) -> Vec<Candidate> {
     let mut out = Vec::new();
-    let mut seen = Vec::new();
-    for &e in entries.iter().filter(|e| e.used()) {
-        if e.extended() {
-            ebr_chain(source, e.start, &mut seen, &mut out);
-        } else {
-            out.push(e.start * MBR_SECTOR);
+    let mut links = 0;
+    for unit in MBR_SECTOR_SIZES {
+        let sector_size = (unit != 512).then_some(unit as u32);
+        let mut seen = Vec::new();
+        for &e in entries.iter().filter(|e| e.used()) {
+            if e.extended() {
+                let chain = Chain {
+                    unit,
+                    sector_size,
+                    ext: e.start,
+                };
+                chain.follow(source, &mut links, &mut seen, &mut out);
+            } else {
+                out.push(Candidate {
+                    offset: e.start * unit,
+                    scheme: Scheme::Mbr,
+                    sector_size,
+                });
+            }
         }
     }
     out
 }
 
-/// Follows the EBRs from the extended partition at `ext`: each EBR's first entry is a logical partition (relative to
-/// that EBR), its second the next EBR (relative to `ext`). A link already seen, outside the source, unreadable or
-/// unsigned ends the chain.
-fn ebr_chain(source: &dyn Source, ext: u64, seen: &mut Vec<u64>, out: &mut Vec<u64>) {
-    let mut lba = ext;
-    while seen.len() < MAX_EBR_LINKS && !seen.contains(&lba) && lba * MBR_SECTOR < source.len() {
-        seen.push(lba);
-        let Some(s) = read_exact(source, lba * MBR_SECTOR, 512) else {
-            return;
-        };
-        if !signed(&s) {
-            return;
+/// An extended partition's EBR chain, read with `unit`-byte sectors.
+struct Chain {
+    unit: u64,
+    sector_size: Option<u32>,
+    ext: u64,
+}
+
+impl Chain {
+    /// Follows the EBRs from the extended partition's start: each EBR's first entry is a logical partition (relative to
+    /// that EBR), its second the next EBR (relative to the extended start). A link already seen, outside the source,
+    /// unreadable or unsigned ends the chain; `links` counts the EBRs read, all chains together.
+    fn follow(
+        &self,
+        source: &dyn Source,
+        links: &mut usize,
+        seen: &mut Vec<u64>,
+        out: &mut Vec<Candidate>,
+    ) {
+        let mut lba = self.ext;
+        while *links < MAX_EBR_LINKS && !seen.contains(&lba) && lba * self.unit < source.len() {
+            *links += 1;
+            seen.push(lba);
+            let Some(s) = read_exact(source, lba * self.unit, 512) else {
+                return;
+            };
+            if !signed(&s) {
+                return;
+            }
+            let logical = entry(&s, 0);
+            if logical.used() && !logical.extended() {
+                out.push(Candidate {
+                    offset: (lba + logical.start) * self.unit,
+                    scheme: Scheme::Mbr,
+                    sector_size: self.sector_size,
+                });
+            }
+            let next = entry(&s, 1);
+            if !next.extended() || next.start == 0 {
+                return;
+            }
+            lba = self.ext + next.start;
         }
-        let logical = entry(&s, 0);
-        if logical.used() && !logical.extended() {
-            out.push((lba + logical.start) * MBR_SECTOR);
-        }
-        let next = entry(&s, 1);
-        if !next.extended() || next.start == 0 {
-            return;
-        }
-        lba = ext + next.start;
     }
 }
 
 /// The GPT's partitions: the primary header (LBA 1) and entries when both CRCs hold, else the backup header at the
-/// primary's AlternateLBA or at the last LBA. 512-byte blocks first, then 4096.
-fn gpt(source: &dyn Source) -> Vec<u64> {
+/// primary's AlternateLBA or at the last LBA. 512-byte blocks first, then 4096. `None` when no header checks out.
+fn gpt(source: &dyn Source) -> Option<Vec<u64>> {
     for bs in GPT_BLOCK_SIZES {
         let blocks = source.len() / bs;
         if blocks < 3 {
@@ -114,7 +168,7 @@ fn gpt(source: &dyn Source) -> Vec<u64> {
         }
         let mut tried = vec![1];
         let alternate = match table(source, bs, 1) {
-            Ok(found) => return found,
+            Ok(found) => return Some(found),
             Err(alternate) => alternate,
         };
         for lba in alternate.into_iter().chain([blocks - 1]) {
@@ -123,11 +177,11 @@ fn gpt(source: &dyn Source) -> Vec<u64> {
             }
             tried.push(lba);
             if let Ok(found) = table(source, bs, lba) {
-                return found;
+                return Some(found);
             }
         }
     }
-    Vec::new()
+    None
 }
 
 /// The partitions of the GPT header at `lba` (blocks of `bs` bytes). `Err(AlternateLBA)` when the header or its
