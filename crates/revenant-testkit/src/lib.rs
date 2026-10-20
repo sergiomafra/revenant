@@ -1,5 +1,7 @@
 //! Synthetic test data for Revenant: deterministic JPEGs and disk images. Nothing here touches real data.
 
+pub mod fs;
+
 use std::io::Write;
 
 use image::ExtendedColorType;

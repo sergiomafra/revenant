@@ -185,7 +185,9 @@ whole 512-byte sector of one repeated byte value is treated as cut there (ruling
 this, but a large flat area coded with optimized Huffman tables could (all `00`); such a photo is `Partial` and is not
 put back together.
 
-Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`).
+Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`); its
+`fs` module builds FAT12/16/32 and exFAT volumes (with deleted files, raw entries and quick formats) inside MBR or GPT
+disks, written from the Microsoft and UEFI specifications.
 
 ## Formats: MP4/MOV
 
