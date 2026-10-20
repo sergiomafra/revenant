@@ -6,11 +6,12 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 
 ## Onde o desenvolvimento está
 
-**19/10/2026.** Módulo 1 (motor), Parte 1.1 (fundação e escultura) mergeada (PR #1, CI verde nas 4 arquiteturas). Parte 1.2
-(RAW e dados da foto) concluída na branch `feat/m1-p2-raw`, aguardando PR/merge; decisões e pendências em
-`docs/superpowers/history/2026-10-19-m1-p2-pendencias.md`. Próxima: 1.3 (arquivos fragmentados e velocidade). Roteiro até a
-1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`. Amostras reais de câmera (CC0,
-nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.
+**20/10/2026.** Módulo 1 (motor): Parte 1.1 (fundação e escultura) mergeada (PR #1, CI verde nas 4 arquiteturas);
+Parte 1.2 (RAW e dados da foto) mergeada (PRs #2 e #3). Parte 1.3 (arquivos fragmentados e velocidade) concluída na
+branch `feat/m1-p3-fragments-speed`, aguardando PR/merge; decisões e pendências em
+`docs/superpowers/history/2026-10-20-m1-p3-pendencias.md`. Próxima: 1.4 (sistemas de arquivos). Roteiro até a 1.0:
+`docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev` (`bench` mede a velocidade).
+Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.
 
 ## Diretrizes fixas
 
@@ -31,7 +32,10 @@ nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_sample
 
 ## Ambiente
 
-Mac Intel, Rust do Homebrew (sem `rustup`). Nunca rodar `brew install/upgrade` de toolchain; alvos extras só no CI.
+Mac Intel, Rust 1.99 instalado pelo Homebrew em `/usr/local/bin` (sem `rustup`); alvos extras só no CI. **O Homebrew não
+funciona mais neste Mac** (Sérgio, 20/10/2026): nunca rodar `brew`. Ferramentas como `ddrescue` ou `cargo-deny` não se
+instalam por ele; antes de compilar ou instalar qualquer ferramenta (`cargo install`, `make`, npm), conferir se o
+binário já existe (`which`, `~/.cargo/bin`, `target/release`) e reaproveitar. O Node vem do `fnm`.
 
 ## Armadilhas
 

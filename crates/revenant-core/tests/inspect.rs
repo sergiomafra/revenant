@@ -1,6 +1,6 @@
 use revenant_core::formats::{FileKind, Health, all_formats};
 use revenant_core::source::FileSource;
-use revenant_core::{CancelToken, Event, Finding, ScanOptions, inspect, scan};
+use revenant_core::{CancelToken, Event, Finding, Fragment, ScanOptions, inspect, scan};
 use revenant_testkit as testkit;
 use testkit::{DiskImage, Mp4Options, TestExif, TiffRawOptions, TiffVariant};
 
@@ -438,6 +438,7 @@ fn noise_never_panics_for_any_kind() {
                 len,
                 kind,
                 health: Health::Partial,
+                fragments: Vec::new(),
             };
             let _ = inspect(&source, &f);
         }
@@ -509,6 +510,180 @@ fn cr3_health_is_judged_on_the_preview_inspect_shows() {
             (cr3.len() as u64, Health::Partial),
             "{name}"
         );
-        assert_eq!(inspect(&source, &f).preview, Some(shown), "{name}");
+        assert_eq!(inspect(&source, &f).preview, Some(shown.clone()), "{name}");
     }
+}
+
+#[test]
+fn fragmented_jpeg_inspects_like_the_whole_file() {
+    let jpeg = testkit::jpeg_with_exif(640, 480, 3, &exif());
+    let len = jpeg.len() as u64;
+    let split = (len / 2 / 512 + 1) * 512;
+    assert!(split < len);
+    let (contiguous_source, contiguous, _keep) = find(&jpeg, FileKind::Jpeg);
+    let whole = inspect(&contiguous_source, &contiguous);
+    assert!(whole.preview.is_some());
+
+    const SECOND: usize = 1 << 20;
+    let mut img = DiskImage::noise(SECOND + jpeg.len() + 8192, 41);
+    img.put(AT, &jpeg[..split as usize]);
+    img.put(SECOND, &jpeg[split as usize..]);
+    let file = img.save();
+    let source = FileSource::open(file.path()).unwrap();
+    let pieces = vec![
+        Fragment {
+            start: AT as u64,
+            len: split,
+        },
+        Fragment {
+            start: SECOND as u64,
+            len: len - split,
+        },
+    ];
+    let f = Finding {
+        id: 1,
+        start: AT as u64,
+        len,
+        kind: FileKind::Jpeg,
+        health: Health::Intact,
+        fragments: pieces.clone(),
+    };
+    let i = inspect(&source, &f);
+    assert_eq!(i.metadata, whole.metadata);
+    assert_exif(&i.metadata);
+    let p = i.preview.unwrap();
+    assert_eq!((p.start, p.len), (AT as u64, len));
+    assert_eq!((p.width, p.height), (640, 480));
+    assert_eq!(p.fragments, pieces);
+    assert_eq!(p.ranges(), pieces);
+    // The contiguous file's preview is one range with no pieces.
+    let wp = whole.preview.unwrap();
+    assert!(wp.fragments.is_empty());
+    assert_eq!(
+        wp.ranges(),
+        vec![Fragment {
+            start: AT as u64,
+            len
+        }]
+    );
+}
+
+#[test]
+fn a_preview_inside_one_piece_has_no_pieces() {
+    // The CR3's full-size JPEG starts the `mdat` payload, at a multiple of 512: split right there, so the whole preview
+    // lies in the second piece.
+    let cr3 = testkit::cr3(4, &exif());
+    let (contiguous_source, contiguous, _keep) = find(&cr3, FileKind::Cr3);
+    let whole = inspect(&contiguous_source, &contiguous);
+    let full = whole.preview.clone().unwrap();
+    assert_eq!((full.width, full.height), (640, 480));
+    let split = full.start - AT as u64;
+    assert_eq!(split % 512, 0);
+    let len = cr3.len() as u64;
+
+    const SECOND: usize = 1 << 20;
+    let mut img = DiskImage::noise(SECOND + cr3.len() + 8192, 43);
+    img.put(AT, &cr3[..split as usize]);
+    img.put(SECOND, &cr3[split as usize..]);
+    let file = img.save();
+    let source = FileSource::open(file.path()).unwrap();
+    let f = Finding {
+        id: 1,
+        start: AT as u64,
+        len,
+        kind: FileKind::Cr3,
+        health: Health::Intact,
+        fragments: vec![
+            Fragment {
+                start: AT as u64,
+                len: split,
+            },
+            Fragment {
+                start: SECOND as u64,
+                len: len - split,
+            },
+        ],
+    };
+    let i = inspect(&source, &f);
+    assert_eq!(i.metadata, whole.metadata);
+    let p = i.preview.unwrap();
+    assert_eq!(
+        (p.start, p.len, p.width, p.height),
+        (SECOND as u64, full.len, 640, 480)
+    );
+    assert!(p.fragments.is_empty(), "{:?}", p.fragments);
+    assert_eq!(
+        p.ranges(),
+        vec![Fragment {
+            start: SECOND as u64,
+            len: full.len
+        }]
+    );
+}
+
+#[test]
+fn a_paired_video_inspects_its_moov_in_the_second_piece() {
+    // A camera video split before its moov (written last): the scan pairs the pieces, and inspect reads the creation time
+    // and size from the moov in the second piece, as for the whole file.
+    let mut v = testkit::avc_video(&testkit::AvcOptions {
+        samples: 120,
+        seed: 1,
+        mov: false,
+        mdat_pad: 0,
+        small_nals: true,
+    });
+    // mvhd version 0: the creation time follows the version and flags; tkhd version 0: width and height at 76.
+    let qt = (1_714_979_289u64 + 2_082_844_800) as u32;
+    let mvhd = v.moov.start + 16;
+    v.bytes[mvhd + 4..mvhd + 8].copy_from_slice(&qt.to_be_bytes());
+    let tkhd = v.moov.start
+        + v.bytes[v.moov.clone()]
+            .windows(4)
+            .position(|w| w == b"tkhd")
+            .unwrap()
+        + 4;
+    v.bytes[tkhd + 76..tkhd + 80].copy_from_slice(&(1920u32 << 16).to_be_bytes());
+    v.bytes[tkhd + 80..tkhd + 84].copy_from_slice(&(1080u32 << 16).to_be_bytes());
+    let (whole_source, whole, _keep) = find(&v.bytes, FileKind::Mp4);
+    assert_eq!(whole.health, Health::Intact);
+    let expected = inspect(&whole_source, &whole).metadata;
+    assert_eq!(expected.captured_at.as_deref(), Some("2024-05-06T07:08:09"));
+    assert_eq!((expected.width, expected.height), (Some(1920), Some(1080)));
+
+    let p = &v.mdat_payload;
+    let l1 = (p.start + p.len() * 2 / 5).div_ceil(512) * 512;
+    const SECOND: usize = 4 << 20;
+    let mut img = DiskImage::noise(8 << 20, 47);
+    img.put(AT, &v.bytes[..l1]).put(SECOND, &v.bytes[l1..]);
+    let file = img.save();
+    let source = FileSource::open(file.path()).unwrap();
+    let mut paired = Vec::new();
+    scan(
+        &source,
+        &all_formats(),
+        &ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |e| {
+            if let Event::Updated(f) = e {
+                paired.push(f);
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(paired.len(), 1, "{paired:?}");
+    let f = &paired[0];
+    assert_eq!(
+        f.fragments,
+        vec![
+            Fragment {
+                start: AT as u64,
+                len: l1 as u64
+            },
+            Fragment {
+                start: SECOND as u64,
+                len: (v.bytes.len() - l1) as u64
+            }
+        ]
+    );
+    assert_eq!(inspect(&source, f).metadata, expected);
 }

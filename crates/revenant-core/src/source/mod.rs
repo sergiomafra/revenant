@@ -1,6 +1,7 @@
 //! Read-only positional access to the data being recovered.
 
 mod file;
+mod fragmented;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -14,6 +15,7 @@ use windows as platform;
 use crate::EngineError;
 
 pub use file::FileSource;
+pub use fragmented::Fragmented;
 
 /// Opaque identifier of a volume (device on Unix, volume serial number on Windows).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

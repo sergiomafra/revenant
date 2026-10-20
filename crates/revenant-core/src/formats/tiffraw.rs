@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use super::jpeg::{OwnJpegs, preview_health};
-use super::{FileKind, Format, HEAD_LEN, Health, Measurement, Reader, SECTOR, all_formats};
+use super::{FileKind, Format, HEAD_LEN, Health, Measurement, Reader, SECTOR, builtin};
 use crate::source::Source;
 use crate::tiff::{TIFF_MAX_LEN, TiffInfo, type_size, walk};
 
@@ -103,16 +103,14 @@ impl Format for TiffRaw {
         let (head, n) = r.head(start);
         let (_, magic, _) = header(&head[..n])?;
         let available = source.len().saturating_sub(start);
+        // The limit is the end of the source (at most the cap). A range that starts at or past the cap is a structural
+        // error wherever the source ends (`starts_past_cap`); any other range past the limit is a cut file: `walk` clamps a
+        // range that starts inside to the limit, so `info.end` covers exactly what is there.
         let info = walk(&mut r, start, available.min(TIFF_MAX_LEN))?;
         let kind = kind_of(&head[..n], magic, &info);
-
-        // Structure that continues past the end of the source is a cut file; `walk` clamps a range that starts inside to the
-        // limit, so `info.end` covers exactly what is there. Past the 1 GiB cap the source is larger than the limit, so
-        // that is a real structural error.
-        let source_ended = info.past_limit && available < TIFF_MAX_LEN;
-        let damaged = info.structural || (info.past_limit && !source_ended);
+        let damaged = info.structural || info.starts_past_cap;
         let mut len = info.end;
-        let mut cut = source_ended;
+        let mut cut = info.past_limit;
         // The starts of the file's own previews and JPEG-coded strips/tiles (which begin with FF D8) are not other files.
         // An uncompressed or vendor-coded strip never begins with a JPEG, so a JPEG at its start is another file.
         let own: HashSet<u64> = info
@@ -124,11 +122,11 @@ impl Format for TiffRaw {
             .collect();
         // Nor is a head inside one of its own JPEGs while that JPEG still decodes (ruling P13).
         let mut own_jpegs = OwnJpegs::new(info.jpegs.iter().map(|&(o, l)| (start + o, l)));
-        let formats = all_formats();
+        let formats = builtin();
         let mut pos = (start / SECTOR + 1) * SECTOR;
         while pos < start + len {
             if !own.contains(&pos)
-                && r.file_starts_at(&formats, pos)
+                && r.file_starts_at(formats, pos)
                 && !own_jpegs.vouch_for(&mut r, pos)
             {
                 len = pos - start;
@@ -147,7 +145,12 @@ impl Format for TiffRaw {
                 info.jpegs.iter().map(|&(o, l)| (start + o, l)).collect();
             preview_health(&mut r, &previews)
         };
-        Some(Measurement { len, kind, health })
+        Some(Measurement {
+            len,
+            kind,
+            health,
+            fragments: Vec::new(),
+        })
     }
 }
 

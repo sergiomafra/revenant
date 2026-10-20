@@ -16,12 +16,15 @@
 //! is zero padding shorter than [`MAX_PADDING`]. Sony pads ARW files with zeros after the raw strip, to a 64 KiB (ILCE-7S) or
 //! 4 KiB (ILCE-7M5) multiple; no IFD references those bytes, so the recovered file opens exactly like the original, and on
 //! a card the engine cannot tell that padding from zeroed free space after the file.
+//!
+//! A second test, [`real_previews_split_in_two`], splits each sample's preview in two and expects the photo put back
+//! together (see its comment).
 
 use std::path::{Path, PathBuf};
 
 use revenant_core::formats::{Health, all_formats};
 use revenant_core::source::{FileSource, Source};
-use revenant_core::{CancelToken, Event, Finding, ScanOptions, inspect, scan};
+use revenant_core::{CancelToken, Event, Finding, Fragment, ScanOptions, inspect, scan};
 use revenant_testkit::DiskImage;
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
@@ -201,21 +204,26 @@ fn source_slice(source: &dyn Source, start: usize, len: usize) -> Option<Vec<u8>
     (source.read_at(start as u64, &mut buf).ok()? == len).then_some(buf)
 }
 
-#[test]
-#[ignore = "needs downloaded samples: scripts/fetch-samples.sh, then REVENANT_SAMPLES=samples/cache"]
-fn real_camera_samples() {
+/// The samples cache directory from `REVENANT_SAMPLES` (a relative path is taken from the workspace root, where the
+/// script puts the cache, not the crate directory).
+fn samples_dir() -> PathBuf {
     let dir = PathBuf::from(
         std::env::var_os("REVENANT_SAMPLES")
             .expect("set REVENANT_SAMPLES to the samples cache directory"),
     );
-    // A relative path is taken from the workspace root (where the script puts the cache), not the crate directory.
-    let dir = if dir.is_relative() {
+    if dir.is_relative() {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(dir)
     } else {
         dir
-    };
+    }
+}
+
+#[test]
+#[ignore = "needs downloaded samples: scripts/fetch-samples.sh, then REVENANT_SAMPLES=samples/cache"]
+fn real_camera_samples() {
+    let dir = samples_dir();
     let mut failures = Vec::new();
     for s in samples() {
         let (errors, summary) = check(&dir, &s);
@@ -231,4 +239,151 @@ fn real_camera_samples() {
         }
     }
     assert!(failures.is_empty(), "failing samples: {failures:?}");
+}
+
+/// The bytes of the preview `inspect` shows for sample `s` (its largest embedded JPEG).
+fn preview_of(dir: &Path, s: &Sample) -> Vec<u8> {
+    let bytes = std::fs::read(dir.join(&s.name)).expect("read sample");
+    let mut img = DiskImage::noise(AT + bytes.len() + TAIL, 0x5A3);
+    img.put(AT, &bytes);
+    let file = img.save();
+    let source = FileSource::open(file.path()).expect("open image");
+    let f = findings(&source)
+        .into_iter()
+        .find(|f| f.start == AT as u64)
+        .expect("the sample is found");
+    let p = inspect(&source, &f).preview.expect("a preview");
+    let from = (p.start - AT as u64) as usize;
+    let preview = &bytes[from..from + p.len as usize];
+    // Alone, it is one `Intact` JPEG: keep the bytes the engine counts (a preview's slot may hold padding after `EOI`).
+    let mut img = DiskImage::noise(AT + preview.len() + TAIL, 0x5A5);
+    img.put(AT, preview);
+    let file = img.save();
+    let source = FileSource::open(file.path()).expect("open image");
+    let alone = findings(&source)
+        .into_iter()
+        .find(|f| f.start == AT as u64)
+        .expect("the preview is found");
+    assert_eq!(alone.health, Health::Intact, "{}: {alone:?}", s.name);
+    preview[..alone.len as usize].to_vec()
+}
+
+/// Bytes of other data between a split photo's first piece and its tail.
+const GAP: usize = 8 << 20;
+
+/// `first` at [`AT`], `tail` [`GAP`] bytes after its end, noise around: the finding at [`AT`].
+fn split_finding(first: &[u8], tail: &[u8]) -> Option<Finding> {
+    let g = AT + first.len() + GAP;
+    let mut img = DiskImage::noise(g + tail.len() + 64 * 1024, 0x5A4);
+    img.put(AT, first).put(g, tail);
+    let file = img.save();
+    let source = FileSource::open(file.path()).expect("open image");
+    findings(&source).into_iter().find(|f| f.start == AT as u64)
+}
+
+/// The restart interval a JPEG's header declares (`DRI`, before its first `SOS`); 0 without one.
+fn restart_interval(j: &[u8]) -> u16 {
+    let mut at = 2;
+    while at + 4 <= j.len() && j[at] == 0xFF {
+        let marker = j[at + 1];
+        let len = usize::from(u16::from_be_bytes([j[at + 2], j[at + 3]]));
+        if marker == 0xDA {
+            break;
+        }
+        if marker == 0xDD {
+            return u16::from_be_bytes([j[at + 4], j[at + 5]]);
+        }
+        at += 2 + len;
+    }
+    0
+}
+
+/// The first piece's length for a split at `k`/10 of `len`: a whole number of sectors.
+fn split_at(len: usize, k: usize) -> usize {
+    (len * k / 10) / 512 * 512
+}
+
+/// Splits whose own tail is not joined: the seam crosses a band of strong texture (block-row boundaries 46–83 of the
+/// EOS Kiss F preview are 3 to 9 times rougher than the image's median, so the DC seam test rejects the true seam).
+/// Accepting them by comparing with the rows next to the seam would also glue one more same-frame foreign tail of the
+/// tried set (ruling Q14 recorded this cost). They must stay a contiguous `Partial`.
+const KNOWN_PARTIAL: [(&str, usize); 2] =
+    [("canon-eos-kiss-f.cr2", 3), ("canon-eos-kiss-f.cr2", 5)];
+
+/// Every sample's preview split at k/10 (k = 2..=8) on a sector boundary, with its own tail [`GAP`] bytes later: the
+/// photo is found joined and `Intact`, pieces exact (joined but `Partial` when the preview uses restart markers, ruling
+/// Q16; [`KNOWN_PARTIAL`] aside). The same first piece with the tail of the
+/// next sample's preview (split at the same k) instead: never `Intact`. Every case is checked and every failure listed
+/// before the test fails.
+#[test]
+#[ignore = "needs downloaded samples: scripts/fetch-samples.sh, then REVENANT_SAMPLES=samples/cache"]
+fn real_previews_split_in_two() {
+    let dir = samples_dir();
+    let list = samples();
+    let previews: Vec<Vec<u8>> = list.iter().map(|s| preview_of(&dir, s)).collect();
+    let (mut own_ok, mut foreign_ok, mut cases, mut on_restart) = (0, 0, 0, 0);
+    let mut failures = Vec::new();
+    for (i, s) in list.iter().enumerate() {
+        let p = &previews[i];
+        let other = &previews[(i + 1) % previews.len()];
+        for k in 2..=8 {
+            cases += 1;
+            let c = split_at(p.len(), k);
+            let g = (AT + c + GAP) as u64;
+            let own = split_finding(&p[..c], &p[c..]);
+            let expected = vec![
+                Fragment {
+                    start: AT as u64,
+                    len: c as u64,
+                },
+                Fragment {
+                    start: g,
+                    len: (p.len() - c) as u64,
+                },
+            ];
+            // Q16: a photo with restart markers is joined but at most Partial.
+            let health = if restart_interval(p) > 0 {
+                on_restart += 1;
+                Health::Partial
+            } else {
+                Health::Intact
+            };
+            let joined = own.as_ref().is_some_and(|f| {
+                f.health == health && f.len == p.len() as u64 && f.fragments == expected
+            });
+            let known = KNOWN_PARTIAL.contains(&(s.name.as_str(), k));
+            match (joined, known) {
+                (true, false) => own_ok += 1,
+                // A known exception stays a contiguous `Partial` (never glued to anything else).
+                (false, true)
+                    if own
+                        .as_ref()
+                        .is_some_and(|f| f.health == Health::Partial && f.fragments.is_empty()) =>
+                {
+                    own_ok += 1
+                }
+                _ => failures.push(format!(
+                    "{} {k}/10 own tail{}: {own:?}",
+                    s.name,
+                    if known { " (known Partial)" } else { "" }
+                )),
+            }
+            let foreign = split_finding(&p[..c], &other[split_at(other.len(), k)..]);
+            match &foreign {
+                Some(f) if f.health == Health::Intact => {
+                    failures.push(format!("{} {k}/10 foreign tail: {foreign:?}", s.name))
+                }
+                _ => foreign_ok += 1,
+            }
+        }
+    }
+    println!(
+        "own tails as expected: {own_ok}/{cases} ({} known Partial, {on_restart} joined Partial for their restart markers); \
+         foreign tails not Intact: {foreign_ok}/{cases}",
+        KNOWN_PARTIAL.len()
+    );
+    for f in &failures {
+        println!("    {f}");
+    }
+    assert!(failures.is_empty(), "{} failing cases", failures.len());
 }

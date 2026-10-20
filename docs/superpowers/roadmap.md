@@ -1,6 +1,6 @@
 # Revenant — roteiro até a versão 1.0
 
-Atualizado em 19/10/2026. Cada parte segue o mesmo caminho: spec, depois telas (quando houver tela), depois plano, execução por
+Atualizado em 20/10/2026. Cada parte segue o mesmo caminho: spec, depois telas (quando houver tela), depois plano, execução por
 subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizada em toda parte.
 
 ## Marcos
@@ -18,14 +18,17 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
 
 - **1.1, concluída:** fundação do repositório; escultura de JPEG e MP4/MOV; estados Íntegro, Parcial e Danificado; extração
   segura; `revenant-dev`.
-- **1.2, RAW e dados da foto:**
+- **1.2, RAW e dados da foto, concluída:**
   - Formatos: CR2, CR3, NEF, ARW, RAF, DNG, ORF, RW2 e HEIC, além de TIFF genérico.
   - Lê os dados da foto (câmera, lente, número de série, ISO, data da foto) e a maior prévia JPEG embutida.
   - Pendências da 1.1.
   - Amostras reais de câmera nos testes.
-- **1.3, arquivos fragmentados e velocidade:**
-  - Remonta JPEG e vídeo partidos em dois ou mais pedaços.
-  - Busca no ritmo do leitor de cartão: leitura em paralelo e mapa de setores ruins.
+- **1.3, arquivos fragmentados e velocidade, concluída** (aguardando merge):
+  - Remonta o JPEG partido em dois pedaços e o vídeo de câmera cujo `moov` ficou longe do `mdat` (dois pedaços).
+  - Busca no ritmo do leitor de cartão: cada setor lido uma vez pela busca e pelos detectores (a busca de lacuna de um
+    JPEG pode reler a sua janela de 64 MiB), conferência em paralelo e mapa de setores ruins (de 21,8 para 503,9 MB/s
+    em JPEG denso; números em `crates/revenant-core/README.md`).
+  - Não cobre: arquivos em 3 ou mais pedaços e fragmentação de RAW (foram para a 1.6).
 - **1.4, sistemas de arquivos:**
   - exFAT e FAT32: arquivos apagados com o nome e a pasta originais, cartão formatado rápido.
   - Deduplicação entre a busca por estrutura e a busca por assinatura.
@@ -35,6 +38,9 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
   - Lê o cartão ou HD direto pelo aparelho no Mac e no Windows, desmontando sem ejetar e sempre só leitura.
   - Cópia do cartão tolerante a setores ruins.
   - A busca fica salva e pode ser retomada.
+- **1.6, fragmentação avançada** (depois da 1.5; não segura o marco A):
+  - Arquivos em 3 ou mais pedaços (JPEG e vídeo), usando o tamanho de cluster que a 1.4 traz.
+  - Fragmentação de RAW, onde houver como validar a emenda (prévia JPEG, tamanhos do sistema de arquivos).
 
 ## Módulo 2: App (Tauri 2 + React; telas aprovadas antes de cada parte)
 

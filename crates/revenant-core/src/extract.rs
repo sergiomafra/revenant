@@ -18,8 +18,8 @@ const MAX_NAME_ATTEMPTS: u32 = 10_000;
 /// Copies the finding's bytes into `dest_dir`, named `revenant_<start as 12 hex digits>.<ext>`
 /// (`_2`, `_3`… if it exists; never overwrites). Refuses if the directory is on the source's volume.
 ///
-/// Stretches that cannot be read are written as zeros, so a partial file comes out instead of none. The copy stops at the
-/// source's end even if the finding's length runs past it.
+/// A file found in pieces is written as its pieces in file order. Stretches that cannot be read are written as zeros, so a
+/// partial file comes out instead of none. Each piece stops at the source's end even if it runs past it.
 /// A write error returns [`EngineError::Write`] and removes the incomplete file.
 pub fn extract(
     source: &dyn Source,
@@ -60,16 +60,19 @@ fn create_unique(finding: &Finding, dir: &Path) -> Result<(PathBuf, File), Engin
     })
 }
 
+/// Copies the finding's ranges in file order.
 fn copy(source: &dyn Source, finding: &Finding, out: &mut File) -> std::io::Result<()> {
-    // Never past the source's end, whatever the finding claims.
-    let end = finding.start.saturating_add(finding.len).min(source.len());
     let mut buf = vec![0u8; CHUNK];
-    let mut pos = finding.start;
-    while pos < end {
-        let n = (end - pos).min(CHUNK as u64) as usize;
-        read_lenient(source, pos, &mut buf[..n]);
-        out.write_all(&buf[..n])?;
-        pos += n as u64;
+    for range in finding.ranges() {
+        // Never past the source's end, whatever the finding claims.
+        let end = range.start.saturating_add(range.len).min(source.len());
+        let mut pos = range.start;
+        while pos < end {
+            let n = (end - pos).min(CHUNK as u64) as usize;
+            read_lenient(source, pos, &mut buf[..n]);
+            out.write_all(&buf[..n])?;
+            pos += n as u64;
+        }
     }
     out.flush()
 }

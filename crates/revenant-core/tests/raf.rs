@@ -65,7 +65,8 @@ fn raf_cut_is_partial() {
         Some(Measurement {
             len: keep as u64,
             kind: FileKind::Raf,
-            health: Health::Partial
+            health: Health::Partial,
+            fragments: Vec::new()
         })
     );
 }

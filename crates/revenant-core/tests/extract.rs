@@ -1,6 +1,6 @@
 use revenant_core::formats::{FileKind, Health};
 use revenant_core::source::{FileSource, Source, VolumeId, volume_of};
-use revenant_core::{EngineError, Finding, extract};
+use revenant_core::{EngineError, Finding, Fragment, extract};
 use revenant_testkit as testkit;
 use testkit::DiskImage;
 
@@ -62,6 +62,7 @@ fn fixture(volume: Option<VolumeId>, bad: Option<(u64, u64)>, jpeg_len: usize) -
         len: bytes.len() as u64,
         kind: FileKind::Jpeg,
         health: Health::Intact,
+        fragments: Vec::new(),
     };
     Fixture {
         _img: img,
@@ -176,4 +177,50 @@ fn length_past_the_source_end_is_clamped() {
         );
         assert_eq!(out, f.image[f.finding.start as usize..]);
     }
+}
+
+#[test]
+fn extracts_a_fragmented_finding_in_file_order() {
+    let mut f = fixture(other(), None, 0);
+    f.finding.start = 8192;
+    f.finding.len = 2500;
+    f.finding.fragments = vec![
+        Fragment {
+            start: 8192,
+            len: 1000,
+        },
+        Fragment {
+            start: 4096,
+            len: 1500,
+        },
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = run_extract(&f, dir.path());
+    assert_eq!(path.file_name().unwrap(), "revenant_000000002000.jpg");
+    let mut expected = f.image[8192..9192].to_vec();
+    expected.extend_from_slice(&f.image[4096..5596]);
+    assert_eq!(std::fs::read(path).unwrap(), expected);
+}
+
+#[test]
+fn a_fragment_past_the_source_end_is_clamped() {
+    let mut f = fixture(other(), None, 0);
+    let end = f.image.len() as u64;
+    f.finding.start = end - 100;
+    f.finding.len = 1100;
+    f.finding.fragments = vec![
+        Fragment {
+            start: end - 100,
+            len: 600,
+        },
+        Fragment {
+            start: 4096,
+            len: 500,
+        },
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = run_extract(&f, dir.path());
+    let mut expected = f.image[end as usize - 100..].to_vec();
+    expected.extend_from_slice(&f.image[4096..4596]);
+    assert_eq!(std::fs::read(path).unwrap(), expected);
 }

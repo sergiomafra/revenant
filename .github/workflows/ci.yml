@@ -28,6 +28,17 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # Some engine tests only exist in release builds (for example: a measurement breaking the pieces contract is
+  # ignored in release, while debug builds assert on it), so one runner also runs the engine's tests in release.
+  release:
+    name: test (release, engine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test (release)
+        run: cargo test --release -p revenant-core
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

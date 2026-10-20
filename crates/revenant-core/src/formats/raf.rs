@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use super::jpeg::{OwnJpegs, preview_health};
-use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, all_formats};
+use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, builtin};
 use crate::source::Source;
 use crate::tiff::TIFF_MAX_LEN;
 
@@ -91,11 +91,11 @@ impl Format for Raf {
         // A head inside the embedded JPEG (its EXIF thumbnail) is the RAF's own while that JPEG still decodes (ruling
         // P13).
         let mut own_jpegs = OwnJpegs::new([(start + pairs[0].0, pairs[0].1)]);
-        let formats = all_formats();
+        let formats = builtin();
         let mut pos = (start / SECTOR + 1) * SECTOR;
         while pos < start + len {
             if !own.contains(&pos)
-                && r.file_starts_at(&formats, pos)
+                && r.file_starts_at(formats, pos)
                 && !own_jpegs.vouch_for(&mut r, pos)
             {
                 len = pos - start;
@@ -115,6 +115,7 @@ impl Format for Raf {
             len,
             kind: FileKind::Raf,
             health,
+            fragments: Vec::new(),
         })
     }
 }

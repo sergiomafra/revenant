@@ -11,9 +11,9 @@ use crate::formats::isobmff::{
 };
 use crate::formats::jpeg::{JPEG_MAX_LEN, exif_tiff, sof_dims};
 use crate::formats::raf::embedded_jpeg;
-use crate::formats::{FileKind, Reader};
-use crate::scan::Finding;
-use crate::source::Source;
+use crate::formats::{FileKind, Fragment, Reader};
+use crate::scan::{Finding, ranges};
+use crate::source::{Fragmented, Source};
 use crate::tiff::{TIFF_MAX_LEN, TiffInfo, walk, walk_exif_ifd};
 
 /// Photo details read from a found file. Every field is `None` when the file does not hold it or holds something
@@ -33,12 +33,24 @@ pub struct Metadata {
 }
 
 /// An embedded JPEG inside the found file (absolute range in the source), ready to show as the file's preview.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preview {
+    /// Where the JPEG starts (the first piece's start when it is in pieces).
     pub start: u64,
+    /// Total length of the JPEG (the sum of its pieces when it has any).
     pub len: u64,
     pub width: u32,
     pub height: u32,
+    /// Empty when the JPEG is one range of the source. Otherwise at least 2 absolute pieces in file order: the first
+    /// starts at `start`, the lengths sum to `len`, no two overlap (a preview of a file found in pieces may span them).
+    pub fragments: Vec<Fragment>,
+}
+
+impl Preview {
+    /// The JPEG's byte ranges in file order: `[Fragment { start, len }]` when contiguous, else `fragments`.
+    pub fn ranges(&self) -> Vec<Fragment> {
+        ranges(self.start, self.len, &self.fragments)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -58,7 +70,13 @@ const CR3_META_UUID: [u8; 16] = [
 
 /// Reads the photo details and the embedded preview of the file `finding` describes. Never fails: what cannot be read
 /// is `None`.
+///
+/// A file found in pieces is inspected as one contiguous file read through a [`Fragmented`] view of its pieces; its
+/// preview's range is mapped back to absolute pieces of the source.
 pub fn inspect(source: &dyn Source, finding: &Finding) -> Inspection {
+    if !finding.fragments.is_empty() {
+        return inspect_fragmented(source, finding);
+    }
     let mut r = Reader::new(source);
     let r = &mut r;
     let f = Span {
@@ -79,6 +97,31 @@ pub fn inspect(source: &dyn Source, finding: &Finding) -> Inspection {
         FileKind::Heic => heic(r, f),
         FileKind::Mp4 | FileKind::Mov => video(r, f),
     }
+}
+
+/// Inspects a file in pieces through a logical view of them, then makes the preview's range absolute again.
+fn inspect_fragmented(source: &dyn Source, finding: &Finding) -> Inspection {
+    let view = Fragmented::new(source, finding.fragments.clone());
+    let logical = Finding {
+        start: 0,
+        fragments: Vec::new(),
+        ..finding.clone()
+    };
+    let Inspection { metadata, preview } = inspect(&view, &logical);
+    let preview = preview.and_then(|p| {
+        let mut pieces = view.absolute(p.start, p.len);
+        let first = pieces.first()?;
+        let start = first.start;
+        if pieces.len() == 1 {
+            pieces.clear();
+        }
+        Some(Preview {
+            start,
+            fragments: pieces,
+            ..p
+        })
+    });
+    Inspection { metadata, preview }
 }
 
 /// An absolute byte range of the source.
@@ -110,7 +153,7 @@ fn jpeg(r: &mut Reader, file: Span, jpeg: Span) -> Inspection {
         .map(|info| metadata_of(&info))
         .unwrap_or_default();
     let preview = best_preview(r, file, &[(jpeg.start, jpeg.len)]);
-    if let Some(p) = preview {
+    if let Some(p) = &preview {
         metadata.width = Some(p.width);
         metadata.height = Some(p.height);
     }
@@ -287,13 +330,16 @@ fn best_preview(r: &mut Reader, file: Span, candidates: &[(u64, u64)]) -> Option
             continue;
         };
         let pixels = u64::from(width) * u64::from(height);
-        let larger = best.is_none_or(|b| pixels > u64::from(b.width) * u64::from(b.height));
+        let larger = best
+            .as_ref()
+            .is_none_or(|b| pixels > u64::from(b.width) * u64::from(b.height));
         if pixels > 0 && larger {
             best = Some(Preview {
                 start,
                 len,
                 width,
                 height,
+                fragments: Vec::new(),
             });
         }
     }
