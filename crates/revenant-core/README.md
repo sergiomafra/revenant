@@ -177,8 +177,9 @@ and
   source as its limit: structure that continues past the end of the source is a cut file (`Partial`), not a damaged one;
   a strip that starts inside the source is kept up to its end, while one that starts beyond it is not counted (a
   corrupted offset never claims the rest of the source). The file is cut at the first 512-aligned sector inside it where
-  another file starts, except at the starts of its own embedded previews and raw strips/tiles (a lossless-JPEG tile
-  legitimately begins with FF D8) and inside its own embedded JPEGs (the EXIF thumbnail in a preview's APP1) as long as
+  another file starts, except at the starts of its own embedded previews and of its JPEG-coded strips/tiles (Compression
+  6, 7 or 34892: a lossy-JPEG tile, such as a DNG's, legitimately begins with FF D8 and confirms; lossless JPEG has no DQT,
+  so it never confirms) and inside its own embedded JPEGs (the EXIF thumbnail in a preview's APP1) as long as
   every own JPEG containing that head (at most `JPEG_MAX_LEN` long) still decodes strictly, and at the end of the
   source; either makes it `Partial`. A file written over part of an own JPEG breaks that decode, so it cuts the RAW and
   is reported on its own. A file written exactly at one of those starts is indistinguishable from the RAW's own data
@@ -229,11 +230,13 @@ the limit, one starting beyond is not counted) and `structural` marks every othe
 file). `truncated` is a size cap hit (the walk is incomplete, not malformed). Callers make `structural` files `Damaged`
 and treat `truncated` as at best `Partial`. First value wins for Make/Model/lens/serial/ISO/date. Each IFD is classified
 once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 go to `jpegs`; lossless JPEG (SOF3) is
-`data`.
+`data`. `jpeg_data_starts` lists the `data` ranges that are JPEG-coded (an IFD with Compression 6, 7 or 34892, or a
+JPEGInterchangeFormat range clamped to the limit), the only ones that may begin with FF D8.
 
 Vendor data it reads: in an RW2 (`IIU\0`) IFD0, Panasonic's tags 0x0002/0x0003 (sensor size), 0x000A (bits per sample),
 0x002D (raw format), 0x002E (JpgFromRaw, a lossy JPEG goes to `jpegs`) and 0x0118 (raw data offset; the length is computed
-with checked arithmetic as described under TIFF-based RAW, an unknown packing or size sets `truncated`;
+with checked arithmetic as described under TIFF-based RAW; an unknown packing or size sets `truncated`, and an unknown
+packing with a usable sensor size claims the raw data up to the 2-bytes-per-pixel bound, clamped to the limit;
 StripOffsets/StripByteCounts are then ignored). In
 an Exif IFD, a MakerNote (0x927C) that starts with `OLYMPUS\0` (IFD at +12) or `OM SYSTEM\0\0\0` (IFD at +16), in the byte
 order its header names and with offsets relative to the MakerNote: its thumbnail (0x0100) and the preview of its

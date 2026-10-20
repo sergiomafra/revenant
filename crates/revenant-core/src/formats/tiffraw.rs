@@ -113,12 +113,14 @@ impl Format for TiffRaw {
         let damaged = info.structural || (info.past_limit && !source_ended);
         let mut len = info.end;
         let mut cut = source_ended;
-        // The starts of the file's own previews and raw strips/tiles are not other files.
+        // The starts of the file's own previews and JPEG-coded strips/tiles (which begin with FF D8) are not other files.
+        // An uncompressed or vendor-coded strip never begins with a JPEG, so a JPEG at its start is another file.
         let own: HashSet<u64> = info
             .jpegs
             .iter()
-            .chain(&info.data)
-            .map(|&(o, _)| start + o)
+            .map(|&(o, _)| o)
+            .chain(info.jpeg_data_starts.iter().copied())
+            .map(|o| start + o)
             .collect();
         // Nor is a head inside one of its own JPEGs while that JPEG still decodes (ruling P13).
         let mut own_jpegs = OwnJpegs::new(info.jpegs.iter().map(|&(o, l)| (start + o, l)));

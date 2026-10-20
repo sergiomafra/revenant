@@ -179,12 +179,9 @@ fn random_head_inside_raw_data_does_not_cut() {
     );
 }
 
-#[test]
-fn raw_strip_starting_with_a_jpeg_at_a_sector_start_does_not_cut() {
-    // Lossless-JPEG raw tiles start with FF D8. When a strip starts on a sector boundary, the scan must not take it
-    // for another file. Search for a Model length that puts the raw strip on a sector boundary.
-    let j = testkit::jpeg(16, 16, 11, 0);
-    let mut found_case = false;
+/// A DNG without preview whose raw strip starts on a sector boundary (searching for a Model length that puts it there),
+/// with its SubIFD's Compression set to `compression` and a JPEG written at the strip start.
+fn dng_with_jpeg_at_an_aligned_strip(compression: u16, j: &[u8]) -> testkit::TiffRaw {
     for n in 0..1200usize {
         let mut o = opts(TiffVariant::Dng, false);
         o.preview = None;
@@ -194,18 +191,68 @@ fn raw_strip_starting_with_a_jpeg_at_a_sector_start_does_not_cut() {
         if !raw.raw.start.is_multiple_of(512) {
             continue;
         }
+        let ifd0 = u32::from_le_bytes(raw.bytes[4..8].try_into().unwrap()) as usize;
+        let sub = entry_value(&raw.bytes, ifd0, 0x014A) as usize;
+        patch_entry(&mut raw.bytes, sub, 0x0103, u32::from(compression));
         let at = raw.raw.start;
-        raw.bytes[at..at + j.len()].copy_from_slice(&j);
+        raw.bytes[at..at + j.len()].copy_from_slice(j);
+        return raw;
+    }
+    panic!("no model length aligned the raw strip");
+}
+
+/// The 4-byte value field of the entry with `tag` in the little-endian IFD at `ifd`.
+fn entry_value(bytes: &[u8], ifd: usize, tag: u16) -> u32 {
+    let n = u16::from_le_bytes([bytes[ifd], bytes[ifd + 1]]) as usize;
+    (0..n)
+        .map(|i| ifd + 2 + 12 * i)
+        .find(|&e| u16::from_le_bytes([bytes[e], bytes[e + 1]]) == tag)
+        .map(|e| u32::from_le_bytes(bytes[e + 8..e + 12].try_into().unwrap()))
+        .unwrap_or_else(|| panic!("tag {tag:#x} not found"))
+}
+
+#[test]
+fn jpeg_compressed_strip_starting_on_a_sector_does_not_cut() {
+    // Strips/tiles compressed as JPEG (6, 7, 34892: lossy JPEG tiles of a DNG) start with FF D8. When one starts on a
+    // sector boundary, the scan must not take it for another file.
+    let j = testkit::jpeg(16, 16, 11, 0);
+    for compression in [6, 7, 34892] {
+        let raw = dng_with_jpeg_at_an_aligned_strip(compression, &j);
         let img = DiskImage::noise(MIB, 8).put(8192, &raw.bytes).save();
         let found = scan_image(&img);
-        // The file has no preview, so it is Partial and the JPEG at its strip is reported too; what matters is that the
+        // Without a preview the file is Partial (so the JPEG at its strip is reported too); what matters is that the
         // file is not cut there.
-        assert_eq!(found[0].0, 8192, "n={n}: {found:?}");
-        assert_eq!(found[0].1, raw.bytes.len() as u64, "n={n}: {found:?}");
-        found_case = true;
-        break;
+        assert_eq!(found[0].0, 8192, "{compression}: {found:?}");
+        assert_eq!(
+            found[0].1,
+            raw.bytes.len() as u64,
+            "{compression}: {found:?}"
+        );
     }
-    assert!(found_case, "no model length aligned the raw strip");
+}
+
+/// An uncompressed strip never starts with a JPEG of its own: a JPEG written exactly at its start is another file, so it
+/// cuts the RAW and is found on its own.
+#[test]
+fn foreign_jpeg_at_an_uncompressed_strip_start_cuts_the_raw() {
+    let j = testkit::jpeg(16, 16, 11, 0);
+    let raw = dng_with_jpeg_at_an_aligned_strip(1, &j);
+    let img = DiskImage::noise(MIB, 8).put(8192, &raw.bytes).save();
+    let found = scan_image(&img);
+    assert_eq!(
+        found[0],
+        (8192, raw.raw.start as u64, FileKind::Dng, Health::Partial),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&(
+            (8192 + raw.raw.start) as u64,
+            j.len() as u64,
+            FileKind::Jpeg,
+            Health::Intact
+        )),
+        "{found:?}"
+    );
 }
 
 #[test]

@@ -72,6 +72,9 @@ pub(crate) struct TiffInfo {
     /// Other strip/tile ranges (raw data), and Panasonic's raw data (RW2 tag 0x0118, length from the sensor size and
     /// packing, or an upper bound for an unknown packing: see `finish_panasonic`).
     pub data: Vec<(u64, u64)>,
+    /// Starts of the `data` ranges that are JPEG-coded and so may begin with FF D8: strips/tiles of an IFD whose
+    /// Compression is JPEG-based (6, 7, 34892) and a JPEGInterchangeFormat range clamped to the limit.
+    pub jpeg_data_starts: Vec<u64>,
     /// IFD entries processed (test observation of the entry cap).
     #[cfg(test)]
     pub entries_seen: usize,
@@ -703,9 +706,12 @@ impl Walker<'_, '_> {
                 }
             } else if o < self.limit && self.room() {
                 self.info.data.push((o, self.limit - o)); // clamped: truncated by the limit
+                self.info.jpeg_data_starts.push(o);
             }
         }
         let jpeg_compression = matches!(t.compression, Some(6 | 7));
+        // Lossy-JPEG DNG tiles (34892) and JPEG strips not classified as previews may begin with FF D8.
+        let jpeg_coded = matches!(t.compression, Some(6 | 7 | 34892));
         let mut kind: Option<bool> = None;
         for (offsets, counts) in [
             (strip_offsets, strip_counts),
@@ -723,6 +729,9 @@ impl Walker<'_, '_> {
                         return;
                     }
                     self.info.data.push((o, self.limit - o));
+                    if jpeg_coded {
+                        self.info.jpeg_data_starts.push(o);
+                    }
                     continue;
                 } else {
                     continue;
@@ -737,6 +746,9 @@ impl Walker<'_, '_> {
                     self.info.jpegs.push((o, l));
                 } else {
                     self.info.data.push((o, l));
+                    if jpeg_coded {
+                        self.info.jpeg_data_starts.push(o);
+                    }
                 }
             }
         }

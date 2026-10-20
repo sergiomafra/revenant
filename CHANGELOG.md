@@ -16,7 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from the embedded JPEG preview (the raw data itself cannot be verified, so a RAW without a decodable preview is partial).
   Panasonic RW2 raw data, which has no length tag, is measured from the sensor size and packing (a packing not yet checked
   against a real camera keeps the raw data up to a safe upper bound, as a partial file); Olympus/OM System ORF
-  previews are read from the MakerNote; a thumbnail inside a RAW's own preview (TIFF RAW, RAF, CR3) no longer cuts the
+  previews are read from the MakerNote; a photo written exactly at the start of an uncompressed raw strip now cuts the RAW
+  and is found; a thumbnail inside a RAW's own preview (TIFF RAW, RAF, CR3) no longer cuts the
   RAW.
 - Fujifilm RAF, Canon CR3 and HEIC photo detection: exact length from the file structure (RAF header blocks; CR3 and HEIC
   boxes), health from the embedded JPEG (RAF; the larger of a CR3's preview and full-size JPEG) or from whether every item extent lies inside the file (HEIC; the
