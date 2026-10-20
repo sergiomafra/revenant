@@ -460,6 +460,55 @@ pieces for a photo it puts back together (see "Fragmented JPEG"); the scan copie
 finding. After an `Intact` finding in pieces, the scan skips heads only inside
 its pieces (each rounded out to whole sectors), so files in the gaps between them are still found.
 
+## File systems: volumes
+
+`filesystem::volumes(source)` lists every FAT12, FAT16, FAT32 and exFAT volume of a source, in offset order (at most 16,
+the lowest offsets), as `Volume { index, fs, offset, len, sector_size, cluster_size, heap_offset, cluster_count, label,
+serial, from_backup, scheme }`. Offsets are absolute; `len` is what the boot sector says and may run past the source's end;
+`cluster_offset(c)` is the absolute offset of cluster `c`, `None` outside `2 ..= cluster_count + 1`. `FsKind::as_str()`
+gives `"fat12"`, `"fat16"`, `"fat32"`, `"exfat"`; `Scheme::as_str()` gives `"none"`, `"mbr"`, `"gpt"`. It only reads, and
+a broken table or boot sector is never an error: it yields fewer volumes. Written from the public specifications (MBR/EBR
+conventions, the UEFI GPT chapter, fatgen103, the Microsoft exFAT specification).
+
+Layouts, tried from sector 0:
+
+- **Superfloppy:** sector 0 is itself a valid boot sector (scheme `none`).
+- **GPT:** an MBR entry of type `0xEE`. The header at LBA 1 (512-byte blocks, else at byte 4096 for 4096-byte blocks)
+  must have the signature, its own LBA, a header CRC32 that holds, at most 128 entries of 128..=1024 bytes (a multiple of
+  128) and an entry-array CRC32 that holds; otherwise the backup header at the primary's AlternateLBA, then at the last
+  LBA, is checked the same way. Every entry with a non-zero type GUID and first LBA ≤ last LBA is a candidate.
+- **MBR:** each of the 4 entries with a non-zero type, start and size; an extended entry (`0x05`, `0x0F`, `0x85`) is
+  followed through its EBR chain (logical partitions relative to their EBR, links relative to the extended start). A link
+  already seen, outside the source, unreadable or without `55 AA` ends a chain; at most 64 EBRs are read in all.
+- **Probe:** when no candidate gave a volume (table destroyed, or no table), the sectors 0, 63, 128, 2048, 8192, 32768 and
+  65536 are tried (scheme `none`).
+
+The partition's own record of where the volume sits (FAT `BPB_HiddSec`, exFAT `PartitionOffset`) is never used for
+placement: a volume is where its table entry (or probe) points.
+
+A FAT boot sector is valid with `55 AA` at 510, a jump (`EB ?? 90` or `E9`), BytsPerSec 512/1024/2048/4096, SecPerClus a
+power of two ≤ 128, RsvdSecCnt ≥ 1, NumFATs 1 or 2, a data region starting before the end, and at least one cluster. It
+is FAT32 by its BPB (FATSz16 = 0, RootEntCnt = 0, FATSz32 > 0, RootClus ≥ 2, and RootClus inside the heap), otherwise
+FAT12 below 4085 clusters, FAT16 below 65525, and refused above. An exFAT boot sector is valid with `"EXFAT   "` at 3,
+bytes 11..64 zero, `55 AA`, BytesPerSectorShift 9..=12, SectorsPerClusterShift ≤ 25 − that, NumberOfFats 1 or 2,
+FatOffset ≥ 24, ClusterHeapOffset ≥ FatOffset + FatLength × NumberOfFats, ClusterCount 1..=2^32 − 11, the heap ending
+within VolumeLength, and the root cluster inside the heap.
+
+Backups: when the primary boot sector is not valid, the exFAT backup boot sector (sector 12) and the FAT32 one (sector 6)
+are tried, for 512- and then 4096-byte sectors, each only with its own sector size (`from_backup: true`); an exFAT
+backup whose boot checksum (sector 23) holds is preferred. An exFAT primary whose fields are valid but whose boot
+checksum (sector 11) does not hold is replaced by a backup whose checksum holds, and kept when there is none.
+
+Label: FAT, the volume-label entry among the root's first 16 entries, else the BPB label (only with the extended boot
+signature `0x29`, which also gives the serial); printable ASCII is kept, any other byte becomes `_`, trailing spaces are
+dropped. exFAT, the `0x83` entry among the first 4 KiB of the root's first cluster (up to the end-of-directory entry).
+An empty label or `"NO NAME"` is `None`.
+
+Bounds: at most 16 volumes, 64 EBRs, 128 GPT entries (128 KiB of entries per header, at most 6 headers tried), 128
+candidate offsets from a table (68 from an MBR) and 7 probes. A candidate that is not a volume costs at most five 512-byte reads; a volume adds its boot checksum
+region (12 sectors) and one label read (≤ 4 KiB). No read is larger than 128 KiB, and none is allocated before it is
+known to lie inside the source.
+
 ## Inspect
 
 `inspect(source, &Finding) -> Inspection` reads what a found file says about itself: `Metadata` (make, model, lens, serial,

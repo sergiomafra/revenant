@@ -4,6 +4,7 @@ pub(crate) mod budget;
 pub(crate) mod cache;
 pub mod error;
 pub mod extract;
+pub mod filesystem;
 pub mod formats;
 pub mod inspect;
 pub(crate) mod pairing;
