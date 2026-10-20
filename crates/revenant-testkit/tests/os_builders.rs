@@ -45,6 +45,7 @@ fn builder_images_mount_on_macos() {
     for (fs, len, cluster, os) in cases {
         let jpeg1 = jpeg(320, 240, 1, 0);
         let long = jpeg(320, 240, 2, 0);
+        let lower = jpeg(320, 240, 5, 0);
         let frag = jpeg(320, 240, 3, 3000);
         let gone = jpeg(320, 240, 4, 0);
         let mut b = FsBuilder::new(fs, len as u64, cluster);
@@ -52,6 +53,7 @@ fn builder_images_mount_on_macos() {
         b.mkdir("DCIM/100TEST");
         b.add("DCIM/100TEST/DSC00001.JPG", &jpeg1);
         b.add("DCIM/100TEST/Long name photo.jpg", &long);
+        b.add("DCIM/100TEST/lower case.jpg", &lower);
         // DSC00003.JPG in two runs with a gap between them.
         let first = b.add("DCIM/100TEST/filler.bin", &vec![7u8; 4 * cluster as usize]);
         b.delete("DCIM/100TEST/filler.bin", DeleteStyle::Camera);
@@ -87,7 +89,12 @@ fn builder_images_mount_on_macos() {
             let d = mount.join("DCIM/100TEST");
             assert_eq!(
                 names(&d),
-                ["DSC00001.JPG", "DSC00003.JPG", "Long name photo.jpg"],
+                [
+                    "DSC00001.JPG",
+                    "DSC00003.JPG",
+                    "Long name photo.jpg",
+                    "lower case.jpg"
+                ],
                 "{fs:?}"
             );
             assert_eq!(
@@ -103,6 +110,11 @@ fn builder_images_mount_on_macos() {
             assert_eq!(
                 std::fs::read(d.join("Long name photo.jpg")).unwrap(),
                 long,
+                "{fs:?}"
+            );
+            assert_eq!(
+                std::fs::read(d.join("lower case.jpg")).unwrap(),
+                lower,
                 "{fs:?}"
             );
             let m = std::fs::metadata(d.join("DSC00001.JPG")).unwrap();
@@ -131,4 +143,57 @@ fn os_formatted_image_round_trips() {
         assert_eq!(std::fs::read(m.join("HELLO.TXT")).unwrap(), b"hi");
     });
     assert_eq!(fsck(&img.path, OsFs::Fat32), Some(true));
+}
+
+/// Seconds since the epoch of a UTC wall-clock "YYYY-MM-DD HH:MM:SS", from the system `date`.
+fn utc_epoch(text: &str) -> i64 {
+    let out = Command::new("/bin/date")
+        .args(["-j", "-u", "-f", "%Y-%m-%d %H:%M:%S", text, "+%s"])
+        .output()
+        .expect("date");
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// exFAT time stamps carry a UTC offset: 07:12:06 at +09:00 is 22:12:06 UTC the day before, at -03:00 it is 10:12:06
+/// UTC; without an offset the driver reads the wall clock as local time (checked on a UTC-3 Mac, so the no-offset case
+/// is compared through `local_time`).
+#[test]
+#[ignore]
+fn exfat_utc_offset_is_honoured() {
+    if !available() {
+        return;
+    }
+    let stamp = |off| FsStamp {
+        year: 2025,
+        month: 12,
+        day: 14,
+        hour: 7,
+        min: 12,
+        sec: 6,
+        utc_offset_min: off,
+    };
+    let mut b = FsBuilder::new(FsType::Exfat, (16 * MIB) as u64, 32 * 1024);
+    for (name, off) in [
+        ("PLUS9.JPG", Some(540)),
+        ("MINUS3.JPG", Some(-180)),
+        ("NONE.JPG", None),
+    ] {
+        b.add(name, b"x");
+        b.stamp(name, stamp(off), stamp(off));
+    }
+    let volume = b.build();
+    let image = disk(Partitioning::Mbr { first_lba: 2048 }, &volume, 20 * MIB);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("card.img");
+    std::fs::write(&path, &image).unwrap();
+    with_raw_mounted(&path, |m| {
+        let mtime = |n: &str| std::fs::metadata(m.join(n)).unwrap().mtime();
+        assert_eq!(mtime("PLUS9.JPG"), utc_epoch("2025-12-13 22:12:06"));
+        assert_eq!(mtime("MINUS3.JPG"), utc_epoch("2025-12-14 10:12:06"));
+        assert_eq!(local_time(mtime("NONE.JPG")), "2025-12-14 07:12:06");
+    });
 }
