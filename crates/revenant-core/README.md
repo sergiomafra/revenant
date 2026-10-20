@@ -188,7 +188,8 @@ of the source), and if (a) that uncut index is `Intact` and (b) a video track (`
 its frames is whole; a photo written over the video is not at a chunk offset, so it still cuts it. Chunk offsets are relative to the start of the file (its `ftyp`), not to the source.
 
 - No `mdat`: not a video (`None`).
-- No `moov`: `Damaged` (the media data is there but not the index; rebuilding it is a later product milestone).
+- No `moov`: `Damaged` (the media data is there but not the index; rebuilding it is a later product milestone). After
+  the scan such a video may be paired with its `moov` found elsewhere (see "Video with a separated index").
 - `moov` larger than 16 MiB: `Damaged`.
 - A box declared larger than what exists (cut mid-`mdat` or mid-`moov` by the end of the source, or an `mdat` cut by another
   file written over it): `Partial`.
@@ -206,6 +207,65 @@ Unreadable sectors:
 - On a box header: the header cannot be parsed, so the walk ends there as if the file were cut (`Partial`, or `Damaged` when
   no `moov` was seen before it). A header that cannot be read after a complete video (`moov` and `mdat` both seen) is only
   what follows the file: the video stays `Intact` (if nothing else is wrong).
+
+### Video with a separated index
+
+A camera writes `ftyp`, then `mdat` (the frames), then `moov` (the index) last. On a fragmented card the `moov` may end up
+elsewhere: the scan then finds the start of the video `Damaged` (no `moov`) and the `moov` nowhere near it. After the
+scan, such videos are paired with orphan `moov` boxes (`pairing.rs`, crate-private) and each video put back together is
+reported as `Event::Updated` (same `id`, 2 pieces).
+
+Collection during the scan: every block the scan reads is searched for `moov` (keeping the last 15 bytes of each window, so
+a header across two windows or blocks is found too). A box start `q` is a candidate when its 16 bytes are a size in
+`[24, MOOV_MAX_LEN + 8]`, `moov`, any 4 bytes and `mvhd`. A candidate is dropped when its header overlaps a piece of a
+finding that was `Intact` when added (rounded to whole sectors: those blocks may never be read, so keeping candidates
+there would depend on timing) or when it lies inside a non-`Damaged` MP4/MOV/CR3/HEIC finding (its own index). At most
+4096 candidates per block are looked at and 4096 per scan are kept (the first ones). The videos are the `Damaged`
+MP4/MOV findings (at most 4096, the first ones).
+
+Pairing a video at `s` (the `Found` start) with a candidate at `q`:
+
+1. Header-only walk from `s`: `ftyp`, then other boxes up to an `mdat` with a declared size, no `moov` before it and no
+   `moov` header right after it. `P` = where `moov` would sit in the file (the end of `mdat`, relative to `s`); `payload` =
+   the start of the `mdat` payload. Anything else is not paired.
+2. Pre-filter, before loading anything: `(q − P) ≡ 0 (mod 512)` for some video (the second piece must start on a sector
+   boundary). Loads are charged by the 1 MiB cache windows they span, at most 1 GiB per scan; a candidate past that is
+   dropped.
+3. The `moov` (at most `MOOV_MAX_LEN`) must be readable, not garbled, hold `mvhd` and a `trak`, and list its samples
+   from `stsz`/`stsc`/`stco`|`co64` consistently (at most 4,000,000 samples); the checkable samples (H.264 `avc1`/`avc3`
+   with `avcC`, HEVC `hvc1`/`hev1` with `hvcC`, Motion-JPEG) must be at least 8.
+4. Arithmetic filter: `(q − P) ≡ 0 (mod 512)`, the first sample of any track within 64 KiB after `payload`, and every
+   sample ending by `P`. At most 256 pairs pass it; the rest are dropped.
+5. Sample checks, never the payload: a NAL sample is walked unit by unit (at most 512): every length at least 1, the
+   header's forbidden bit 0, the type 1–23 (H.264) or at most 40 with a non-zero temporal id (HEVC), the units summing
+   exactly to the sample size. A Motion-JPEG sample starts `FF D8 FF` and ends `FF D9`. `A(i)` reads sample `i` at
+   `s + offset`, `B(i)` at `q − P + offset`. `k` = the first sample failing `A` (binary search; `n` if the last passes).
+   Up to 32 evenly spaced samples before `k` must pass `A` and up to 32 after it must pass `B`.
+6. Break points `L1`: sector boundaries (relative to `s`) from the start of sample `k − 1` (not its end: a sample cut
+   inside its last NAL unit's payload still passes `A`) to the start of sample `k + 1` (or `P`), at least `payload`,
+   at most 4096 tried; samples `k − 1` and `k` must pass read across `L1` (bytes before it at `s`, after it at the second
+   piece). The pieces are `[s, s + L1)` and `[q − P + L1, … + (P − L1) + moov size)`, inside the source, not
+   overlapping.
+7. Uniqueness: a video with two or more passing `moov`s, or a `moov` passing for two or more videos, is not paired.
+
+Health of a reassembled video: what the index says against its length (`P` + the `moov` size), as for a contiguous file
+(`Damaged` or `Partial` stay so); an unreadable sector in either piece (from the scan's bad-sector map, so it agrees with
+the `Unreadable` events) makes it `Partial`; so does more than one passing `L1` (the smallest is kept), or a bound hit
+anywhere (the per-block or per-scan candidate cap, the video cap, the load budget, the pair cap, more than 4096 break
+points, or the step budget below): an unchecked candidate might have passed too. Otherwise `Intact`. The checks validate
+lengths and header bytes, never the payload, so a break point inside one NAL unit's payload cannot be told from one a
+sector away: real H.264/HEVC with large slices (tens of KiB per NAL unit) will usually pair as `Partial` until 1.4
+(the file system's cluster size will narrow `L1`). The kind comes from the `ftyp`.
+
+Bounds on hostile input: at most 4096 candidates and 4096 videos, 1 GiB of `moov` loads (one `moov` in memory at a
+time, plus its sample list: at most 4,000,000 samples, about 16 B each, twice), 256 pairs, 4096 break points per pair,
+512 NAL units per sample check, and 2^24 sample-check steps per scan in total (past it no further pair is checked).
+Cancellation is looked at before each `moov`, each pair and each break point; a cancelled scan returns
+`Err(Cancelled)` without the remaining `Updated` events.
+
+Not covered: a video in three or more pieces (a middle piece holding fewer than 1/32 of the samples between the two
+verified sides may go unnoticed and be paired), a `moov` before its `mdat`, an `mdat` of size 0, two videos whose first
+pieces are identical, and fragmented MP4 (`moof`).
 
 ## Formats: CR3 and HEIC (ISO BMFF)
 
@@ -398,7 +458,9 @@ file never hides the rest of the disk; a damaged file may then overlap another f
 Reading once: the scan and every `measure` read through one shared cache (`CachedSource`, crate-private) of
 `ScanOptions::cache_bytes` (default 256 MiB; values below 1 MiB are raised to it). For files that fit in the cache, each
 sector is read once by the scan and the detectors; a JPEG gap search re-reads the photo, its 64 MiB window and at most
-64 MiB for its tries (see "Fragmented JPEG"), and a `Partial` or
+64 MiB for its tries (see "Fragmented JPEG"), the pairing step after the scan reads the headers of the candidate videos,
+the `moov`s it loads (at most 1 GiB) and the samples it checks again (see "Video with a separated index"), and a
+`Partial` or
 `Damaged` finding larger than the cache may be read again (the scan keeps examining heads inside it, so it reads its blocks
 itself). The cache reads the source in aligned 1 MiB windows (rounded down to whole sectors) and keeps the most recently used
 ones up to `cache_bytes`; a window being loaded is not counted yet, so each reading thread can hold one more window on top.
@@ -431,8 +493,10 @@ thread) one window being loaded (1 MiB) and its reader pool (at most 4 MiB), plu
 every scan in the process, plus the decoder's internal buffers), plus what each running measurement holds (for example a
 `moov` of at most 16 MiB, or a JPEG gap search's DC values, about 3 × 13 MiB at 210 megapixels, plus 3 MiB), plus about
 200 B per recognized sector start in the read-ahead (at most
-lookahead × block / sector of them). With the defaults on a 16-thread machine: about 256 MiB + 17 × 5 MiB + 512 MiB,
-plus the measurements' own buffers.
+lookahead × block / sector of them), plus the `moov` candidates (16 B each: at most 4096 per block read ahead, and
+4096 kept) and the `Damaged` videos kept for pairing (at most 4096 findings). After the scan, the pairing step holds one
+`moov` (at most 16 MiB) and its sample lists (at most 4,000,000 samples, about 32 B each, so up to about 128 MiB). With
+the defaults on a 16-thread machine: about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
 
 Events:
 
@@ -444,6 +508,10 @@ Events:
 - `Unreadable { start, len }`: when a block cannot be read it is re-read sector by sector; each run of consecutive failed
   sectors (also across blocks) is one event and counts in `ScanSummary::unreadable_bytes`. A run is split where a finding
   ends. The scan then continues.
+- `Updated(Finding)`: a better version of a finding already reported, which replaces the earlier `Found` with the same
+  `id`. Emitted after every `Found` (and the last `Progress`), before `scan` returns, in id order; counted in
+  `ScanSummary::updated`. Today: a video put back together with its separated `moov` (see "Video with a separated
+  index").
 
 `CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block examined and each block read ahead, before and after
 every event and while waiting for a measurement. Once it is seen no further event is emitted (a cancel from inside the

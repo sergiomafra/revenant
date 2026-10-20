@@ -357,6 +357,155 @@ fn mp4_build(
     }
 }
 
+/// Shape of a synthetic H.264 camera video built by [`avc_video`].
+pub struct AvcOptions {
+    /// Video samples (frames).
+    pub samples: usize,
+    pub seed: u64,
+    /// Major brand `qt  ` instead of `isom`.
+    pub mov: bool,
+    /// Bytes of padding at the end of `mdat`, after the last sample.
+    pub mdat_pad: usize,
+    /// `true`: NAL payloads of 64–448 bytes (1–3 per sample, sample sizes follow), so every 512-byte step of a wrong
+    /// break point crosses a NAL header and the correct one is unique; `false`: samples of 2–24 KiB (large NAL units, so a
+    /// break point a sector off may land inside one NAL unit on both sides and still pass a NAL walk).
+    pub small_nals: bool,
+}
+
+/// A synthetic camera video and where its parts are.
+pub struct AvcVideo {
+    pub bytes: Vec<u8>,
+    /// The `mdat` payload (samples, then the padding).
+    pub mdat_payload: std::ops::Range<usize>,
+    /// The whole `moov` box.
+    pub moov: std::ops::Range<usize>,
+}
+
+/// One NAL unit with a 4-byte big-endian length: `header`, then `payload` seeded random bytes.
+fn push_nal(out: &mut Vec<u8>, header: u8, payload: usize, rng: &mut SplitMix64) {
+    out.extend_from_slice(&((payload + 1) as u32).to_be_bytes());
+    out.push(header);
+    let at = out.len();
+    out.resize(at + payload, 0);
+    rng.fill(&mut out[at..]);
+}
+
+/// A camera-style H.264 video: `ftyp`, `mdat` (32-bit size), `moov` at the end. One video `trak`: an `avc1` sample entry
+/// with an `avcC` (lengthSizeMinusOne = 3), `stsz` per sample, `stsc` 4 samples per chunk, `stco`. Each sample holds 1–3
+/// NAL units (4-byte big-endian length, header byte `0x65` for the first sample of a chunk, else `0x41`, seeded random
+/// payload); sample sizes are in [2 KiB, 24 KiB] from `seed` (with `small_nals`, NAL payloads in [64, 448] bytes instead).
+/// Chunks follow each other in `mdat`, then `mdat_pad` random bytes.
+pub fn avc_video(opts: &AvcOptions) -> AvcVideo {
+    let mut rng = SplitMix64(opts.seed);
+    let mut payload = Vec::new();
+    let mut sizes = Vec::with_capacity(opts.samples);
+    for i in 0..opts.samples {
+        let header = if i % 4 == 0 { 0x65 } else { 0x41 };
+        let nals = 1 + (rng.next() % 3) as usize;
+        let start = payload.len();
+        if opts.small_nals {
+            for _ in 0..nals {
+                let len = 64 + (rng.next() % 385) as usize;
+                push_nal(&mut payload, header, len, &mut rng);
+            }
+        } else {
+            let size = 2048 + (rng.next() % (22 * 1024 + 1)) as usize;
+            // Split the sample into `nals` units of about equal size (each unit: 4-byte length, header, payload).
+            let body = size - 5 * nals;
+            for j in 0..nals {
+                let len = if j + 1 == nals {
+                    body - (nals - 1) * (body / nals)
+                } else {
+                    body / nals
+                };
+                push_nal(&mut payload, header, len, &mut rng);
+            }
+        }
+        sizes.push((payload.len() - start) as u32);
+    }
+    let at = payload.len();
+    payload.resize(at + opts.mdat_pad, 0);
+    rng.fill(&mut payload[at..]);
+
+    let brand: &[u8; 4] = if opts.mov { b"qt  " } else { b"isom" };
+    let mut ftyp = brand.to_vec();
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(brand);
+    let ftyp = bmff_box(b"ftyp", &ftyp);
+    let mdat = bmff_box(b"mdat", &payload);
+    let data_at = ftyp.len() + 8;
+
+    // Chunk offsets (absolute in the file): every 4 samples.
+    let mut chunks = Vec::new();
+    let mut off = data_at as u32;
+    for (i, &s) in sizes.iter().enumerate() {
+        if i % 4 == 0 {
+            chunks.push(off);
+        }
+        off += s;
+    }
+    let full_box = |kind: &[u8; 4], body: &[u8]| {
+        let mut p = vec![0u8; 4]; // version and flags
+        p.extend_from_slice(body);
+        bmff_box(kind, &p)
+    };
+    let mut stsz = 0u32.to_be_bytes().to_vec(); // sample_size 0: a table follows
+    stsz.extend_from_slice(&(sizes.len() as u32).to_be_bytes());
+    sizes
+        .iter()
+        .for_each(|s| stsz.extend_from_slice(&s.to_be_bytes()));
+    // 4 samples per chunk; a shorter last chunk gets its own entry.
+    let mut runs = vec![[1u32, 4, 1]];
+    if sizes.len() % 4 != 0 {
+        runs.push([chunks.len() as u32, (sizes.len() % 4) as u32, 1]);
+    }
+    let mut stsc = (runs.len() as u32).to_be_bytes().to_vec();
+    runs.iter()
+        .flatten()
+        .for_each(|v| stsc.extend_from_slice(&v.to_be_bytes()));
+    let mut stco = (chunks.len() as u32).to_be_bytes().to_vec();
+    chunks
+        .iter()
+        .for_each(|c| stco.extend_from_slice(&c.to_be_bytes()));
+    // avc1: reserved (6), data reference index (2), then 70 bytes of visual fields, then the avcC box.
+    let mut avc1 = vec![0u8; 78];
+    avc1[7] = 1;
+    avc1[24..28].copy_from_slice(&(1920u32 << 16 | 1080).to_be_bytes());
+    avc1[74..76].copy_from_slice(&0x18u16.to_be_bytes());
+    avc1[76..78].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    // avcC: version 1, profile, compatibility, level, lengthSizeMinusOne = 3, no SPS, no PPS.
+    avc1.extend(bmff_box(b"avcC", &[1, 0x64, 0, 0x28, 0xFF, 0xE0, 0]));
+    let mut stsd = 1u32.to_be_bytes().to_vec();
+    stsd.extend(bmff_box(b"avc1", &avc1));
+    let stbl = bmff_box(
+        b"stbl",
+        &[
+            full_box(b"stsd", &stsd),
+            full_box(b"stsz", &stsz),
+            full_box(b"stsc", &stsc),
+            full_box(b"stco", &stco),
+        ]
+        .concat(),
+    );
+    let mut hdlr = vec![0; 8];
+    hdlr.extend_from_slice(b"vide");
+    hdlr.extend_from_slice(&[0; 13]);
+    let mdia = bmff_box(
+        b"mdia",
+        &[bmff_box(b"hdlr", &hdlr), bmff_box(b"minf", &stbl)].concat(),
+    );
+    let trak = bmff_box(b"trak", &[bmff_box(b"tkhd", &[0; 84]), mdia].concat());
+    let moov = bmff_box(b"moov", &[bmff_box(b"mvhd", &[0; 100]), trak].concat());
+
+    let bytes = [ftyp, mdat, moov].concat();
+    let moov_at = data_at + payload.len();
+    AvcVideo {
+        mdat_payload: data_at..moov_at,
+        moov: moov_at..bytes.len(),
+        bytes,
+    }
+}
+
 /// Which camera family's TIFF flavor [`tiff_raw`] imitates (header magic and default `Make`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TiffVariant {

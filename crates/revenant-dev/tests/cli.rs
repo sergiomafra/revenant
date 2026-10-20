@@ -409,3 +409,67 @@ fn bench_reports_its_thread_count() {
         .clone();
     assert_eq!(lines(&out)[0]["threads"], 3);
 }
+
+#[test]
+fn updated_lines_follow_found_lines() {
+    // A camera video split in two: its moov ended up 11 MiB further on.
+    let v = revenant_testkit::avc_video(&revenant_testkit::AvcOptions {
+        samples: 120,
+        seed: 1,
+        mov: false,
+        mdat_pad: 0,
+        small_nals: true,
+    });
+    let p = &v.mdat_payload;
+    let l1 = (p.start + p.len() * 2 / 5).div_ceil(512) * 512;
+    let mut img = DiskImage::noise(24 << 20, 7);
+    img.put(1 << 20, &v.bytes[..l1])
+        .put(12 << 20, &v.bytes[l1..]);
+    let img = img.save();
+    let dest = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .arg("scan")
+        .arg(img.path())
+        .arg("--extract")
+        .arg(dest.path())
+        .arg("--allow-same-volume")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events = lines(&out);
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["found", "updated", "summary"], "{events:?}");
+    let (found, updated) = (&events[0], &events[1]);
+    assert_eq!(
+        (found["id"].as_u64(), found["health"].as_str()),
+        (Some(1), Some("damaged"))
+    );
+    assert!(found.get("fragments").is_none());
+    assert_eq!(updated["id"], 1);
+    assert_eq!(updated["kind"], "mp4");
+    assert_eq!(updated["health"], "intact");
+    assert_eq!(updated["len"], v.bytes.len() as u64);
+    assert_eq!(
+        updated["fragments"],
+        serde_json::json!([
+            {"start": 1 << 20, "len": l1},
+            {"start": 12 << 20, "len": v.bytes.len() - l1}
+        ])
+    );
+    // The updated finding is extracted again, under a new name.
+    let (first, second) = (
+        found["file"].as_str().unwrap(),
+        updated["file"].as_str().unwrap(),
+    );
+    assert_ne!(first, second);
+    assert!(second.ends_with("_2.mp4"), "{second}");
+    assert_eq!(std::fs::read(second).unwrap(), v.bytes);
+    assert_eq!(events[2]["updated"], 1);
+    assert_eq!(events[2]["found"], 1);
+}

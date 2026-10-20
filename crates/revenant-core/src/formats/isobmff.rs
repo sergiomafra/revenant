@@ -206,7 +206,7 @@ fn total_sample_size(payload: &[u8]) -> Option<u64> {
 /// Judges the index in `moov` against the measured file end. A garbled box walk anywhere on the way to the sample
 /// tables is `Damaged`; so is a non-fragmented file with no `trak` carrying both a chunk table and `stsz`. Otherwise
 /// `Partial` if some track's chunks point at or past `end` or cannot fit before it, else `Intact`.
-fn index_health(moov: &[u8], end: u64, fragmented: bool) -> Health {
+pub(crate) fn index_health(moov: &[u8], end: u64, fragmented: bool) -> Health {
     let mut garbled = false;
     let (mut has_tables, mut exceeds) = (false, false);
     for (_, trak) in children(moov, &mut garbled)
@@ -613,6 +613,210 @@ pub(crate) fn cr3_full_jpeg(r: &mut Reader, start: u64, moov: &[u8]) -> Option<(
     (r.read(at, &mut soi) == 3 && soi == [0xFF, 0xD8, 0xFF]).then_some((at, l))
 }
 
+/// Where a video without `moov` keeps its media data.
+pub(crate) struct MdatLayout {
+    /// From the `ftyp`, as the walk decides.
+    pub kind: FileKind,
+    /// Absolute offset of the `mdat` box.
+    pub mdat_at: u64,
+    /// 8, or 16 for a 64-bit size.
+    pub header_len: u64,
+    /// The `mdat` box's declared size (header included), non-zero.
+    pub declared: u64,
+}
+
+/// Header-only walk from `start` (no payload reads): `Some` only for an `ftyp` followed, through at most
+/// [`CONFIRM_BOXES`] other accepted boxes, by an `mdat` with a declared (non-zero) size, with no `moov` before it and none
+/// right after it (a video whose own `moov` follows its `mdat` is not missing one).
+pub(crate) fn moovless_layout(r: &mut Reader, start: u64) -> Option<MdatLayout> {
+    let (head, n) = r.head(start);
+    let h = parse_header(&head[..n])?;
+    let size = h.size?;
+    if &h.kind != b"ftyp" || !(12..=4096).contains(&size) {
+        return None;
+    }
+    let mut brand = [0u8; 4];
+    r.read(start + h.header_len, &mut brand);
+    let mut kind = match &brand {
+        b"qt  " => FileKind::Mov,
+        b"crx " => FileKind::Cr3,
+        _ => FileKind::Mp4,
+    };
+    if kind == FileKind::Mp4 && heic_brand(r, start, &h, size) {
+        kind = FileKind::Heic;
+    }
+    let mut pos = start + size;
+    for _ in 0..CONFIRM_BOXES {
+        let (head, n) = r.head(pos);
+        let h = parse_header(&head[..n])?;
+        let size = h.size?;
+        match &h.kind {
+            b"mdat" => {
+                let end = pos.checked_add(size)?;
+                let (next, n) = r.head(end);
+                if parse_header(&next[..n]).is_some_and(|b| &b.kind == b"moov") {
+                    return None;
+                }
+                return Some(MdatLayout {
+                    kind,
+                    mdat_at: pos,
+                    header_len: h.header_len,
+                    declared: size,
+                });
+            }
+            b"moov" | b"ftyp" | b"moof" => return None,
+            _ => pos = pos.checked_add(size)?,
+        }
+    }
+    None
+}
+
+/// One sample of a track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Sample {
+    /// Relative to the start of the file.
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// How a track's samples can be checked without decoding them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Check {
+    /// H.264 (`avc1`/`avc3`) or HEVC (`hvc1`/`hev1`): length-prefixed NAL units, `length_size` bytes per length.
+    Nal { length_size: u8, hevc: bool },
+    /// Motion-JPEG: one JPEG per sample.
+    Mjpeg,
+}
+
+/// Most samples [`track_samples`] lists for one `moov` (all tracks together).
+pub(crate) const MAX_SAMPLES: usize = 4_000_000;
+
+/// Per track of a `moov` payload: its check (`None` = not checkable: audio, other codecs) and its samples sorted by
+/// offset, from `stsz`/`stsc`/`stco`|`co64`. A `trak` without an `stbl` lists nothing. `None` for the whole `moov` when its
+/// boxes are garbled, a sample table is truncated or inconsistent (the chunks do not hold exactly the samples `stsz`
+/// lists), or there are more than [`MAX_SAMPLES`] samples.
+pub(crate) fn track_samples(moov: &[u8]) -> Option<Vec<(Option<Check>, Vec<Sample>)>> {
+    let mut garbled = false;
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for (_, trak) in children(moov, &mut garbled)
+        .into_iter()
+        .filter(|(k, _)| k == b"trak")
+    {
+        let Some(mdia) = child(trak, b"mdia", &mut garbled) else {
+            continue;
+        };
+        let video =
+            child(mdia, b"hdlr", &mut garbled).is_some_and(|p| p.get(8..12) == Some(b"vide"));
+        let stbl = child(mdia, b"minf", &mut garbled).and_then(|m| child(m, b"stbl", &mut garbled));
+        let Some(stbl) = stbl else { continue };
+        let check = if video {
+            child(stbl, b"stsd", &mut garbled).and_then(sample_check)
+        } else {
+            None
+        };
+        let samples = stbl_samples(stbl, &mut garbled, MAX_SAMPLES - total)?;
+        total += samples.len();
+        out.push((check, samples));
+    }
+    (!garbled).then_some(out)
+}
+
+/// The samples of one `stbl`, sorted by offset; `None` if a table is missing, truncated or inconsistent, or there are
+/// more than `max` samples.
+fn stbl_samples(stbl: &[u8], garbled: &mut bool, max: usize) -> Option<Vec<Sample>> {
+    let stsz = child(stbl, b"stsz", garbled)?;
+    let fixed = u64::from(be32(stsz.get(4..8)?));
+    let count = be32(stsz.get(8..12)?) as usize;
+    if count > max || (fixed == 0 && stsz.len() < 12 + 4 * count) {
+        return None;
+    }
+    let size = |i: usize| {
+        if fixed != 0 {
+            fixed
+        } else {
+            u64::from(be32(&stsz[12 + 4 * i..]))
+        }
+    };
+    let (table, wide) = match child(stbl, b"stco", garbled) {
+        Some(p) => (p, false),
+        None => (child(stbl, b"co64", garbled)?, true),
+    };
+    let entry = if wide { 8 } else { 4 };
+    let chunks = be32(table.get(4..8)?) as usize;
+    if table.len() < 8 + entry * chunks {
+        return None;
+    }
+    let chunk = |i: usize| {
+        let e = &table[8 + entry * i..];
+        if wide { be64(e) } else { u64::from(be32(e)) }
+    };
+    // stsc: (first chunk, samples per chunk, description index), first chunks ascending from 1.
+    let stsc = child(stbl, b"stsc", garbled)?;
+    let runs = be32(stsc.get(4..8)?) as usize;
+    if stsc.len() < 8 + 12 * runs {
+        return None;
+    }
+    let run = |i: usize| {
+        let e = &stsc[8 + 12 * i..];
+        (u64::from(be32(e)), u64::from(be32(&e[4..])))
+    };
+    let mut samples = Vec::with_capacity(count);
+    let mut r = 0usize;
+    for c in 0..chunks {
+        let n = c as u64 + 1;
+        while r + 1 < runs && run(r + 1).0 <= n {
+            r += 1;
+        }
+        let per_chunk = if runs > 0 && run(r).0 <= n {
+            run(r).1
+        } else {
+            0
+        };
+        let mut at = chunk(c);
+        for _ in 0..per_chunk {
+            if samples.len() == count {
+                return None; // the chunks hold more samples than stsz lists
+            }
+            let s = size(samples.len());
+            samples.push(Sample {
+                offset: at,
+                size: s,
+            });
+            at = at.checked_add(s)?;
+        }
+    }
+    if samples.len() != count {
+        return None;
+    }
+    samples.sort_unstable_by_key(|s| s.offset);
+    Some(samples)
+}
+
+/// The check for the first sample entry of an `stsd` payload: `avc1`/`avc3` with an `avcC`, `hvc1`/`hev1` with an `hvcC`
+/// (length sizes 1, 2 or 4), or Motion-JPEG.
+fn sample_check(stsd: &[u8]) -> Option<Check> {
+    // version/flags (4), entry count (4), then the first entry: size (4), type (4), payload.
+    let size = be32(stsd.get(8..12)?) as usize;
+    let entry = stsd.get(16..8 + size)?;
+    let kind = stsd.get(12..16)?;
+    let hevc = match kind {
+        b"mjpa" | b"mjpb" | b"jpeg" => return Some(Check::Mjpeg),
+        b"avc1" | b"avc3" => false,
+        b"hvc1" | b"hev1" => true,
+        _ => return None,
+    };
+    // A visual sample entry has 78 bytes of fields before its child boxes.
+    let mut ignored = false;
+    let config = child(
+        entry.get(78..)?,
+        if hevc { b"hvcC" } else { b"avcC" },
+        &mut ignored,
+    )?;
+    let length_size = (config.get(if hevc { 21 } else { 4 })? & 3) + 1;
+    (length_size != 3).then_some(Check::Nal { length_size, hevc })
+}
+
 /// Top-level boxes read by [`top_level`].
 const MAX_TOP_LEVEL_BOXES: usize = 4096;
 
@@ -921,6 +1125,100 @@ mod tests {
         fn volume(&self) -> Option<VolumeId> {
             None
         }
+    }
+
+    fn avc(samples: usize, small_nals: bool) -> revenant_testkit::AvcVideo {
+        revenant_testkit::avc_video(&revenant_testkit::AvcOptions {
+            samples,
+            seed: 3,
+            mov: false,
+            mdat_pad: 0,
+            small_nals,
+        })
+    }
+
+    #[test]
+    fn track_samples_lists_the_index() {
+        let v = avc(10, false);
+        let t = track_samples(&v.bytes[v.moov.start + 8..v.moov.end]).unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(
+            t[0].0,
+            Some(Check::Nal {
+                length_size: 4,
+                hevc: false
+            })
+        );
+        let s = &t[0].1;
+        assert_eq!(s.len(), 10);
+        assert_eq!(s[0].offset, v.mdat_payload.start as u64);
+        assert!(s.windows(2).all(|w| w[0].offset + w[0].size == w[1].offset));
+        assert_eq!(s[9].offset + s[9].size, v.mdat_payload.end as u64);
+        assert!(s.iter().all(|x| (2048..=24 * 1024).contains(&x.size)));
+    }
+
+    /// The `moov` payload of `v` with 4 bytes at `delta` past the `kind` box type replaced by `value`.
+    fn patched(
+        v: &revenant_testkit::AvcVideo,
+        kind: &[u8; 4],
+        delta: usize,
+        value: u32,
+    ) -> Vec<u8> {
+        let mut moov = v.bytes[v.moov.start + 8..v.moov.end].to_vec();
+        let at = moov.windows(4).position(|w| w == kind).unwrap() + delta;
+        moov[at..at + 4].copy_from_slice(&value.to_be_bytes());
+        moov
+    }
+
+    #[test]
+    fn track_samples_rejects_truncated_or_inconsistent_tables() {
+        let v = avc(10, true);
+        // Counts far past the tables (stsz count, stco count, stsc entry count).
+        assert!(track_samples(&patched(&v, b"stsz", 12, u32::MAX)).is_none());
+        assert!(track_samples(&patched(&v, b"stco", 8, u32::MAX)).is_none());
+        assert!(track_samples(&patched(&v, b"stsc", 8, u32::MAX)).is_none());
+        // 5 samples per chunk: the 3 chunks would hold 15 samples, stsz lists 10.
+        assert!(track_samples(&patched(&v, b"stsc", 16, 5)).is_none());
+        // 3 per chunk: they hold 9.
+        assert!(track_samples(&patched(&v, b"stsc", 16, 3)).is_none());
+        // A fixed sample size above the 4,000,000-sample cap.
+        let mut over = patched(&v, b"stsz", 8, 100);
+        let at = over.windows(4).position(|w| w == b"stsz").unwrap() + 12;
+        over[at..at + 4].copy_from_slice(&(MAX_SAMPLES as u32 + 1).to_be_bytes());
+        assert!(track_samples(&over).is_none());
+        // Not a known codec: listed, not checkable.
+        let t = track_samples(&patched(&v, b"avc1", 0, u32::from_be_bytes(*b"mp4a"))).unwrap();
+        assert_eq!(t[0].0, None);
+        assert_eq!(t[0].1.len(), 10);
+    }
+
+    #[test]
+    fn moovless_layout_needs_ftyp_then_mdat_without_moov() {
+        let v = avc(20, true);
+        let cut = v.mdat_payload.start + 4096;
+        let mut image = vec![0x33u8; 8192];
+        image.extend_from_slice(&v.bytes[..cut]);
+        image.resize(image.len() + 65536, 0x33);
+        let src = Mem(image);
+        let l = moovless_layout(&mut Reader::new(&src), 8192).unwrap();
+        assert_eq!(l.kind, FileKind::Mp4);
+        assert_eq!(l.mdat_at, 8192 + 20);
+        assert_eq!(l.header_len, 8);
+        assert_eq!(l.declared, (v.moov.start - 20) as u64);
+        // The whole video has its moov right after its mdat.
+        let whole = Mem([vec![0; 512], v.bytes.clone()].concat());
+        assert!(moovless_layout(&mut Reader::new(&whole), 512).is_none());
+        // moov before mdat, or a size-0 mdat.
+        let first = revenant_testkit::mp4(&revenant_testkit::Mp4Options {
+            mdat_len: 4096,
+            moov_at_end: false,
+            mov: true,
+            mdat_64bit: false,
+        });
+        assert!(moovless_layout(&mut Reader::new(&Mem(first)), 0).is_none());
+        let mut zero = v.bytes[..cut].to_vec();
+        zero[20..24].copy_from_slice(&[0; 4]);
+        assert!(moovless_layout(&mut Reader::new(&Mem(zero)), 0).is_none());
     }
 
     #[test]

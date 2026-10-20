@@ -6,6 +6,7 @@ pub mod error;
 pub mod extract;
 pub mod formats;
 pub mod inspect;
+pub(crate) mod pairing;
 pub mod scan;
 pub mod source;
 pub(crate) mod tiff;

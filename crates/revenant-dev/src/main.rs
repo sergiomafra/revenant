@@ -80,8 +80,17 @@ fn parse_bench_image(s: &str) -> Result<BenchImage, String> {
 #[serde(tag = "event", rename_all = "lowercase")]
 enum Line {
     Found(Box<FoundLine>),
-    Unreadable { start: u64, len: u64 },
-    Summary { found: u64, unreadable_bytes: u64 },
+    Unreadable {
+        start: u64,
+        len: u64,
+    },
+    /// A better version of an earlier `found` line with the same `id` (same fields).
+    Updated(Box<FoundLine>),
+    Summary {
+        found: u64,
+        unreadable_bytes: u64,
+        updated: u64,
+    },
 }
 
 #[derive(Serialize)]
@@ -182,8 +191,13 @@ fn emit(line: &Line) -> bool {
 }
 
 fn found_line(f: &Finding, details: Inspection, out: Outputs) -> Line {
+    Line::Found(finding_fields(f, details, out))
+}
+
+/// The fields of a `found` (or `updated`) line.
+fn finding_fields(f: &Finding, details: Inspection, out: Outputs) -> Box<FoundLine> {
     let m = details.metadata;
-    Line::Found(Box::new(FoundLine {
+    Box::new(FoundLine {
         id: f.id,
         start: f.start,
         len: f.len,
@@ -213,7 +227,7 @@ fn found_line(f: &Finding, details: Inspection, out: Outputs) -> Line {
         error: out.error,
         preview_file: out.preview_file,
         preview_error: out.preview_error,
-    }))
+    })
 }
 
 /// How many `_N` suffixes are tried for a preview's file name (as `extract` does).
@@ -279,6 +293,32 @@ fn check_folder(dest: &Path) -> Result<(), EngineError> {
     }
 }
 
+/// Extracts the finding and writes its preview (when asked) and reads its details; `Err` only for a fatal error
+/// (`destination_on_source`).
+fn finding_line(
+    source: &dyn Source,
+    f: &Finding,
+    dest: Option<&Path>,
+    previews: Option<&Path>,
+) -> Result<(Inspection, Outputs), EngineError> {
+    let mut out = Outputs::default();
+    if let Some(dest) = dest {
+        match extract(source, f, dest) {
+            Ok(p) => out.file = Some(p.display().to_string()),
+            Err(EngineError::DestinationOnSource) => return Err(EngineError::DestinationOnSource),
+            Err(e) => out.error = Some(e.code()),
+        }
+    }
+    let details = inspect(source, f);
+    if let (Some(dir), Some(p)) = (previews, &details.preview) {
+        match write_preview(source, f, p, dir) {
+            Ok(path) => out.preview_file = Some(path.display().to_string()),
+            Err(e) => out.preview_error = Some(e.code()),
+        }
+    }
+    Ok((details, out))
+}
+
 fn run_scan(
     image: &Path,
     dest: Option<&Path>,
@@ -312,30 +352,29 @@ fn run_scan(
         },
         &cancel,
         &mut |event| match event {
-            Event::Found(f) => {
-                let mut out = Outputs::default();
-                if let Some(dest) = dest {
-                    match extract(source, &f, dest) {
-                        Ok(p) => out.file = Some(p.display().to_string()),
-                        Err(EngineError::DestinationOnSource) => {
-                            fatal = Some(EngineError::DestinationOnSource);
-                            cancel.cancel();
-                            return;
-                        }
-                        Err(e) => out.error = Some(e.code()),
+            Event::Found(f) => match finding_line(source, &f, dest, previews) {
+                Ok((details, out)) => {
+                    if !emit(&found_line(&f, details, out)) {
+                        cancel.cancel();
                     }
                 }
-                let details = inspect(source, &f);
-                if let (Some(dir), Some(p)) = (previews, &details.preview) {
-                    match write_preview(source, &f, p, dir) {
-                        Ok(path) => out.preview_file = Some(path.display().to_string()),
-                        Err(e) => out.preview_error = Some(e.code()),
-                    }
-                }
-                if !emit(&found_line(&f, details, out)) {
+                Err(e) => {
+                    fatal = Some(e);
                     cancel.cancel();
                 }
-            }
+            },
+            // An updated finding is written again (`extract` and the previews pick a new `_N` name).
+            Event::Updated(f) => match finding_line(source, &f, dest, previews) {
+                Ok((details, out)) => {
+                    if !emit(&Line::Updated(finding_fields(&f, details, out))) {
+                        cancel.cancel();
+                    }
+                }
+                Err(e) => {
+                    fatal = Some(e);
+                    cancel.cancel();
+                }
+            },
             Event::Unreadable { start, len } => {
                 if !emit(&Line::Unreadable { start, len }) {
                     cancel.cancel();
@@ -357,6 +396,7 @@ fn run_scan(
     emit(&Line::Summary {
         found: summary.found,
         unreadable_bytes: summary.unreadable_bytes,
+        updated: summary.updated,
     });
     Ok(())
 }

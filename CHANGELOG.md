@@ -43,6 +43,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   intact only when exactly one continuation fits and every possible one was tried; otherwise it is partial (for example
   two photos from one camera written interleaved). The search is bounded (a first piece of at least 16 KiB, at most
   4096 tries reading at most 64 MiB) and stops at once when the scan is cancelled.
+- A camera video whose index ended up elsewhere on the card (its `moov`, written last, landed away from the frames) is put
+  back together after the scan: the damaged video is reported again, whole, with its two pieces in order (a new
+  `updated` event). It is reported intact only when exactly one break point between the pieces fits and nothing was
+  left unchecked; real H.264/HEVC videos with large slices will usually come out partial (they play, at most one frame
+  may be damaged). A moov that fits two videos, or a video that fits two moovs, is left alone. The search is bounded
+  (at most 4096 candidates, 1 GiB of indexes loaded, 256 pairs checked) and stops when the scan is cancelled.
 - Real camera samples: an opt-in test (and CI job) runs the engine over real CR2, CR3, NEF, ARW, RAF, DNG, ORF and RW2
   files (CC0, from raw.pixls.us), downloaded on demand by `scripts/fetch-samples.sh` and checked by SHA-256.
 

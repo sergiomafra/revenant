@@ -74,6 +74,11 @@ impl Runs {
                 .is_some_and(|(_, &e)| e >= end)
     }
 
+    /// Whether some run overlaps `[start, end)`.
+    pub(crate) fn overlaps(&self, start: u64, end: u64) -> bool {
+        !self.within(start, end).is_empty()
+    }
+
     /// Drops the runs that end at or before `pos`.
     pub(crate) fn drop_below(&mut self, pos: u64) {
         while let Some((&s, &e)) = self.0.first_key_value()
@@ -526,6 +531,14 @@ mod tests {
             .step_by(512)
             .map(|at| read(s, at, 512))
             .collect()
+    }
+
+    #[test]
+    fn runs_overlap() {
+        let mut r = Runs::default();
+        r.add(100, 200, usize::MAX);
+        assert!(r.overlaps(199, 300) && r.overlaps(0, 101) && r.overlaps(150, 151));
+        assert!(!r.overlaps(200, 300) && !r.overlaps(0, 100) && !r.overlaps(150, 150));
     }
 
     #[test]

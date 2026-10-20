@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::EngineError;
-use crate::cache::{CACHE_WINDOW, CachedSource};
+use crate::cache::{CACHE_WINDOW, CachedSource, Runs};
 use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
 use crate::source::Source;
-use pipeline::{Block, CloseQueue, Outcome, Shared};
+use pipeline::{Block, CloseQueue, MoovFinder, Outcome, Shared};
 
 /// Bytes of a sector start shown to `Format::recognizes`.
 const HEAD_LEN: usize = 16;
@@ -40,10 +40,9 @@ impl Finding {
     }
 }
 
-/// Whether a measurement at `at` keeps the pieces contract: no pieces, or at least 2 in file order whose first starts at
-/// `at`, whose lengths sum to `len`, that do not overlap and that lie inside a source of `source_len` bytes.
-fn pieces_ok(at: u64, m: &Measurement, source_len: u64) -> bool {
-    let p = &m.fragments;
+/// Whether a file at `at` of `len` bytes keeps the pieces contract: no pieces, or at least 2 in file order whose first
+/// starts at `at`, whose lengths sum to `len`, that do not overlap and that lie inside a source of `source_len` bytes.
+fn pieces_ok(at: u64, len: u64, p: &[Fragment], source_len: u64) -> bool {
     if p.is_empty() {
         return true;
     }
@@ -53,12 +52,12 @@ fn pieces_ok(at: u64, m: &Measurement, source_len: u64) -> bool {
             .is_some_and(|end| end <= source_len)
     });
     let sum = p.iter().try_fold(0u64, |acc, f| acc.checked_add(f.len));
-    let mut sorted = p.clone();
+    let mut sorted = p.to_vec();
     sorted.sort_by_key(|f| f.start);
     let disjoint = sorted
         .windows(2)
         .all(|w| w[0].start.saturating_add(w[0].len) <= w[1].start);
-    p.len() >= 2 && p[0].start == at && sum == Some(m.len) && inside && disjoint
+    p.len() >= 2 && p[0].start == at && sum == Some(len) && inside && disjoint
 }
 
 /// `[Fragment { start, len }]` when `fragments` is empty, else `fragments`.
@@ -85,7 +84,9 @@ const MAX_THREADS: usize = 64;
 /// at once: the JPEG bytes and the 1-byte-per-pixel output; the decoder's internal buffers, such as a progressive
 /// image's coefficients, come on top) and what each running measurement holds (for example a `moov` of at most 16 MiB,
 /// or a JPEG gap search's DC values, about 3 × 13 MiB at 210 megapixels, plus 3 MiB),
-/// plus about 200 B per recognized sector start in the read-ahead (at most lookahead × block / sector of them). So with
+/// plus about 200 B per recognized sector start in the read-ahead (at most lookahead × block / sector of them), plus the
+/// orphan `moov` candidates and `Damaged` videos kept for pairing (at most 4096 + 4096 per block read ahead, and 4096
+/// findings), and, after the scan, the pairing step's one `moov` and its sample lists (up to about 128 MiB). So with
 /// the defaults on a 16-thread machine, about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
 pub struct ScanOptions {
     /// Granularity of candidate starts and of unreadable-region handling, in bytes. Above 512, the detectors see a sector that
@@ -168,13 +169,25 @@ pub enum Event {
         start: u64,
         len: u64,
     },
+    /// A better version of a finding already reported: it replaces the earlier `Found` with the same `id`. Emitted after
+    /// every `Found`, before `scan` returns (today: a video put back together with its separated `moov`).
+    Updated(Finding),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ScanSummary {
     pub found: u64,
     pub unreadable_bytes: u64,
+    /// `Updated` events emitted.
+    pub updated: u64,
 }
+
+/// Most orphan `moov` candidates kept per scan (the first ones, by offset).
+const MAX_MOOVS: usize = 4096;
+/// Most `Damaged` moov-less video candidates kept per scan (the first ones, by id).
+const MAX_VIDEOS: usize = 4096;
+/// Bytes of a `moov` candidate's header: a skip range overlapping them drops the candidate.
+const MOOV_HEAD: u64 = 16;
 
 /// A finding not yet emitted.
 struct Pending {
@@ -195,6 +208,14 @@ struct Commit<'a, 's> {
     /// Found but not yet emitted, in start order.
     pending: VecDeque<Pending>,
     next_id: u64,
+    /// Orphan `moov` candidates kept, ascending, as (box start, declared size).
+    moovs: Vec<(u64, u64)>,
+    /// Ranges of the non-`Damaged` ISO BMFF findings (their own `moov` is no orphan); pruned like the skip ranges.
+    own_moovs: Runs,
+    /// `Damaged` MP4/MOV findings, in id order (candidates for pairing).
+    videos: Vec<Finding>,
+    /// A candidate (of either kind) was dropped by a cap: an unchecked one might have paired, so no pairing is `Intact`.
+    capped: bool,
 }
 
 impl Commit<'_, '_> {
@@ -221,7 +242,60 @@ impl Commit<'_, '_> {
 
     fn emit_found(&mut self, p: Pending) -> Result<(), EngineError> {
         self.summary.found += 1;
+        let f = &p.finding;
+        if f.health == Health::Damaged && matches!(f.kind, FileKind::Mp4 | FileKind::Mov) {
+            if self.videos.len() < MAX_VIDEOS {
+                self.videos.push(f.clone());
+            } else {
+                self.capped = true;
+            }
+        }
         self.emit(Event::Found(p.finding))
+    }
+
+    /// Keeps the `moov` candidates of a block just examined (each header ends in it, so every finding that could hold
+    /// it has been added): drops those whose header overlaps a committed skip range (those blocks may not have been
+    /// read at all, so keeping them would depend on timing) or that lie inside a non-`Damaged` ISO BMFF finding.
+    fn keep_moovs(&mut self, found: Vec<(u64, u64)>, capped: bool) {
+        self.capped |= capped;
+        let skips = pipeline::lock(&self.shared.skips);
+        for (q, size) in found {
+            if skips.overlaps(q, q + MOOV_HEAD) || self.own_moovs.overlaps(q, q + 1) {
+                continue;
+            }
+            if self.moovs.len() < MAX_MOOVS {
+                self.moovs.push((q, size));
+            } else {
+                self.capped = true;
+            }
+        }
+    }
+
+    /// After the scan: pairs `Damaged` moov-less videos with orphan `moov`s and emits each video put back together.
+    fn pair(&mut self) -> Result<(), EngineError> {
+        if self.videos.is_empty() || self.moovs.is_empty() {
+            return Ok(());
+        }
+        let cancel = self.shared.cancel;
+        let paired =
+            crate::pairing::pair_videos(&self.shared.cache, &self.videos, &self.moovs, cancel);
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        for mut f in paired {
+            // A pairing bug: caught in debug builds, ignored (no event) in release.
+            let ok = pieces_ok(f.start, f.len, &f.fragments, self.shared.total);
+            debug_assert!(ok, "pieces contract broken by pairing: {f:?}");
+            if !ok {
+                continue;
+            }
+            if self.capped && f.health == Health::Intact {
+                f.health = Health::Partial;
+            }
+            self.summary.updated += 1;
+            self.emit(Event::Updated(f))?;
+        }
+        Ok(())
     }
 
     /// Walks the block's sectors in order.
@@ -307,7 +381,7 @@ impl Commit<'_, '_> {
             return;
         }
         // A detector bug: caught in debug builds, ignored (no finding) in release.
-        let ok = pieces_ok(at, &m, self.shared.total);
+        let ok = pieces_ok(at, m.len, &m.fragments, self.shared.total);
         debug_assert!(ok, "pieces contract broken at {at}: {m:?}");
         if !ok {
             return;
@@ -320,6 +394,17 @@ impl Commit<'_, '_> {
             .map(|r| round_up(r.start.saturating_add(r.len)))
             .max()
             .unwrap_or(at);
+        if m.health != Health::Damaged
+            && matches!(
+                m.kind,
+                FileKind::Mp4 | FileKind::Mov | FileKind::Cr3 | FileKind::Heic
+            )
+        {
+            for r in &ranges {
+                self.own_moovs
+                    .add(r.start, r.start.saturating_add(r.len), usize::MAX);
+            }
+        }
         if m.health == Health::Intact {
             let mut skips = pipeline::lock(&self.shared.skips);
             for r in &ranges {
@@ -364,16 +449,24 @@ impl Commit<'_, '_> {
 /// to `opts.threads` measuring threads; it then takes the blocks in order and, for each head the sequential walk would
 /// examine, waits for its measurement. The events, ids and summary are the same for any `threads` and `cache_bytes`.
 ///
+/// After every `Found`, `Damaged` MP4/MOV findings without a `moov` (at most 4096) are paired with orphan `moov` boxes
+/// met during the scan (at most 4096, see `pairing`): each video put back together is emitted as an
+/// [`Event::Updated`] with the same id and 2 pieces, then `scan` returns. An orphan `moov` candidate is a box start whose
+/// first 16 bytes are a size in `[24, MOOV_MAX_LEN + 8]`, `moov`, any 4 bytes and `mvhd`, found in every block the scan
+/// reads; one whose header overlaps a committed skip range (those blocks may not be read at all) or lies inside a
+/// non-`Damaged` MP4/MOV/CR3/HEIC finding is dropped.
+///
 /// The scan and every `measure` read through one [`CachedSource`] of `opts.cache_bytes`, so each sector is read from
-/// `source` once and a sector found unreadable is never read again. A block wholly inside an `Intact` finding whose bytes
+/// `source` once and a sector found unreadable is never read again (the pairing step reads the samples it checks and
+/// the `moov`s it loads again, through the same cache). A block wholly inside an `Intact` finding whose bytes
 /// have all gone through the cache already (read by `measure`) is not read again: its unreadable sectors come from the
 /// cache's bad map.
 ///
 /// `opts.sector` is raised to at least 16 (the head length) and `opts.block` rounded down to whole sectors, so a head
 /// never straddles two blocks. Cancellation is checked before each block examined or read ahead, before and after
-/// every event and while waiting for a measurement: once it is seen no further event is emitted, the measuring threads
-/// drop their remaining jobs, and the scan returns `Err(Cancelled)` after they have all stopped; findings still pending
-/// are dropped.
+/// every event, while waiting for a measurement and during the pairing step: once it is seen no further event is
+/// emitted, the measuring threads drop their remaining jobs, and the scan returns `Err(Cancelled)` after they have all
+/// stopped; findings still pending and `Updated` events not yet emitted are dropped.
 pub fn scan(
     source: &dyn Source,
     formats: &[Box<dyn Format>],
@@ -402,7 +495,12 @@ pub fn scan(
             run: None,
             pending: VecDeque::new(),
             next_id: 1,
+            moovs: Vec::new(),
+            own_moovs: Runs::default(),
+            videos: Vec::new(),
+            capped: false,
         };
+        let mut finder = MoovFinder::default();
         let mut ahead: VecDeque<Block> = VecDeque::with_capacity(lookahead);
         let mut fill_pos = 0u64;
         loop {
@@ -414,14 +512,21 @@ pub fn scan(
                     return Err(EngineError::Cancelled);
                 }
                 let end = (fill_pos + block).min(total);
-                ahead.push_back(shared.fill(fill_pos, end, workers > 0));
+                ahead.push_back(shared.fill(fill_pos, end, workers > 0, &mut finder));
                 fill_pos = end;
                 shared.cache.forget_coverage_below(fill_pos);
             }
-            let Some(b) = ahead.pop_front() else { break };
+            let Some(mut b) = ahead.pop_front() else {
+                break;
+            };
             let read = b.end;
+            let (moovs, capped) = (std::mem::take(&mut b.moovs), b.moovs_capped);
             commit.block(b)?;
-            shared.prune_skips(read);
+            commit.keep_moovs(moovs, capped);
+            // A `moov` header may start up to 15 bytes before the next block: keep the ranges that could still overlap it.
+            let keep_from = read.saturating_sub(MOOV_HEAD);
+            shared.prune_skips(keep_from);
+            commit.own_moovs.drop_below(keep_from);
             commit.emit(Event::Progress { read, total })?;
         }
         commit.flush_run()?;
@@ -431,6 +536,7 @@ pub fn scan(
         if total == 0 {
             commit.emit(Event::Progress { read: 0, total })?;
         }
+        commit.pair()?;
         Ok(commit.summary)
     })
 }

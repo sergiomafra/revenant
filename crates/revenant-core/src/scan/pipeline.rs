@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::{CancelToken, HEAD_LEN};
 use crate::cache::{CachedSource, Runs};
-use crate::formats::{CancelScope, Format, Measurement};
+use crate::formats::{CancelScope, Format, MOOV_MAX_LEN, Measurement};
 use crate::source::Source;
 
 /// How often a wait for a measurement looks at the cancel token.
@@ -119,6 +119,98 @@ pub(super) struct Block {
     /// Not read: wholly inside a committed skip range and already read through the cache (by a measure). Its flags come
     /// from the cache's bad map; a head the commit loop needs in it is read then.
     pub(super) deferred: bool,
+    /// Orphan `moov` candidates whose 16-byte header ends in this block (see [`MoovFinder`]), ascending, as (box start,
+    /// declared size).
+    pub(super) moovs: Vec<(u64, u64)>,
+    /// More candidates than [`MAX_BLOCK_MOOVS`] were met in this block: the rest were not kept.
+    pub(super) moovs_capped: bool,
+}
+
+/// Most `moov` candidates kept per block.
+pub(super) const MAX_BLOCK_MOOVS: usize = 4096;
+
+/// Bytes of a candidate `moov` box header looked at: size, `moov`, the first child's size and `mvhd`.
+const MOOV_HEAD: usize = 16;
+
+/// Searches the bytes the read stage reads, in order, for orphan `moov` boxes: a box start `q` whose 16 bytes are a size
+/// in `[24, MOOV_MAX_LEN + 8]`, `moov`, any 4 bytes and `mvhd`. Keeps the last 15 bytes seen, so a header across two
+/// windows or blocks is found too; a block that is not read (deferred) breaks the stream.
+#[derive(Default)]
+pub(super) struct MoovFinder {
+    /// The last bytes seen (at most 15) and where they end.
+    tail: Vec<u8>,
+    tail_end: u64,
+}
+
+/// The declared size, when `b` (16 bytes) is a candidate `moov` box header.
+fn moov_head(b: &[u8]) -> Option<u64> {
+    let size = u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    (&b[4..8] == b"moov" && &b[12..16] == b"mvhd" && (24..=MOOV_MAX_LEN + 8).contains(&size))
+        .then_some(size)
+}
+
+impl MoovFinder {
+    /// Forgets the tail: the next bytes do not follow the last ones.
+    pub(super) fn reset(&mut self) {
+        self.tail.clear();
+    }
+
+    /// Looks at `bytes`, which start at the absolute offset `from`; pushes each candidate's `(q, size)` (ascending) to
+    /// `out` until it holds `cap`, then sets `capped`.
+    fn feed(
+        &mut self,
+        from: u64,
+        bytes: &[u8],
+        out: &mut Vec<(u64, u64)>,
+        cap: usize,
+        capped: &mut bool,
+    ) {
+        let mut push = |q: u64, size: u64| {
+            if out.len() < cap {
+                out.push((q, size));
+            } else {
+                *capped = true;
+            }
+        };
+        if self.tail_end != from {
+            self.tail.clear();
+        }
+        // Headers that start in the tail and end in `bytes`.
+        if !self.tail.is_empty() {
+            let t = self.tail.len();
+            let mut joined = [0u8; 2 * (MOOV_HEAD - 1)];
+            let more = bytes.len().min(MOOV_HEAD - 1);
+            joined[..t].copy_from_slice(&self.tail);
+            joined[t..t + more].copy_from_slice(&bytes[..more]);
+            for i in 0..t {
+                if i + MOOV_HEAD > t
+                    && i + MOOV_HEAD <= t + more
+                    && let Some(size) = moov_head(&joined[i..i + MOOV_HEAD])
+                {
+                    push(from - (t - i) as u64, size);
+                }
+            }
+        }
+        for hit in memchr::memmem::find_iter(bytes, b"moov") {
+            if hit >= 4
+                && hit + MOOV_HEAD - 4 <= bytes.len()
+                && let Some(size) = moov_head(&bytes[hit - 4..hit + MOOV_HEAD - 4])
+            {
+                push(from + (hit - 4) as u64, size);
+            }
+        }
+        // Keep the last 15 bytes of the stream.
+        let keep = MOOV_HEAD - 1;
+        if bytes.len() >= keep {
+            self.tail.clear();
+            self.tail.extend_from_slice(&bytes[bytes.len() - keep..]);
+        } else {
+            self.tail.extend_from_slice(bytes);
+            let excess = self.tail.len().saturating_sub(keep);
+            self.tail.drain(..excess);
+        }
+        self.tail_end = from + bytes.len() as u64;
+    }
 }
 
 /// State shared by the scan thread and the workers.
@@ -214,8 +306,9 @@ impl<'s> Shared<'s> {
         }
     }
 
-    /// Reads the block `[pos, end)` (or defers it) and, with workers, queues a job for each head to examine.
-    pub(super) fn fill(&self, pos: u64, end: u64, workers: bool) -> Block {
+    /// Reads the block `[pos, end)` (or defers it) and, with workers, queues a job for each head to examine. `finder`
+    /// searches the bytes read for orphan `moov` candidates.
+    pub(super) fn fill(&self, pos: u64, end: u64, workers: bool, finder: &mut MoovFinder) -> Block {
         let sector = self.sector;
         let sectors = (end - pos).div_ceil(sector) as usize;
         if lock(&self.skips).covers(pos, end) && self.cache.covered(pos, end) {
@@ -226,17 +319,22 @@ impl<'s> Shared<'s> {
                 let last = ((s + l - pos).div_ceil(sector) as usize).min(sectors);
                 flags[first..last].fill(true);
             }
+            finder.reset();
             return Block {
                 pos,
                 end,
                 bad,
                 heads: Vec::new(),
                 deferred: true,
+                moovs: Vec::new(),
+                moovs_capped: false,
             };
         }
         let mut bad: Option<Vec<bool>> = None;
         let mut heads = Vec::new();
+        let (mut moovs, mut moovs_capped) = (Vec::new(), false);
         self.cache.visit(pos, end, |from, bytes, runs| {
+            finder.feed(from, bytes, &mut moovs, MAX_BLOCK_MOOVS, &mut moovs_capped);
             let mut run = runs.iter().peekable();
             let mut at = from;
             let stop = from + bytes.len() as u64;
@@ -288,6 +386,8 @@ impl<'s> Shared<'s> {
             bad,
             heads,
             deferred: false,
+            moovs,
+            moovs_capped,
         }
     }
 
@@ -297,5 +397,58 @@ impl<'s> Shared<'s> {
         let want = HEAD_LEN.min((self.total - at) as usize);
         let n = self.cache.read_at(at, &mut head[..want]).ok()?;
         (n == want && self.formats.iter().any(|f| f.recognizes(&head[..n]))).then_some((head, n))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feeds `data` split at `cuts` and returns the candidates.
+    fn find(data: &[u8], cuts: &[usize], cap: usize) -> (Vec<(u64, u64)>, bool) {
+        let mut f = MoovFinder::default();
+        let (mut out, mut capped) = (Vec::new(), false);
+        let mut from = 0;
+        for &to in cuts.iter().chain([data.len()].iter()) {
+            f.feed(from as u64, &data[from..to], &mut out, cap, &mut capped);
+            from = to;
+        }
+        (out, capped)
+    }
+
+    fn header(size: u32) -> Vec<u8> {
+        let mut h = size.to_be_bytes().to_vec();
+        h.extend_from_slice(b"moov\0\0\0\x6cmvhd");
+        h
+    }
+
+    #[test]
+    fn moov_headers_are_found_across_chunk_boundaries() {
+        let mut data = vec![7u8; 4096];
+        for (at, size) in [(0, 24), (1000, 4096), (2000, 1 << 24)] {
+            data[at..at + 16].copy_from_slice(&header(size));
+        }
+        // Not candidates: a size below 24 or above 16 MiB + 8, no `mvhd`, a header cut by the end.
+        data[3000..3016].copy_from_slice(&header(23));
+        data[3100..3116].copy_from_slice(&header((1 << 24) + 9));
+        data[3200..3216].copy_from_slice(&header(4096));
+        data[3212] = b'x';
+        data[4088..4096].copy_from_slice(&header(4096)[..8]);
+        let want = vec![(0, 24), (1000, 4096), (2000, 1 << 24)];
+        assert_eq!(find(&data, &[], 10), (want.clone(), false));
+        // Every split of every header, and many tiny chunks.
+        for d in 1..16 {
+            assert_eq!(find(&data, &[1000 + d, 2000 + d], 10).0, want, "{d}");
+        }
+        let tiny: Vec<usize> = (1..4096).step_by(3).collect();
+        assert_eq!(find(&data, &tiny, 10).0, want);
+        // A gap (a block not read) breaks the stream.
+        let mut f = MoovFinder::default();
+        let (mut out, mut capped) = (Vec::new(), false);
+        f.feed(0, &data[..1008], &mut out, 10, &mut capped);
+        f.feed(5000, &data[1008..1016], &mut out, 10, &mut capped);
+        assert_eq!(out, vec![(0, 24)]);
+        // The cap.
+        assert_eq!(find(&data, &[], 2), (want[..2].to_vec(), true));
     }
 }

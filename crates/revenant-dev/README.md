@@ -39,7 +39,7 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
 {"event":"found","id":1,"start":0,"len":12345,"kind":"jpeg","health":"intact","width":64,"height":48,"preview":{"start":0,"len":12345,"width":64,"height":48}}
 {"event":"unreadable","start":1044480,"len":4096}
 {"event":"found","id":2,"start":1049088,"len":13507425,"kind":"nef","health":"intact","make":"NIKON CORPORATION","model":"NIKON Z 6","lens":"NIKKOR Z 24-70mm f/4 S","iso":100,"captured_at":"2019-11-29T17:15:20","width":4548,"height":3030,"preview":{"start":3215360,"len":432488,"width":3024,"height":2016}}
-{"event":"summary","found":2,"unreadable_bytes":4096}
+{"event":"summary","found":2,"unreadable_bytes":4096,"updated":0}
 ```
 
 - `kind`: `jpeg`, `mp4`, `mov`, `cr2`, `nef`, `arw`, `dng`, `orf`, `rw2`, `raf`, `cr3`, `heic` or `tiff`.
@@ -59,6 +59,18 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   {"event":"found","id":1,"start":65536,"len":71816,"kind":"jpeg","health":"intact","fragments":[{"start":65536,"len":36352},{"start":3145728,"len":35464}],"width":1024,"height":768,"preview":{"start":65536,"len":71816,"width":1024,"height":768,"fragments":[{"start":65536,"len":36352},{"start":3145728,"len":35464}]}}
   {"event":"found","id":2,"start":101888,"len":8250,"kind":"jpeg","health":"intact","width":64,"height":64,"preview":{"start":101888,"len":8250,"width":64,"height":64}}
   ```
+- `updated`: a better version of an earlier `found` line with the same `id`, with the same fields; it replaces that
+  line. These lines come after every `found` line, just before the summary, whose `updated` counts them. Today: a
+  camera video whose index (`moov`) ended up elsewhere on the card, found `damaged` and then put back together from its
+  two pieces:
+
+  ```json
+  {"event":"found","id":1,"start":1048576,"len":55090,"kind":"mp4","health":"damaged"}
+  {"event":"updated","id":1,"start":1048576,"len":56144,"kind":"mp4","health":"intact","fragments":[{"start":1048576,"len":22528},{"start":12582912,"len":33616}]}
+  ```
+
+  With `--extract` and `--previews`, an updated finding is written again: same naming, so it gets the next free `_N`
+  suffix (for example `revenant_000000100000_2.mp4` next to the damaged `revenant_000000100000.mp4`).
 - With `--extract`, a `found` line gets `"file":"<path>"`. If extracting that one finding fails (for example
   `write_failed` when the folder is not writable), it gets `"error":"<code>"` instead and the scan continues.
 - With `--previews`, a `found` line that has a `preview` gets `"preview_file":"<path>"`, or `"preview_error":"<code>"`
