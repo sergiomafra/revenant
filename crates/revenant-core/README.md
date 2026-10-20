@@ -535,20 +535,26 @@ was listed so far. Written from fatgen103 (FAT entries, directory entries, long 
 
 - `Listing.files`: the photo/video files, those whose extension `FileKind::from_extension` knows (jpg jpeg jpe, mp4 m4v,
   mov, cr2, cr3, nef nrw, arw, dng, orf ori, rw2, raf, heic heif hif, tif tiff; any case). Each is an `FsFile`:
-  - `origin`: `volume` (the volume's index), `path` (components joined by `/`, from the root, no leading `/`),
-    `state` `live`, `placement` `chain`, `size` as recorded, `created` and `modified` as `FsTime` (local time
+  - `origin`: `volume` (the volume's index), `folder` (components joined by `/`, from the root, no leading `/`, `""`
+    for the root; `None` when dropped, see Bounds; one string shared by the files of a folder), `name`, `state` `live`, `placement` `chain`, `size` as recorded, `created` and `modified` as `FsTime` (local time
     `YYYY-MM-DDTHH:MM:SS`, no offset on FAT; `None` when a field is out of range: month, day for that month and year,
     hour, minute, seconds, or a creation 10 ms count above 199). The creation time adds its 10 ms count, floored to the
-    second. `name()` is the last component, `folder()` the rest (`""` for the root).
+    second. `name()`, `folder()` (an `Option`) and `path()` (`folder/name`, or the name alone) read them.
   - `pieces`: absolute byte ranges in file order, consecutive clusters joined, holding the first `size` bytes; a piece
     past the end of the source is cut or dropped, and a file with no piece left is not listed.
   - `trusted` (ruling D3): the chain is complete (exactly `ceil(size / cluster)` clusters, the last one end-of-chain),
     with no cycle and no cluster another chain holds, in at most 4096 runs.
 
   Sorted by (first piece start, volume, path).
-- `Listing.others`: the first piece of every other live file (any other extension, or none), sorted by start.
+- `Listing.others`: the first piece of every other live file (any other extension, or none), sorted by start. Such a
+  file keeps no name or path.
 - `Listing.live`: the merged ranges of every live file (its pieces) and every trusted live directory (its clusters).
-  The fixed FAT12/16 root region is not in it, nor is a directory that is not trusted.
+  The fixed FAT12/16 root region is not in it, nor is a directory that is not trusted (ruling R8), nor a file or
+  directory left out by the piece or photo cap.
+- `Listing.truncated` (ruling R7): a cap or budget dropped or degraded something: a file left out by the piece or photo
+  cap, a folder dropped by the path cap or budget, a volume whose contested set overflowed, a directory not entered for
+  the directory or depth cap, entries not read for the entry cap or a directory chain running past 2 MiB, or a volume
+  too large to walk.
 
 The walk:
 
@@ -564,7 +570,9 @@ The walk:
   FAT32 the low 28 bits; end-of-chain is ≥ `0xFF8`/`0xFFF8`/`0x0FFFFFF8`, bad is `0xFF7`/`0xFFF7`/`0x0FFFFFF7`, and a
   value outside the heap is invalid. A chain is followed until end-of-chain, a free, bad or invalid entry, a cluster
   outside the heap or already claimed, `ceil(size / cluster)` clusters, or 4096 runs. A sector of the first FAT that
-  cannot be read is read from the next copy; one no copy gives stops the chain there.
+  cannot be read is read from the next copy; one no copy gives stops the chain there. The FAT32 `ExtFlags` field is not
+  honored: with mirroring disabled and an active FAT other than 0, the first FAT is still read first, and the others
+  only stand in for its unreadable sectors.
 - **Claims.** Every live directory and file claims the clusters of its chain, in walk order (depth first, entries in
   on-disk order). A chain that reaches a cluster another chain claimed stops there and the cluster becomes contested;
   once the walk of the volume ends, every file and directory holding a contested cluster is untrusted. Reaching a
@@ -581,7 +589,15 @@ Bounds (each lowerable in unit tests): per volume at most 65,536 directories, 4,
 clusters; per listing at most 262,144 photo/video files and `MAX_PIECES` (2^20) pieces, counting a file's runs (a
 photo/video's pieces, an other file's ranges in `live`) and a directory's runs. A file that would pass either cap is not
 listed at all (not in `files`, `others` or `live`); a directory past the piece cap is still walked but its ranges are not
-in `live`. Following chains examines each cluster of a volume at most once.
+in `live`. Once the entry cap is reached the walk of the volume stops: no further directory is read. Following chains
+examines each cluster of a volume at most once.
+
+Paths (ruling R6): a photo/video whose path (folder, `/`, name) would pass `MAX_PATH_BYTES` (4096 bytes) keeps its name
+and loses its folder, and so do the files under a directory whose own path would pass it. Folder strings are held once
+per directory and shared by its files and subdirectory walk; the listing pays for each from a 64 MiB budget, and once
+that runs out new directories get no folder (their files are listed without one). A name is at most 255 UTF-16 units
+(765 UTF-8 bytes), so the names of the at most 262,144 listed photo/videos take at most about 192 MiB; other files keep
+no name. While a directory is read its entries are held at once (at most 65,536, about 50 MiB of names at worst).
 
 Reads: only metadata, through the given source: the boot sector again (to locate the FATs and the root), the FATs in
 32 KiB blocks cached up to 8 MiB (a block whose read fails is read again sector by sector, from each copy in turn; a

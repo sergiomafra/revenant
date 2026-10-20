@@ -4,6 +4,7 @@
 //! the directory entry (§6) and long names (§7). Live entries only; deleted ones are another walk's job.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::alloc::{Claims, ClusterMap, Entry, follow};
 use super::boot::{self, Layout, Root};
@@ -25,8 +26,9 @@ const LFN_UNITS: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
 ///
 /// The root (FAT12/16: the fixed region; FAT32: the `RootClus` chain) is walked depth first, entries in on-disk order.
 /// Every directory and every live file claims its chain; a directory whose first cluster is already claimed is not
-/// entered (a loop or a second link). Bounds: [`Limits`] (directories, entries, depth, bytes per directory) and the
-/// listing's budget.
+/// entered (a loop or a second link). Bounds: [`Limits`] (directories, entries, depth, bytes per directory, paths) and
+/// the listing's budget; a cap that drops or degrades something marks the listing truncated, and once the entry cap is
+/// reached no further directory is read.
 pub(super) fn walk(
     source: &dyn Source,
     v: &Volume,
@@ -49,14 +51,17 @@ pub(super) fn walk(
             len: entries * 32,
             sector_size: layout.sector_size,
         },
-        Root::Cluster(c) => {
-            let chain = follow(&mut map, &mut claims, c, dir_clusters);
-            col.dir(budget, &chain);
-            Region::Runs(chain.runs)
-        }
+        Root::Cluster(c) => Region::Runs(dir_chain(
+            &mut map,
+            &mut claims,
+            &mut col,
+            budget,
+            c,
+            dir_clusters,
+        )),
     };
     let mut stack = vec![Dir {
-        path: String::new(),
+        folder: Some(Arc::from("")),
         depth: 0,
         region: root,
     }];
@@ -66,36 +71,39 @@ pub(super) fn walk(
         if cancel.is_cancelled() {
             break;
         }
-        let children = read_dir(source, v, &d.region, fat32, &mut entries, limits.entries);
+        let (children, capped) =
+            read_dir(source, v, &d.region, fat32, &mut entries, limits.entries);
         let mut subdirs = Vec::new();
         for ch in children {
-            let path = if d.path.is_empty() {
-                ch.name
-            } else {
-                format!("{}/{}", d.path, ch.name)
-            };
             if ch.dir {
-                if d.depth >= limits.depth
-                    || dirs >= limits.dirs
-                    || !claims.in_heap(ch.first)
-                    || claims.is_claimed(ch.first)
-                {
+                if !claims.in_heap(ch.first) || claims.is_claimed(ch.first) {
+                    continue;
+                }
+                if d.depth >= limits.depth || dirs >= limits.dirs {
+                    budget.truncated = true;
                     continue;
                 }
                 dirs += 1;
-                let chain = follow(&mut map, &mut claims, ch.first, dir_clusters);
-                col.dir(budget, &chain);
+                let runs = dir_chain(
+                    &mut map,
+                    &mut claims,
+                    &mut col,
+                    budget,
+                    ch.first,
+                    dir_clusters,
+                );
                 subdirs.push(Dir {
-                    path,
+                    folder: budget.subfolder(d.folder.as_ref(), &ch.name),
                     depth: d.depth + 1,
-                    region: Region::Runs(chain.runs),
+                    region: Region::Runs(runs),
                 });
             } else if ch.size > 0 {
                 let need = (ch.size as u64).div_ceil(v.cluster_size);
                 let chain = follow(&mut map, &mut claims, ch.first, need);
                 let origin = FsOrigin {
                     volume: v.index,
-                    path,
+                    folder: d.folder.clone(),
+                    name: ch.name,
                     state: FsState::Live,
                     placement: Placement::Chain,
                     size: ch.size as u64,
@@ -105,14 +113,43 @@ pub(super) fn walk(
                 col.file(budget, origin, chain);
             }
         }
+        if capped {
+            // The volume's entry budget is spent: no further directory is read.
+            budget.truncated = true;
+            break;
+        }
         stack.extend(subdirs.into_iter().rev());
     }
     col.finish(&claims, out);
 }
 
+/// Follows a directory's chain for at most `dir_clusters` clusters and hands it to the collector; a chain that goes on
+/// past that cap marks the listing truncated.
+fn dir_chain(
+    map: &mut FatMap<'_>,
+    claims: &mut Claims,
+    col: &mut Collector<'_>,
+    budget: &mut Budget,
+    first: u32,
+    dir_clusters: u64,
+) -> Vec<(u32, u32)> {
+    let chain = follow(map, claims, first, dir_clusters);
+    let taken: u64 = chain.runs.iter().map(|&(_, n)| n as u64).sum();
+    if !chain.ended
+        && taken == dir_clusters
+        && let Some(&(start, n)) = chain.runs.last()
+        && matches!(map.entry(start + n - 1), Entry::Next(_))
+    {
+        budget.truncated = true;
+    }
+    col.dir(budget, &chain);
+    chain.runs
+}
+
 /// A directory waiting to be read.
 struct Dir {
-    path: String,
+    /// Its own path (the folder of its files), shared with them; `None` once dropped by the path cap or budget.
+    folder: Option<Arc<str>>,
     depth: u32,
     region: Region,
 }
@@ -141,8 +178,9 @@ struct Child {
     modified: Option<FsTime>,
 }
 
-/// The live entries of a directory, up to the end-of-directory entry or the volume's entry budget. An unreadable
-/// sector or cluster is skipped (its entries are lost, and a long name across it is not used).
+/// The live entries of a directory, up to the end-of-directory entry or the volume's entry budget, and whether that
+/// budget ran out before the directory ended. An unreadable sector or cluster is skipped (its entries are lost, and a
+/// long name across it is not used).
 fn read_dir(
     source: &dyn Source,
     v: &Volume,
@@ -150,11 +188,12 @@ fn read_dir(
     fat32: bool,
     entries: &mut u64,
     cap: u64,
-) -> Vec<Child> {
+) -> (Vec<Child>, bool) {
     let mut r = DirReader {
         fat32,
         entries,
         cap,
+        capped: false,
         long: LongName::default(),
         out: Vec::new(),
     };
@@ -192,13 +231,14 @@ fn read_dir(
             }
         }
     }
-    r.out
+    (r.out, r.capped)
 }
 
 struct DirReader<'a> {
     fat32: bool,
     entries: &'a mut u64,
     cap: u64,
+    capped: bool,
     long: LongName,
     out: Vec<Child>,
 }
@@ -212,6 +252,7 @@ impl DirReader<'_> {
         };
         for e in chunk.as_chunks::<32>().0 {
             if *self.entries >= self.cap {
+                self.capped = true;
                 return false;
             }
             *self.entries += 1;
@@ -520,6 +561,7 @@ impl ClusterMap for FatMap<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filesystem::MAX_WALKED_CLUSTERS;
     use crate::filesystem::listing::read_with;
     use crate::formats::tests::Mem;
     use revenant_testkit::fs::{FsBuilder, FsType, Partitioning, disk};
@@ -537,8 +579,8 @@ mod tests {
         read_with(&src, &CancelToken::default(), limits)
     }
 
-    fn paths(l: &Listing) -> Vec<&str> {
-        let mut p: Vec<&str> = l.files.iter().map(|f| f.origin.path.as_str()).collect();
+    fn paths(l: &Listing) -> Vec<String> {
+        let mut p: Vec<String> = l.files.iter().map(|f| f.origin.path()).collect();
         p.sort();
         p
     }
@@ -569,14 +611,15 @@ mod tests {
             },
         );
         assert_eq!(l.files.len(), 7);
-        let trusted: Vec<&str> = l
+        let trusted: Vec<String> = l
             .files
             .iter()
             .filter(|f| f.trusted)
-            .map(|f| f.origin.path.as_str())
+            .map(|f| f.origin.path())
             .collect();
         assert_eq!(trusted, ["DCIM/OK.JPG"]);
         assert!(in_live(&l, &b, dcim));
+        assert!(!l.truncated);
         // The set fills: every live file of the volume is untrusted, and so are its directories.
         let l = list(
             &b,
@@ -589,6 +632,7 @@ mod tests {
         assert!(l.files.iter().all(|f| !f.trusted));
         assert!(!in_live(&l, &b, dcim));
         assert!(in_live(&l, &b, ok));
+        assert!(l.truncated);
     }
 
     #[test]
@@ -612,6 +656,8 @@ mod tests {
         assert!(!in_live(&l, &b, 3000) && !in_live(&l, &b, e[0]));
         let pieces = l.files.iter().map(|f| f.pieces.len()).sum::<usize>() + l.others.len() + 2;
         assert!(pieces <= 5);
+        assert!(l.truncated);
+        assert!(!list(&b, &Limits::DEFAULT).truncated);
         // Nothing left at all: no file, no panic.
         let l = list(
             &b,
@@ -640,6 +686,16 @@ mod tests {
         assert_eq!(paths(&l), ["DCIM/A.JPG", "DCIM/C.JPG"]);
         assert_eq!(l.others.len(), 1);
         assert!(!in_live(&l, &b, b.clusters("DCIM/D.JPG")[0]));
+        assert!(l.truncated);
+        let l = list(
+            &b,
+            &Limits {
+                files: 3,
+                ..Limits::DEFAULT
+            },
+        );
+        assert_eq!(l.files.len(), 3);
+        assert!(!l.truncated);
     }
 
     #[test]
@@ -657,7 +713,9 @@ mod tests {
             "TOP.JPG",
             "Z/Z1.JPG",
         ];
-        assert_eq!(paths(&list(&b, &Limits::DEFAULT)), all);
+        let l = list(&b, &Limits::DEFAULT);
+        assert_eq!(paths(&l), all);
+        assert!(!l.truncated);
         // Depth 2: A/B is walked, A/B/C is not.
         let l = list(
             &b,
@@ -667,6 +725,7 @@ mod tests {
             },
         );
         assert_eq!(paths(&l), ["A/A1.JPG", "A/B/B1.JPG", "TOP.JPG", "Z/Z1.JPG"]);
+        assert!(l.truncated);
         // Three directories: the root, A and Z (found while reading the root), not A/B.
         let l = list(
             &b,
@@ -676,6 +735,7 @@ mod tests {
             },
         );
         assert_eq!(paths(&l), ["A/A1.JPG", "TOP.JPG", "Z/Z1.JPG"]);
+        assert!(l.truncated);
         // Entries: the root's label, TOP, A, Z and its end marker, then A's `.`, `..` and A1.
         let l = list(
             &b,
@@ -685,6 +745,7 @@ mod tests {
             },
         );
         assert_eq!(paths(&l), ["A/A1.JPG", "TOP.JPG"]);
+        assert!(l.truncated);
         let l = list(
             &b,
             &Limits {
@@ -693,6 +754,7 @@ mod tests {
             },
         );
         assert_eq!(paths(&l), ["TOP.JPG"]);
+        assert!(l.truncated);
         // A directory of at most 2 clusters: a third cluster's entries are not read, and it is untrusted.
         let mut b = card();
         for i in 0..40 {
@@ -709,6 +771,146 @@ mod tests {
         );
         assert_eq!(l.files.len(), 16 + 14);
         assert!(!in_live(&l, &b, d[0]));
+        assert!(l.truncated);
+        // Exactly two clusters that end there: within the cap, nothing truncated.
+        let mut b = card();
+        for i in 0..30 {
+            b.add(&format!("D/F{i:02}.JPG"), &[1; 512]);
+        }
+        assert_eq!(b.clusters("D").len(), 2);
+        let l = list(
+            &b,
+            &Limits {
+                fat_dir_bytes: 1024,
+                ..Limits::DEFAULT
+            },
+        );
+        assert_eq!(l.files.len(), 30);
+        assert!(!l.truncated);
+        // Three clusters, the chain broken (free) at the second: it stops at the cap but nothing lies past it.
+        let mut b = card();
+        for i in 0..40 {
+            b.add(&format!("D/F{i:02}.JPG"), &[1; 512]);
+        }
+        let d = b.clusters("D");
+        b.set_fat(d[1], 0);
+        let l = list(
+            &b,
+            &Limits {
+                fat_dir_bytes: 1024,
+                ..Limits::DEFAULT
+            },
+        );
+        assert_eq!(l.files.len(), 30);
+        assert!(!l.truncated);
+    }
+
+    /// A source recording the offset of every read.
+    struct Watch {
+        inner: Mem,
+        reads: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl Source for Watch {
+        fn len(&self) -> u64 {
+            self.inner.len()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, crate::EngineError> {
+            self.reads.lock().unwrap().push(offset);
+            self.inner.read_at(offset, buf)
+        }
+
+        fn volume(&self) -> Option<crate::source::VolumeId> {
+            None
+        }
+    }
+
+    #[test]
+    fn the_walk_stops_reading_once_the_entry_cap_is_reached() {
+        let mut b = card();
+        b.add("TOP.JPG", &[1; 512]);
+        b.add("A/A1.JPG", &[1; 512]);
+        b.add("A/B/B1.JPG", &[1; 512]);
+        b.add("Z/Z1.JPG", &[1; 512]);
+        let v = b.build();
+        let len = v.len() + (8 << 20);
+        let src = Watch {
+            inner: Mem(disk(Partitioning::Mbr { first_lba: 8192 }, &v, len)),
+            reads: Default::default(),
+        };
+        // The root's 5 slots and A's `.`, `..`, A1: the cap is reached inside A.
+        let l = read_with(
+            &src,
+            &CancelToken::default(),
+            &Limits {
+                entries: 8,
+                ..Limits::DEFAULT
+            },
+        );
+        assert_eq!(paths(&l), ["A/A1.JPG", "TOP.JPG"]);
+        assert!(l.truncated);
+        let reads = src.reads.lock().unwrap();
+        for dir in ["A/B", "Z"] {
+            let at = VOL + b.cluster_offset(b.clusters(dir)[0]);
+            assert!(!reads.contains(&at), "{dir} was read");
+        }
+        assert!(reads.contains(&(VOL + b.cluster_offset(b.clusters("A")[0]))));
+    }
+
+    #[test]
+    fn path_cap_and_budget_drop_folders() {
+        let mut b = card();
+        b.add("DCIM/A/X.JPG", &[1; 512]);
+        b.add("DCIM/B/Y.JPG", &[1; 512]);
+        b.add("DCIM/LONGNAME.JPG", &[1; 512]);
+        let folder = |l: &Listing, name: &str| {
+            let f = l.files.iter().find(|f| f.origin.name() == name).unwrap();
+            f.origin.folder().map(str::to_string)
+        };
+        // Budget: "DCIM" (4) and "DCIM/A" (6) fit in 10 bytes, "DCIM/B" does not.
+        let l = list(
+            &b,
+            &Limits {
+                path_budget: 10,
+                ..Limits::DEFAULT
+            },
+        );
+        assert_eq!(l.files.len(), 3);
+        assert_eq!(folder(&l, "X.JPG").as_deref(), Some("DCIM/A"));
+        assert_eq!(folder(&l, "Y.JPG"), None);
+        assert_eq!(folder(&l, "LONGNAME.JPG").as_deref(), Some("DCIM"));
+        assert!(l.truncated);
+        // Cap of 16 bytes: "DCIM/LONGNAME.JPG" (17) loses its folder, "DCIM/A/X.JPG" (12) keeps it.
+        let l = list(
+            &b,
+            &Limits {
+                path_bytes: 16,
+                ..Limits::DEFAULT
+            },
+        );
+        assert_eq!(l.files.len(), 3);
+        assert_eq!(folder(&l, "LONGNAME.JPG"), None);
+        assert_eq!(folder(&l, "X.JPG").as_deref(), Some("DCIM/A"));
+        assert!(l.truncated);
+        assert!(!list(&b, &Limits::DEFAULT).truncated);
+    }
+
+    #[test]
+    fn a_volume_too_large_to_walk_is_reported_and_truncates() {
+        let mut b = card();
+        b.add("DCIM/A.JPG", &[1; 512]);
+        let mut v = b.build();
+        // TotSec32 such that the cluster count passes 2^28 (the boot sector does not need the volume to fit the source).
+        let total: u32 = 0x1100_0000;
+        v[32..36].copy_from_slice(&total.to_le_bytes());
+        let len = v.len() + (8 << 20);
+        let src = Mem(disk(Partitioning::Mbr { first_lba: 8192 }, &v, len));
+        let l = read_with(&src, &CancelToken::default(), &Limits::DEFAULT);
+        assert_eq!(l.volumes.len(), 1);
+        assert!(l.volumes[0].cluster_count > MAX_WALKED_CLUSTERS);
+        assert!(l.files.is_empty() && l.live.is_empty());
+        assert!(l.truncated);
     }
 
     fn entry(name: &[u8; 11], case: u8) -> [u8; 32] {

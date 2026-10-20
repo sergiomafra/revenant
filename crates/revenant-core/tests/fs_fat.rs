@@ -4,7 +4,9 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use revenant_core::EngineError;
-use revenant_core::filesystem::{FsFile, FsState, FsTime, Listing, Placement, read};
+use revenant_core::filesystem::{
+    FsFile, FsState, FsTime, Listing, MAX_PATH_BYTES, Placement, read,
+};
 use revenant_core::formats::{FileKind, Fragment};
 use revenant_core::scan::CancelToken;
 use revenant_core::source::{FileSource, Source, VolumeId};
@@ -41,13 +43,13 @@ fn listing(bytes: &[u8]) -> Listing {
 }
 
 fn file<'a>(l: &'a Listing, path: &str) -> &'a FsFile {
-    let found: Vec<_> = l.files.iter().filter(|f| f.origin.path == path).collect();
+    let found: Vec<_> = l.files.iter().filter(|f| f.origin.path() == path).collect();
     assert_eq!(found.len(), 1, "{path} in {:?}", paths(l));
     found[0]
 }
 
-fn paths(l: &Listing) -> Vec<&str> {
-    l.files.iter().map(|f| f.origin.path.as_str()).collect()
+fn paths(l: &Listing) -> Vec<String> {
+    l.files.iter().map(|f| f.origin.path()).collect()
 }
 
 /// Absolute pieces of `clusters` (file order) for the first `size` bytes, consecutive clusters joined.
@@ -182,7 +184,7 @@ fn lists_live_files_with_paths_names_and_times() {
 
     let a = file(&l, "DCIM/100MSDCF/DSC01234.ARW");
     assert_eq!(a.origin.name(), "DSC01234.ARW");
-    assert_eq!(a.origin.folder(), "DCIM/100MSDCF");
+    assert_eq!(a.origin.folder(), Some("DCIM/100MSDCF"));
     assert_eq!(a.origin.volume, 0);
     assert_eq!(a.origin.state, FsState::Live);
     assert_eq!(a.origin.placement, Placement::Chain);
@@ -218,7 +220,7 @@ fn lists_live_files_with_paths_names_and_times() {
     );
     let m = file(&l, "PRIVATE/M4ROOT/CLIP/C0001.MP4");
     assert_eq!((m.kind, m.origin.size), (FileKind::Mp4, video.len() as u64));
-    assert_eq!(m.origin.folder(), "PRIVATE/M4ROOT/CLIP");
+    assert_eq!(m.origin.folder(), Some("PRIVATE/M4ROOT/CLIP"));
     let n = file(&l, "DCIM/100MSDCF/Long name photo.jpg");
     assert_eq!(n.origin.name(), "Long name photo.jpg");
     assert_eq!(n.kind, FileKind::Jpeg);
@@ -290,7 +292,7 @@ fn fat12_and_fat16_roots_are_read() {
             "{fs:?}"
         );
         assert!(l.files.iter().all(|f| f.trusted), "{fs:?}");
-        assert_eq!(file(&l, "ROOT.JPG").origin.folder(), "");
+        assert_eq!(file(&l, "ROOT.JPG").origin.folder(), Some(""));
         // Ruling C10: the fixed root region is not in `live`; the directories in the heap are.
         let (root, root_len) = fixed_root(&v);
         assert!(!overlaps(&l.live, root, root_len), "{fs:?}");
@@ -376,11 +378,11 @@ fn hostile_directory_loop_and_chain_cycle_are_bounded() {
     assert!(
         !l.files
             .iter()
-            .any(|f| f.origin.path.contains("LOOP/") || f.origin.path.contains("SELF/")),
+            .any(|f| f.origin.path().contains("LOOP/") || f.origin.path().contains("SELF/")),
         "{:?}",
         paths(&l)
     );
-    let mut in_100: Vec<&str> = paths(&l)
+    let mut in_100: Vec<String> = paths(&l)
         .into_iter()
         .filter(|p| p.starts_with("DCIM/100/"))
         .collect();
@@ -409,8 +411,8 @@ fn hostile_directory_loop_and_chain_cycle_are_bounded() {
     // DCIM/BIG is parsed up to its 2 MiB cap only, and is not trusted.
     let big = b.clusters("DCIM/BIG");
     assert!(!overlaps(&l.live, VOL + b.cluster_offset(big[0]), 512));
-    assert!(paths(&l).contains(&"DCIM/BIG/EARLY.JPG"));
-    assert!(!paths(&l).contains(&"DCIM/BIG/LATE.JPG"));
+    assert!(paths(&l).iter().any(|p| p == "DCIM/BIG/EARLY.JPG"));
+    assert!(!paths(&l).iter().any(|p| p == "DCIM/BIG/LATE.JPG"));
 }
 
 /// A source whose reads fail when they touch any of `bad` (absolute byte ranges).
@@ -626,7 +628,7 @@ fn hostile_names_with_slash_and_nul_are_flattened() {
     let mut got: Vec<(&str, &str)> = l
         .files
         .iter()
-        .map(|f| (f.origin.folder(), f.origin.name()))
+        .map(|f| (f.origin.folder().unwrap(), f.origin.name()))
         .collect();
     got.sort();
     assert_eq!(
@@ -829,4 +831,57 @@ fn pieces_past_the_source_end_are_dropped() {
         }]
     );
     assert!(l.live.iter().all(|r| r.start + r.len <= bytes.len() as u64));
+}
+
+#[test]
+fn deep_hostile_paths_keep_the_name_and_drop_the_folder() {
+    // Ruling R6's probe: 32 nested directories named with 255 U+FFFD (765 UTF-8 bytes each).
+    let mut b = card();
+    let part = "\u{FFFD}".repeat(255);
+    let mut folder = String::new();
+    for depth in 1..=32 {
+        if !folder.is_empty() {
+            folder.push('/');
+        }
+        folder.push_str(&part);
+        if matches!(depth, 5 | 6 | 32) {
+            b.add(&format!("{folder}/A.JPG"), &bytes(512, depth as u8));
+            b.add(&format!("{folder}/B.JPG"), &bytes(512, depth as u8));
+        }
+    }
+    let l = listing(&placed(&b));
+    assert_eq!(
+        l.files.len(),
+        6,
+        "{:?}",
+        l.files.iter().map(|f| f.origin.name()).collect::<Vec<_>>()
+    );
+    assert!(l.truncated);
+    for f in &l.files {
+        assert!(matches!(f.origin.name(), "A.JPG" | "B.JPG"));
+        let path = f.origin.path();
+        assert!(path.len() <= MAX_PATH_BYTES, "{} bytes", path.len());
+    }
+    // Depth 5: 5 × 765 + 4 separators + "/A.JPG" = 3,835 bytes, kept; depth 6 and 32: past 4,096, folder dropped.
+    let kept: Vec<&FsFile> = l
+        .files
+        .iter()
+        .filter(|f| f.origin.folder().is_some())
+        .collect();
+    assert_eq!(kept.len(), 2);
+    let want = [part.as_str(); 5].join("/");
+    assert!(
+        kept.iter()
+            .all(|f| f.origin.folder() == Some(want.as_str()))
+    );
+    // The files of one folder share its string.
+    let (x, y) = (&kept[0].origin.folder, &kept[1].origin.folder);
+    assert!(std::sync::Arc::ptr_eq(
+        x.as_ref().unwrap(),
+        y.as_ref().unwrap()
+    ));
+    // A clean card is not truncated.
+    let mut b = card();
+    b.add("DCIM/A.JPG", &bytes(512, 1));
+    assert!(!listing(&placed(&b)).truncated);
 }

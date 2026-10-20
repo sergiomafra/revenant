@@ -2,6 +2,7 @@
 //! placement can be trusted.
 
 use std::fmt;
+use std::sync::Arc;
 
 use super::alloc::{Chain, Claims};
 use super::{FsKind, Limits, MAX_WALKED_CLUSTERS, Volume, fat, volumes};
@@ -69,8 +70,12 @@ impl fmt::Display for FsTime {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsOrigin {
     pub volume: u32,
-    /// Components joined by '/', root-relative, no leading '/'; "?" for a directory whose name is unknown.
-    pub path: String,
+    /// The folder holding the file: components joined by '/', root-relative, no leading '/', "" for the root; "?" for a
+    /// directory whose name is unknown. `None` when it was dropped: the path would pass [`super::MAX_PATH_BYTES`] or the
+    /// listing's path budget ran out ([`Listing::truncated`]). Files of one folder share the string.
+    pub folder: Option<Arc<str>>,
+    /// The file's name (one component, never holding '/').
+    pub name: String,
     pub state: FsState,
     pub placement: Placement,
     /// As recorded in the entry.
@@ -80,14 +85,22 @@ pub struct FsOrigin {
 }
 
 impl FsOrigin {
-    /// The last component of the path.
+    /// The file's name.
     pub fn name(&self) -> &str {
-        self.path.rsplit_once('/').map_or(&self.path, |(_, n)| n)
+        &self.name
     }
 
-    /// The path of the folder holding the file; "" for the root.
-    pub fn folder(&self) -> &str {
-        self.path.rsplit_once('/').map_or("", |(d, _)| d)
+    /// The folder holding the file ("" for the root), `None` when it was dropped.
+    pub fn folder(&self) -> Option<&str> {
+        self.folder.as_deref()
+    }
+
+    /// `folder/name` (the name alone in the root, or when the folder was dropped).
+    pub fn path(&self) -> String {
+        match self.folder() {
+            Some(f) if !f.is_empty() => format!("{f}/{}", self.name),
+            _ => self.name.clone(),
+        }
     }
 }
 
@@ -107,15 +120,20 @@ pub struct FsFile {
 pub struct Listing {
     pub volumes: Vec<Volume>,
     /// Photo/video files only (extension known to `FileKind::from_extension`), sorted by (first piece start, volume,
-    /// path).
+    /// folder, name).
     pub files: Vec<FsFile>,
-    /// Merged absolute ranges of every live file and live directory of any kind (D7 cap, `keep_moovs`, orphans, D18);
-    /// the fixed FAT12/16 root region is not in it.
+    /// Merged absolute ranges of every live file (any kind, trusted or not) and of every trusted live directory
+    /// (D7 cap, `keep_moovs`, orphans, D18). Not in it: the fixed FAT12/16 root region, a directory that is not trusted
+    /// (ruling R8), and a directory or file left out by the piece or photo cap.
     pub live: Vec<Fragment>,
     /// First piece of every live file that is not a photo/video (any other extension), sorted by start: the scan
     /// consumes the head there without a finding (Task 7). There is no pre-skip list: nothing is skipped before the
     /// search (R10).
     pub others: Vec<Fragment>,
+    /// A cap or budget dropped or degraded something (ruling R7): a file left out by the piece or photo cap, a folder
+    /// dropped by the path cap or budget, a volume's trust lost to the contested-set overflow, a directory or entries
+    /// not read because of the directory, depth, entry or directory-size caps, or a volume too large to walk.
+    pub truncated: bool,
 }
 
 /// Lists the files of every volume (cancel checked per directory). Never fails: a broken file system yields fewer
@@ -133,6 +151,9 @@ pub(crate) fn read_with(source: &dyn Source, cancel: &CancelToken, limits: &Limi
     let mut budget = Budget {
         files: limits.files,
         pieces: limits.pieces,
+        path_bytes: limits.path_bytes,
+        paths: limits.path_budget,
+        truncated: false,
     };
     let vols = out.volumes.clone();
     for v in &vols {
@@ -140,6 +161,7 @@ pub(crate) fn read_with(source: &dyn Source, cancel: &CancelToken, limits: &Limi
             break;
         }
         if v.cluster_count > MAX_WALKED_CLUSTERS {
+            budget.truncated = true;
             continue;
         }
         match v.fs {
@@ -149,39 +171,69 @@ pub(crate) fn read_with(source: &dyn Source, cancel: &CancelToken, limits: &Limi
             FsKind::Exfat => {}
         }
     }
+    out.truncated |= budget.truncated;
     out.files.sort_by(|a, b| {
-        (a.pieces[0].start, a.origin.volume, &a.origin.path).cmp(&(
-            b.pieces[0].start,
-            b.origin.volume,
-            &b.origin.path,
-        ))
+        let key = |f: &FsFile| (f.pieces[0].start, f.origin.volume, f.origin.folder.clone());
+        key(a)
+            .cmp(&key(b))
+            .then_with(|| a.origin.name.cmp(&b.origin.name))
     });
     out.others.sort_by_key(|f| (f.start, f.len));
     out.live = merged(std::mem::take(&mut out.live));
     out
 }
 
-/// What is left of the listing's caps, shared by every volume.
+/// What is left of the listing's caps, shared by every volume, and whether one of them dropped something.
 pub(super) struct Budget {
     files: usize,
     pieces: usize,
+    /// Longest path (folder + '/' + name) kept.
+    path_bytes: usize,
+    /// Bytes of folder strings still allowed.
+    paths: usize,
+    pub(super) truncated: bool,
 }
 
 impl Budget {
-    /// Takes `pieces` (and a photo/video slot when `photo`); false, taking nothing, when either would run out.
+    /// Takes `pieces` (and a photo/video slot when `photo`); false, taking nothing and marking the listing truncated,
+    /// when either would run out.
     fn take(&mut self, pieces: usize, photo: bool) -> bool {
         if pieces > self.pieces || (photo && self.files == 0) {
+            self.truncated = true;
             return false;
         }
         self.pieces -= pieces;
         self.files -= usize::from(photo);
         true
     }
+
+    /// The folder of child directory `name` of `parent`: `None` when the parent's was dropped (already marked), and
+    /// `None` marking the listing truncated when the path would pass the path cap or the path budget cannot pay for it.
+    pub(super) fn subfolder(&mut self, parent: Option<&Arc<str>>, name: &str) -> Option<Arc<str>> {
+        let parent = parent?;
+        let len = if parent.is_empty() {
+            name.len()
+        } else {
+            parent.len() + 1 + name.len()
+        };
+        if len > self.path_bytes || len > self.paths {
+            self.truncated = true;
+            return None;
+        }
+        self.paths -= len;
+        Some(if parent.is_empty() {
+            Arc::from(name)
+        } else {
+            Arc::from(format!("{parent}/{name}"))
+        })
+    }
 }
 
+/// A file waiting for the end of its volume's walk. Only a photo/video keeps its origin.
 struct Pending {
-    origin: FsOrigin,
+    origin: Option<FsOrigin>,
     kind: Option<FileKind>,
+    size: u64,
     runs: Vec<(u32, u32)>,
     /// The chain alone allows trust (complete, no conflict).
     chain_ok: bool,
@@ -211,18 +263,30 @@ impl<'a> Collector<'a> {
         }
     }
 
-    /// A live file and its chain; not listed when it has no cluster or the budget runs out.
-    pub(super) fn file(&mut self, budget: &mut Budget, origin: FsOrigin, chain: Chain) {
+    /// A live file and its chain; not listed when it has no cluster or the budget runs out. A photo/video whose path
+    /// would pass the path cap keeps its name and loses its folder.
+    pub(super) fn file(&mut self, budget: &mut Budget, mut origin: FsOrigin, chain: Chain) {
         if chain.runs.is_empty() {
             return;
         }
-        let kind = extension(origin.name()).and_then(FileKind::from_extension);
+        let kind = extension(&origin.name).and_then(FileKind::from_extension);
         if !budget.take(chain.runs.len(), kind.is_some()) {
             return;
         }
+        let size = origin.size;
+        let origin = kind.map(|_| {
+            if let Some(f) = &origin.folder
+                && f.len() + 1 + origin.name.len() > budget.path_bytes
+            {
+                origin.folder = None;
+                budget.truncated = true;
+            }
+            origin
+        });
         self.files.push(Pending {
             origin,
             kind,
+            size,
             chain_ok: chain.complete && !chain.conflict,
             runs: chain.runs,
         });
@@ -239,9 +303,12 @@ impl<'a> Collector<'a> {
         });
     }
 
-    /// Settles trust (no contested cluster, the contested set not overflowed: ruling C11) and adds everything to `out`.
-    /// A directory's ranges enter `live` only when it is trusted (ruling C10).
+    /// Settles trust (no contested cluster, the contested set not overflowed: ruling C11, which marks the listing
+    /// truncated) and adds everything to `out`. A directory's ranges enter `live` only when it is trusted (ruling R8).
     pub(super) fn finish(self, claims: &Claims, out: &mut Listing) {
+        if claims.overflowed() {
+            out.truncated = true;
+        }
         let trusted = |ok: bool, runs: &[(u32, u32)]| {
             ok && !claims.overflowed() && !claims.touches_contested(runs)
         };
@@ -251,19 +318,19 @@ impl<'a> Collector<'a> {
             }
         }
         for f in &self.files {
-            let pieces = self.pieces(&f.runs, f.origin.size);
+            let pieces = self.pieces(&f.runs, f.size);
             let Some(&first) = pieces.first() else {
                 continue;
             };
             out.live.extend_from_slice(&pieces);
-            match f.kind {
-                Some(kind) => out.files.push(FsFile {
+            match (f.kind, &f.origin) {
+                (Some(kind), Some(origin)) => out.files.push(FsFile {
                     trusted: trusted(f.chain_ok, &f.runs),
-                    origin: f.origin.clone(),
+                    origin: origin.clone(),
                     kind,
                     pieces,
                 }),
-                None => out.others.push(first),
+                _ => out.others.push(first),
             }
         }
     }
@@ -339,21 +406,59 @@ mod tests {
     }
 
     #[test]
-    fn name_and_folder() {
+    fn name_folder_and_path() {
         let mut o = FsOrigin {
             volume: 0,
-            path: "DCIM/100MSDCF/DSC01234.ARW".into(),
+            folder: Some(Arc::from("DCIM/100MSDCF")),
+            name: "DSC01234.ARW".into(),
             state: FsState::Live,
             placement: Placement::Chain,
             size: 1,
             created: None,
             modified: None,
         };
-        assert_eq!((o.name(), o.folder()), ("DSC01234.ARW", "DCIM/100MSDCF"));
-        o.path = "ROOT.JPG".into();
-        assert_eq!((o.name(), o.folder()), ("ROOT.JPG", ""));
+        assert_eq!(
+            (o.name(), o.folder()),
+            ("DSC01234.ARW", Some("DCIM/100MSDCF"))
+        );
+        assert_eq!(o.path(), "DCIM/100MSDCF/DSC01234.ARW");
+        o.folder = Some(Arc::from(""));
+        assert_eq!((o.folder(), o.path().as_str()), (Some(""), "DSC01234.ARW"));
+        o.folder = None;
+        assert_eq!((o.folder(), o.path().as_str()), (None, "DSC01234.ARW"));
         assert_eq!(FsState::Orphaned.as_str(), "orphaned");
         assert_eq!(Placement::Guessed.as_str(), "guessed");
+    }
+
+    #[test]
+    fn subfolders_respect_the_path_cap_and_budget() {
+        let budget = |path_bytes, paths| Budget {
+            files: 1,
+            pieces: 1,
+            path_bytes,
+            paths,
+            truncated: false,
+        };
+        let root: Arc<str> = Arc::from("");
+        // The cap alone (an ample budget): 4 + 1 + 4 = 9 bytes is past 8.
+        let mut b = budget(8, 1000);
+        let a = b.subfolder(Some(&root), "AAAA").unwrap();
+        assert_eq!(&*a, "AAAA");
+        assert!(!b.truncated);
+        assert_eq!(b.subfolder(Some(&a), "BBBB"), None);
+        assert!(b.truncated);
+        assert_eq!(b.subfolder(Some(&a), "BBB").as_deref(), Some("AAAA/BBB"));
+        // Under a dropped folder (already counted when it was dropped).
+        b.truncated = false;
+        assert_eq!(b.subfolder(None, "C"), None);
+        assert!(!b.truncated);
+        // The budget alone (an ample cap): 4 bytes paid, 2 left, "AAAA/BB" (7) does not fit.
+        let mut b = budget(1000, 6);
+        let a = b.subfolder(Some(&root), "AAAA").unwrap();
+        assert_eq!(b.subfolder(Some(&a), "BB"), None);
+        assert!(b.truncated);
+        assert_eq!(b.subfolder(Some(&root), "CC").as_deref(), Some("CC"));
+        assert_eq!(b.subfolder(Some(&root), "D"), None);
     }
 
     #[test]

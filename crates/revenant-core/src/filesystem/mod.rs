@@ -36,6 +36,12 @@ pub(crate) const MAX_DEPTH: u32 = 32;
 pub(crate) const MAX_FAT_DIR_BYTES: u64 = 2 << 20;
 /// Most contested clusters recorded per volume; past it the volume's live files are all untrusted (ruling C11).
 pub(crate) const MAX_CONTESTED: usize = 65_536;
+/// Longest path (folder + '/' + name, in UTF-8 bytes) a listed file keeps; past it the file keeps its name and loses its
+/// folder (ruling R6).
+pub const MAX_PATH_BYTES: usize = 4096;
+/// Bytes of folder strings one listing may hold (each folder is held once and shared by its files); past it, files are
+/// listed without a folder (ruling R6).
+pub(crate) const MAX_PATH_BUDGET: usize = 64 << 20;
 /// Volumes with more clusters are reported but not walked.
 pub(crate) const MAX_WALKED_CLUSTERS: u32 = 1 << 28;
 
@@ -50,6 +56,8 @@ pub(crate) struct Limits {
     pub depth: u32,
     pub fat_dir_bytes: u64,
     pub contested: usize,
+    pub path_bytes: usize,
+    pub path_budget: usize,
 }
 
 impl Limits {
@@ -61,6 +69,8 @@ impl Limits {
         depth: MAX_DEPTH,
         fat_dir_bytes: MAX_FAT_DIR_BYTES,
         contested: MAX_CONTESTED,
+        path_bytes: MAX_PATH_BYTES,
+        path_budget: MAX_PATH_BUDGET,
     };
 }
 
