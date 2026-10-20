@@ -625,6 +625,40 @@ mod tests {
     }
 
     #[test]
+    fn the_pair_cap_makes_a_pairing_partial() {
+        // Two pairs allowed: v1 and v2 against v2's moov (only v2 passes); v1 against v1's moov is never checked.
+        let limits = Limits {
+            max_pairs: 2,
+            ..LIMITS
+        };
+        assert_eq!(run(limits, 2).0, vec![(2, Health::Partial)]);
+    }
+
+    /// For video `id`, the result under the smallest break-point cap that still reaches its passing break point.
+    fn first_reached(id: u64) -> (u64, (u64, Health)) {
+        (1..=64)
+            .find_map(|max_breaks| {
+                let limits = Limits {
+                    max_breaks,
+                    ..LIMITS
+                };
+                let found = run(limits, 2).0.into_iter().find(|f| f.0 == id)?;
+                Some((max_breaks, found))
+            })
+            .expect("a cap reaches the passing break point")
+    }
+
+    #[test]
+    fn the_break_point_cap_makes_a_pairing_partial() {
+        // v2's passing break point is not its last candidate: the smallest cap that reaches it leaves boundaries
+        // untried, so the pairing cannot be shown unique.
+        assert_eq!(run(LIMITS, 2).0[1], (2, Health::Intact));
+        assert_eq!(first_reached(2).1, (2, Health::Partial));
+        // v1's is its last candidate: the smallest cap that reaches it tries them all.
+        assert_eq!(first_reached(1).1, (1, Health::Intact));
+    }
+
+    #[test]
     fn an_exhausted_sample_budget_makes_a_pairing_partial() {
         // Room for one moov's 120 samples: the second one is never listed, so v2's pairing cannot be shown unique.
         let limits = Limits {

@@ -468,6 +468,11 @@ fn pairing_events_do_not_depend_on_threads_or_cache() {
 /// The split layout plus `fakes` fake `moov` headers of `size` bytes, 512 bytes apart from 14 MiB on, congruent to the
 /// video's `P` modulo 512 (so the pre-filter loads them) or not. Returns the one `Updated`.
 fn split_with_fakes(fakes: usize, size: u32, congruent: bool) -> Finding {
+    split_with_fakes_every(fakes, size, congruent, 512)
+}
+
+/// [`split_with_fakes`] with the fakes `spacing` bytes apart.
+fn split_with_fakes_every(fakes: usize, size: u32, congruent: bool, spacing: usize) -> Finding {
     let v = video(1, true, 0);
     let l1 = cut(&v, 2);
     let mut img = split_image(&v, l1);
@@ -477,7 +482,7 @@ fn split_with_fakes(fakes: usize, size: u32, congruent: bool) -> Finding {
         (v.moov.start + 100) % 512
     };
     for i in 0..fakes {
-        img.put(14 * MIB + i * 512 + residue, &fake_moov(size));
+        img.put(14 * MIB + i * spacing + residue, &fake_moov(size));
     }
     let file = img.save();
     let (_, events) = run(&Src::new(&file));
@@ -485,6 +490,25 @@ fn split_with_fakes(fakes: usize, size: u32, congruent: bool) -> Finding {
     assert_eq!(u.len(), 1, "{events:?}");
     assert_eq!(extracted(&Src::new(&file), &u[0]), v.bytes);
     u[0].clone()
+}
+
+#[test]
+fn the_kept_candidate_cap_alone_makes_a_pairing_partial() {
+    // 4200 fakes 1024 bytes apart: at most 4096 in any 4 MiB block (no block overflows), but 4201 candidates in all.
+    assert_eq!(
+        split_with_fakes_every(4200, 4096, false, 1024).health,
+        Health::Partial
+    );
+}
+
+#[test]
+fn the_per_block_cap_alone_makes_a_pairing_partial() {
+    // 4096 fakes 512 bytes apart from 14 MiB fill [14, 16) MiB: with the real moov, block [12, 16) MiB holds 4097
+    // candidates, one over its cap, while the 4096 it keeps fit the per-scan cap.
+    assert_eq!(
+        split_with_fakes_every(4096, 4096, false, 512).health,
+        Health::Partial
+    );
 }
 
 #[test]
