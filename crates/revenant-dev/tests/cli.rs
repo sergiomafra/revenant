@@ -313,3 +313,49 @@ fn missing_previews_folder_fails_before_scanning() {
         .clone();
     assert!(out.stdout.is_empty());
 }
+
+#[test]
+fn bench_reports_each_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .args([
+            "bench",
+            "--size-mib",
+            "8",
+            "--runs",
+            "1",
+            "--images",
+            "noise,dense-jpeg",
+            "--dir",
+        ])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events = lines(&out);
+    assert_eq!(events.len(), 2);
+    for e in &events {
+        assert_eq!(e["event"], "bench");
+        assert_eq!(e["bytes"], 8 * 1024 * 1024);
+        assert_eq!(e["runs"], 1);
+        assert!(e["mb_per_s"].as_f64().unwrap() > 0.0);
+    }
+    assert_eq!(events[0]["image"], "noise");
+    assert_eq!(events[0]["placed"], 0);
+    assert_eq!(events[1]["image"], "dense-jpeg");
+    assert!(events[1]["placed"].as_u64().unwrap() >= 4);
+    assert_eq!(events[1]["found"], events[1]["placed"]);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn bench_rejects_an_unknown_image() {
+    Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .args(["bench", "--images", "bogus"])
+        .assert()
+        .code(2);
+}

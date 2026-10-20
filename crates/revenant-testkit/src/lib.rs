@@ -1026,3 +1026,142 @@ pub fn heic_with_tiff_offset(
     let meta = meta_with(payload_at, payload_at + image.len() as u32);
     [ftyp, meta, bmff_box(b"mdat", &[image, exif_item].concat())].concat()
 }
+
+/// Kinds of synthetic disk image streamed by [`write_bench_image`] for the scan benchmark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchImage {
+    /// Seeded noise only.
+    Noise,
+    /// Camera-like JPEGs back to back.
+    DenseJpeg,
+    /// TIFF-based RAW files (with a JPEG preview) back to back.
+    DenseRaw,
+    /// MP4 files with `moov` at the end.
+    Video,
+    /// Like `DenseJpeg`, but the second half of every file is replaced by noise.
+    CutJpeg,
+}
+
+impl BenchImage {
+    pub const ALL: [BenchImage; 5] = [
+        BenchImage::Noise,
+        BenchImage::DenseJpeg,
+        BenchImage::DenseRaw,
+        BenchImage::Video,
+        BenchImage::CutJpeg,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BenchImage::Noise => "noise",
+            BenchImage::DenseJpeg => "dense-jpeg",
+            BenchImage::DenseRaw => "dense-raw",
+            BenchImage::Video => "video",
+            BenchImage::CutJpeg => "cut-jpeg",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<BenchImage> {
+        BenchImage::ALL.into_iter().find(|k| k.name() == s)
+    }
+}
+
+/// Images of at least this size use the large file shapes.
+const BENCH_BIG: u64 = 512 * 1024 * 1024;
+
+fn write_noise(rng: &mut SplitMix64, mut n: u64, out: &mut dyn Write) -> std::io::Result<()> {
+    let mut buf = vec![0u8; 1 << 20];
+    while n > 0 {
+        let k = n.min(buf.len() as u64) as usize;
+        rng.fill(&mut buf[..k]);
+        out.write_all(&buf[..k])?;
+        n -= k as u64;
+    }
+    Ok(())
+}
+
+/// Streams a synthetic disk image of exactly `len` bytes into `out`; returns how many files it placed. Files go back to
+/// back, each at the next 512-byte boundary, the rest is seeded noise. Big images (`len >= 512 MiB`) use larger files:
+/// `DenseJpeg`/`CutJpeg` cycle 8 distinct JPEGs (3000×2000, else 320×240); `DenseRaw` cycles 4 RAWs (Arw, Nef, Cr2, Dng;
+/// 24 MiB / 1 MiB of raw data, preview 1616×1080 / 160×120); `Video` writes MP4s with `mdat` of 256 MiB / 8 MiB.
+pub fn write_bench_image(kind: BenchImage, len: u64, out: &mut dyn Write) -> std::io::Result<u64> {
+    let big = len >= BENCH_BIG;
+    let files: Vec<Vec<u8>> = match kind {
+        BenchImage::Noise => Vec::new(),
+        BenchImage::DenseJpeg | BenchImage::CutJpeg => {
+            let (w, h) = if big { (3000, 2000) } else { (320, 240) };
+            (0..8).map(|s| jpeg(w, h, 100 + s, 30_000)).collect()
+        }
+        BenchImage::DenseRaw => [
+            TiffVariant::Arw,
+            TiffVariant::Nef,
+            TiffVariant::Cr2,
+            TiffVariant::Dng,
+        ]
+        .into_iter()
+        .zip(200u64..)
+        .map(|(variant, seed)| {
+            tiff_raw(&TiffRawOptions {
+                variant,
+                big_endian: false,
+                raw_len: if big { 24 << 20 } else { 1 << 20 },
+                seed,
+                preview: Some(if big { (1616, 1080) } else { (160, 120) }),
+                preview_sector_aligned: false,
+                exif: TestExif::default(),
+            })
+            .bytes
+        })
+        .collect(),
+        BenchImage::Video => vec![mp4(&Mp4Options {
+            mdat_len: if big { 256 << 20 } else { 8 << 20 },
+            moov_at_end: true,
+            mov: false,
+            mdat_64bit: false,
+        })],
+    };
+    let mut rng = SplitMix64(0xBE7C_0001);
+    let mut pos = 0u64;
+    let mut placed = 0u64;
+    let mut cycle = 0usize;
+    while !files.is_empty() {
+        let file = &files[cycle % files.len()];
+        if pos + file.len() as u64 > len {
+            break;
+        }
+        if kind == BenchImage::CutJpeg {
+            let keep = file.len() / 2;
+            out.write_all(&file[..keep])?;
+            write_noise(&mut rng, (file.len() - keep) as u64, out)?;
+        } else {
+            out.write_all(file)?;
+        }
+        pos += file.len() as u64;
+        placed += 1;
+        cycle += 1;
+        let next = pos.next_multiple_of(512);
+        if next - pos > 0 {
+            write_noise(&mut rng, (next - pos).min(len - pos), out)?;
+            pos = next.min(len);
+        }
+    }
+    write_noise(&mut rng, len - pos, out)?;
+    Ok(placed)
+}
+
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+
+    #[test]
+    fn bench_images_have_exact_length_and_are_named() {
+        for kind in BenchImage::ALL {
+            let mut v = Vec::new();
+            let placed = write_bench_image(kind, 16 << 20, &mut v).unwrap();
+            assert_eq!(v.len(), 16 << 20, "{}", kind.name());
+            assert_eq!(placed == 0, kind == BenchImage::Noise, "{}", kind.name());
+            assert_eq!(BenchImage::parse(kind.name()), Some(kind));
+        }
+        assert_eq!(BenchImage::parse("nope"), None);
+    }
+}

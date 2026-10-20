@@ -54,6 +54,28 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   (`read_failed`, `write_failed`) if writing that preview failed; the scan continues.
 - Fatal errors print `error: <code>` to stderr and exit with 1 (for example `open_failed`, `destination_on_source`).
 
+## Benchmark
+
+```sh
+cargo run --release -p revenant-dev -- bench [--size-mib N=1024] [--runs N=3] [--images a,b,..=all] [--dir DIR=temp]
+```
+
+Writes each synthetic image into a fresh temp dir under `--dir`, scans it `--runs` times and prints one JSON line per image
+(`image`, `bytes`, `placed` = files put in the image, `found` = findings of the best run, `runs`, `best_seconds`,
+`mb_per_s` with MB = 10^6 bytes). The temp files are removed at the end. Always measure with a release build.
+
+Images (files go back to back, each at the next 512-byte boundary, the rest is seeded noise):
+
+- `noise`: no files; the cost of reading and scanning bytes that match nothing.
+- `dense-jpeg`: 8 distinct camera-like JPEGs cycled (3000x2000 from 512 MiB up, else 320x240).
+- `dense-raw`: 4 TIFF-based RAWs (ARW, NEF, CR2, DNG) with a JPEG preview, cycled.
+- `video`: MP4 files with `moov` at the end (256 MiB `mdat` from 512 MiB up, else 8 MiB).
+- `cut-jpeg`: like `dense-jpeg` but the second half of every file is noise. It has no speed target (each cut JPEG starts
+  a gap search that may re-read its 64 MiB window); it is only measured and reported.
+
+The numbers are page-cache throughput (the first write leaves the image in the cache): an upper bound for a card reader,
+not a prediction of it.
+
 ## Making a card image (read-only)
 
 Work on an image of the card, not on the card itself. Imaging only reads from the card.

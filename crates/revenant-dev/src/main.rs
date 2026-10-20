@@ -5,6 +5,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod bench;
+
 use clap::{Parser, Subcommand};
 use revenant_core::formats::all_formats;
 use revenant_core::source::{FileSource, Source, VolumeId, volume_of};
@@ -12,6 +14,7 @@ use revenant_core::{
     CancelToken, EngineError, Event, Finding, Inspection, Preview, ScanOptions, extract, inspect,
     scan,
 };
+use revenant_testkit::BenchImage;
 use serde::Serialize;
 
 #[derive(Parser)]
@@ -41,6 +44,30 @@ enum Command {
         #[arg(long)]
         allow_same_volume: bool,
     },
+    /// Measure scan throughput on synthetic images written to a temp dir (page-cache speed, not a card reader's).
+    Bench {
+        /// Size of each image in MiB.
+        #[arg(long, value_name = "N", default_value_t = 1024)]
+        size_mib: u64,
+        /// Scans per image; the best run is reported.
+        #[arg(long, value_name = "N", default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
+        runs: u32,
+        /// Images to measure: noise, dense-jpeg, dense-raw, video, cut-jpeg.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_parser = parse_bench_image,
+            default_values = ["noise", "dense-jpeg", "dense-raw", "video", "cut-jpeg"]
+        )]
+        images: Vec<BenchImage>,
+        /// Folder for the temporary images (default: the system temp dir).
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
+    },
+}
+
+fn parse_bench_image(s: &str) -> Result<BenchImage, String> {
+    BenchImage::parse(s).ok_or_else(|| format!("unknown image '{s}'"))
 }
 
 #[derive(Serialize)]
@@ -297,6 +324,12 @@ fn run_scan(
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
+        Command::Bench {
+            size_mib,
+            runs,
+            images,
+            dir,
+        } => bench::run_bench(size_mib, runs, &images, dir.as_deref()),
         Command::Scan {
             image,
             extract,
