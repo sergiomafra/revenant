@@ -61,6 +61,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   creation and modification times and where their pieces are on the disk, even when a file is fragmented or a FAT
   sector is unreadable (the FAT's second copy is used). A damaged or forged volume (directory loops, chains that loop
   or cross each other) is read in bounded time, and the files it touches are marked as not trusted.
+- Deleted photos and videos on FAT12/16/32 volumes are listed with their folders and names, including the contents of
+  deleted folders: the lost first letter comes back from the long name, or from similar names nearby; where the file
+  probably lies is guessed from the clusters that are free today (never from clusters another file now uses); on FAT32
+  cards where Windows deleted the file, its real starting point is found by checking the few places it can be. Deleted
+  files are never trusted more than the evidence allows: a guess that had to step over other files is marked as not
+  trusted.
 
 ### Changed
 

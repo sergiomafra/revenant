@@ -7,12 +7,16 @@
 mod alloc;
 mod boot;
 mod fat;
+mod fat_deleted;
 mod listing;
 mod partitions;
 
+use crate::cache::CachedSource;
 use crate::source::Source;
 use partitions::Candidate;
 
+#[allow(unused_imports)] // `read_with` is the scan's entry point (Task 7).
+pub(crate) use listing::read_with;
 pub use listing::{FsFile, FsOrigin, FsState, FsTime, Listing, Placement, read};
 
 /// Most volumes reported for one source (the lowest offsets are kept).
@@ -44,6 +48,11 @@ pub const MAX_PATH_BYTES: usize = 4096;
 pub(crate) const MAX_PATH_BUDGET: usize = 64 << 20;
 /// Volumes with more clusters are reported but not walked.
 pub(crate) const MAX_WALKED_CLUSTERS: u32 = 1 << 28;
+/// Cluster examinations per volume shared by the deleted-file guesses (ruling C7); once spent, the volume's remaining
+/// deleted files are not listed.
+pub(crate) const MAX_GUESS_STEPS: u64 = 1 << 26;
+/// Head checks of 512 bytes through the [`Probe`] per listing (ruling D10/C2): 32 MiB read outside the cache at most.
+pub(crate) const MAX_PROBES: usize = 65_536;
 
 /// The bounds of one listing: [`Limits::DEFAULT`] holds the constants above; unit tests pass lowered copies (the
 /// `cfg(test)` twins), which integration tests cannot reach.
@@ -58,6 +67,8 @@ pub(crate) struct Limits {
     pub contested: usize,
     pub path_bytes: usize,
     pub path_budget: usize,
+    pub guess_steps: u64,
+    pub probes: usize,
 }
 
 impl Limits {
@@ -71,7 +82,53 @@ impl Limits {
         contested: MAX_CONTESTED,
         path_bytes: MAX_PATH_BYTES,
         path_budget: MAX_PATH_BUDGET,
+        guess_steps: MAX_GUESS_STEPS,
+        probes: MAX_PROBES,
     };
+}
+
+/// Reads the head of a cluster for the FAT32 high-word check (ruling D10): 512 bytes from the raw source, outside the
+/// scan's cache. `None` means "does not recognize": a read error, the end of the source, or (ruling C2) a range the
+/// cache already knows to hold an unreadable sector, which is then not read at all.
+pub(crate) trait Probe {
+    fn read512(&self, at: u64) -> Option<[u8; 512]>;
+}
+
+/// A [`Probe`] over a source, refusing what `known_bad`'s bad-sector map holds.
+pub(crate) struct SourceProbe<'a, 'c> {
+    source: &'a dyn Source,
+    known_bad: Option<&'a CachedSource<'c>>,
+}
+
+impl<'a, 'c> SourceProbe<'a, 'c> {
+    /// Reads `source` itself (what [`read`] uses).
+    pub(crate) fn new(source: &'a dyn Source) -> Self {
+        SourceProbe {
+            source,
+            known_bad: None,
+        }
+    }
+
+    /// Reads `raw`, the source under `cache`, never a range `cache` knows to be unreadable (the scan's probe, Task 7).
+    #[allow(dead_code)] // The scan builds it (Task 7); the unit tests do now.
+    pub(crate) fn beside(raw: &'a dyn Source, cache: &'a CachedSource<'c>) -> Self {
+        SourceProbe {
+            source: raw,
+            known_bad: Some(cache),
+        }
+    }
+}
+
+impl Probe for SourceProbe<'_, '_> {
+    fn read512(&self, at: u64) -> Option<[u8; 512]> {
+        let end = at.checked_add(512)?;
+        if let Some(cache) = self.known_bad
+            && !cache.bad_runs(at, end).is_empty()
+        {
+            return None;
+        }
+        read_exact(self.source, at, 512)?.try_into().ok()
+    }
 }
 
 /// Where a volume is looked for, in 512-byte sectors, when no table gave one.

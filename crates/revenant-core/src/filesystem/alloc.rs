@@ -1,7 +1,9 @@
 //! Cluster chains and who holds which cluster: shared by the FAT walk (live and deleted files) and exFAT.
 //!
 //! A live chain claims every cluster it passes; a chain that reaches a cluster another chain already holds stops there
-//! (a cross-link) and the cluster becomes contested, so every holder of it can be marked untrusted afterwards.
+//! (a cross-link) and the cluster becomes contested, so every holder of it can be marked untrusted afterwards. A deleted
+//! file has no chain left: where its clusters were is guessed ([`guess`], ruling D4) from the allocation alone, and it
+//! claims nothing.
 
 use std::collections::BTreeSet;
 
@@ -24,8 +26,20 @@ pub(crate) enum Entry {
 pub(crate) trait ClusterMap {
     fn entry(&mut self, c: u32) -> Entry;
     /// Whether cluster `c` is in use; `None` when that cannot be read.
-    #[allow(dead_code)] // Used by the deleted-file walk (Task 5) and exFAT (Task 6).
     fn allocated(&mut self, c: u32) -> Option<bool>;
+
+    /// How many clusters in a row from `from` (up to `to`, inclusive, at most the last cluster of the heap) are free
+    /// (`free`), or not free (`!free`: allocated or unreadable). A map may answer faster than one
+    /// [`ClusterMap::allocated`] call per cluster.
+    fn count(&mut self, from: u32, to: u32, free: bool) -> u64 {
+        let mut n = 0;
+        let mut c = from as u64;
+        while c <= to as u64 && (self.allocated(c as u32) == Some(false)) == free {
+            n += 1;
+            c += 1;
+        }
+        n
+    }
 }
 
 /// The clusters live chains hold (a bitmap over the heap) and the contested ones (claimed twice, at most `cap`).
@@ -153,6 +167,171 @@ pub(crate) fn follow(
     chain
 }
 
+/// Per-volume budget of cluster examinations ([`super::MAX_GUESS_STEPS`]), shared by [`guess`], the old exFAT chain
+/// and the bitmap check; once exhausted the caller lists no more deleted files of that volume (walk order, ruling C7).
+pub(crate) struct Budget {
+    left: u64,
+    exhausted: bool,
+}
+
+impl Budget {
+    pub(crate) fn new(steps: u64) -> Budget {
+        Budget {
+            left: steps,
+            exhausted: false,
+        }
+    }
+
+    /// Takes `n` steps; false, and exhausted from then on, when fewer are left.
+    pub(crate) fn spend(&mut self, n: u64) -> bool {
+        if self.exhausted || n > self.left {
+            self.exhausted = true;
+            return false;
+        }
+        self.left -= n;
+        true
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    fn left(&self) -> u64 {
+        if self.exhausted { 0 } else { self.left }
+    }
+}
+
+/// Where a deleted file's clusters probably are (ruling D4): runs `(first cluster, count)` in file order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Guess {
+    pub runs: Vec<(u32, u32)>,
+    /// Allocated clusters were stepped over (the file is then fragmented, so untrusted).
+    pub skipped: bool,
+    /// Fewer clusters than the size needs were found.
+    pub short: bool,
+}
+
+/// The clusters of a deleted file, a run at a time, as ruling D4 places them: free clusters from the first one up,
+/// stepping over allocated (or unreadable) ones, until `last` or `2 × need + 1024` clusters were examined. Each
+/// examined cluster spends one step of the budget, exactly as if they were looked at one by one.
+pub(crate) struct Cursor {
+    next: u64,
+    last: u32,
+    examined: u64,
+    bound: u64,
+    found: bool,
+    skipped: bool,
+}
+
+impl Cursor {
+    /// `None` when `first` is outside `2 ..= last` or not free today (the file was overwritten).
+    pub(crate) fn new(
+        map: &mut dyn ClusterMap,
+        first: u32,
+        need: u64,
+        last: u32,
+    ) -> Option<Cursor> {
+        if first < 2 || first > last || map.allocated(first) != Some(false) {
+            return None;
+        }
+        Some(Cursor {
+            next: first as u64,
+            last,
+            examined: 0,
+            bound: need.saturating_mul(2).saturating_add(1024),
+            found: false,
+            skipped: false,
+        })
+    }
+
+    /// The next run of free clusters `(first, count)`, at most `max` long (`max ≥ 1`); `Ok(None)` at the end (past
+    /// `last`, or the examination bound reached); `Err(())` when the budget ran out first.
+    pub(crate) fn run(
+        &mut self,
+        map: &mut dyn ClusterMap,
+        budget: &mut Budget,
+        max: u64,
+    ) -> Result<Option<(u32, u32)>, ()> {
+        loop {
+            if self.next > self.last as u64 || self.examined >= self.bound {
+                return Ok(None);
+            }
+            // Clusters that may still be examined, and those the budget pays for.
+            let room = (self.last as u64 - self.next + 1).min(self.bound - self.examined);
+            let paid = room.min(budget.left());
+            if paid == 0 {
+                budget.spend(1);
+                return Err(());
+            }
+            let at = self.next as u32;
+            let end = (self.next + paid - 1) as u32;
+            let busy = map.count(at, end, false);
+            self.take(budget, busy);
+            if busy > 0 && self.found {
+                self.skipped = true;
+            }
+            if busy == paid {
+                continue;
+            }
+            let len = map.count(self.next as u32, end, true).min(max);
+            if len == 0 {
+                // The map disagrees with itself: count the cluster as not free.
+                self.take(budget, 1);
+                self.skipped |= self.found;
+                continue;
+            }
+            let first = self.next as u32;
+            self.take(budget, len);
+            self.found = true;
+            return Ok(Some((first, len as u32)));
+        }
+    }
+
+    fn take(&mut self, budget: &mut Budget, n: u64) {
+        self.examined += n;
+        self.next += n;
+        budget.spend(n);
+    }
+
+    /// Allocated clusters were stepped over after the first one.
+    pub(crate) fn skipped(&self) -> bool {
+        self.skipped
+    }
+}
+
+/// Ruling D4: `need` clusters for a deleted file starting at `first`, in at most [`MAX_RUNS`] runs (past that the guess
+/// is short). `None` when `first` is outside `2 ..= last` or allocated (overwritten), or the budget runs out.
+pub(crate) fn guess(
+    map: &mut dyn ClusterMap,
+    budget: &mut Budget,
+    first: u32,
+    need: u64,
+    last: u32,
+) -> Option<Guess> {
+    let mut cursor = Cursor::new(map, first, need, last)?;
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    let mut taken = 0u64;
+    while taken < need {
+        // A run past the cap is examined only as far as its first cluster, as the rule reads cluster by cluster.
+        let full = runs.len() == MAX_RUNS;
+        let max = if full { 1 } else { need - taken };
+        let Some((c, n)) = cursor.run(map, budget, max).ok()? else {
+            break;
+        };
+        match runs.last_mut() {
+            Some((start, len)) if *start + *len == c => *len += n,
+            _ if full => break,
+            _ => runs.push((c, n)),
+        }
+        taken += n as u64;
+    }
+    Some(Guess {
+        runs,
+        skipped: cursor.skipped(),
+        short: taken < need,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +422,83 @@ mod tests {
         assert!(follow(&mut map, &mut claims, 102, 1).runs.is_empty());
         assert_eq!(map.allocated(5), Some(true));
         assert_eq!(map.allocated(7), Some(false));
+    }
+
+    /// Counts `allocated` calls.
+    struct Counted(Map, u64);
+
+    impl ClusterMap for Counted {
+        fn entry(&mut self, c: u32) -> Entry {
+            self.0.entry(c)
+        }
+
+        fn allocated(&mut self, c: u32) -> Option<bool> {
+            self.1 += 1;
+            self.0.allocated(c)
+        }
+    }
+
+    fn used(clusters: impl IntoIterator<Item = u32>) -> Map {
+        Map(clusters.into_iter().map(|c| (c, Entry::End)).collect())
+    }
+
+    #[test]
+    fn guess_follows_the_rules() {
+        let steps = || Budget::new(1 << 26);
+        // A free map: one run, exactly the clusters needed.
+        let g = guess(&mut used([]), &mut steps(), 10, 5, 100).unwrap();
+        assert_eq!(
+            g,
+            Guess {
+                runs: vec![(10, 5)],
+                skipped: false,
+                short: false
+            }
+        );
+        // One allocated cluster in the middle is stepped over.
+        let g = guess(&mut used([12]), &mut steps(), 10, 5, 100).unwrap();
+        assert_eq!(g.runs, vec![(10, 2), (13, 3)]);
+        assert!(g.skipped && !g.short);
+        // Allocated clusters before the end do not count as skipped once enough clusters were taken.
+        let g = guess(&mut used([15]), &mut steps(), 10, 5, 100).unwrap();
+        assert!(!g.skipped);
+        // The first cluster allocated (overwritten), unreadable or outside the heap: nothing.
+        assert_eq!(guess(&mut used([10]), &mut steps(), 10, 5, 100), None);
+        for first in [0, 1, 101] {
+            assert_eq!(
+                guess(&mut used([]), &mut steps(), first, 5, 100),
+                None,
+                "{first}"
+            );
+        }
+        // The heap ends first: short.
+        let g = guess(&mut used([]), &mut steps(), 98, 5, 100).unwrap();
+        assert_eq!(g.runs, vec![(98, 3)]);
+        assert!(g.short);
+        // Everything allocated after the first cluster: at most 2 × need + 1024 clusters are examined (one step
+        // each), then short.
+        let mut map = Counted(used(11..200_000), 0);
+        let mut budget = steps();
+        let g = guess(&mut map, &mut budget, 10, 3, 199_999).unwrap();
+        assert_eq!(g.runs, vec![(10, 1)]);
+        assert!(g.short && g.skipped);
+        assert_eq!(budget.left(), (1 << 26) - 1030);
+        assert!(map.1 <= 2 * 1031, "{}", map.1);
+        // The budget: each examination is one step, shared across calls, and once spent nothing more is guessed.
+        let mut budget = Budget::new(7);
+        assert!(guess(&mut used([]), &mut budget, 10, 5, 100).is_some());
+        assert!(!budget.exhausted());
+        assert_eq!(guess(&mut used([]), &mut budget, 20, 5, 100), None);
+        assert!(budget.exhausted());
+        assert_eq!(guess(&mut used([]), &mut budget, 30, 1, 100), None);
+        let mut exact = Budget::new(5);
+        assert!(guess(&mut used([]), &mut exact, 10, 5, 100).is_some());
+        // At most 4096 runs: every other cluster allocated.
+        let mut map = used((0..10_000u32).map(|i| 11 + 2 * i));
+        let g = guess(&mut map, &mut steps(), 10, 5000, 30_000).unwrap();
+        assert_eq!(g.runs.len(), MAX_RUNS);
+        assert!(g.runs.iter().all(|&(_, n)| n == 1));
+        assert!(g.short && g.skipped);
     }
 
     #[test]

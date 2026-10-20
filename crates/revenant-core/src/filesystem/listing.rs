@@ -4,8 +4,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use super::alloc::{Chain, Claims};
-use super::{FsKind, Limits, MAX_WALKED_CLUSTERS, Volume, fat, volumes};
+use super::alloc::{Chain, Claims, Guess};
+use super::fat_deleted::Probes;
+use super::{FsKind, Limits, MAX_WALKED_CLUSTERS, Probe, SourceProbe, Volume, fat, volumes};
 use crate::formats::{FileKind, Fragment};
 use crate::scan::CancelToken;
 use crate::source::Source;
@@ -112,7 +113,8 @@ pub struct FsFile {
     /// Absolute pieces in file order, sum = min(size, what the clusters hold and the source holds). The whole
     /// listing holds at most [`super::MAX_PIECES`] (1 << 20) pieces: a file that would pass it is not listed.
     pub pieces: Vec<Fragment>,
-    /// Ruling D3: the placement is trusted (a live file: a complete chain, no cycle nor cross-link).
+    /// Ruling D3: the placement is trusted (a live file: a complete chain, no cycle nor cross-link; a deleted file: one
+    /// run of clusters free today, as many as its size needs).
     pub trusted: bool,
 }
 
@@ -132,18 +134,32 @@ pub struct Listing {
     pub others: Vec<Fragment>,
     /// A cap or budget dropped or degraded something (ruling R7): a file left out by the piece or photo cap, a folder
     /// dropped by the path cap or budget, a volume's trust lost to the contested-set overflow, a directory or entries
-    /// not read because of the directory, depth, entry or directory-size caps, or a volume too large to walk.
+    /// not read because of the directory, depth, entry or directory-size caps, a volume too large to walk, deleted
+    /// files not listed because a volume's guess budget or the listing's high-word probes ran out, or deleted folders
+    /// not walked because too many were waiting.
     pub truncated: bool,
 }
 
-/// Lists the files of every volume (cancel checked per directory). Never fails: a broken file system yields fewer
-/// files. Reads only file-system metadata (boot sectors, FATs, directories), each once but for the FAT sectors a small
-/// cache drops.
+/// Lists the files of every volume (cancel checked per directory), live and deleted. Never fails: a broken file system
+/// yields fewer files. Reads file-system metadata (boot sectors, FATs, directories), each once but for the FAT sectors
+/// a small cache drops, plus at most 65,536 heads of 512 bytes for the FAT32 high-word check (ruling D10).
 pub fn read(source: &dyn Source, cancel: &CancelToken) -> Listing {
-    read_with(source, cancel, &Limits::DEFAULT)
+    read_with(source, &SourceProbe::new(source), cancel)
 }
 
-pub(crate) fn read_with(source: &dyn Source, cancel: &CancelToken, limits: &Limits) -> Listing {
+/// [`read`] with metadata read through `meta` (the scan's cache) and the high-word heads through `probe` (the raw
+/// source, ruling C2).
+pub(crate) fn read_with(meta: &dyn Source, probe: &dyn Probe, cancel: &CancelToken) -> Listing {
+    read_limited(meta, probe, cancel, &Limits::DEFAULT)
+}
+
+pub(crate) fn read_limited(
+    source: &dyn Source,
+    probe: &dyn Probe,
+    cancel: &CancelToken,
+    limits: &Limits,
+) -> Listing {
+    let mut probes = Probes::new(probe, limits.probes);
     let mut out = Listing {
         volumes: volumes(source),
         ..Listing::default()
@@ -165,13 +181,19 @@ pub(crate) fn read_with(source: &dyn Source, cancel: &CancelToken, limits: &Limi
             continue;
         }
         match v.fs {
-            FsKind::Fat12 | FsKind::Fat16 | FsKind::Fat32 => {
-                fat::walk(source, v, cancel, limits, &mut budget, &mut out)
-            }
+            FsKind::Fat12 | FsKind::Fat16 | FsKind::Fat32 => fat::walk(
+                source,
+                v,
+                cancel,
+                limits,
+                &mut budget,
+                &mut probes,
+                &mut out,
+            ),
             FsKind::Exfat => {}
         }
     }
-    out.truncated |= budget.truncated;
+    out.truncated |= budget.truncated || probes.ran_out();
     out.files.sort_by(|a, b| {
         let key = |f: &FsFile| (f.pieces[0].start, f.origin.volume, f.origin.folder.clone());
         key(a)
@@ -236,8 +258,10 @@ struct Pending {
     kind: Option<FileKind>,
     size: u64,
     runs: Vec<(u32, u32)>,
-    /// The chain alone allows trust (complete, no conflict).
+    /// The chain (or the guess) alone allows trust: complete, no conflict (deleted: one run, not short).
     chain_ok: bool,
+    /// A live file: its ranges go to `live` (a deleted one's never do).
+    live: bool,
 }
 
 struct PendingDir {
@@ -290,7 +314,43 @@ impl<'a> Collector<'a> {
             size,
             chain_ok: chain.complete && !chain.conflict,
             runs: chain.runs,
+            live: true,
         });
+    }
+
+    /// A deleted photo/video of `kind` and its guessed clusters (ruling D4); never in `live`, never claiming. Returns
+    /// its index for [`Collector::name_mut`], or `None` when it has no cluster or the budget runs out. As for a live
+    /// file, a path past the path cap drops the folder.
+    pub(super) fn deleted(
+        &mut self,
+        budget: &mut Budget,
+        mut origin: FsOrigin,
+        kind: FileKind,
+        guess: Guess,
+    ) -> Option<usize> {
+        if guess.runs.is_empty() || !budget.take(guess.runs.len(), true) {
+            return None;
+        }
+        if let Some(f) = &origin.folder
+            && f.len() + 1 + origin.name.len() > budget.path_bytes
+        {
+            origin.folder = None;
+            budget.truncated = true;
+        }
+        self.files.push(Pending {
+            size: origin.size,
+            origin: Some(Box::new(origin)),
+            kind: Some(kind),
+            chain_ok: guess.runs.len() == 1 && !guess.short,
+            runs: guess.runs,
+            live: false,
+        });
+        Some(self.files.len() - 1)
+    }
+
+    /// The name of pending file `i` (a deleted one whose first letter is settled later, ruling D9).
+    pub(super) fn name_mut(&mut self, i: usize) -> Option<&mut String> {
+        self.files.get_mut(i)?.origin.as_mut().map(|o| &mut o.name)
     }
 
     /// A live directory's chain (its ranges are kept when the budget allows and it turns out trusted).
@@ -331,7 +391,9 @@ impl<'a> Collector<'a> {
             let Some(&first) = pieces.first() else {
                 continue;
             };
-            out.live.extend_from_slice(&pieces);
+            if f.live {
+                out.live.extend_from_slice(&pieces);
+            }
             match (f.kind, f.origin) {
                 (Some(kind), Some(origin)) => out.files.push(FsFile {
                     trusted: trusted(f.chain_ok, &f.runs),
@@ -339,7 +401,8 @@ impl<'a> Collector<'a> {
                     kind,
                     pieces,
                 }),
-                _ => out.others.push(first),
+                _ if f.live => out.others.push(first),
+                _ => {}
             }
         }
     }
@@ -370,7 +433,7 @@ fn pieces(volume: &Volume, source_len: u64, runs: &[(u32, u32)], size: u64) -> V
 }
 
 /// The text after the last '.' of a name, if any.
-fn extension(name: &str) -> Option<&str> {
+pub(super) fn extension(name: &str) -> Option<&str> {
     name.rsplit_once('.').map(|(_, e)| e)
 }
 

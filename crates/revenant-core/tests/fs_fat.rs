@@ -1,4 +1,5 @@
-//! The live tree of FAT12/16/32 volumes: names, folders, times, cluster chains, the FAT mirror and hostile volumes.
+//! The tree of FAT12/16/32 volumes: names, folders, times, cluster chains, the FAT mirror, deleted files and folders,
+//! and hostile volumes.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -10,7 +11,7 @@ use revenant_core::filesystem::{
 use revenant_core::formats::{FileKind, Fragment};
 use revenant_core::scan::CancelToken;
 use revenant_core::source::{FileSource, Source, VolumeId};
-use revenant_testkit::fs::{FsBuilder, FsStamp, FsType, Partitioning, disk};
+use revenant_testkit::fs::{DeleteStyle, FsBuilder, FsStamp, FsType, Partitioning, disk};
 use revenant_testkit::{Mp4Options, TestExif, TiffRawOptions, TiffVariant, jpeg, mp4, tiff_raw};
 
 const MIB: usize = 1 << 20;
@@ -884,4 +885,260 @@ fn deep_hostile_paths_keep_the_name_and_drop_the_folder() {
     let mut b = card();
     b.add("DCIM/A.JPG", &bytes(512, 1));
     assert!(!listing(&placed(&b)).truncated);
+}
+
+// ---- Deleted files and folders (Task 5) ----
+
+/// The volume of `b` with `patch` applied to its bytes, at LBA 8192 of a disk 8 MiB longer than the volume.
+fn placed_with(b: &FsBuilder, patch: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut v = b.build();
+    patch(&mut v);
+    let len = v.len() + 8 * MIB;
+    disk(Partitioning::Mbr { first_lba: 8192 }, &v, len)
+}
+
+fn deleted(l: &Listing) -> Vec<&FsFile> {
+    l.files
+        .iter()
+        .filter(|f| f.origin.state == FsState::Deleted)
+        .collect()
+}
+
+/// A JPEG of exactly `len` bytes (a few hundred at least).
+fn small_jpeg_of_len(len: usize, seed: u64) -> Vec<u8> {
+    let base = jpeg(8, 8, seed, 0).len();
+    let j = jpeg(8, 8, seed, len - base - 4);
+    assert_eq!(j.len(), len);
+    j
+}
+
+fn consecutive(clusters: &[u32]) -> bool {
+    clusters.windows(2).all(|w| w[1] == w[0] + 1)
+}
+
+#[test]
+fn deleted_file_is_listed_contiguous() {
+    let mut b = card();
+    let photos: Vec<Vec<u8>> = (1..=3).map(|seed| jpeg(640, 480, seed, 0)).collect();
+    for (i, p) in photos.iter().enumerate() {
+        b.add(&format!("DCIM/100MSDCF/DSC0123{}.JPG", 4 + i), p);
+    }
+    let clusters = b.clusters("DCIM/100MSDCF/DSC01235.JPG");
+    assert!(consecutive(&clusters));
+    b.delete("DCIM/100MSDCF/DSC01235.JPG", DeleteStyle::Camera);
+    let l = listing(&placed(&b));
+    let f = file(&l, "DCIM/100MSDCF/DSC01235.JPG");
+    assert_eq!(f.origin.state, FsState::Deleted);
+    assert_eq!(f.origin.placement, Placement::Guessed);
+    assert_eq!(f.origin.size, photos[1].len() as u64);
+    assert_eq!(f.kind, FileKind::Jpeg);
+    assert_eq!(
+        f.pieces,
+        vec![Fragment {
+            start: VOL + b.cluster_offset(clusters[0]),
+            len: photos[1].len() as u64
+        }]
+    );
+    assert!(f.trusted);
+    for live in ["DCIM/100MSDCF/DSC01234.JPG", "DCIM/100MSDCF/DSC01236.JPG"] {
+        assert_eq!(file(&l, live).origin.state, FsState::Live);
+    }
+    // A deleted file is not live: its clusters are not in `live`.
+    assert!(!overlaps(&l.live, VOL + b.cluster_offset(clusters[0]), 1));
+    assert!(!l.truncated);
+}
+
+#[test]
+fn first_character_comes_from_the_lfn_or_siblings() {
+    let mut b = card();
+    b.add("DCIM/100MSDCF/Long name photo.jpg", &jpeg(320, 240, 4, 0));
+    for i in 4..=6 {
+        b.add(
+            &format!("DCIM/100MSDCF/DSC0123{i}.JPG"),
+            &jpeg(160, 120, i, 0),
+        );
+    }
+    b.add("MISC/Q1234567.JPG", &jpeg(160, 120, 9, 0));
+    // A deleted long name whose first letter does not give its short name's checksum: the long name is not used.
+    let other = jpeg(160, 120, 10, 0);
+    let at = b.add("MISC/KEEP.TXT", &other);
+    let sfn = *b"ZEBRAP~1JPG";
+    let sum = sfn_checksum(&sfn);
+    let mut part = lfn_entry(1, true, sum, &lfn_units("Apple photo.jpg", 1));
+    part[0] = 0xE5;
+    let mut part2 = lfn_entry(2, true, sum, &lfn_units("Apple photo.jpg", 2));
+    part2[0] = 0xE5;
+    let mut short = short_entry(&sfn, 0x20, at[0], other.len() as u32);
+    short[0] = 0xE5;
+    b.delete("MISC/KEEP.TXT", DeleteStyle::Camera);
+    b.raw_entry("MISC", part2)
+        .raw_entry("MISC", part)
+        .raw_entry("MISC", short);
+    for p in [
+        "DCIM/100MSDCF/Long name photo.jpg",
+        "DCIM/100MSDCF/DSC01235.JPG",
+        "MISC/Q1234567.JPG",
+    ] {
+        b.delete(p, DeleteStyle::Camera);
+    }
+    let l = listing(&placed(&b));
+    for p in [
+        "DCIM/100MSDCF/Long name photo.jpg",
+        "DCIM/100MSDCF/DSC01235.JPG",
+        "MISC/_1234567.JPG",
+        "MISC/_EBRAP~1.JPG",
+    ] {
+        assert_eq!(file(&l, p).origin.state, FsState::Deleted, "{p}");
+    }
+    assert_eq!(deleted(&l).len(), 4, "{:?}", paths(&l));
+}
+
+#[test]
+fn deleted_file_never_takes_live_clusters() {
+    let mut b = card();
+    let c = 80_000;
+    let a = small_jpeg_of_len(5 * 512 - 100, 1);
+    b.add_at("DCIM/APHOTO01.JPG", &a, &[c, c + 1, c + 2, c + 3, c + 4]);
+    b.delete("DCIM/APHOTO01.JPG", DeleteStyle::Camera);
+    b.add_at("DCIM/LIVE0001.TXT", &bytes(512, 7), &[c + 2]);
+    // B's first cluster is then given to a live file: B was overwritten and is not listed.
+    let bp = jpeg(8, 8, 2, 0);
+    let n = (bp.len() as u32).div_ceil(512);
+    b.add_at(
+        "DCIM/BPHOTO02.JPG",
+        &bp,
+        &(81_000..81_000 + n).collect::<Vec<_>>(),
+    );
+    b.delete("DCIM/BPHOTO02.JPG", DeleteStyle::Camera);
+    b.add_at("DCIM/LIVE0002.TXT", &bytes(512, 8), &[81_000]);
+    let l = listing(&placed(&b));
+    let at = |c: u32| VOL + b.cluster_offset(c);
+    let f = file(&l, "DCIM/_PHOTO01.JPG");
+    assert_eq!(f.origin.placement, Placement::Guessed);
+    assert_eq!(
+        f.pieces,
+        vec![
+            Fragment {
+                start: at(c),
+                len: 1024
+            },
+            Fragment {
+                start: at(c + 3),
+                len: a.len() as u64 - 1024
+            },
+        ]
+    );
+    assert!(!f.trusted);
+    assert!(
+        f.pieces
+            .iter()
+            .all(|p| !(p.start <= at(c + 2) && at(c + 2) < p.start + p.len))
+    );
+    assert_eq!(deleted(&l).len(), 1, "{:?}", paths(&l));
+    assert!(!l.truncated);
+}
+
+#[test]
+fn windows_deleted_file_finds_its_high_word() {
+    let mut b = card();
+    b.add("DCIM/WIN00000.JPG", &jpeg(160, 120, 1, 0));
+    let first = jpeg(160, 120, 2, 0);
+    let second = jpeg(160, 120, 3, 0);
+    let n = |d: &[u8]| (d.len() as u32).div_ceil(512);
+    assert!(n(&first) < 100 && n(&second) < 100);
+    b.add_at(
+        "DCIM/WIN00001.JPG",
+        &first,
+        &(70_000..70_000 + n(&first)).collect::<Vec<_>>(),
+    );
+    b.add_at(
+        "DCIM/WIN00002.JPG",
+        &second,
+        &(70_100..70_100 + n(&second)).collect::<Vec<_>>(),
+    );
+    b.delete("DCIM/WIN00001.JPG", DeleteStyle::WindowsFat32);
+    b.delete("DCIM/WIN00002.JPG", DeleteStyle::WindowsFat32);
+    // Cluster 70,100 − 65,536 = 4,564 is free and holds a JPEG head (no entry points at it): both candidates of the
+    // second file are recognized.
+    let stray = jpeg(64, 64, 9, 0);
+    let stray_at = b.cluster_offset(4_564) as usize;
+    let bytes = placed_with(&b, |v| {
+        v[stray_at..stray_at + stray.len()].copy_from_slice(&stray)
+    });
+    let l = listing(&bytes);
+    let f = file(&l, "DCIM/WIN00001.JPG");
+    assert_eq!(f.origin.state, FsState::Deleted);
+    assert_eq!(
+        f.pieces,
+        vec![Fragment {
+            start: VOL + b.cluster_offset(70_000),
+            len: first.len() as u64
+        }]
+    );
+    assert!(f.trusted);
+    assert_eq!(deleted(&l).len(), 1, "{:?}", paths(&l));
+    // Without the stray head, the second one is found too.
+    let l = listing(&placed(&b));
+    let f = file(&l, "DCIM/WIN00002.JPG");
+    assert_eq!(f.pieces[0].start, VOL + b.cluster_offset(70_100));
+}
+
+#[test]
+fn hostile_deleted_entries_are_bounded() {
+    let mut b = card();
+    b.add("DCIM/OK.JPG", &jpeg(160, 120, 1, 0));
+    b.mkdir("DCIM/HOSTILE");
+    for i in 0..10_000u32 {
+        let mut name: [u8; 11] = format!("D{i:07}JPG").as_bytes().try_into().unwrap();
+        name[0] = 0xE5;
+        b.raw_entry("DCIM/HOSTILE", short_entry(&name, 0x20, 70_000, u32::MAX));
+    }
+    let bytes = placed(&b);
+    let t = Instant::now();
+    let l = listing(&bytes);
+    assert!(
+        t.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        t.elapsed()
+    );
+    assert_eq!(file(&l, "DCIM/OK.JPG").origin.state, FsState::Live);
+    let gone = deleted(&l);
+    assert!(!gone.is_empty() && gone.len() < 10_000, "{}", gone.len());
+    assert!(l.truncated, "the step budget ran out");
+    let end = bytes.len() as u64;
+    for f in gone {
+        assert!(!f.pieces.is_empty());
+        assert!(!f.trusted);
+        assert!(f.pieces.iter().all(|p| p.len > 0 && p.start + p.len <= end));
+        assert!(f.pieces.iter().map(|p| p.len).sum::<u64>() <= f.origin.size);
+        assert_eq!(f.pieces[0].start, VOL + b.cluster_offset(70_000));
+    }
+}
+
+#[test]
+fn deleted_directory_contents_are_listed() {
+    let mut b = card();
+    let one = jpeg(160, 120, 1, 0);
+    let two = jpeg(160, 120, 2, 0);
+    b.add("DCIM/100TEST/DSC00001.JPG", &one);
+    b.add("DCIM/100TEST/DSC00002.JPG", &two);
+    b.add("DCIM/101TEST/DSC00010.JPG", &jpeg(160, 120, 3, 0));
+    let c1 = b.clusters("DCIM/100TEST/DSC00001.JPG");
+    let c2 = b.clusters("DCIM/100TEST/DSC00002.JPG");
+    b.delete("DCIM/100TEST", DeleteStyle::Camera);
+    let l = listing(&placed(&b));
+    for (p, c, d) in [
+        ("DCIM/_00TEST/DSC00001.JPG", &c1, &one),
+        ("DCIM/_00TEST/DSC00002.JPG", &c2, &two),
+    ] {
+        let f = file(&l, p);
+        assert_eq!(f.origin.state, FsState::Deleted, "{p}");
+        assert_eq!(f.origin.placement, Placement::Guessed, "{p}");
+        assert_eq!(f.pieces, pieces_of(&b, c, d.len() as u64, 512), "{p}");
+    }
+    assert_eq!(
+        file(&l, "DCIM/101TEST/DSC00010.JPG").origin.state,
+        FsState::Live
+    );
+    assert_eq!(l.files.len(), 3, "{:?}", paths(&l));
 }

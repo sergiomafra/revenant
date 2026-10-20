@@ -528,33 +528,41 @@ No read is larger than 128 KiB, and none is allocated before it is known to lie 
 
 ## File systems: FAT
 
-`filesystem::read(source, cancel)` returns a `Listing` of the live files of every FAT12/16/32 volume `volumes` finds
-(exFAT volumes are listed in `volumes` but not walked yet; a volume of more than 2^28 clusters is not walked). It never
-fails: a broken volume yields fewer files. Cancellation is checked before each directory; a cancelled read returns what
-was listed so far. Written from fatgen103 (FAT entries, directory entries, long names).
+`filesystem::read(source, cancel)` returns a `Listing` of the live and deleted files of every FAT12/16/32 volume
+`volumes` finds (exFAT volumes are listed in `volumes` but not walked yet; a volume of more than 2^28 clusters is not
+walked). It never fails: a broken volume yields fewer files. Cancellation is checked before each directory; a cancelled
+read returns what was listed so far. Written from fatgen103 (FAT entries, directory entries, long names). The scan
+(Task 7) calls the crate-internal `read_with(meta, probe, cancel)`: metadata through its cache, the FAT32 high-word
+heads through a `Probe` over the raw source (see Deleted files); `read` uses the given source for both.
 
 - `Listing.files`: the photo/video files, those whose extension `FileKind::from_extension` knows (jpg jpeg jpe, mp4 m4v,
   mov, cr2, cr3, nef nrw, arw, dng, orf ori, rw2, raf, heic heif hif, tif tiff; any case). Each is an `FsFile`:
   - `origin`: `volume` (the volume's index), `folder` (components joined by `/`, from the root, no leading `/`, `""`
-    for the root; `None` when dropped, see Bounds; one string shared by the files of a folder), `name`, `state` `live`, `placement` `chain`, `size` as recorded, `created` and `modified` as `FsTime` (local time
+    for the root; `None` when dropped, see Bounds; one string shared by the files of a folder), `name`, `state` (`live`,
+    or `deleted`), `placement` (`chain` for a live file, `guessed` for a deleted one), `size` as recorded, `created` and `modified` as `FsTime` (local time
     `YYYY-MM-DDTHH:MM:SS`, no offset on FAT; `None` when a field is out of range: month, day for that month and year,
     hour, minute, seconds, or a creation 10 ms count above 199). The creation time adds its 10 ms count, floored to the
     second. `name()`, `folder()` (an `Option`) and `path()` (`folder/name`, or the name alone) read them.
   - `pieces`: absolute byte ranges in file order, consecutive clusters joined, holding the first `size` bytes; a piece
     past the end of the source is cut or dropped, and a file with no piece left is not listed.
-  - `trusted` (ruling D3): the chain is complete (exactly `ceil(size / cluster)` clusters, the last one end-of-chain),
-    with no cycle and no cluster another chain holds, in at most 4096 runs.
+  - `trusted` (ruling D3): a live file's chain is complete (exactly `ceil(size / cluster)` clusters, the last one
+    end-of-chain), with no cycle and no cluster another chain holds, in at most 4096 runs; a deleted file's guess is
+    one run of free clusters, as many as its size needs. Either way it says where the bytes probably are, never that
+    they are intact: health comes from the detectors (an untrusted file is at most partial, D3).
 
-  Sorted by (first piece start, volume, path).
+  Sorted by (first piece start, volume, path). Several entries, live or deleted, may share a first cluster: all are
+  listed (the scan picks one).
 - `Listing.others`: the first piece of every other live file (any other extension, or none), sorted by start. Such a
-  file keeps no name or path.
-- `Listing.live`: the merged ranges of every live file (its pieces) and every trusted live directory (its clusters).
+  file keeps no name or path. A deleted file of another kind is not listed anywhere.
+- `Listing.live`: the merged ranges of every live file (its pieces) and every trusted live directory (its clusters);
+  never a deleted file or directory.
   The fixed FAT12/16 root region is not in it, nor is a directory that is not trusted (ruling R8), nor a file or
   directory left out by the piece or photo cap.
 - `Listing.truncated` (ruling R7): a cap or budget dropped or degraded something: a file left out by the piece or photo
   cap, a folder dropped by the path cap or budget, a volume whose contested set overflowed, a directory not entered for
-  the directory or depth cap, entries not read for the entry cap or a directory chain running past 2 MiB, or a volume
-  too large to walk.
+  the directory or depth cap, entries not read for the entry cap or a directory chain running past 2 MiB, a volume
+  too large to walk, deleted files not listed because the volume's guess steps or the listing's high-word probes ran
+  out, or deleted folders not walked because 65,536 were already waiting.
 
 The walk:
 
@@ -563,8 +571,8 @@ The walk:
   `0x0000`, decoded lossily. Otherwise the 8.3 name: base and extension trimmed, joined by `.` when the extension is not
   empty, lower-cased as the NT bits of byte 12 say (`0x08` base, `0x10` extension), a first byte `0x05` read as `0xE5`,
   any byte outside printable ASCII read as `_`. In every component `/` and NUL become `_`, and an empty one is `_`, so
-  `name()`/`folder()` never split one wrongly. Deleted entries (`0xE5`), the volume label, `.` and `..` are skipped;
-  `0x00` ends a directory. An entry is a long-name part when its attribute byte masked with `0x3F` is `0x0F`
+  `name()`/`folder()` never split one wrongly. Deleted entries (`0xE5`) are read as described under Deleted files;
+  the volume label, `.` and `..` are skipped; `0x00` ends a directory. An entry is a long-name part when its attribute byte masked with `0x3F` is `0x0F`
   (fatgen103's mask).
 - **Chains.** The first cluster is `hi << 16 | lo` on FAT32, `lo` otherwise. FAT12 entries are packed 12 bits, FAT16 16,
   FAT32 the low 28 bits; end-of-chain is ≥ `0xFF8`/`0xFFF8`/`0x0FFFFFF8`, bad is `0xFF7`/`0xFFF7`/`0x0FFFFFF7`, and a
@@ -584,13 +592,54 @@ The walk:
   C10); one that is not trusted is still walked, as far as its chain goes. An unreadable cluster or sector of a
   directory is skipped.
 
+### Deleted files and folders
+
+A deleted entry (byte 0 `0xE5`) keeps its size, times and first cluster; its chain was freed. Only deleted
+photos/videos (by extension) of size > 0 are listed, with `state` `deleted` and `placement` `guessed`; they claim
+nothing and never enter `live` or `others`.
+
+- **First letter (ruling D9).** Byte 0 of the short name is lost. The deleted long-name parts right before the short
+  entry (attribute `0x0F`, byte 0 also `0xE5`, so their ordinals are lost too) that carry the nearest part's checksum
+  are taken nearest first, at most 20, and read up to the first `0x0000`; when their first character, upper-cased
+  (ASCII), as byte 0 makes the short name's checksum match theirs, that byte is restored and the long name is the
+  file's name. Otherwise byte 0 is the most common first byte among the short names with the same bytes 1, 2 and 3 —
+  live ones, or deleted ones already restored — first in the same directory, then in the whole volume (ties: the
+  lowest byte), formatted like the rest of the 8.3 name; otherwise it is `_`. The volume-wide count is taken once the
+  live tree is walked (so a later folder's names count), and the names still unknown are settled then, in walk order.
+- **Placement (ruling D4).** `need = ceil(size / cluster)`. Nothing is listed when the first cluster is outside the
+  heap or allocated today (overwritten). From it, clusters free today are taken in order, allocated (or unreadable)
+  ones stepped over, until `need` were taken, the heap ends, `2 × need + 1024` clusters were examined, or 4096 runs.
+  Fewer than `need` (short): the pieces hold what was found. Stepping over a cluster, or more than one run, makes the
+  file untrusted.
+- **FAT32 high word (ruling D10, C2, C3).** Windows zeroes a deleted FAT32 entry's high cluster word. On a FAT32
+  volume with clusters past `0xFFFF`, a deleted file whose recorded high word is 0 has as candidates `lo` and every
+  `h << 16 | lo` (`h ≥ 1`) inside the heap (at most `last >> 16`, ≤ 4096); a candidate counts when it is free today and
+  the format of the extension's kind (JPEG; ISO BMFF for mp4/mov/cr3/heic; TIFF RAW for cr2/nef/arw/dng/orf/rw2/tif;
+  RAF) recognizes the first 16 bytes of its head. Exactly one candidate: it is the first cluster. None or several:
+  the file is not listed. Every head check is one read of 512 bytes through the `Probe` (outside the scan's cache);
+  the probe refuses, without reading, a range the cache already knows to be unreadable, and a refused or failed read
+  recognizes nothing. At most 65,536 checks per listing (32 MiB); once spent, no more candidates are tried and a file
+  whose candidates were not all checked is not listed. Cost (D10): a camera-deleted file whose head was overwritten
+  by noise may take the name of another photo that sits at its only recognized candidate.
+- **Deleted folders.** A deleted directory met in the live tree waits (at most 65,536 per volume) until the live walk
+  ends; then each is walked depth first, in the order met. Its clusters are the D4 guess for 2 MiB (read as needed,
+  up to its end-of-directory entry), and it is read only when its first cluster starts with its own `.` entry (for a
+  FAT32 directory whose recorded high word is 0 only `lo` is tried). Every entry in it is deleted, whatever its byte
+  0 says; deleted directories inside it are walked too (never twice the same first cluster). It never claims and never
+  enters `live`. The directory, depth and entry caps apply as for live ones; a waiting directory counts against the
+  directory cap once it is walked, so deleted folders never take room from the live tree.
+- **Step budget (ruling C7).** Every cluster examined by the guesses of a volume (files and deleted folders) costs
+  one step of 2^26; once spent, the volume's remaining deleted files are not listed and no further deleted folder is
+  read (walk order). The allocation is read a FAT block at a time, so 2^26 steps take well under a second.
+
 Bounds (each lowerable in unit tests): per volume at most 65,536 directories, 4,000,000 directory entries (every
 32-byte slot read counts, the end marker included), depth 32 (the root is 0), 2 MiB per directory, 65,536 contested
 clusters; per listing at most 262,144 photo/video files and `MAX_PIECES` (2^20) pieces, counting a file's runs (a
 photo/video's pieces, an other file's ranges in `live`) and a directory's runs. A file that would pass either cap is not
 listed at all (not in `files`, `others` or `live`); a directory past the piece cap is still walked but its ranges are not
 in `live`. Once the entry cap is reached the walk of the volume stops: no further directory is read. Following chains
-examines each cluster of a volume at most once.
+examines each cluster of a volume at most once; the deleted-file guesses examine at most 2^26 clusters per volume, and
+the high-word checks read at most 65,536 heads per listing.
 
 Paths (ruling R6): a photo/video whose path (folder, `/`, name) would pass `MAX_PATH_BYTES` (4096 bytes) keeps its name
 and loses its folder, and so do the files under a directory whose own path would pass it. Folder strings are held once
@@ -617,17 +666,26 @@ consumed and its origin moved into the listing, never copied, so every name is h
     65,536 of them take ≈ 3.5 MiB; its chain is followed again through the FAT when it is read;
   - the claims bitmap: ≤ 32 MiB at 2^28 clusters;
   - the contested set: ≤ 65,536 clusters, ≈ 1.5 MiB;
-  - the FAT cache: ≤ 8 MiB.
+  - the FAT cache: ≤ 8 MiB;
+  - deleted entries: the first-letter count of the live tree, 4 B per known short name while walking (≤ 32 MiB at
+    4,000,000 entries with the vector's growth), then 8 B per distinct (bytes 1–3, byte 0) pair (≤ 32 MiB; the first
+    is freed once the second is built, at the end of the live walk); names counted later in deleted folders, ≈ 16 B each (≤ 64 MiB at the entry
+    cap, only with millions of entries inside deleted folders); the deleted folders waiting (≤ 65,536 × 56 B ≈
+    3.5 MiB) and those walked (≤ 65,536 first clusters); the names still to settle (16 B each, at most one per listed
+    deleted file or waiting folder); one directory's restored-name count (≤ 65,536 × 8 B); a deleted file's guess
+    (≤ 4096 runs, 64 KiB) until it is listed or dropped.
 
 Combined worst case at the default caps: ≈ 355 MiB retained. The peak, which adds every transient above at once
 (including the brief overlap of the old and new buffers while `files` grows, ≈ 19 MiB, and while `live` is merged,
 ≈ 16 MiB), is ≈ 535 MiB. Before origins were moved, the names alone were held twice at the end of each volume
 (+195 MiB).
 
-Reads: only metadata, through the given source: the boot sector again (to locate the FATs and the root), the FATs in
+Reads: metadata, through the given source: the boot sector again (to locate the FATs and the root), the FATs in
 32 KiB blocks cached up to 8 MiB (a block whose read fails is read again sector by sector, from each copy in turn; a
-block may be read again after the cache is emptied), each directory cluster once (at most 512 KiB per read), and the
-FAT12/16 root region once (at most 2 MiB).
+block may be read again after the cache is emptied), each directory cluster once (at most 512 KiB per read; a deleted
+folder's clusters too), and the FAT12/16 root region once (at most 2 MiB). Besides: up to 65,536 reads of 512 bytes
+(32 MiB) for the FAT32 high-word checks, through the `Probe` (the scan's raw source, outside the cache, never a range
+the cache knows to be unreadable); the only exception to reading each byte once.
 
 ## Inspect
 
