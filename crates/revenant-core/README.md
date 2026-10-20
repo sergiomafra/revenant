@@ -127,8 +127,11 @@ crate-private). All positions are absolute 512-byte sector boundaries:
    piece and the DC seam test holds. The DC seam test compares the mean `|ΔDC|` between the luma blocks on both sides of the
    seam with the median of the other block-row boundaries: it passes iff the image has at least 4 block rows and the seam
    is at most 3 × that median + 4 (it is what rejects another photo's tail spliced at a restart marker, where the MCU count
-   alone would pass). A try stops after the MCU row below the seam if the seam already fails against the rows above it,
-   and at an MCU row where its decoder state (position in the second piece, MCU, buffered bits, DC predictors) is one a
+   alone would pass). A try stops after the MCU row below the seam when the seam is already sure to fail (ruling Q14):
+   rougher than 3 × the `⌊n/2⌋`-th smallest (from 0) of the boundary means above it + 4, `n` being the number of
+   boundaries off the seam (their median, the final base, is at most that); with the seam in the upper half of the image
+   there is no such bound (the rows below could be rougher than those above, as under a sky) and the try runs on. It also
+   stops at an MCU row where its decoder state (position in the second piece, MCU, buffered bits, DC predictors) is one a
    failed try with the same EOI passed through: from there it reads the same bytes and fails the same way (up to 16,384
    states are remembered).
 4. The first passing pair is the result: the measurement is the two pieces, with the JPEG health rule above applied to
@@ -164,7 +167,11 @@ a photo of the same frame glued to the other's tail exactly on a restart marker 
 contiguous file (the MCU count and restart markers are all right, and a DC step below the seam threshold is not seen).
 More generally, the DC seam test runs only at the joins the search makes, never inside a contiguous file: a cut photo
 immediately followed, with no gap, by the tail of a near-identical photo of the same frame (same camera and settings)
-whose bytes decode exactly to EOI is a valid JPEG and comes out `Intact`. And a photo whose entropy-coded data holds a
+whose bytes decode exactly to EOI is a valid JPEG and comes out `Intact`. A photo split inside a band much rougher
+than the rest of the image is not put back together: the DC seam test compares the seam with the whole image's median
+(2 of 56 real preview splits in `tests/real_samples.rs`, both in the EOS Kiss F preview's textured middle, stay
+`Partial`; comparing with the rows next to the seam would join them, but would also glue one more same-frame foreign
+tail in the set that was tried). And a photo whose entropy-coded data holds a
 whole 512-byte sector of one repeated byte value is treated as cut there (rulings Q5, C3): camera photos very rarely do
 this, but a large flat area coded with optimized Huffman tables could (all `00`); such a photo is `Partial` and is not
 put back together.
@@ -585,7 +592,10 @@ nothing is ever overwritten; after 10,000 attempts it fails with `write_failed`)
 `tests/real_samples.rs` runs the engine over real camera files (one each of CR2, CR3, NEF, ARW, RAF, DNG, ORF, RW2; all
 CC0 from raw.pixls.us, listed with URL and SHA-256 in `samples/samples.toml`, never committed). Each is embedded in a
 noise image at a sector start and must come out as exactly one finding of its kind, `Intact`, with the file's length
-(for ARW, trailing zero padding under 64 KiB aside), make and model, and a preview that decodes strictly. It is ignored by default:
+(for ARW, trailing zero padding under 64 KiB aside), make and model, and a preview that decodes strictly. A second test
+splits each sample's preview in two at k/10 (k = 2..=8, on a sector boundary) with its own tail 8 MiB further on: it
+must come out joined and `Intact` (except the 2 known `Partial` splits above), and with another sample's tail instead,
+never `Intact`. Both are ignored by default:
 
 ```sh
 scripts/fetch-samples.sh

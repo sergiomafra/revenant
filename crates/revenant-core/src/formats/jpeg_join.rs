@@ -6,8 +6,8 @@
 //!
 //! Bounds: the first piece is at least [`MIN_FIRST_PIECE`]; the window is [`JPEG_GAP_MAX`] bytes (one record per sector);
 //! at most [`MAX_JOIN_TRIES`] joins are decoded and the tries read at most [`JOIN_BYTES_MAX`] bytes in all. A try whose
-//! MCU row after the seam fails the seam test stops there, and so does a try reaching a decoder state a failed try
-//! reached over the same bytes. The search looks at the scan's cancel flag every MiB of the window, before every try and
+//! seam is sure to fail the seam test once the MCU row below it is decoded stops there, and so does a try reaching a
+//! decoder state a failed try reached over the same bytes. The search looks at the scan's cancel flag every MiB of the window, before every try and
 //! at every MCU row of a try.
 
 use std::collections::{HashMap, HashSet};
@@ -70,8 +70,8 @@ struct Break {
     c1: u64,
     /// The last cursor of the contiguous walk at or before `c1`.
     cur: Cursor,
-    /// Median of the block-row boundary means above the seam (for the early seam test); `None` when there are none.
-    base_above: Option<f64>,
+    /// The early seam test's base (see [`early_base`]); `None` when there is none.
+    early_base: Option<f64>,
 }
 
 /// Bifragment gap carving for the baseline JPEG at `start` (entropy data from `scan_start`) whose contiguous walk ended
@@ -110,18 +110,11 @@ pub(crate) fn join(r: &mut Reader, start: u64, scan_start: u64, cut: u64) -> Opt
         .filter(|&c| c > scan_start && c + BREAK_BACK * SECTOR > x && c - start >= MIN_FIRST_PIECE)
         .filter_map(|c1| {
             let cur = run0.resume.iter().rev().find(|c| c.pos <= c1)?.clone();
-            let seam_row_top =
-                cur.mcu / u64::from(frame.mcus_x) * u64::from(frame.luma_blocks_per_mcu().1);
-            let base_above = median(
-                boundaries
-                    .iter()
-                    .filter(|&&(b, _)| b < seam_row_top)
-                    .map(|&(_, m)| m),
-            );
+            let early_base = early_base(&frame, &boundaries, cur.mcu);
             Some(Break {
                 c1,
                 cur,
-                base_above,
+                early_base,
             })
         })
         .collect();
@@ -406,8 +399,8 @@ struct Window {
 
 /// Decodes the photo through `pieces` from the break `b`: passes when every MCU decodes, `EOI` follows right at the end
 /// of the second piece, and the DC seam test holds. At each MCU row it looks at the cancel flag and the read budget
-/// (`Unknown` if either stops it) and at `memo`; after the MCU row below the seam it gives up if the seam already fails
-/// the test against the rows above it.
+/// (`Unknown` if either stops it) and at `memo`; after the MCU row below the seam it gives up if the seam is already sure
+/// to fail the test (see [`early_base`]).
 fn try_join(
     source: &Overlay,
     frame: &Frame,
@@ -456,7 +449,7 @@ fn try_join(
             }
             if c.mcu == check_at
                 && let (Some(base), Some(at_seam)) =
-                    (b.base_above, seam_mean(frame, Dc { head, tail: dc }, seam))
+                    (b.early_base, seam_mean(frame, Dc { head, tail: dc }, seam))
                 && !within(at_seam, base)
             {
                 seam_failed = true;
@@ -587,6 +580,40 @@ fn seam_mean(frame: &Frame, dc: Dc, seam_mcu: u64) -> Option<f64> {
         n += k;
     }
     (n > 0).then(|| sum / n as f64)
+}
+
+/// An upper bound on the base [`seam_ok`] will compare the seam at `seam_mcu` with, from the block-row boundaries
+/// `known` (as `(b, mean)`, decoded from the first piece); `None` when they cannot bound it. The base is the median of
+/// the `n` boundaries off the seam; those above the seam are some of them, and the median of `n` values is at most the
+/// `⌊n/2⌋`-th smallest (from 0) of any `k > ⌊n/2⌋` of them. So a seam rougher than 3 × this bound + 4 fails the final
+/// test too (ruling Q14: the early test only drops tries that cannot pass). With the seam in the upper half of the image
+/// there is no bound: the rows below, not decoded yet, could be rougher than the ones above (sky over a landscape).
+fn early_base(frame: &Frame, known: &[(u64, f64)], seam_mcu: u64) -> Option<f64> {
+    let g = Grid::new(
+        frame,
+        Dc {
+            head: &[],
+            tail: &[],
+        },
+    );
+    let seam = seam_rows(&g, seam_mcu);
+    let on_seam = seam
+        .iter()
+        .filter(|(by, cols)| (1..g.blocks_y).contains(by) && !cols.is_empty())
+        .count() as u64;
+    let n = g.blocks_y.saturating_sub(1).saturating_sub(on_seam);
+    let top = seam[0].0;
+    let mut above: Vec<f64> = known
+        .iter()
+        .filter(|&&(b, _)| b < top)
+        .map(|&(_, m)| m)
+        .collect();
+    let i = usize::try_from(n / 2).ok()?;
+    if above.len() <= i {
+        return None;
+    }
+    above.sort_by(f64::total_cmp);
+    Some(above[i])
 }
 
 /// The seam is no rougher than the image: `V_seam ≤ 3 × V_base + 4`.
@@ -730,6 +757,79 @@ mod tests {
         assert_eq!((small.mcus_x, small.mcus_y), (64, 3));
         let flat = vec![7; 64 * 3];
         assert!(!seam_ok(&small, &flat, 64));
+    }
+
+    #[test]
+    fn the_early_seam_test_never_rejects_what_the_final_one_accepts() {
+        // Sky over texture, as in a landscape: flat block rows above row `top`, rough ones from it on. Wherever the seam
+        // falls, a join the final test accepts must not be dropped after the MCU row below the seam.
+        let big = frame_of(&testkit::jpeg_flat_with_restarts(512, 384, 0));
+        let mut x = 5u64;
+        let mut noise = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 40) % 120) as i32 - 60
+        };
+        let (mut accepted, mut sure) = (0, 0);
+        for top in [6, 12, 20, 24, 30, 36, 42] {
+            let dc = grid(|_, by| if by < top { 100 } else { 100 + noise() });
+            for row in [top - 2, top, top + 2] {
+                for col in [0, 17, 63] {
+                    let seam = row * 64 + col;
+                    let at_seam = seam_mean(
+                        &big,
+                        Dc {
+                            head: &dc,
+                            tail: &[],
+                        },
+                        seam,
+                    )
+                    .unwrap();
+                    let head = Dc {
+                        head: &dc[..seam as usize],
+                        tail: &[],
+                    };
+                    let early = early_base(&big, &boundary_means(&big, head), seam);
+                    let rejects = early.is_some_and(|base| !within(at_seam, base));
+                    if seam_ok(&big, &dc, seam) {
+                        accepted += 1;
+                        assert!(
+                            !rejects,
+                            "seam at row {row}, column {col}, texture from {top}"
+                        );
+                    } else {
+                        sure += usize::from(rejects);
+                    }
+                }
+            }
+        }
+        assert!(accepted > 20, "{accepted}");
+        // Still a sure reject below the middle of the image: a smooth photo glued to another one.
+        let a = |bx: u64, by: u64| (2 * by + bx) as i32;
+        let glued = grid(|bx, by| {
+            if by < 40 {
+                a(bx, by)
+            } else {
+                500 - 3 * by as i32
+            }
+        });
+        let head = Dc {
+            head: &glued[..40 * 64],
+            tail: &[],
+        };
+        let at_seam = seam_mean(
+            &big,
+            Dc {
+                head: &glued,
+                tail: &[],
+            },
+            40 * 64,
+        )
+        .unwrap();
+        let base = early_base(&big, &boundary_means(&big, head), 40 * 64).expect("a bound");
+        assert!(!within(at_seam, base) && !seam_ok(&big, &glued, 40 * 64));
+        assert!(sure > 0, "the early test never fires");
     }
 
     /// `a = jpeg(640, 480, 3, 0)`: `a[..c]` at 0 then `sectors` sectors of `[00; 510] FF D9`.
