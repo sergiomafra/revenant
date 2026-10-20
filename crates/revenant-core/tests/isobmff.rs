@@ -546,11 +546,12 @@ fn cr3_is_found_intact_with_kind_cr3() {
     );
 }
 
-/// The `PRVW` and the full-size JPEG are judged together, like a TIFF RAW's previews: the largest decides. A broken
-/// `PRVW` next to a clean full-size JPEG leaves the CR3 Intact; with no full-size JPEG (the first chunk is not a JPEG) the
-/// `PRVW` decides alone.
+/// Both the `PRVW` and the full-size JPEG must strict-decode for `Intact` (ruling P18, revised): the walk cannot see file
+/// heads inside the `PRVW` box, so a broken `PRVW` is the only sign that something was written over it. A broken `PRVW`
+/// next to a clean full-size JPEG is `Partial`, as is a broken full-size JPEG next to a clean `PRVW`; with no full-size
+/// JPEG (the first chunk is not a JPEG) the `PRVW` decides alone.
 #[test]
-fn cr3_with_broken_preview_is_judged_with_the_full_size_jpeg() {
+fn cr3_needs_both_previews_to_decode_to_be_intact() {
     let mut v = testkit::cr3(7, &exif());
     let prvw = pos(&v, b"PRVW");
     let size = u32::from_be_bytes(v[prvw + 16..prvw + 20].try_into().unwrap()) as usize;
@@ -559,15 +560,58 @@ fn cr3_with_broken_preview_is_judged_with_the_full_size_jpeg() {
     let m = measure(&place(&v)).unwrap();
     assert_eq!(
         (m.kind, m.len, m.health),
-        (FileKind::Cr3, v.len() as u64, Health::Intact)
+        (FileKind::Cr3, v.len() as u64, Health::Partial)
     );
 
+    let mut v = testkit::cr3(7, &exif());
+    let full = pos(&v, b"mdat") + 4;
+    assert_eq!(&v[full..full + 3], &[0xFF, 0xD8, 0xFF]);
+    v[full + 1000..full + 1064].copy_from_slice(&[0xFF, 0xC4].repeat(32));
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!(
+        (m.kind, m.len, m.health),
+        (FileKind::Cr3, v.len() as u64, Health::Partial)
+    );
+
+    // No full-size JPEG (the first chunk is not a JPEG): the clean `PRVW` decides alone.
+    let mut v = testkit::cr3(7, &exif());
     let full = pos(&v, b"mdat") + 4;
     v[full..full + 2].copy_from_slice(&[0, 0]);
     let m = measure(&place(&v)).unwrap();
     assert_eq!(
         (m.kind, m.len, m.health),
-        (FileKind::Cr3, v.len() as u64, Health::Partial)
+        (FileKind::Cr3, v.len() as u64, Health::Intact)
+    );
+}
+
+/// A small file written inside the `PRVW` JPEG is not seen by the CR3 walk (it only checks heads inside `mdat`), so the
+/// broken `PRVW` keeps the CR3 `Partial`, the scan keeps looking inside it, and the file is found.
+#[test]
+fn file_written_inside_cr3_prvw_is_found() {
+    let v = testkit::cr3(7, &exif());
+    let foreign = testkit::jpeg(8, 8, 77, 0);
+    let at = 512;
+    let prvw = pos(&v, b"PRVW");
+    assert!(
+        prvw < at && at + foreign.len() < prvw + 20 + 36_000,
+        "inside the PRVW JPEG"
+    );
+    let mut v = v;
+    v[at..at + foreign.len()].copy_from_slice(&foreign);
+    let img = place(&v);
+    let found = scan_kinds(&img);
+    assert!(
+        found.contains(&(AT as u64, v.len() as u64, FileKind::Cr3, Health::Partial)),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&(
+            (AT + at) as u64,
+            foreign.len() as u64,
+            FileKind::Jpeg,
+            Health::Intact
+        )),
+        "{found:?}"
     );
 }
 

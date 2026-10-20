@@ -20,7 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and is found; a thumbnail inside a RAW's own preview (TIFF RAW, RAF, CR3) no longer cuts the
   RAW.
 - Fujifilm RAF, Canon CR3 and HEIC photo detection: exact length from the file structure (RAF header blocks; CR3 and HEIC
-  boxes), health from the embedded JPEG (RAF; the larger of a CR3's preview and full-size JPEG) or from whether every item extent lies inside the file (HEIC; the
+  boxes), health from the embedded JPEG (RAF; a CR3's preview and full-size JPEG, both of which must decode) or from whether every item extent lies inside the file (HEIC; the
   image data itself is never decoded). A JPEG a CR3 or HEIC keeps inside its own data no longer cuts it.
 - Photo details and preview: for any found file, camera make and model, lens, serial number, ISO, capture time and dimensions
   (JPEG, RAW, CR3, HEIC; capture time and size for MP4/MOV), and the embedded JPEG the results screen can show (the largest
@@ -45,3 +45,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cut by the JPEG frames inside their data.
 - JPEGs with DAC/JPG segments or `FF` fill bytes before a marker are measured instead of skipped; a JPEG too large to decode
   (over 210 megapixels) with a complete structure is partial instead of damaged.
+
+### Fixed
+
+- A small file written inside a Canon CR3's `PRVW` preview was hidden and the CR3 reported intact; a CR3 is now intact only
+  if both its preview and its full-size JPEG decode, so the file inside is found.
