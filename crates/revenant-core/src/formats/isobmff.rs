@@ -25,9 +25,10 @@
 //! msf1`, as the major or a compatible brand, but not with an `avif`/`avis` major brand) with no `moov` in the file is
 //! a HEIC (an MP4 that merely lists `mif1` has a `moov` and stays an MP4); anything else is an MP4.
 //!
-//! CR3 follows the rules above (it has `trak`s), and in addition its `PRVW` preview JPEG (in the top-level `uuid`
-//! `eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16`) must decode strictly, else the file is at best `Partial` (a missing or
-//! oversized preview too). The `PRVW` layout (after the 16-byte uuid and 8 bytes: the box with 4+2 reserved bytes,
+//! CR3 follows the rules above (it has `trak`s), and in addition its JPEGs are judged like a TIFF RAW's previews: the
+//! `PRVW` preview (in the top-level `uuid` `eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16`) and the full-size JPEG (first chunk
+//! of the first track), the same candidates `inspect` shows; the largest must decode strictly, else the file is at best
+//! `Partial` (a missing `PRVW`, or one whose size does not fit its box, too). The `PRVW` layout (after the 16-byte uuid and 8 bytes: the box with 4+2 reserved bytes,
 //! width, height, a 1, the JPEG size, then the JPEG) is from public format notes and the testkit; not yet checked on
 //! real files.
 //!
@@ -476,7 +477,7 @@ fn judge(r: &mut Reader, start: u64, w: &Walk) -> Option<Measurement> {
     };
     match index_health(&data, len, w.has_moof) {
         Health::Intact if r.bad_in(start, pos) => measured(Health::Partial),
-        Health::Intact if kind == FileKind::Cr3 => measured(cr3_preview_health(r, w)),
+        Health::Intact if kind == FileKind::Cr3 => measured(cr3_preview_health(r, start, w)),
         health => measured(health),
     }
 }
@@ -508,18 +509,21 @@ pub(crate) fn cr3_prvw(r: &mut Reader, uuids: &[(u64, u64)]) -> Option<(u64, u64
     None
 }
 
-/// Content check of a CR3 whose structure is complete: the `PRVW` JPEG must decode strictly. No preview found, or one
-/// whose size field does not fit its box, is `Partial`.
-fn cr3_preview_health(r: &mut Reader, w: &Walk) -> Health {
-    match cr3_prvw(r, &w.uuids) {
-        Some(range) => preview_health(r, &[range]),
-        None => Health::Partial,
+/// Content check of a CR3 whose structure is complete, judged like a TIFF RAW's previews over the `PRVW` JPEG and the
+/// full-size JPEG (the same candidates `inspect` picks its preview from): the largest must decode strictly, and any one
+/// whose size cannot be measured makes it `Partial`. No `PRVW`, or one whose size field does not fit its box, is
+/// `Partial` too.
+fn cr3_preview_health(r: &mut Reader, start: u64, w: &Walk) -> Health {
+    if cr3_prvw(r, &w.uuids).is_none() {
+        return Health::Partial;
     }
+    let candidates = cr3_jpegs(r, start, w);
+    preview_health(r, &candidates)
 }
 
 /// First chunk of the first `trak` of a CR3 `moov` payload as `(offset from the start of the file, length of its first
 /// sample)`: Canon keeps the full-size JPEG there.
-pub(crate) fn cr3_first_chunk(moov: &[u8]) -> Option<(u64, u64)> {
+fn cr3_first_chunk(moov: &[u8]) -> Option<(u64, u64)> {
     let mut garbled = false;
     let trak = child(moov, b"trak", &mut garbled)?;
     let stbl = child(trak, b"mdia", &mut garbled)

@@ -546,13 +546,24 @@ fn cr3_is_found_intact_with_kind_cr3() {
     );
 }
 
+/// The `PRVW` and the full-size JPEG are judged together, like a TIFF RAW's previews: the largest decides. A broken
+/// `PRVW` next to a clean full-size JPEG leaves the CR3 Intact; with no full-size JPEG (the first chunk is not a JPEG) the
+/// `PRVW` decides alone.
 #[test]
-fn cr3_with_broken_preview_is_partial() {
+fn cr3_with_broken_preview_is_judged_with_the_full_size_jpeg() {
     let mut v = testkit::cr3(7, &exif());
     let prvw = pos(&v, b"PRVW");
     let size = u32::from_be_bytes(v[prvw + 16..prvw + 20].try_into().unwrap()) as usize;
     let mid = prvw + 20 + size / 2;
     v[mid..mid + 64].copy_from_slice(&[0xFF, 0xC4].repeat(32));
+    let m = measure(&place(&v)).unwrap();
+    assert_eq!(
+        (m.kind, m.len, m.health),
+        (FileKind::Cr3, v.len() as u64, Health::Intact)
+    );
+
+    let full = pos(&v, b"mdat") + 4;
+    v[full..full + 2].copy_from_slice(&[0, 0]);
     let m = measure(&place(&v)).unwrap();
     assert_eq!(
         (m.kind, m.len, m.health),

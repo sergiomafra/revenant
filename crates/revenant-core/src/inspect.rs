@@ -7,7 +7,7 @@
 //! parseable SOF and lie inside the finding).
 
 use crate::formats::isobmff::{
-    be32, be64, child, children, cr3_first_chunk, cr3_prvw, heic_exif_item, load, top_level,
+    be32, be64, child, children, cr3_full_jpeg, cr3_prvw, heic_exif_item, load, top_level,
 };
 use crate::formats::jpeg::{JPEG_MAX_LEN, exif_tiff, sof_dims};
 use crate::formats::raf::embedded_jpeg;
@@ -158,9 +158,8 @@ fn cr3(r: &mut Reader, f: Span) -> Inspection {
         && let Some(moov) = load(r, at, len)
     {
         let mut garbled = false;
-        if let Some((o, l)) = cr3_first_chunk(&moov) {
-            candidates.push((f.start.saturating_add(o), l));
-        }
+        // The same candidates the CR3's health is judged on.
+        candidates.extend(cr3_full_jpeg(r, f.start, &moov));
         let meta = children(&moov, &mut garbled)
             .into_iter()
             .find(|(k, p)| k == b"uuid" && p.starts_with(&CR3_META_UUID))

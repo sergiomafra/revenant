@@ -484,3 +484,31 @@ fn orf_preview_comes_from_the_olympus_makernote() {
         );
     }
 }
+
+/// A CR3 is judged on the same JPEG `inspect` shows as its preview: the largest of `PRVW` and the full-size JPEG. A
+/// full-size JPEG that does not decode cleanly makes the CR3 Partial even though its `PRVW` decodes.
+#[test]
+fn cr3_health_is_judged_on_the_preview_inspect_shows() {
+    let clean = testkit::cr3(4, &exif());
+    let (source, f, _keep) = find(&clean, FileKind::Cr3);
+    let shown = inspect(&source, &f).preview.unwrap();
+    assert_eq!((shown.width, shown.height), (640, 480));
+    assert_eq!(f.health, Health::Intact);
+
+    let corruptions: [(&str, Vec<u8>); 2] = [
+        ("lenient only", [0xFF, 0x01].repeat(4)),
+        ("undecodable", [0xFF, 0xC4].repeat(32)),
+    ];
+    for (name, patch) in corruptions {
+        let mut cr3 = clean.clone();
+        let mid = (shown.start + shown.len / 2) as usize - AT;
+        cr3[mid..mid + patch.len()].copy_from_slice(&patch);
+        let (source, f, _keep) = find(&cr3, FileKind::Cr3);
+        assert_eq!(
+            (f.len, f.health),
+            (cr3.len() as u64, Health::Partial),
+            "{name}"
+        );
+        assert_eq!(inspect(&source, &f).preview, Some(shown), "{name}");
+    }
+}
