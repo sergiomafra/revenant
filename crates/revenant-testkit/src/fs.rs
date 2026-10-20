@@ -878,7 +878,8 @@ impl FsBuilder {
             }
         };
         let contiguous = clusters.windows(2).all(|w| w[1] == w[0] + 1);
-        let no_fat_chain = !self.fat_like() && contiguous;
+        // An empty file has no clusters: AllocationPossible only, first cluster 0, as real writers do.
+        let no_fat_chain = !self.fat_like() && !clusters.is_empty() && contiguous;
         self.nodes[id].no_fat_chain = no_fat_chain;
         self.nodes[id].data = data.to_vec();
         self.claim(id, &clusters, !no_fat_chain);
@@ -895,7 +896,11 @@ impl FsBuilder {
     }
 
     /// `data` in the next free clusters (first fit, ascending); returns its clusters in file order. On exFAT a
-    /// contiguous file is NoFatChain. A name that is not an upper-case 8.3 name gets LFN entries (FAT; SFN "XXXXXX~1.EXT").
+    /// contiguous file is NoFatChain (an empty file: flags 0x01, first cluster 0, length 0). A name that is not an
+    /// upper-case 8.3 name gets LFN entries (FAT; SFN "XXXXXX~1.EXT"). That includes a lower-case 8.3 name such as
+    /// `a.jpg`: real Windows would write the SFN `A       JPG` with the NT case flags (byte 12) and no LFN; this builder
+    /// always writes the LFN instead (byte 12 is always 0). New entries always go after the existing ones: slots of
+    /// deleted entries are never reused.
     pub fn add(&mut self, path: &str, data: &[u8]) -> Vec<u32> {
         let (dir, name) = self.parent_of(path);
         self.add_file(dir, name, data, None)
@@ -924,7 +929,8 @@ impl FsBuilder {
 
     /// Camera: FAT ← 0xE5 on byte 0 of the SFN and its LFN entries, chain entries ← 0; exFAT ← InUse bits cleared,
     /// bitmap bits cleared, FAT entries kept. WindowsFat32: as Camera and the SFN's high cluster word ← 0.
-    /// A directory: its entries first (recursively), then itself.
+    /// A directory: its entries first (recursively), then itself. The deleted entries keep their directory slots for
+    /// good (the builder never reuses them), and their freed clusters go back to the allocator.
     pub fn delete(&mut self, path: &str, style: DeleteStyle) -> &mut Self {
         let id = self.find(path);
         assert!(id != 0, "the root cannot be deleted");
@@ -1251,6 +1257,15 @@ fn short_name(name: &[u16]) -> Option<[u8; 11]> {
 
 /// Quick-formats a FAT or exFAT volume in place, reading its type and geometry from its own boot sector (also used
 /// by Task 10's opt-in test on an image macOS made).
+///
+/// FAT: the FATs are reset but for the root chain (FAT32: the root's first cluster only), the root is emptied but for
+/// the volume label, FSInfo says every cluster but the root's is free (next free: the lowest other cluster), and the
+/// backup boot record is recopied. exFAT assumes the usual layout: the bitmap from cluster 2, the up-case table in the
+/// ONE cluster right after the bitmap (or after the root when the root sits there), the root at
+/// `FirstClusterOfRootDirectory`; it writes a fresh bitmap, the 128-entry identity up-case table and a root holding the
+/// label, bitmap and up-case entries, then the boot checksum and backup region. A volume whose up-case table is longer
+/// than a cluster (macOS writes the full table) keeps the old table's later clusters untouched but unallocated. The
+/// boot sector itself is kept.
 pub fn quick_format_in_place(volume: &mut [u8]) {
     let geo = Geo::read(volume);
     let bps = geo.bps as usize;
@@ -1277,7 +1292,7 @@ pub fn quick_format_in_place(volume: &mut [u8]) {
             let fsinfo = u16::from_le_bytes([volume[48], volume[49]]) as usize * bps;
             if fsinfo > 0 && fsinfo + bps <= volume.len() {
                 put32(volume, fsinfo + 488, geo.count - 1);
-                put32(volume, fsinfo + 492, 0xFFFF_FFFF);
+                put32(volume, fsinfo + 492, if root == 2 { 3 } else { 2 });
             }
             let backup = u16::from_le_bytes([volume[50], volume[51]]) as usize * bps;
             if backup > 0 && backup + 3 * bps <= volume.len() {
@@ -1368,6 +1383,46 @@ fn sectors_of(volume: &[u8]) -> u64 {
     volume.len() as u64 / SECTOR
 }
 
+/// Whether a placed volume's boot sector records where it sits on the disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HiddenSectors {
+    /// FAT `BPB_HiddSec` (offset 28, also in the FAT32 backup boot sector) and exFAT `PartitionOffset` (offset 64,
+    /// then the boot checksum and backup region refreshed) set to the volume's first LBA, as formatters write them.
+    Partition,
+    /// Both left at 0 (the volume's bytes are copied unchanged).
+    Zero,
+}
+
+/// Records `lba` in the volume's own boot sector (and backup).
+fn set_hidden_sectors(v: &mut [u8], lba: u64) {
+    if &v[3..11] == b"EXFAT   " {
+        put64(v, 64, lba);
+        finish_exfat_boot(v);
+        return;
+    }
+    put32(
+        v,
+        28,
+        u32::try_from(lba).expect("FAT hidden sectors are 32-bit"),
+    );
+    if Geo::read(v).fs == FsType::Fat32 {
+        let bps = u16::from_le_bytes([v[11], v[12]]) as usize;
+        let backup = u16::from_le_bytes([v[50], v[51]]) as usize * bps;
+        if backup > 0 && backup + bps <= v.len() {
+            put32(v, backup + 28, lba as u32);
+        }
+    }
+}
+
+/// Copies `volume` to `lba`, recording `lba` in its boot sector unless `hidden` is `Zero`.
+fn place_volume(d: &mut [u8], lba: u64, volume: &[u8], hidden: HiddenSectors) {
+    place(d, lba, volume);
+    if hidden == HiddenSectors::Partition {
+        let at = (lba * SECTOR) as usize;
+        set_hidden_sectors(&mut d[at..at + volume.len()], lba);
+    }
+}
+
 fn place(d: &mut [u8], lba: u64, volume: &[u8]) {
     let at = (lba * SECTOR) as usize;
     assert!(
@@ -1380,8 +1435,19 @@ fn place(d: &mut [u8], lba: u64, volume: &[u8]) {
 /// Zeros of `disk_len` bytes holding `volume` at the partitioning's offset. MBR: one primary entry, type 0x01 (FAT12),
 /// 0x0E (FAT16), 0x0C (FAT32), 0x07 (exFAT), read from the volume's own boot sector. GPT: protective MBR (0xEE),
 /// header at LBA 1 and entries at LBA 2 (128 × 128 B), backup entries and header at the end, CRC32s set, one Basic
-/// Data partition.
+/// Data partition. The placed volume's FAT `BPB_HiddSec` / exFAT `PartitionOffset` is set to its first LBA
+/// ([`HiddenSectors::Partition`]); [`disk_with`] can keep them at 0.
 pub fn disk(p: Partitioning, volume: &[u8], disk_len: usize) -> Vec<u8> {
+    disk_with(p, volume, disk_len, HiddenSectors::Partition)
+}
+
+/// As [`disk`], choosing whether the volume records its first LBA.
+pub fn disk_with(
+    p: Partitioning,
+    volume: &[u8],
+    disk_len: usize,
+    hidden: HiddenSectors,
+) -> Vec<u8> {
     assert!(
         disk_len.is_multiple_of(512),
         "disk length must be a multiple of 512"
@@ -1389,13 +1455,13 @@ pub fn disk(p: Partitioning, volume: &[u8], disk_len: usize) -> Vec<u8> {
     let mut d = vec![0u8; disk_len];
     let sectors = sectors_of(volume);
     match p {
-        Partitioning::Superfloppy => place(&mut d, 0, volume),
+        Partitioning::Superfloppy => place_volume(&mut d, 0, volume, hidden),
         Partitioning::Mbr { first_lba } => {
             assert!(first_lba >= 1, "the MBR takes sector 0");
             mbr_entry(&mut d, 0, mbr_type(volume), first_lba, sectors as u32);
             d[510] = 0x55;
             d[511] = 0xAA;
-            place(&mut d, first_lba as u64, volume);
+            place_volume(&mut d, first_lba as u64, volume, hidden);
         }
         Partitioning::Gpt { first_lba } => {
             let total = disk_len as u64 / SECTOR;
@@ -1449,7 +1515,7 @@ pub fn disk(p: Partitioning, volume: &[u8], disk_len: usize) -> Vec<u8> {
             place(&mut d, 2, &entries);
             place(&mut d, last - 32, &entries);
             place(&mut d, last, &header(last, 1, last - 32));
-            place(&mut d, first_lba, volume);
+            place_volume(&mut d, first_lba, volume, hidden);
         }
     }
     d
@@ -1457,6 +1523,7 @@ pub fn disk(p: Partitioning, volume: &[u8], disk_len: usize) -> Vec<u8> {
 
 /// MBR with `primary` entries `(first_lba, volume, type)` and, when `logical` is not empty, an extended partition
 /// (type 0x0F) after them holding one EBR per logical volume, chained. Each EBR is the sector just before its volume.
+/// Every volume records its absolute first LBA (FAT `BPB_HiddSec`, exFAT `PartitionOffset`), as [`disk`] does.
 pub fn mbr_disk(
     primary: &[(u32, &[u8], u8)],
     logical: &[(u32, &[u8], u8)],
@@ -1471,7 +1538,7 @@ pub fn mbr_disk(
     let mut d = vec![0u8; disk_len];
     for (i, &(lba, volume, kind)) in primary.iter().enumerate() {
         mbr_entry(&mut d, i, kind, lba, sectors_of(volume) as u32);
-        place(&mut d, lba as u64, volume);
+        place_volume(&mut d, lba as u64, volume, HiddenSectors::Partition);
     }
     if let Some(&(first, _, _)) = logical.first() {
         let ext = first - 1;
@@ -1500,7 +1567,7 @@ pub fn mbr_disk(
             }
             sector[510] = 0x55;
             sector[511] = 0xAA;
-            place(&mut d, lba as u64, volume);
+            place_volume(&mut d, lba as u64, volume, HiddenSectors::Partition);
         }
     }
     d[510] = 0x55;

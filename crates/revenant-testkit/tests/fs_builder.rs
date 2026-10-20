@@ -1,7 +1,8 @@
 //! The synthetic FAT/exFAT volumes and MBR/GPT disks, checked against the Microsoft specifications' field offsets.
 
 use revenant_testkit::fs::{
-    DeleteStyle, FsBuilder, FsType, Partitioning, crc32, disk, mbr_disk, quick_format_in_place,
+    DeleteStyle, FsBuilder, FsStamp, FsType, HiddenSectors, Partitioning, crc32, disk, disk_with,
+    mbr_disk, quick_format_in_place,
 };
 
 fn u16_at(v: &[u8], at: usize) -> u16 {
@@ -51,6 +52,49 @@ fn exfat_set_checksum(set: &[u8]) -> u16 {
     sum
 }
 
+/// exFAT boot checksum (spec §3.4) of sectors 0..=10, bytes 106, 107 and 112 skipped.
+fn exfat_boot_sum(v: &[u8]) -> u32 {
+    let mut sum = 0u32;
+    for (i, &byte) in v[..11 * 512].iter().enumerate() {
+        if i == 106 || i == 107 || i == 112 {
+            continue;
+        }
+        sum = (if sum & 1 != 0 { 0x8000_0000u32 } else { 0 })
+            .wrapping_add(sum >> 1)
+            .wrapping_add(byte as u32);
+    }
+    sum
+}
+
+/// A placed FAT volume: `BPB_HiddSec` == `lba` (and in the FAT32 backup boot sector), every other byte unchanged.
+fn assert_fat_placed(placed: &[u8], vol: &[u8], lba: u32, fat32: bool) {
+    assert_eq!(placed.len(), vol.len());
+    assert_eq!(u32_at(vol, 28), 0, "the builder writes 0");
+    assert_eq!(u32_at(placed, 28), lba);
+    let mut expect = vol.to_vec();
+    expect[28..32].copy_from_slice(&lba.to_le_bytes());
+    if fat32 {
+        assert_eq!(u32_at(placed, 6 * 512 + 28), lba);
+        expect[6 * 512 + 28..6 * 512 + 32].copy_from_slice(&lba.to_le_bytes());
+    }
+    assert!(placed == &expect[..]);
+}
+
+/// A placed exFAT volume: `PartitionOffset` == `lba`, the boot checksum and backup region refreshed, the rest unchanged.
+fn assert_exfat_placed(placed: &[u8], vol: &[u8], lba: u64) {
+    assert_eq!(u64_at(vol, 64), 0, "the builder writes 0");
+    assert_eq!(u64_at(placed, 64), lba);
+    assert_eq!(placed[..64], vol[..64]);
+    assert_eq!(placed[72..11 * 512], vol[72..11 * 512]);
+    let sum = exfat_boot_sum(placed);
+    assert_ne!(sum, exfat_boot_sum(vol));
+    for i in 0..128 {
+        assert_eq!(u32_at(placed, 11 * 512 + 4 * i), sum);
+    }
+    assert_eq!(placed[12 * 512..24 * 512], placed[..12 * 512]);
+    assert!(placed[24 * 512..] == vol[24 * 512..]);
+}
+
 #[test]
 fn fat32_layout_is_as_documented() {
     let mut b = FsBuilder::new(FsType::Fat32, 48 << 20, 512);
@@ -74,6 +118,10 @@ fn fat32_layout_is_as_documented() {
     assert_eq!(&v[71..82], b"REVENANT   ");
     assert_eq!(u32_at(&v, 512), 0x4161_5252, "FSInfo lead signature");
     assert_eq!(u32_at(&v, 512 + 484), 0x6141_7272);
+    // FSInfo: root (2), DCIM (3), 100TEST (4) and the file (5..=7) are taken.
+    assert_eq!(u32_at(&v, 512 + 488), b.cluster_count() - 6, "free count");
+    assert_eq!(u32_at(&v, 512 + 492), 8, "next free");
+    assert_eq!(v[7 * 512..8 * 512], v[512..1024], "backup FSInfo");
     assert_eq!(v[6 * 512..7 * 512], v[..512]);
     assert!(b.cluster_count() >= 65_525);
     assert_eq!(fat32_entry(&v, cs[0]), cs[1]);
@@ -281,15 +329,7 @@ fn exfat_boot_region_checksums() {
     for s in 1..=8 {
         assert_eq!(v[s * 512 + 508..s * 512 + 512], [0, 0, 0x55, 0xAA]);
     }
-    let mut sum = 0u32;
-    for (i, &byte) in v[..11 * 512].iter().enumerate() {
-        if i == 106 || i == 107 || i == 112 {
-            continue;
-        }
-        sum = (if sum & 1 != 0 { 0x8000_0000u32 } else { 0 })
-            .wrapping_add(sum >> 1)
-            .wrapping_add(byte as u32);
-    }
+    let sum = exfat_boot_sum(&v);
     for i in 0..128 {
         assert_eq!(u32_at(&v, 11 * 512 + 4 * i), sum);
     }
@@ -318,6 +358,32 @@ fn exfat_entry_sets() {
         .find(|e| e[0] == 0x82)
         .unwrap();
     assert_eq!(u64_at(&upcase, 24), 256);
+    let upcase_at = b.cluster_offset(u32_at(&upcase, 20)) as usize;
+    let table = &v[upcase_at..upcase_at + 256];
+    let want: Vec<u8> = (0..128u16).flat_map(u16::to_le_bytes).collect();
+    assert_eq!(table, &want[..], "identity up-case table");
+    let mut table_sum = 0u32;
+    for &byte in table {
+        table_sum = (if table_sum & 1 != 0 {
+            0x8000_0000u32
+        } else {
+            0
+        })
+        .wrapping_add(table_sum >> 1)
+        .wrapping_add(byte as u32);
+    }
+    assert_ne!(table_sum, 0);
+    assert_eq!(u32_at(&upcase, 4), table_sum, "TableChecksum");
+    assert_eq!(bitmap[1], 0, "first bitmap");
+    assert_eq!(u32_at(&bitmap, 20), 2, "bitmap at cluster 2");
+    assert_eq!(
+        u64_at(&bitmap, 24),
+        (b.cluster_count() as u64).div_ceil(8),
+        "bitmap length"
+    );
+    // Bitmap (1 cluster), up-case table, root, in that order.
+    assert_eq!(u32_at(&upcase, 20), 3);
+    assert_eq!(root, 4);
 
     let e = entries(&v, &b, dcim, cluster);
     assert_eq!([e[0][0], e[1][0], e[2][0]], [0x85, 0xC0, 0xC1]);
@@ -520,6 +586,12 @@ fn quick_format_keeps_data_clusters() {
         }
         assert!(u32_at(&q, fat_at + 4 * root as usize) >= 0x0FFF_FFF8);
         assert_eq!(q[..512], v[..512]);
+        if fs == FsType::Fat32 {
+            assert_eq!(u32_at(&q, 512 + 488), b.cluster_count() - 1, "free count");
+            assert_eq!(u32_at(&q, 512 + 492), 3, "next free");
+            assert_eq!(q[7 * 512..8 * 512], q[512..1024], "backup FSInfo");
+            assert_eq!(q[6 * 512..7 * 512], q[..512], "backup boot");
+        }
         if fs == FsType::Exfat {
             assert_eq!(q[12 * 512..24 * 512], q[..12 * 512]);
             let bitmap = b.cluster_offset(2) as usize;
@@ -541,8 +613,19 @@ fn disk_layouts() {
     assert_eq!(u32_at(&d, 446 + 8), 2048);
     assert_eq!(u32_at(&d, 446 + 12), (48 << 20) / 512);
     assert_eq!(d[510..512], [0x55, 0xAA]);
-    assert_eq!(d[1 << 20..(1 << 20) + vol.len()], vol[..]);
+    assert_fat_placed(&d[1 << 20..(1 << 20) + vol.len()], &vol, 2048, true);
     assert!(d[462..510].iter().all(|&x| x == 0));
+    let z = disk_with(
+        Partitioning::Mbr { first_lba: 2048 },
+        &vol,
+        len,
+        HiddenSectors::Zero,
+    );
+    assert!(
+        z[1 << 20..(1 << 20) + vol.len()] == vol[..],
+        "Zero keeps the volume's bytes"
+    );
+    assert_eq!(z[..512], d[..512]);
 
     let exfat = FsBuilder::new(FsType::Exfat, 16 << 20, 32 << 10).build();
     let fat16 = FsBuilder::new(FsType::Fat16, 16 << 20, 2048).build();
@@ -550,7 +633,22 @@ fn disk_layouts() {
     for (v, t) in [(&exfat, 0x07), (&fat16, 0x0E), (&fat12, 0x01)] {
         let d = disk(Partitioning::Mbr { first_lba: 63 }, v, 20 << 20);
         assert_eq!(d[446 + 4], t);
+        let placed = &d[63 * 512..63 * 512 + v.len()];
+        if t == 0x07 {
+            assert_exfat_placed(placed, v, 63);
+            let z = disk_with(
+                Partitioning::Mbr { first_lba: 63 },
+                v,
+                20 << 20,
+                HiddenSectors::Zero,
+            );
+            assert!(z[63 * 512..63 * 512 + v.len()] == v[..]);
+        } else {
+            assert_fat_placed(placed, v, 63, false);
+        }
     }
+    let d = disk(Partitioning::Gpt { first_lba: 4096 }, &exfat, 20 << 20);
+    assert_exfat_placed(&d[4096 * 512..4096 * 512 + exfat.len()], &exfat, 4096);
 
     let d = disk(Partitioning::Gpt { first_lba: 2048 }, &vol, len);
     let last = (len / 512 - 1) as u64;
@@ -580,7 +678,14 @@ fn disk_layouts() {
     );
     assert_eq!(u64_at(entry, 32), 2048);
     assert_eq!(u64_at(entry, 40), 2048 + (48 << 20) / 512 - 1);
-    assert_eq!(d[1 << 20..(1 << 20) + vol.len()], vol[..]);
+    assert_fat_placed(&d[1 << 20..(1 << 20) + vol.len()], &vol, 2048, true);
+    let z = disk_with(
+        Partitioning::Gpt { first_lba: 2048 },
+        &vol,
+        len,
+        HiddenSectors::Zero,
+    );
+    assert!(z[1 << 20..(1 << 20) + vol.len()] == vol[..]);
     let backup = last as usize * 512;
     assert_eq!(&d[backup..backup + 8], b"EFI PART");
     header(backup);
@@ -594,7 +699,7 @@ fn disk_layouts() {
     );
 
     let d = disk(Partitioning::Superfloppy, &vol, len);
-    assert_eq!(d[..vol.len()], vol[..]);
+    assert!(d[..vol.len()] == vol[..], "a superfloppy starts at LBA 0");
     assert!(d[vol.len()..].iter().all(|&x| x == 0));
 
     assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
@@ -637,7 +742,98 @@ fn extended_partitions_chain_their_ebrs() {
     let ebr2 = next as usize * 512;
     assert_eq!((d[ebr2 + 446 + 4], u32_at(&d, ebr2 + 446 + 8)), (0x0E, 1));
     assert_eq!(d[ebr2 + 462 + 4], 0, "end of the chain");
-    assert_eq!(d[2048 * 512..2048 * 512 + fat32.len()], fat32[..]);
-    assert_eq!(d[a_at as usize * 512..][..a.len()], a[..]);
-    assert_eq!(d[b_at as usize * 512..][..a.len()], a[..]);
+    assert_fat_placed(&d[2048 * 512..2048 * 512 + fat32.len()], &fat32, 2048, true);
+    let at = exfat_at as usize * 512;
+    assert_exfat_placed(&d[at..at + exfat.len()], &exfat, exfat_at as u64);
+    // Logical volumes record their absolute first LBA.
+    assert_fat_placed(&d[a_at as usize * 512..][..a.len()], &a, a_at, false);
+    assert_fat_placed(&d[b_at as usize * 512..][..a.len()], &a, b_at, false);
+}
+
+#[test]
+fn dot_entries_point_at_themselves_and_their_parent() {
+    let mut b = FsBuilder::new(FsType::Fat32, 48 << 20, 512);
+    b.mkdir("DCIM/100TEST");
+    // Fill clusters 5..=70_000 so the next directories get a non-zero high word.
+    b.add("FILL.BIN", &vec![0u8; (70_000 - 4) * 512]);
+    b.mkdir("HIGH/SUB");
+    let v = b.build();
+    let dot = |dir: &str| {
+        let e = entries(&v, &b, b.clusters(dir)[0], 512);
+        let cluster = |e: &[u8; 32]| (u16_at(e, 20) as u32) << 16 | u16_at(e, 26) as u32;
+        assert_eq!(&e[0][..11], b".          ");
+        assert_eq!(&e[1][..11], b"..         ");
+        assert_eq!((e[0][11], e[1][11]), (0x10, 0x10));
+        (cluster(&e[0]), cluster(&e[1]))
+    };
+    assert_eq!(dot("DCIM"), (3, 0), ".. of a root child is 0");
+    assert_eq!(dot("DCIM/100TEST"), (4, 3));
+    assert_eq!(b.clusters("HIGH"), [70_001]);
+    assert_eq!(dot("HIGH"), (70_001, 0));
+    assert_eq!(dot("HIGH/SUB"), (70_002, 70_001));
+    let high = entries(&v, &b, 2, 512)
+        .into_iter()
+        .find(|e| &e[..11] == b"HIGH       ")
+        .unwrap();
+    assert_eq!(u16_at(&high, 20), 1);
+}
+
+#[test]
+fn builds_are_deterministic() {
+    for (fs, len, cluster) in [
+        (FsType::Fat12, 2u64 << 20, 1024u32),
+        (FsType::Fat16, 16 << 20, 2048),
+        (FsType::Fat32, 48 << 20, 512),
+        (FsType::Exfat, 16 << 20, 32 << 10),
+    ] {
+        let make = || {
+            let mut b = FsBuilder::new(fs, len, cluster);
+            b.mkdir("DCIM/100TEST/SUB");
+            for i in 0..20 {
+                b.add(
+                    &format!("DCIM/100TEST/Photo {i}.jpg"),
+                    &vec![i as u8; 700 * (i + 1)],
+                );
+            }
+            b.add_at("DCIM/X.JPG", &vec![9u8; 2 * cluster as usize], &[60, 50]);
+            b.delete("DCIM/100TEST", DeleteStyle::Camera);
+            b.add("DCIM/AFTER.JPG", &vec![1u8; 5000]);
+            b.raw_entry("DCIM", [0x41; 32]);
+            b.set_fat(70, 0x0FF7);
+            let stamp = FsStamp {
+                year: 2001,
+                month: 2,
+                day: 3,
+                hour: 4,
+                min: 5,
+                sec: 6,
+                utc_offset_min: Some(60),
+            };
+            b.stamp("DCIM/AFTER.JPG", stamp, stamp);
+            b
+        };
+        let (b1, b2) = (make(), make());
+        let v = b1.build();
+        assert!(v == b2.build(), "{fs:?}: two builders");
+        assert!(v == b1.build(), "{fs:?}: two builds");
+        assert!(
+            b1.build_quick_formatted() == b2.build_quick_formatted(),
+            "{fs:?}"
+        );
+    }
+}
+
+#[test]
+fn empty_exfat_file_has_no_allocation() {
+    let mut b = FsBuilder::new(FsType::Exfat, 16 << 20, 32 << 10);
+    assert!(b.add("E.JPG", &[]).is_empty());
+    let v = b.build();
+    let e = entries(&v, &b, u32_at(&v, 96), 32 << 10);
+    let i = e.iter().position(|e| e[0] == 0x85).unwrap();
+    let stream = e[i + 1];
+    assert_eq!(stream[0], 0xC0);
+    assert_eq!(stream[1], 0x01, "AllocationPossible only");
+    assert_eq!(u32_at(&stream, 20), 0);
+    assert_eq!(u64_at(&stream, 8), 0);
+    assert_eq!(u64_at(&stream, 24), 0);
 }
