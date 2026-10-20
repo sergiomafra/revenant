@@ -227,6 +227,25 @@ fn mp4_creation_time_and_size() {
 }
 
 #[test]
+fn a_jpeg_with_many_app_segments_before_the_sof() {
+    let plain = testkit::jpeg_with_app_segments(64, 48, 1, 0);
+    let many = testkit::jpeg_with_app_segments(64, 48, 1, 20);
+    let (source, f0, _k0) = find(&plain, FileKind::Jpeg);
+    let (source20, f20, _k20) = find(&many, FileKind::Jpeg);
+    assert_eq!(f20.health, f0.health);
+    assert_eq!(f20.health, Health::Intact);
+    assert_eq!(f20.len, many.len() as u64);
+    let i = inspect(&source20, &f20);
+    assert_eq!((i.metadata.width, i.metadata.height), (Some(64), Some(48)));
+    let p = i.preview.unwrap();
+    assert_eq!(
+        (p.start, p.len, p.width, p.height),
+        (f20.start, f20.len, 64, 48)
+    );
+    assert!(inspect(&source, &f0).preview.is_some());
+}
+
+#[test]
 fn a_finding_cut_inside_the_sof_has_no_preview() {
     let jpeg = testkit::jpeg_with_exif(64, 48, 1, &exif());
     let (source, f, _keep) = find(&jpeg, FileKind::Jpeg);

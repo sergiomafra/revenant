@@ -638,6 +638,20 @@ pub fn jpeg_with_exif(width: u32, height: u32, seed: u64, exif: &TestExif) -> Ve
     out
 }
 
+/// Like [`jpeg`] without padding, with `count` extra 100-byte APP2 segments (as split ICC profiles) before the rest of
+/// the headers, so the SOF comes after more than `count` marker segments.
+pub fn jpeg_with_app_segments(width: u32, height: u32, seed: u64, count: usize) -> Vec<u8> {
+    let base = encode_noise(width, height, seed);
+    let mut out = base[..2].to_vec();
+    for i in 0..count {
+        let mut seg = vec![0xFF, 0xE2, 0, 102];
+        seg.extend(std::iter::repeat_n(i as u8, 100));
+        out.extend(seg);
+    }
+    out.extend_from_slice(&base[2..]);
+    out
+}
+
 fn put_be32(buf: &mut [u8], at: usize, v: u32) {
     buf[at..at + 4].copy_from_slice(&v.to_be_bytes());
 }
