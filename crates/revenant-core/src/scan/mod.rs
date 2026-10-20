@@ -291,7 +291,13 @@ impl Commit<'_, '_> {
     }
 
     fn measure(&self, at: u64, head: &[u8]) -> Option<Measurement> {
-        pipeline::measure(self.shared.formats, &self.shared.cache, at, head)
+        pipeline::measure(
+            self.shared.formats,
+            &self.shared.cache,
+            at,
+            head,
+            self.shared.cancel,
+        )
     }
 
     /// Turns the measurement at `at` into a pending finding; an `Intact` one adds a skip range per piece.

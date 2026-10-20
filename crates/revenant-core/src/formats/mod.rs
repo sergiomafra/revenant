@@ -8,6 +8,7 @@
 pub(crate) mod isobmff;
 pub(crate) mod jpeg;
 pub(crate) mod jpeg_entropy;
+mod jpeg_join;
 pub(crate) mod raf;
 mod tiffraw;
 
@@ -21,6 +22,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
+use crate::scan::CancelToken;
 use crate::source::Source;
 
 /// Kind of file a detector found.
@@ -148,6 +150,35 @@ pub fn all_formats() -> Vec<Box<dyn Format>> {
 pub(crate) fn builtin() -> &'static [Box<dyn Format>] {
     static FORMATS: OnceLock<Vec<Box<dyn Format>>> = OnceLock::new();
     FORMATS.get_or_init(all_formats)
+}
+
+thread_local! {
+    /// The cancel token of the scan whose measurement runs on this thread, if any.
+    static CANCEL: RefCell<Option<CancelToken>> = const { RefCell::new(None) };
+}
+
+/// While alive, [`cancelled`] on this thread reports `token`: a measurement that can run long (the JPEG gap search)
+/// looks at it and gives up when the scan is cancelled. Restores the previous token when dropped.
+pub(crate) struct CancelScope(Option<CancelToken>);
+
+impl CancelScope {
+    pub(crate) fn enter(token: &CancelToken) -> Self {
+        Self(CANCEL.with(|c| c.replace(Some(token.clone()))))
+    }
+}
+
+impl Drop for CancelScope {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        let _ = CANCEL.try_with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// Whether the scan this thread measures for has been cancelled (`false` outside a scan).
+pub(crate) fn cancelled() -> bool {
+    CANCEL
+        .try_with(|c| c.borrow().as_ref().is_some_and(CancelToken::is_cancelled))
+        .unwrap_or(false)
 }
 
 /// Bytes of a sector start shown to [`Format::recognizes`].

@@ -68,7 +68,11 @@ measurement, however many checks need it.
 not end the file; DAC and JPG markers count as segments, and `FF` fill bytes before a marker are skipped), requires DQT and SOF before SOS, and scans the entropy-coded data up to EOI (`FF D9`), up to
 `JPEG_MAX_LEN` (64 MiB). If the header walk breaks on an unreadable sector, the search for EOI continues from there. Health:
 
-- `Intact`: EOI found, no unreadable sector inside, and `zune-jpeg` decodes the bytes in strict mode.
+- `Intact`: EOI found, no unreadable sector inside, `zune-jpeg` decodes the bytes in strict mode, and, for a frame
+  Revenant's entropy decoder covers (below), that decoder walks every MCU with EOI right after the last one. `zune-jpeg`'s
+  strict mode counts neither: it zero-fills past an early EOI and ignores data left before EOI, so half a photo followed by
+  zeros, by another photo's tail or by its own tail with a sector missing, then an EOI, would otherwise pass. Such a file
+  is `Partial` (and may be put back together, see "Fragmented JPEG").
 - `Partial`: no EOI before the end of the source, `JPEG_MAX_LEN`, or a 512-byte sector that starts another recognized file
   (the length stops there), and something of the photo would show (below); or EOI found and only the lenient decode succeeds; or EOI found, the file contains unreadable
   sectors and a decode (strict or lenient) of the zero-filled bytes succeeds. The length never exceeds `JPEG_MAX_LEN`.
@@ -91,6 +95,44 @@ coefficients per block, 16 bits per code and the bytes up to the cut; a DHT whos
 rejected.
 
 The validation decode outputs grayscale (1 byte per pixel) to bound memory.
+
+### Fragmented JPEG
+
+When a JPEG is not `Intact` and its frame is one the entropy decoder covers, but its contiguous data does not decode to
+EOI with every MCU (another file was written in the middle of it, or the rest of it lies further on), `Jpeg::measure`
+searches for where the photo's data continues and puts the photo back together from two pieces (`formats/jpeg_join.rs`,
+crate-private). All positions are absolute 512-byte sector boundaries:
+
+1. The contiguous data is decoded (keeping each block's luma DC value). The break `x` is the first sign that the data
+   stopped being this photo: the decode error, the cut, or the first sector of one repeated byte value (erased space,
+   which would otherwise decode as valid blocks). The first piece may end at any of the 4 sector boundaries at or before
+   `x` (`c1`), each resumed from the decoder's last state at or before it.
+2. One forward pass over the window of `JPEG_GAP_MAX` (64 MiB) after the earliest `c1` records, for each sector start `g`,
+   the first event at or after it: an `FF D9` (`EOI` at `e`), or a sign the bytes are not entropy-coded data (`FF`
+   followed by anything but `00`, `D0`–`D7`, `D9`, `FF`; a sector of one repeated byte value or an unreadable one; a sector
+   where another file starts). The candidates are, for each distinct `EOI`, the first 4 sector starts whose first event
+   it is; the second piece `[g, e + 2)` therefore ends inside the window.
+3. Every pair `(c1, g)` with `g > c1` and a total length within `JPEG_MAX_LEN` is tried, closest `g` first, then latest
+   `c1`: the decoder resumes over the two pieces and passes when every MCU decodes with EOI right at the end of the second
+   piece and the DC seam test holds. The DC seam test compares the mean `|ΔDC|` between the luma blocks on both sides of the
+   seam with the median of the other block-row boundaries: it passes iff the image has at least 4 block rows and the seam
+   is at most 3 × that median + 4 (it is what rejects another photo's tail spliced at a restart marker, where the MCU count
+   alone would pass). A try stops after the MCU row below the seam if the seam already fails against the rows above it.
+4. The first passing pair is the result: the measurement is the two pieces, health from `zune-jpeg` over them (strict →
+   `Intact`, lenient only → `Partial`; neither → the join is dropped and the contiguous result stands), an unreadable
+   sector in either piece making it at most `Partial`.
+
+Evidence for `Intact` (ruling Q1): exactly one candidate in the whole window passed, and every candidate was tried. A
+second passing candidate (the search then stops) or hitting a bound makes the reassembled photo at most `Partial`.
+
+Bounds on hostile input: one 8-byte record per sector of the window (at most 131,072), at most `MAX_JOIN_TRIES` (4096)
+tries and 256 MiB of continuation bytes decoded in total; the first piece's last bytes are read once and kept in memory
+(at most 1 MiB). The search looks at the scan's cancel flag every MiB of the window and before every try (a measurement
+reaches the flag through a per-thread scope set by the scan), so a cancelled scan does not wait for it. Each sector is
+read once by the scan and the detectors; a JPEG gap search may re-read up to its 64 MiB window (through the scan's cache).
+
+Not covered: progressive, arithmetic-coded or 12-bit JPEGs (any frame the decoder does not cover), three or more pieces,
+a second piece that lies before the first, and a second piece that ends past the window.
 
 Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`).
 
@@ -284,8 +326,9 @@ and `Preview` carry `fragments: Vec<Fragment>` with one contract: empty for a co
 in file order, the first starting at `start`, their lengths summing to `len`, no two overlapping. `start` is always the
 first piece's start and `len` the total length. `Finding::ranges()` and `Preview::ranges()` give `[Fragment { start, len }]`
 for a contiguous file, else the pieces. A measurement that breaks this contract (or has a piece outside the
-source) is a detector bug: debug builds assert on it, release builds ignore it (no finding). No detector produces pieces yet (reassembly comes later in this part); the scan
-copies a measurement's `fragments` into its finding. After an `Intact` finding in pieces, the scan skips heads only inside
+source) is a detector bug: debug builds assert on it, release builds ignore it (no finding). `formats::Jpeg` produces two
+pieces for a photo it puts back together (see "Fragmented JPEG"); the scan copies a measurement's `fragments` into its
+finding. After an `Intact` finding in pieces, the scan skips heads only inside
 its pieces (each rounded out to whole sectors), so files in the gaps between them are still found.
 
 ## Inspect
@@ -375,8 +418,8 @@ Events:
 `CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block examined and each block read ahead, before and after
 every event and while waiting for a measurement. Once it is seen no further event is emitted (a cancel from inside the
 callback makes that event the last one), the measuring threads drop their remaining jobs, and `scan` returns
-`EngineError::Cancelled` after every thread has stopped (a measurement already running is finished first); findings still
-pending are dropped.
+`EngineError::Cancelled` after every thread has stopped (a measurement already running is finished first, except a JPEG
+gap search, which gives up as soon as it sees the cancel); findings still pending are dropped.
 
 ## Extract
 

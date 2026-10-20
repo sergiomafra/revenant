@@ -6,14 +6,16 @@
 
 use std::collections::HashMap;
 
-use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, builtin, jpeg_entropy};
+use super::{
+    FileKind, Format, Health, Measurement, Reader, SECTOR, builtin, jpeg_entropy, jpeg_join,
+};
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
 
 use crate::budget::DECODE_BUDGET;
-use crate::source::Source;
+use crate::source::{Fragmented, Source};
 
 /// Longest JPEG the detector will follow (and decode).
 pub const JPEG_MAX_LEN: u64 = 64 * 1024 * 1024;
@@ -165,6 +167,16 @@ fn cut_health(r: &mut Reader, start: u64, scan_start: u64, end: u64) -> Health {
         }
     }
     Health::Partial
+}
+
+/// Whether our entropy decoder walks the JPEG at `start` from `scan_start` through every MCU with `EOI` right at `eoi`
+/// (exact MCU count, nothing left before `EOI`). A frame it does not cover counts as walked (the other decoders decide).
+fn walks_to_eoi(r: &mut Reader, start: u64, scan_start: u64, eoi: u64) -> bool {
+    let Some(frame) = jpeg_entropy::frame(r, start, scan_start) else {
+        return true;
+    };
+    jpeg_entropy::decode(r, &frame, frame.start(scan_start), eoi + 2, false).end
+        == (jpeg_entropy::End::Eoi { at: eoi })
 }
 
 /// Where entropy-coded data found in `[from, end)` stops being a photo's: the start of the first 512-byte sector
@@ -405,50 +417,81 @@ impl Format for Jpeg {
         }
 
         let header = walk_header(&mut r, start, JPEG_MAX_LEN)?;
-        let mut pos = header.scan_start;
-
-        // Entropy-coded data. FF00 and RSTn are data; EOI ends the file.
-        let formats = builtin();
-        let cut = |r: &mut Reader, end: u64| Measurement {
-            len: end - start,
-            kind: FileKind::Jpeg,
-            health: cut_health(r, start, header.scan_start, end),
-            fragments: Vec::new(),
-        };
-        loop {
-            if pos - start >= JPEG_MAX_LEN {
-                return Some(cut(&mut r, start + JPEG_MAX_LEN));
-            }
-            let Some(b) = r.byte(pos) else {
-                return Some(cut(&mut r, pos));
-            };
-            if pos.is_multiple_of(SECTOR) && r.file_starts_at(formats, pos) {
-                return Some(cut(&mut r, pos));
-            }
-            if b == 0xFF && r.byte(pos + 1) == Some(EOI) {
-                let len = pos + 2 - start;
-                if len > JPEG_MAX_LEN {
-                    return Some(cut(&mut r, start + JPEG_MAX_LEN));
-                }
-                return Some(Measurement {
-                    len,
-                    kind: FileKind::Jpeg,
-                    health: match decode_health(&mut r, start, len) {
-                        // No decoder here handles arithmetic coding: complete but not verifiable.
-                        Health::Damaged if header.has_dac => Health::Partial,
-                        health => health,
-                    },
-                    fragments: Vec::new(),
-                });
-            }
-            // Nothing happens between here and the next `FF`, the next sector start (where another file may begin), the size
-            // cap or the end of the source.
-            let stop = (pos / SECTOR + 1)
-                .saturating_mul(SECTOR)
-                .min(start + JPEG_MAX_LEN)
-                .min(r.len);
-            pos = r.find_ff(pos + 1, stop).unwrap_or(stop);
+        let contiguous = contiguous(&mut r, start, &header);
+        if contiguous.health == Health::Intact {
+            return Some(contiguous);
         }
+        // The photo may continue elsewhere: put it back together from two pieces if it does.
+        let end = start + contiguous.len;
+        let Some(joined) = jpeg_join::join(&mut r, start, header.scan_start, end) else {
+            return Some(contiguous);
+        };
+        let view = Fragmented::new(source, joined.fragments.to_vec());
+        let health = match decode_health(&mut Reader::new(&view), 0, joined.len) {
+            Health::Damaged => return Some(contiguous),
+            // Q1: `Intact` only if exactly one continuation in the whole window passed.
+            Health::Intact if joined.unique => Health::Intact,
+            _ => Health::Partial,
+        };
+        Some(Measurement {
+            len: joined.len,
+            kind: FileKind::Jpeg,
+            health,
+            fragments: joined.fragments.to_vec(),
+        })
+    }
+}
+
+/// The JPEG at `start` as one contiguous run of bytes: up to its `EOI`, or cut by another file's head, the end of the
+/// source or [`JPEG_MAX_LEN`].
+fn contiguous(r: &mut Reader, start: u64, header: &Header) -> Measurement {
+    let mut pos = header.scan_start;
+
+    // Entropy-coded data. FF00 and RSTn are data; EOI ends the file.
+    let formats = builtin();
+    let cut = |r: &mut Reader, end: u64| Measurement {
+        len: end - start,
+        kind: FileKind::Jpeg,
+        health: cut_health(r, start, header.scan_start, end),
+        fragments: Vec::new(),
+    };
+    loop {
+        if pos - start >= JPEG_MAX_LEN {
+            return cut(r, start + JPEG_MAX_LEN);
+        }
+        let Some(b) = r.byte(pos) else {
+            return cut(r, pos);
+        };
+        if pos.is_multiple_of(SECTOR) && r.file_starts_at(formats, pos) {
+            return cut(r, pos);
+        }
+        if b == 0xFF && r.byte(pos + 1) == Some(EOI) {
+            let len = pos + 2 - start;
+            if len > JPEG_MAX_LEN {
+                return cut(r, start + JPEG_MAX_LEN);
+            }
+            return Measurement {
+                len,
+                kind: FileKind::Jpeg,
+                health: match decode_health(r, start, len) {
+                    // No decoder here handles arithmetic coding: complete but not verifiable.
+                    Health::Damaged if header.has_dac => Health::Partial,
+                    // zune-jpeg's strict mode counts neither the MCUs nor data left before EOI.
+                    Health::Intact if !walks_to_eoi(r, start, header.scan_start, pos) => {
+                        Health::Partial
+                    }
+                    health => health,
+                },
+                fragments: Vec::new(),
+            };
+        }
+        // Nothing happens between here and the next `FF`, the next sector start (where another file may begin), the size
+        // cap or the end of the source.
+        let stop = (pos / SECTOR + 1)
+            .saturating_mul(SECTOR)
+            .min(start + JPEG_MAX_LEN)
+            .min(r.len);
+        pos = r.find_ff(pos + 1, stop).unwrap_or(stop);
     }
 }
 

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::{CancelToken, HEAD_LEN};
 use crate::cache::{CachedSource, Runs};
-use crate::formats::{Format, Measurement};
+use crate::formats::{CancelScope, Format, Measurement};
 use crate::source::Source;
 
 /// How often a wait for a measurement looks at the cancel token.
@@ -20,13 +20,16 @@ pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The first measurement of the formats that recognize `head`, as the sequential scan takes it.
+/// The first measurement of the formats that recognize `head`, as the sequential scan takes it. A long measurement
+/// gives up once `cancel` is set (its result is then never used).
 pub(super) fn measure(
     formats: &[Box<dyn Format>],
     source: &dyn Source,
     at: u64,
     head: &[u8],
+    cancel: &CancelToken,
 ) -> Option<Measurement> {
+    let _scope = CancelScope::enter(cancel);
     formats
         .iter()
         .filter(|f| f.recognizes(head))
@@ -196,7 +199,13 @@ impl<'s> Shared<'s> {
             // A panicking detector must not leave the commit loop waiting: the job is handed back unmeasured, and the
             // commit loop measures it on the scan thread, where the panic surfaces as it would in a sequential scan.
             let result = catch_unwind(AssertUnwindSafe(|| {
-                measure(self.formats, &self.cache, job.at, &job.head[..job.head_len])
+                measure(
+                    self.formats,
+                    &self.cache,
+                    job.at,
+                    &job.head[..job.head_len],
+                    self.cancel,
+                )
             }));
             job.slot.fill(match result {
                 Ok(m) => SlotState::Done(m),

@@ -31,9 +31,14 @@ impl SplitMix64 {
 fn encode_noise(width: u32, height: u32, seed: u64) -> Vec<u8> {
     let mut pixels = vec![0u8; width as usize * height as usize * 3];
     SplitMix64(seed).fill(&mut pixels);
+    encode_rgb(&pixels, width, height)
+}
+
+/// Baseline JPEG (quality 90) of `pixels` (RGB, row by row), without the JFIF APP0.
+fn encode_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut out = Vec::new();
     JpegEncoder::new_with_quality(&mut out, 90)
-        .encode(&pixels, width, height, ExtendedColorType::Rgb8)
+        .encode(pixels, width, height, ExtendedColorType::Rgb8)
         .expect("encoding a JPEG in memory cannot fail");
     // Drop the JFIF APP0 (18 bytes) so tiny images stay as small as a baseline JPEG can be.
     if out[2..4] == [0xFF, 0xE0] {
@@ -41,6 +46,39 @@ fn encode_noise(width: u32, height: u32, seed: u64) -> Vec<u8> {
         out.drain(2..4 + len);
     }
     out
+}
+
+/// Valid baseline JPEG (quality 90, no APP0/APP1) of smooth content, like a photo's sky or skin: each channel is the sum
+/// of two low-frequency sinusoids whose orientation and phase come from `seed`. Neighbouring 8×8 blocks have close DC
+/// values, so a seam between two different images shows in the DC grid.
+pub fn jpeg_smooth(width: u32, height: u32, seed: u64) -> Vec<u8> {
+    let mut rng = SplitMix64(seed);
+    let mut unit = || (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
+    let tau = std::f64::consts::TAU;
+    // (cos θ, sin θ, cycles across the image, phase) of each wave.
+    let waves: [(f64, f64, f64, f64); 2] = std::array::from_fn(|_| {
+        let angle = unit() * tau;
+        (angle.cos(), angle.sin(), 1.0 + 2.0 * unit(), unit() * tau)
+    });
+    let size = f64::from(width.max(height));
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 3);
+    for y in 0..height {
+        for x in 0..width {
+            let (fx, fy) = (f64::from(x) / size, f64::from(y) / size);
+            for channel in 0..3 {
+                let shift = f64::from(channel) * 0.7;
+                let v: f64 = waves
+                    .iter()
+                    .zip([60.0, 40.0])
+                    .map(|(&(c, s, cycles, phase), amp)| {
+                        amp * (tau * cycles * (c * fx + s * fy) + phase + shift).sin()
+                    })
+                    .sum();
+                pixels.push((128.0 + v).round().clamp(0.0, 255.0) as u8);
+            }
+        }
+    }
+    encode_rgb(&pixels, width, height)
 }
 
 fn app1_segment(payload: &[u8]) -> Vec<u8> {
@@ -907,18 +945,52 @@ impl BitWriter {
 /// byte by byte (every block: DC diff 0, EOB; RSTn every `interval` MCUs, byte-aligned with 1-bits). Strict-decodable.
 /// `interval == 0` means no DRI segment and no RST markers.
 pub fn jpeg_flat_with_restarts(width: u32, height: u32, interval: u16) -> Vec<u8> {
-    flat_jpeg(width, height, &[(1, 1)], interval)
+    flat_jpeg(width, height, &[(1, 1)], interval, &|_, _| 0)
+}
+
+/// Like [`jpeg_flat_with_restarts`], but block `(bx, by)` has the quantized DC value `dc(bx, by)` (its pixels are
+/// `128 + dc / 8`; keep `|dc| ≤ 1016`). The DC predictor resets at each restart marker, as T.81 requires.
+pub fn jpeg_gray_dc(
+    width: u32,
+    height: u32,
+    interval: u16,
+    dc: &dyn Fn(u32, u32) -> i16,
+) -> Vec<u8> {
+    flat_jpeg(width, height, &[(1, 1)], interval, dc)
 }
 
 /// Like [`jpeg_flat_with_restarts`], with three interleaved components (Y, Cb, Cr): Y sampled `luma` = `(h, v)` (each 1
 /// or 2), Cb and Cr 1×1, all coded with the standard luminance tables. Each MCU holds `h × v` Y blocks then one Cb and
 /// one Cr block. Strict-decodable, flat mid gray.
 pub fn jpeg_flat_ycbcr(width: u32, height: u32, luma: (u8, u8), interval: u16) -> Vec<u8> {
-    flat_jpeg(width, height, &[luma, (1, 1), (1, 1)], interval)
+    flat_jpeg(width, height, &[luma, (1, 1), (1, 1)], interval, &|_, _| 0)
 }
 
-/// Flat baseline JPEG with the components sampled `(h, v)` each (ids 1, 2, ...), every one interleaved in one scan.
-fn flat_jpeg(width: u32, height: u32, comps: &[(u8, u8)], interval: u16) -> Vec<u8> {
+/// Code of each DC category (0..=11) of the typical luminance DC table: `(code, length)`, canonical (T.81 Annex C).
+fn std_dc_codes() -> [(u32, u32); 12] {
+    let mut codes = [(0, 0); 12];
+    let (mut code, mut k) = (0u32, 0usize);
+    for len in 1..=16u32 {
+        for _ in 0..STD_LUMA_DC_BITS[len as usize - 1] {
+            codes[usize::from(STD_LUMA_DC_VALS[k])] = (code, len);
+            code += 1;
+            k += 1;
+        }
+        code <<= 1;
+    }
+    codes
+}
+
+/// Baseline JPEG with the components sampled `(h, v)` each (ids 1, 2, ...), every one interleaved in one scan. Every
+/// block has no AC coefficient; a single-component image's block `(bx, by)` has the DC value `dc(bx, by)`, the blocks of
+/// several components DC 0.
+fn flat_jpeg(
+    width: u32,
+    height: u32,
+    comps: &[(u8, u8)],
+    interval: u16,
+    dc: &dyn Fn(u32, u32) -> i16,
+) -> Vec<u8> {
     let (w, h) = (
         u16::try_from(width).expect("width fits a SOF"),
         u16::try_from(height).expect("height fits a SOF"),
@@ -976,16 +1048,32 @@ fn flat_jpeg(width: u32, height: u32, comps: &[(u8, u8)], interval: u16) -> Vec<
                 .sum(),
         )
     };
+    let dc_codes = std_dc_codes();
+    let blocks_x = u64::from(w.div_ceil(8));
     let mut data = BitWriter::default();
     let mut restarts = 0u8;
+    let mut pred = 0i32;
     for m in 0..mcus {
         if interval > 0 && m > 0 && m % u64::from(interval) == 0 {
             data.align();
             data.out.extend_from_slice(&[0xFF, 0xD0 + restarts % 8]);
             restarts = restarts.wrapping_add(1);
+            pred = 0;
         }
         for _ in 0..blocks {
-            data.bits(0b00, 2); // DC category 0 (difference 0)
+            let value = if comps.len() == 1 {
+                i32::from(dc((m % blocks_x) as u32, (m / blocks_x) as u32))
+            } else {
+                0
+            };
+            let diff = value - pred;
+            pred = value;
+            let category = 32 - diff.unsigned_abs().leading_zeros();
+            let (code, len) = dc_codes[category as usize];
+            data.bits(code, len);
+            // T.81 F.1.2.1: a negative difference is sent as `diff − 1` in `category` bits.
+            let bits = if diff < 0 { diff - 1 } else { diff };
+            data.bits(bits as u32 & ((1 << category) - 1), category);
             data.bits(0b1010, 4); // AC end of block
         }
     }
@@ -1381,5 +1469,67 @@ mod flat_jpeg_tests {
             assert_eq!(img.dimensions(), (33, 17));
             assert!(img.pixels().all(|p| p.0 == [128; 3]), "{luma:?}/{interval}");
         }
+    }
+}
+
+#[cfg(test)]
+mod gray_dc_tests {
+    use super::*;
+
+    #[test]
+    fn gray_dc_jpeg_decodes_to_its_dc_values() {
+        let dc = |bx: u32, by: u32| (bx as i16 - 8) * 40 + by as i16 * 24 - 200;
+        for interval in [0, 3, 16] {
+            let bytes = jpeg_gray_dc(128, 64, interval, &dc);
+            let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+                .expect("decodes")
+                .to_luma8();
+            for by in 0..8 {
+                for bx in 0..16 {
+                    let want = (128 + i32::from(dc(bx, by)) / 8) as u8;
+                    let got = img.get_pixel(bx * 8 + 3, by * 8 + 3).0[0];
+                    assert!(
+                        got.abs_diff(want) <= 1,
+                        "{interval}: ({bx},{by}) {got} vs {want}"
+                    );
+                }
+            }
+        }
+        assert!(jpeg_gray_dc(64, 16, 4, &|_, _| 0) == jpeg_flat_with_restarts(64, 16, 4));
+    }
+}
+
+#[cfg(test)]
+mod smooth_jpeg_tests {
+    use super::*;
+
+    #[test]
+    fn smooth_jpeg_is_smooth_deterministic_and_bare() {
+        let a = jpeg_smooth(256, 128, 1);
+        assert!(a == jpeg_smooth(256, 128, 1));
+        assert!(a != jpeg_smooth(256, 128, 2));
+        // SOI then straight to the tables: no APP0/APP1.
+        assert_eq!(a[..2], [0xFF, 0xD8]);
+        assert!(!matches!(a[3], 0xE0..=0xEF));
+        let img = image::load_from_memory_with_format(&a, image::ImageFormat::Jpeg)
+            .expect("decodes")
+            .to_luma8();
+        assert_eq!(img.dimensions(), (256, 128));
+        // Neighbouring pixels differ little, unlike noise.
+        let mean_step = img
+            .rows()
+            .flat_map(|row| {
+                let row: Vec<u8> = row.map(|p| p.0[0]).collect();
+                (1..row.len())
+                    .map(|i| u32::from(row[i].abs_diff(row[i - 1])))
+                    .collect::<Vec<_>>()
+            })
+            .sum::<u32>() as f64
+            / f64::from(256 * 127);
+        assert!(mean_step < 4.0, "{mean_step}");
+        let (min, max) = img
+            .pixels()
+            .fold((255, 0), |(lo, hi), p| (p.0[0].min(lo), p.0[0].max(hi)));
+        assert!(max - min > 60, "{min}..{max}");
     }
 }

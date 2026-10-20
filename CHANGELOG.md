@@ -38,6 +38,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   photos and videos: extraction writes the pieces in order, photo details and previews are read across them, and
   `revenant-dev` adds a `fragments` key to a `found` line (and its `preview`) only when there are pieces. Contiguous files
   are unchanged.
+- A photo split in two pieces on the card (another file was written in the middle of it) is put back together: the rest of
+  the photo is searched for in the next 64 MiB, and the photo is recovered whole, its pieces in order. It is reported
+  intact only when exactly one continuation fits; otherwise it is partial.
 - Real camera samples: an opt-in test (and CI job) runs the engine over real CR2, CR3, NEF, ARW, RAF, DNG, ORF and RW2
   files (CC0, from raw.pixls.us), downloaded on demand by `scripts/fetch-samples.sh` and checked by SHA-256.
 
@@ -65,6 +68,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   once), so many large photos checked together cannot exhaust memory.
 
 ### Fixed
+
+- Half a photo followed by zeros, by another photo's data or by its own data with a gap, then an end-of-image marker, was
+  reported intact (the decoder used for the check fills in what is missing). It is now partial, and put back together when
+  the rest of the photo is found.
 
 - A small file written inside a Canon CR3's `PRVW` preview was hidden and the CR3 reported intact; a CR3 is now intact only
   if both its preview and its full-size JPEG decode, so the file inside is found.

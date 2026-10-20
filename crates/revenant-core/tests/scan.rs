@@ -1636,3 +1636,113 @@ fn a_panicking_detector_panics_the_scan_without_hanging() {
     let formats: Vec<Box<dyn Format>> = vec![Box::new(Panics)];
     let _ = run_with(&source, &formats, &threads(8));
 }
+
+#[test]
+fn scan_reports_the_reassembled_jpeg_and_the_file_in_the_gap() {
+    // As in tests/jpeg.rs: a smooth photo split at c, a small JPEG right after the first piece, the rest at 3 MiB.
+    let a = testkit::jpeg_smooth(1024, 768, 1);
+    let c = (a.len() / 2).next_multiple_of(512);
+    let small = testkit::jpeg(64, 64, 9, 0);
+    let start = 64 * 1024;
+    let file = DiskImage::noise(8 * MIB, 5)
+        .put(start, &a[..c])
+        .put(start + c, &small)
+        .put(3 * MIB, &a[c..])
+        .save();
+    let source = SlowSource(
+        FileSource::open(file.path()).unwrap(),
+        std::time::Duration::ZERO,
+    );
+    for n in [1, 8] {
+        let (r, events) = run(&source, &threads(n));
+        r.unwrap();
+        let found: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Found(f) => Some(f.clone()),
+                _ => None,
+            })
+            .collect();
+        let summary: Vec<_> = found
+            .iter()
+            .map(|f| (f.start, f.len, f.kind, f.health, f.fragments.clone()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    start as u64,
+                    a.len() as u64,
+                    FileKind::Jpeg,
+                    Health::Intact,
+                    vec![
+                        Fragment {
+                            start: start as u64,
+                            len: c as u64
+                        },
+                        Fragment {
+                            start: 3 * MIB as u64,
+                            len: (a.len() - c) as u64
+                        },
+                    ]
+                ),
+                (
+                    (start + c) as u64,
+                    small.len() as u64,
+                    FileKind::Jpeg,
+                    Health::Intact,
+                    vec![]
+                ),
+            ],
+            "threads {n}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = revenant_core::extract(&source, &found[0], dir.path()).unwrap();
+        assert!(std::fs::read(path).unwrap() == a, "byte-identical");
+    }
+}
+
+#[test]
+fn cancel_stops_a_jpeg_gap_search() {
+    use std::time::{Duration, Instant};
+    // A photo cut in half, then 64 MiB of sectors each ending in FF D9: its gap search reads the whole window and tries
+    // MAX_JOIN_TRIES joins. At 20 ms per 1 MiB read that is well over a second.
+    let a = testkit::jpeg(640, 480, 3, 0);
+    let c = (a.len() / 2).next_multiple_of(512);
+    let mut img = DiskImage::zeros(c + 64 * MIB);
+    img.put(0, &a[..c]);
+    let mut sector = [0u8; 512];
+    sector[510..].copy_from_slice(&[0xFF, 0xD9]);
+    for i in 0..(64 * MIB / 512) {
+        img.put(c + i * 512, &sector);
+    }
+    let file = img.save();
+    let source = SlowSource(
+        FileSource::open(file.path()).unwrap(),
+        Duration::from_millis(20),
+    );
+    let cancel = CancelToken::default();
+    let cancelled_at = std::sync::Mutex::new(None);
+    let opts = ScanOptions {
+        threads: 2,
+        // A small cache and read-ahead, so the scan does not read the window for the search first.
+        cache_bytes: 8 * MIB,
+        ..ScanOptions::default()
+    };
+    let r = std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            *cancelled_at.lock().unwrap() = Some(Instant::now());
+            cancel.cancel();
+        });
+        scan(&source, &all_formats(), &opts, &cancel, &mut |_| {})
+    });
+    let returned = Instant::now();
+    assert_eq!(r.unwrap_err().code(), "cancelled");
+    let at = cancelled_at.lock().unwrap().expect("cancelled");
+    assert!(
+        returned - at < Duration::from_millis(700),
+        "{:?}",
+        returned - at
+    );
+}

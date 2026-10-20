@@ -441,3 +441,286 @@ fn confirms_walks_at_most_one_mib_of_header() {
     assert!(!Jpeg.confirms(&source, 4096));
     assert!(source.bytes.load(std::sync::atomic::Ordering::Relaxed) <= MIB as u64 + 4096);
 }
+
+// Two-piece JPEGs (bifragment gap carving).
+
+const KIB: usize = 1024;
+/// Where the photo under test starts.
+const START: usize = 64 * KIB;
+
+/// `a = jpeg_smooth(1024, 768, 1)` and its split point `c`: the first multiple of 512 at or after half of it.
+fn smooth_photo() -> (Vec<u8>, usize) {
+    let a = testkit::jpeg_smooth(1024, 768, 1);
+    let c = (a.len() / 2).next_multiple_of(512);
+    (a, c)
+}
+
+/// The pieces contract of a measurement at `start` on a source of `source_len` bytes: at least 2 pieces, the first at
+/// `start`, lengths summing to `len`, none overlapping, all inside the source.
+fn assert_pieces(m: &Measurement, start: u64, source_len: u64) {
+    let p = &m.fragments;
+    assert!(p.len() >= 2, "{m:?}");
+    assert_eq!(p[0].start, start, "{m:?}");
+    assert_eq!(p.iter().map(|f| f.len).sum::<u64>(), m.len, "{m:?}");
+    assert!(
+        p.iter().all(|f| f.len > 0 && f.start + f.len <= source_len),
+        "{m:?}"
+    );
+    let mut sorted = p.clone();
+    sorted.sort_by_key(|f| f.start);
+    assert!(
+        sorted
+            .windows(2)
+            .all(|w| w[0].start + w[0].len <= w[1].start),
+        "{m:?}"
+    );
+}
+
+/// The measurement of `a` reassembled from `a[..c]` at `START` and `a[c..]` at `tail`.
+fn reassembled(a: &[u8], c: usize, tail: usize, health: Health) -> Measurement {
+    Measurement {
+        len: a.len() as u64,
+        kind: FileKind::Jpeg,
+        health,
+        fragments: vec![
+            revenant_core::Fragment {
+                start: START as u64,
+                len: c as u64,
+            },
+            revenant_core::Fragment {
+                start: tail as u64,
+                len: (a.len() - c) as u64,
+            },
+        ],
+    }
+}
+
+/// Measures at `START` and checks the pieces contract when the result has pieces.
+fn measure_at_start(img: &DiskImage) -> Measurement {
+    let file = img.save();
+    let len = std::fs::metadata(file.path()).unwrap().len();
+    let m = measure(&file, START as u64).expect("a JPEG");
+    if !m.fragments.is_empty() {
+        assert_pieces(&m, START as u64, len);
+    }
+    m
+}
+
+/// 8 MiB of noise (seed 5), `a[..c]` at `START` and `a[c..]` at 3 MiB.
+fn split_photo_image() -> (DiskImage, Vec<u8>, usize) {
+    let (a, c) = smooth_photo();
+    let mut img = DiskImage::noise(8 * MIB, 5);
+    img.put(START, &a[..c]).put(3 * MIB, &a[c..]);
+    (img, a, c)
+}
+
+#[test]
+fn photo_ending_early_in_an_eoi_is_not_intact() {
+    // Half a photo, then zeros and an EOI: zune-jpeg's strict mode accepts it (it neither counts MCUs nor rejects data
+    // before EOI), our entropy decoder does not (EOI before the last MCU).
+    let (a, c) = smooth_photo();
+    let mut bytes = a[..c].to_vec();
+    bytes.extend_from_slice(&[0; 510]);
+    bytes.extend_from_slice(&[0xFF, 0xD9]);
+    let img = DiskImage::zeros(START + bytes.len() + 4096)
+        .put(START, &bytes)
+        .save();
+    let m = measure(&img, START as u64).unwrap();
+    assert_eq!((m.len, m.health), (bytes.len() as u64, Health::Partial));
+}
+
+#[test]
+fn bifragment_jpeg_is_reassembled_intact() {
+    let (mut img, a, c) = split_photo_image();
+    img.put(START + c, &testkit::jpeg(64, 64, 9, 0));
+    assert_eq!(
+        measure_at_start(&img),
+        reassembled(&a, c, 3 * MIB, Health::Intact)
+    );
+}
+
+#[test]
+fn fragment_followed_by_noise_is_reassembled() {
+    let (img, a, c) = split_photo_image();
+    assert_eq!(
+        measure_at_start(&img),
+        reassembled(&a, c, 3 * MIB, Health::Intact)
+    );
+}
+
+#[test]
+fn fragment_followed_by_zeros_is_reassembled() {
+    let (a, c) = smooth_photo();
+    let mut img = DiskImage::zeros(8 * MIB);
+    img.put(START, &a[..c]).put(3 * MIB, &a[c..]);
+    assert_eq!(
+        measure_at_start(&img),
+        reassembled(&a, c, 3 * MIB, Health::Intact)
+    );
+}
+
+#[test]
+fn two_passing_continuations_are_partial() {
+    let (mut img, a, c) = split_photo_image();
+    img.put(5 * MIB, &a[c..]);
+    assert_eq!(
+        measure_at_start(&img),
+        reassembled(&a, c, 3 * MIB, Health::Partial)
+    );
+}
+
+#[test]
+fn search_cut_short_by_the_cap_is_partial() {
+    // After the real tail, 1100 sectors each ending in FF D9: 4 tries each, more than MAX_JOIN_TRIES (4096) in all, so
+    // the search stops before the candidates run out.
+    let (mut img, a, c) = split_photo_image();
+    let after = (3 * MIB + a.len() - c).next_multiple_of(512);
+    let mut sector = [0u8; 512];
+    sector[510..].copy_from_slice(&[0xFF, 0xD9]);
+    for i in 0..1100 {
+        img.put(after + i * 512, &sector);
+    }
+    assert_eq!(
+        measure_at_start(&img),
+        reassembled(&a, c, 3 * MIB, Health::Partial)
+    );
+}
+
+#[test]
+fn glued_halves_of_two_photos_are_not_intact() {
+    let (a, c) = smooth_photo();
+    let b = testkit::jpeg_smooth(1024, 768, 2);
+    let mut img = DiskImage::noise(8 * MIB, 5);
+    img.put(START, &a[..c]).put(START + c, &b);
+    let m = measure_at_start(&img);
+    assert_ne!(m.health, Health::Intact, "{m:?}");
+    // b itself is found whole.
+    let file = img.save();
+    let mb = measure(&file, (START + c) as u64).unwrap();
+    assert_eq!(
+        (mb.len, mb.health, mb.fragments.len()),
+        (b.len() as u64, Health::Intact, 0)
+    );
+}
+
+#[test]
+fn foreign_tail_after_the_gap_is_not_glued_intact() {
+    let (a, c) = smooth_photo();
+    let b = testkit::jpeg_smooth(1024, 768, 2);
+    let mut img = DiskImage::noise(8 * MIB, 5);
+    img.put(START, &a[..c]).put(3 * MIB, &b[c..]);
+    let m = measure_at_start(&img);
+    assert_ne!(m.health, Health::Intact, "{m:?}");
+}
+
+#[test]
+fn three_pieces_are_not_reassembled() {
+    let (a, c) = smooth_photo();
+    let mut img = DiskImage::noise(8 * MIB, 5);
+    img.put(START, &a[..c])
+        .put(2 * MIB, &a[c..c + 4096])
+        .put(4 * MIB, &a[c + 4096..]);
+    let m = measure_at_start(&img);
+    assert_eq!((m.fragments.len(), m.health), (0, Health::Partial), "{m:?}");
+}
+
+#[test]
+fn hostile_gap_search_is_bounded() {
+    // a[..c] then 65 MiB of sectors each `[00; 510] FF D9`: every sector is a distinct EOI, so the window holds far more
+    // candidates than MAX_JOIN_TRIES.
+    let a = testkit::jpeg(640, 480, 3, 0);
+    let c = (a.len() / 2).next_multiple_of(512);
+    let mut img = DiskImage::zeros(c + 65 * MIB);
+    img.put(0, &a[..c]);
+    let mut sector = [0u8; 512];
+    sector[510..].copy_from_slice(&[0xFF, 0xD9]);
+    for i in 0..(65 * MIB / 512) {
+        img.put(c + i * 512, &sector);
+    }
+    let file = img.save();
+    let source = Counting {
+        inner: FileSource::open(file.path()).unwrap(),
+        bytes: Default::default(),
+    };
+    let t = std::time::Instant::now();
+    let m = Jpeg.measure(&source, 0).expect("a JPEG");
+    let took = t.elapsed();
+    if !m.fragments.is_empty() {
+        assert_pieces(&m, 0, revenant_core::source::Source::len(&source));
+    }
+    assert_ne!(m.health, Health::Intact, "{m:?}");
+    assert!(took < std::time::Duration::from_secs(10), "{took:?}");
+    let read = source.bytes.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(read <= 68 * MIB as u64, "{} MiB read", read / MIB as u64);
+}
+
+/// Offset in `j` of its `k`-th restart marker (1-based).
+fn restart_marker(j: &[u8], k: usize) -> usize {
+    let data = scan_data_start(j);
+    let at = j[data..]
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| w[0] == 0xFF && (0xD0..=0xD7).contains(&w[1]))
+        .nth(k - 1)
+        .expect("restart marker")
+        .0;
+    data + at
+}
+
+#[test]
+fn tail_spliced_at_a_restart_marker_needs_the_dc_seam() {
+    // Restart markers every MCU row: DC predictors reset there, so any photo of the same geometry and tables continues
+    // validly at its own 16th marker with the exact MCU count. Only the DC seam tells the photo's own tail from another's.
+    let dc_a = |bx: u32, by: u32| bx as i16 * 2 + by as i16 * 3 - 100;
+    let dc_b = |bx: u32, by: u32| 400 - bx as i16 * 2 - by as i16 * 3;
+    let a = testkit::jpeg_gray_dc(512, 256, 64, &dc_a);
+    let b = testkit::jpeg_gray_dc(512, 256, 64, &dc_b);
+    // At the 16th marker the seam is judged right after its row (against the rows above); at the 1st, with no row above,
+    // only once the whole image is decoded.
+    for k in [16, 1] {
+        let (pa, pb) = (restart_marker(&a, k), restart_marker(&b, k));
+        // The first piece ends right before the marker, on a sector boundary.
+        let start = 64 * KIB - pa % 512 + 512;
+        assert_eq!((start + pa) % 512, 0);
+        let image = |tail: &[u8]| {
+            let mut img = DiskImage::noise(8 * MIB, 5);
+            img.put(start, &a[..pa]).put(3 * MIB, tail);
+            let file = img.save();
+            let m = measure(&file, start as u64).unwrap();
+            if !m.fragments.is_empty() {
+                assert_pieces(&m, start as u64, 8 * MIB as u64);
+            }
+            m
+        };
+        let own = image(&a[pa..]);
+        assert_eq!(
+            (own.len, own.health, own.fragments.len()),
+            (a.len() as u64, Health::Intact, 2),
+            "marker {k}"
+        );
+        let foreign = image(&b[pb..]);
+        assert!(foreign.fragments.is_empty(), "marker {k}: {foreign:?}");
+        assert_ne!(foreign.health, Health::Intact, "marker {k}: {foreign:?}");
+    }
+}
+
+#[test]
+fn photo_glued_to_a_wrong_tail_is_not_intact() {
+    // Half a photo straight followed by another photo's tail, or by its own tail with a sector missing: zune-jpeg's
+    // strict mode decodes both (an MCU count it does not check comes out wrong), our entropy decoder does not.
+    let (a, c) = smooth_photo();
+    let b = testkit::jpeg_smooth(1024, 768, 2);
+    for (name, tail) in [("other tail", &b[c..]), ("sector missing", &a[c + 512..])] {
+        let mut bytes = a[..c].to_vec();
+        bytes.extend_from_slice(tail);
+        let img = DiskImage::zeros(START + bytes.len() + 4096)
+            .put(START, &bytes)
+            .save();
+        let m = measure(&img, START as u64).unwrap();
+        assert_eq!(
+            (m.len, m.health, m.fragments.len()),
+            (bytes.len() as u64, Health::Partial, 0),
+            "{name}"
+        );
+    }
+}

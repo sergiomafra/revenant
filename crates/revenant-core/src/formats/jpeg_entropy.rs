@@ -128,7 +128,6 @@ impl Frame {
     }
 
     /// Blocks of component 0 in one MCU, `(horizontally, vertically)`; `(1, 1)` for a single-component scan.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the JPEG gap search"))]
     pub(crate) fn luma_blocks_per_mcu(&self) -> (u32, u32) {
         self.luma_hv
     }
@@ -345,7 +344,6 @@ pub(crate) struct Cursor {
 
 impl Cursor {
     /// The same state, every position minus `by` (for decoding the same bytes through a view that starts `by` later).
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the JPEG gap search"))]
     pub(crate) fn shifted_back(&self, by: u64) -> Cursor {
         let mut c = self.clone();
         c.pos -= by;
@@ -384,7 +382,6 @@ pub(crate) enum End {
 }
 
 /// Result of [`decode`].
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the JPEG gap search"))]
 pub(crate) struct Run {
     /// Complete MCUs: the index of the first MCU not decoded.
     pub mcus: u64,
@@ -425,6 +422,25 @@ impl Bytes<'_, '_> {
         }
         Some(self.buf[(pos - self.start) as usize])
     }
+
+    /// The 8 bytes at `pos` as a big-endian word, if they are all already buffered and below the limit.
+    #[inline(always)]
+    fn word(&self, pos: u64) -> Option<u64> {
+        let end = pos.checked_add(8)?;
+        if pos < self.start || end > self.start + self.len as u64 || end > self.limit {
+            return None;
+        }
+        let at = (pos - self.start) as usize;
+        let bytes: [u8; 8] = self.buf[at..at + 8].try_into().ok()?;
+        Some(u64::from_be_bytes(bytes))
+    }
+}
+
+/// Whether any byte of `w` is `FF`.
+#[inline(always)]
+fn has_ff(w: u64) -> bool {
+    let x = !w; // an FF byte becomes 00
+    x.wrapping_sub(0x0101_0101_0101_0101) & !x & 0x8080_8080_8080_8080 != 0
 }
 
 /// Why the bit buffer could not be filled further.
@@ -443,7 +459,24 @@ enum Fail {
 }
 
 /// Loads whole bytes into the bit buffer until it holds more than 56 bits, a marker or the end of the data.
+#[inline(always)]
 fn fill(c: &mut Cursor, src: &mut Bytes) -> Stop {
+    // Fast path: the next 8 bytes are buffered and none is `FF` (no stuffing, no marker), so the whole bytes that fit
+    // are loaded at once.
+    if c.nbits <= 56
+        && let Some(w) = src.word(c.pos)
+        && !has_ff(w)
+    {
+        let n = (64 - c.nbits) / 8;
+        c.bits |= (w >> (64 - 8 * n)) << (64 - 8 * n - c.nbits);
+        for i in 0..n {
+            c.byte_pos[usize::from(c.loaded & 7)] = c.pos + u64::from(i);
+            c.loaded = c.loaded.wrapping_add(1);
+        }
+        c.nbits += 8 * n;
+        c.pos += u64::from(n);
+        return Stop::Full;
+    }
     while c.nbits <= 56 {
         let Some(b) = src.get(c.pos) else {
             return Stop::OutOfData;
@@ -476,7 +509,7 @@ fn short(c: &Cursor, stop: Stop) -> Fail {
 }
 
 /// Makes at least `n` (≤ 16) bits available.
-#[inline]
+#[inline(always)]
 fn need(c: &mut Cursor, src: &mut Bytes, n: u32) -> Result<(), Fail> {
     if c.nbits < n {
         let stop = fill(c, src);
@@ -488,7 +521,7 @@ fn need(c: &mut Cursor, src: &mut Bytes, n: u32) -> Result<(), Fail> {
 }
 
 /// Decodes one Huffman symbol (T.81 F.2.2.3).
-#[inline]
+#[inline(always)]
 fn symbol(c: &mut Cursor, src: &mut Bytes, t: &Huffman) -> Result<u8, Fail> {
     let stop = if c.nbits < 16 {
         fill(c, src)
@@ -598,7 +631,6 @@ fn marker_after_padding(c: &mut Cursor, src: &mut Bytes) -> Result<(u64, u8), Fa
 }
 
 /// Decodes MCUs from `from`, reading only bytes in `[from.pos, limit)`.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the JPEG gap search"))]
 pub(crate) fn decode(
     r: &mut Reader,
     frame: &Frame,

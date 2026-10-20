@@ -52,7 +52,13 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   (`width`, `height`); absent when there is none (MP4/MOV, HEIC).
 - `fragments`: present only when the file was found in pieces: `[{"start":…,"len":…},…]`, the absolute ranges in file
   order (the first starts at `start`, the lengths sum to `len`). `preview` gets the same key under the same rule, and
-  `--previews` writes all of a preview's pieces in order. Contiguous files (every file today) have no `fragments` key.
+  `--previews` writes all of a preview's pieces in order. Contiguous files have no `fragments` key. A JPEG put back
+  together from two pieces, with a small photo found in the gap:
+
+  ```json
+  {"event":"found","id":1,"start":65536,"len":71816,"kind":"jpeg","health":"intact","fragments":[{"start":65536,"len":36352},{"start":3145728,"len":35464}],"width":1024,"height":768,"preview":{"start":65536,"len":71816,"width":1024,"height":768,"fragments":[{"start":65536,"len":36352},{"start":3145728,"len":35464}]}}
+  {"event":"found","id":2,"start":101888,"len":8250,"kind":"jpeg","health":"intact","width":64,"height":64,"preview":{"start":101888,"len":8250,"width":64,"height":64}}
+  ```
 - With `--extract`, a `found` line gets `"file":"<path>"`. If extracting that one finding fails (for example
   `write_failed` when the folder is not writable), it gets `"error":"<code>"` instead and the scan continues.
 - With `--previews`, a `found` line that has a `preview` gets `"preview_file":"<path>"`, or `"preview_error":"<code>"`
