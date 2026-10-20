@@ -88,6 +88,12 @@ reproduzem a estrutura:
 - O MakerNote antigo `OLYMP\0` da Olympus (E-10 e afins, offsets relativos ao TIFF) não é lido.
 - Não há HEIC real: nenhuma amostra com licença CC0/domínio público verificável foi achada.
 
+- **Aberto antes do merge (P18 revisto):** com a regra "a maior prévia decide" no CR3, um arquivo pequeno gravado dentro
+  da prévia PRVW some, e o CR3 aparece Íntegro (reproduzido). Correção pequena: enquanto a leitura do CR3 não procurar
+  cabeçalhos dentro do `uuid` da PRVW, uma PRVW quebrada mantém o CR3 no máximo Parcial. Teste com a sonda do revisor.
+- **P17:** um RW2 Parcial continua tendo o JpgFromRaw dele relatado como um achado separado (só um achado Íntegro esconde o
+  que há dentro dele, como no R10 da 1.1). Deduplicação na Parte 1.4.
+
 **Parte 1.4 (sistemas de arquivos)**
 - Uma foto gravada exatamente no início de uma prévia ou de um strip com compressão JPEG de RAW, de um chunk de CR3 ou de
   uma extensão de HEIC não se distingue dos dados do próprio arquivo. Os metadados do sistema de arquivos resolvem isso.
