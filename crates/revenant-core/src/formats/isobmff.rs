@@ -42,13 +42,14 @@
 //!
 //! An `mdat` head that is exactly a chunk start (CR3: of any track; Motion-JPEG video: of its track) or an extent start
 //! (HEIC) is the file's own data, not another file: see `measure`. A foreign file starting exactly there is
-//! indistinguishable from it.
+//! indistinguishable from it. So is a CR3 head inside its own `PRVW` or full-size JPEG while that JPEG still decodes
+//! (ruling P13).
 //!
 //! Unreadable sectors read as zeros: inside `moov` the index is unusable -> `Damaged` (the length still covers `moov`, so
 //! extraction keeps it); anywhere else in the file an otherwise `Intact` file becomes `Partial`. A box header that cannot
 //! be read ends the walk there, like a cut (`Partial`, or `Damaged` without `moov`).
 
-use super::jpeg::preview_health;
+use super::jpeg::{OwnJpegs, preview_health};
 use super::{FileKind, Format, HEAD_LEN, Health, Measurement, Reader, SECTOR, all_formats};
 use crate::source::Source;
 
@@ -114,18 +115,22 @@ fn parse_header(b: &[u8]) -> Option<BoxHeader> {
 }
 
 /// First 512-byte sector start strictly inside `(box_start, box_end)` where any format recognizes a file, except the
-/// sorted absolute positions in `own` (data the file itself keeps there).
+/// sorted absolute positions in `own` (data the file itself keeps there) and heads inside an own JPEG that still decodes
+/// (`jpegs`, ruling P13).
 fn next_file_inside(
     r: &mut Reader,
     formats: &[Box<dyn Format>],
     box_start: u64,
     box_end: u64,
     own: &[u64],
+    jpegs: &mut OwnJpegs,
 ) -> Option<u64> {
     (box_start / SECTOR + 1..)
         .map(|i| i * SECTOR)
         .take_while(|&s| s < box_end)
-        .find(|&s| own.binary_search(&s).is_err() && r.file_starts_at(formats, s))
+        .find(|&s| {
+            own.binary_search(&s).is_err() && r.file_starts_at(formats, s) && !jpegs.vouch_for(r, s)
+        })
 }
 
 /// Children `(type, payload)` of a box payload, bounded by the payload itself. Sets `garbled` if the walk ends on an
@@ -254,7 +259,7 @@ impl Format for IsoBmff {
             return None;
         }
         let formats = all_formats();
-        let walk = walk_boxes(&mut r, &formats, start, true, &[]);
+        let walk = walk_boxes(&mut r, &formats, start, true, &[], &mut OwnJpegs::default());
         let first = judge(&mut r, start, &walk)?;
         if !walk.cut_in_mdat {
             return Some(first);
@@ -262,7 +267,14 @@ impl Format for IsoBmff {
         // Motion-JPEG stores one JPEG per frame in `mdat`, a CR3 keeps its full-size JPEG there and a HEIC may hold JPEG
         // items: those are the file's own, not another file. Walk the box headers again, without the checks inside
         // `mdat` (so this costs one read per box, not per sector), to learn the file's own data starts from its index.
-        let again = walk_boxes(&mut r, &formats, start, false, &[]);
+        let again = walk_boxes(
+            &mut r,
+            &formats,
+            start,
+            false,
+            &[],
+            &mut OwnJpegs::default(),
+        );
         let own: Vec<u64> = own_starts(&mut r, &again)
             .iter()
             .map(|o| start + o)
@@ -277,7 +289,13 @@ impl Format for IsoBmff {
         if exempt {
             // Skip the file's own data starts: the first head that is not one ends the file (for Motion-JPEG, a video
             // whose every head is one of its frames is whole).
-            let walk = walk_boxes(&mut r, &formats, start, true, &own);
+            // A CR3's own JPEGs carry EXIF thumbnails that may start on a sector (ruling P13).
+            let mut jpegs = if again.kind == FileKind::Cr3 {
+                OwnJpegs::new(cr3_jpegs(&mut r, start, &again))
+            } else {
+                OwnJpegs::default()
+            };
+            let walk = walk_boxes(&mut r, &formats, start, true, &own, &mut jpegs);
             return judge(&mut r, start, &walk);
         }
         Some(first)
@@ -311,13 +329,14 @@ const MAX_BRANDS: usize = 64;
 const HEIC_BRANDS: [&[u8; 4]; 6] = [b"heic", b"heix", b"heim", b"heis", b"mif1", b"msf1"];
 
 /// Walks the top-level boxes of the file at `start`. With `inner_checks`, every sector start inside `mdat` where a file
-/// starts ends the file there, except the sorted absolute positions in `own`.
+/// starts ends the file there, except the sorted absolute positions in `own` and heads that `jpegs` vouches for.
 fn walk_boxes(
     r: &mut Reader,
     formats: &[Box<dyn Format>],
     start: u64,
     inner_checks: bool,
     own: &[u64],
+    jpegs: &mut OwnJpegs,
 ) -> Walk {
     let source_len = r.source.len();
     let mut w = Walk {
@@ -370,7 +389,7 @@ fn walk_boxes(
         let mut cut = false;
         if inner_checks
             && &h.kind == b"mdat"
-            && let Some(next) = next_file_inside(r, formats, pos, pos + size, own)
+            && let Some(next) = next_file_inside(r, formats, pos, pos + size, own, jpegs)
         {
             // Another file was written over the rest of this mdat (or a size-0 mdat ends where the next file
             // begins): the video ends there. A declared size the data no longer reaches is a cut.
@@ -530,6 +549,23 @@ pub(crate) fn cr3_first_chunk(moov: &[u8]) -> Option<(u64, u64)> {
         u64::from(be32(stsz.get(12..16)?))
     };
     Some((at, len))
+}
+
+/// The JPEGs a walked CR3 keeps, as `(absolute offset, length)`: the `PRVW` preview and the full-size JPEG (see
+/// [`cr3_full_jpeg`]).
+fn cr3_jpegs(r: &mut Reader, start: u64, w: &Walk) -> Vec<(u64, u64)> {
+    let moov = w.moov.and_then(|(at, len)| load(r, at, len));
+    let full = moov.and_then(|m| cr3_full_jpeg(r, start, &m));
+    cr3_prvw(r, &w.uuids).into_iter().chain(full).collect()
+}
+
+/// The first chunk of the first track of a CR3 (`moov` payload, file at `start`) as `(absolute offset, length of its
+/// first sample)`, when it starts with a JPEG SOI: Canon keeps the full-size JPEG there.
+pub(crate) fn cr3_full_jpeg(r: &mut Reader, start: u64, moov: &[u8]) -> Option<(u64, u64)> {
+    let (o, l) = cr3_first_chunk(moov)?;
+    let at = start.checked_add(o)?;
+    let mut soi = [0u8; 3];
+    (r.read(at, &mut soi) == 3 && soi == [0xFF, 0xD8, 0xFF]).then_some((at, l))
 }
 
 /// Top-level boxes read by [`top_level`].

@@ -649,7 +649,7 @@ pub fn panasonic_rw2(opts: &Rw2Options) -> TiffRaw {
 /// Like [`jpeg`] without padding, with an APP1 `Exif\0\0` segment holding a 16x16 thumbnail JPEG that starts `at` bytes
 /// from the start of the JPEG (zeros fill the payload before it). `at` must be at least 12 and leave the APP1 under the
 /// segment limit.
-fn jpeg_with_thumbnail_at(width: u32, height: u32, seed: u64, at: usize) -> Vec<u8> {
+pub fn jpeg_with_thumbnail_at(width: u32, height: u32, seed: u64, at: usize) -> Vec<u8> {
     let base = encode_noise(width, height, seed);
     // SOI (2) + APP1 marker and length (4) come before the payload.
     let mut payload = b"Exif\0\0".to_vec();
@@ -856,9 +856,13 @@ fn put_be32(buf: &mut [u8], at: usize, v: u32) {
 /// at 0x64/0x68 the CFA offset/len. The JPEG is a testkit JPEG with an EXIF APP1 built from `exif`. The CFA data is
 /// `raw_len` bytes of noise and comes last.
 pub fn raf(raw_len: usize, seed: u64, exif: &TestExif) -> Vec<u8> {
+    raf_with_jpeg(raw_len, seed, &jpeg_with_exif(160, 120, seed, exif))
+}
+
+/// Like [`raf`], with `jpeg` as the embedded JPEG. It sits at offset 0x94 of the file.
+pub fn raf_with_jpeg(raw_len: usize, seed: u64, jpeg: &[u8]) -> Vec<u8> {
     const HEADER: usize = 0x94;
     const CFA_HEADER_LEN: usize = 64;
-    let jpeg = jpeg_with_exif(160, 120, seed, exif);
     let cfa_header_at = (HEADER + jpeg.len()).next_multiple_of(16);
     let cfa_at = cfa_header_at + CFA_HEADER_LEN;
     let mut out = vec![0u8; cfa_at + raw_len];
@@ -875,7 +879,7 @@ pub fn raf(raw_len: usize, seed: u64, exif: &TestExif) -> Vec<u8> {
     ] {
         put_be32(&mut out, at, v as u32);
     }
-    out[HEADER..HEADER + jpeg.len()].copy_from_slice(&jpeg);
+    out[HEADER..HEADER + jpeg.len()].copy_from_slice(jpeg);
     SplitMix64(seed ^ 0x0052_4146).fill(&mut out[cfa_header_at..]);
     out
 }
@@ -894,8 +898,12 @@ const CR3_PRVW_UUID: [u8; 16] = [
 /// eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16 at top level holding a `PRVW` box with a smaller JPEG. Box order: `ftyp`, `moov`,
 /// preview `uuid`, a `free` pad, `mdat`; the `mdat` payload (the full-size JPEG) starts at a multiple of 512.
 pub fn cr3(seed: u64, exif: &TestExif) -> Vec<u8> {
+    cr3_with_full_jpeg(seed, exif, &jpeg(640, 480, seed, 0))
+}
+
+/// Like [`cr3`], with `full` as the full-size JPEG (the first chunk, at the start of the `mdat` payload).
+pub fn cr3_with_full_jpeg(seed: u64, exif: &TestExif, full: &[u8]) -> Vec<u8> {
     let enc = Enc(false);
-    let full = jpeg(640, 480, seed, 0);
     let small = jpeg(160, 120, seed ^ 0x5052_5657, 0);
 
     let mut ftyp = b"crx ".to_vec();
@@ -940,7 +948,7 @@ pub fn cr3(seed: u64, exif: &TestExif) -> Vec<u8> {
         moov,
         prvw_uuid,
         bmff_box(b"free", &free),
-        bmff_box(b"mdat", &full),
+        bmff_box(b"mdat", full),
     ]
     .concat()
 }

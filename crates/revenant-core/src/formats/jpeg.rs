@@ -4,6 +4,8 @@
 //! Unreadable sectors read as zeros. A file containing any is at best `Partial`; if the header walk breaks on one, the
 //! search for EOI continues from there (the file is then judged by the decoders like any other).
 
+use std::collections::HashMap;
+
 use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, all_formats};
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
@@ -226,6 +228,64 @@ pub(super) fn preview_health(r: &mut Reader, previews: &[(u64, u64)]) -> Health 
     match best {
         Some((_, o, l)) if decode_health(r, o, l) == Health::Intact => Health::Intact,
         _ => Health::Partial,
+    }
+}
+
+/// A file's own embedded JPEGs, for deciding whether a file head inside one of them is the file's own data (ruling P13):
+/// the EXIF thumbnail in a preview's APP1 is a complete JPEG, and it may start on a sector. Such a head is the file's own
+/// while every own JPEG containing it is at most [`JPEG_MAX_LEN`] long and still decodes strictly; a file written over
+/// part of an own JPEG breaks that decode, so it is another file. One decode per containing JPEG, cached, and only done
+/// when a head is found inside one.
+#[derive(Default)]
+pub(crate) struct OwnJpegs {
+    /// `[start, end)` absolute, sorted.
+    jpegs: Vec<(u64, u64)>,
+    /// The same ranges merged into disjoint ones.
+    merged: Vec<(u64, u64)>,
+    decodes: HashMap<(u64, u64), bool>,
+}
+
+impl OwnJpegs {
+    /// From `(absolute offset, length)` ranges; empty ranges are ignored.
+    pub(crate) fn new(ranges: impl IntoIterator<Item = (u64, u64)>) -> Self {
+        let mut jpegs: Vec<(u64, u64)> = ranges
+            .into_iter()
+            .filter(|&(_, l)| l > 0)
+            .map(|(o, l)| (o, o.saturating_add(l)))
+            .collect();
+        jpegs.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(jpegs.len());
+        for &(s, e) in &jpegs {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        Self {
+            jpegs,
+            merged,
+            decodes: HashMap::new(),
+        }
+    }
+
+    /// Whether the file head at `pos` lies inside an own JPEG and every own JPEG containing it vouches for it (see the
+    /// type).
+    pub(crate) fn vouch_for(&mut self, r: &mut Reader, pos: u64) -> bool {
+        let i = self.merged.partition_point(|&(s, _)| s < pos);
+        if i == 0 || pos >= self.merged[i - 1].1 {
+            return false;
+        }
+        let decodes = &mut self.decodes;
+        self.jpegs
+            .iter()
+            .take_while(|&&(s, _)| s < pos)
+            .filter(|&&(_, e)| pos < e)
+            .all(|&(s, e)| {
+                // Over the JPEG size cap it is not decoded, so it cannot vouch for the head.
+                *decodes.entry((s, e)).or_insert_with(|| {
+                    e - s <= JPEG_MAX_LEN && decode_health(r, s, e - s) == Health::Intact
+                })
+            })
     }
 }
 

@@ -134,7 +134,9 @@ brand is never HEIC.
   means complete structure with every extent inside the file, not that the image decodes.
 - A sector-aligned file head inside `mdat` is normally "another file starts here". For CR3 and HEIC the starts of the
   file's own data (CR3: the chunks of every track, which include its full-size JPEG; HEIC: the `iloc` extents) are
-  skipped, so a JPEG the file itself keeps there does not cut it; any other head still does. A foreign file that starts
+  skipped, so a JPEG the file itself keeps there does not cut it; so is, for a CR3, a head inside its full-size JPEG or
+  `PRVW` (the EXIF thumbnail) as long as that JPEG still decodes strictly (ruling P13, as for TIFF RAWs); any other head
+  still does, and a file written over part of an own JPEG breaks its decode, so it cuts the CR3. A foreign file that starts
   exactly at a CR3 chunk or HEIC extent start is indistinguishable from the file's own data and does not cut it. The
   checks need the index to be readable: if `moov`/`meta` is missing or unusable, a head inside `mdat` cuts the file as
   before.
@@ -152,7 +154,9 @@ a file.
 - Length: the furthest end of the three blocks (at least the 0x6C-byte header). A block that starts past the end of the
   source is not counted (a corrupted offset never claims the rest of the source), one that starts inside is kept up to
   the end of the source; either makes the file `Partial`. The file also ends at the first 512-aligned sector inside it
-  where another file starts, except at the starts of its own blocks (`Partial`).
+  where another file starts (`Partial`), except at the starts of its own blocks and inside its embedded JPEG (the EXIF
+  thumbnail) while that JPEG still decodes strictly (ruling P13, as for TIFF RAWs); a file written over part of the JPEG
+  breaks its decode, so it cuts the RAF and is reported on its own.
 - Health: like a TIFF RAW, only the embedded JPEG can be verified. `Intact` needs a complete file, no unreadable sector
   and a strict decode of the JPEG; no JPEG, or one that decodes leniently or not at all, is `Partial`.
 

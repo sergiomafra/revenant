@@ -941,3 +941,52 @@ fn motion_jpeg_exception_needs_a_video_track() {
     let m = measure(&img).unwrap();
     assert_eq!((m.len, m.health), (512, Health::Damaged));
 }
+
+/// A CR3 whose full-size JPEG (the first chunk, on a sector start) carries an EXIF thumbnail 512 bytes in, also on a
+/// sector start.
+fn cr3_with_aligned_thumbnail() -> Vec<u8> {
+    let full = testkit::jpeg_with_thumbnail_at(640, 480, 7, 512);
+    testkit::cr3_with_full_jpeg(7, &exif(), &full)
+}
+
+/// The thumbnail inside the CR3's own full-size JPEG is its own data while that JPEG still decodes (ruling P13).
+#[test]
+fn thumbnail_inside_the_cr3_full_size_jpeg_does_not_cut_it() {
+    let v = cr3_with_aligned_thumbnail();
+    let img = place(&v);
+    assert_eq!(
+        scan_kinds(&img),
+        vec![(AT as u64, v.len() as u64, FileKind::Cr3, Health::Intact)]
+    );
+}
+
+/// A file written over part of the full-size JPEG breaks its decode, so no head inside that JPEG is exempt any more: the
+/// CR3 is cut at the first one (the thumbnail) and the foreign file is found on its own.
+#[test]
+fn foreign_jpeg_inside_the_cr3_full_size_jpeg_cuts_it() {
+    let mut v = cr3_with_aligned_thumbnail();
+    let mdat = pos(&v, b"mdat");
+    let foreign = testkit::jpeg(8, 8, 77, 0);
+    let at = mdat + 4 + 4096;
+    v[at..at + foreign.len()].copy_from_slice(&foreign);
+    let found = scan_kinds(&place(&v));
+    assert_eq!(
+        found[0],
+        (
+            AT as u64,
+            (mdat + 4 + 512) as u64,
+            FileKind::Cr3,
+            Health::Partial
+        ),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&(
+            (AT + at) as u64,
+            foreign.len() as u64,
+            FileKind::Jpeg,
+            Health::Intact
+        )),
+        "{found:?}"
+    );
+}

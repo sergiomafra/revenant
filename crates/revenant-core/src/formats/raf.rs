@@ -4,7 +4,7 @@
 //! The extent is the furthest end of the three blocks. A block that starts past the end of the source is not counted (a
 //! corrupted offset never claims the rest of the source), one that starts inside is kept up to the end of the source;
 //! either makes the file `Partial`, like a file cut at the first 512-aligned sector inside it where another file starts
-//! (except at the starts of its own blocks).
+//! (except at the starts of its own blocks, and inside its embedded JPEG while that JPEG still decodes: ruling P13).
 //!
 //! Health. There is no RAW decoder here, so the sensor data is never verified; the only content check is the embedded
 //! JPEG, judged like a TIFF RAW's previews: `Intact` needs a complete file, no unreadable sector and a strict decode of
@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use super::jpeg::preview_health;
+use super::jpeg::{OwnJpegs, preview_health};
 use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, all_formats};
 use crate::source::Source;
 use crate::tiff::TIFF_MAX_LEN;
@@ -88,10 +88,16 @@ impl Format for Raf {
             len = len.max((off + l).min(available));
         }
 
+        // A head inside the embedded JPEG (its EXIF thumbnail) is the RAF's own while that JPEG still decodes (ruling
+        // P13).
+        let mut own_jpegs = OwnJpegs::new([(start + pairs[0].0, pairs[0].1)]);
         let formats = all_formats();
         let mut pos = (start / SECTOR + 1) * SECTOR;
         while pos < start + len {
-            if !own.contains(&pos) && r.file_starts_at(&formats, pos) {
+            if !own.contains(&pos)
+                && r.file_starts_at(&formats, pos)
+                && !own_jpegs.vouch_for(&mut r, pos)
+            {
                 len = pos - start;
                 cut = true;
                 break;

@@ -186,3 +186,54 @@ fn raf_block_starting_with_a_jpeg_at_a_sector_start_is_not_cut() {
         vec![(AT as u64, moved.len() as u64, FileKind::Raf, Health::Intact)]
     );
 }
+
+/// A RAF whose embedded JPEG carries an EXIF thumbnail starting on a sector boundary (the file sits on a sector start and
+/// its JPEG at 0x94, so a thumbnail 364 bytes into the JPEG lands on 512).
+fn raf_with_aligned_thumbnail() -> Vec<u8> {
+    let jpeg = testkit::jpeg_with_thumbnail_at(160, 120, 7, 512 - 0x94);
+    let raf = testkit::raf_with_jpeg(120_000, 7, &jpeg);
+    assert_eq!(&raf[512..515], &[0xFF, 0xD8, 0xFF]);
+    raf
+}
+
+/// The thumbnail inside the RAF's own JPEG is its own data while that JPEG still decodes (ruling P13).
+#[test]
+fn thumbnail_inside_the_embedded_jpeg_does_not_cut_the_raf() {
+    let raf = raf_with_aligned_thumbnail();
+    let img = DiskImage::noise(1 << 20, 3).put(AT, &raf).save();
+    assert_eq!(
+        scan_image(&img),
+        vec![(AT as u64, raf.len() as u64, FileKind::Raf, Health::Intact)]
+    );
+}
+
+/// A file written over part of the embedded JPEG breaks its decode, so no head inside that JPEG is exempt any more: the
+/// RAF is cut at the first one (the thumbnail) and the foreign file is found on its own.
+#[test]
+fn foreign_jpeg_inside_the_embedded_jpeg_cuts_the_raf() {
+    let mut raf = raf_with_aligned_thumbnail();
+    let jpeg_len = u32::from_be_bytes(raf[0x58..0x5C].try_into().unwrap()) as usize;
+    let foreign = testkit::jpeg(8, 8, 77, 0);
+    let at = 2048;
+    assert!(
+        at + foreign.len() < 0x94 + jpeg_len,
+        "inside the embedded JPEG"
+    );
+    raf[at..at + foreign.len()].copy_from_slice(&foreign);
+    let img = DiskImage::noise(1 << 20, 3).put(AT, &raf).save();
+    let found = scan_image(&img);
+    assert_eq!(
+        found[0],
+        (AT as u64, 512, FileKind::Raf, Health::Partial),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&(
+            (AT + at) as u64,
+            foreign.len() as u64,
+            FileKind::Jpeg,
+            Health::Intact
+        )),
+        "{found:?}"
+    );
+}
