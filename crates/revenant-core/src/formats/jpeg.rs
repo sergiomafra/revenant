@@ -130,25 +130,20 @@ pub(super) fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
     }
 }
 
-/// Marker segments `sof_pixels` looks through.
-const SOF_SEGMENTS: usize = 16;
+/// Marker segments looked through for a SOF (health and inspection use the same bound).
+pub(crate) const SOF_SEGMENTS: usize = 16;
 
 /// Pixel count (width x height) from the first SOF of the JPEG of `len` bytes at `start`, looking at the first 16
 /// marker segments. `None` if no SOF is found there.
 pub(super) fn sof_pixels(r: &mut Reader, start: u64, len: u64) -> Option<u64> {
-    sof_dims(r, start, len, SOF_SEGMENTS).map(|(w, h)| u64::from(w) * u64::from(h))
+    sof_dims(r, start, len).map(|(w, h)| u64::from(w) * u64::from(h))
 }
 
-/// `(width, height)` from the first SOF of the JPEG of `len` bytes at `start`, looking at the first `max_segments`
-/// marker segments. `None` if no SOF is found there.
-pub(crate) fn sof_dims(
-    r: &mut Reader,
-    start: u64,
-    len: u64,
-    max_segments: usize,
-) -> Option<(u32, u32)> {
+/// `(width, height)` from the first SOF of the JPEG of `len` bytes at `start`, looking at the first [`SOF_SEGMENTS`]
+/// marker segments; the SOF must lie entirely inside `len`. `None` if no SOF is found there.
+pub(crate) fn sof_dims(r: &mut Reader, start: u64, len: u64) -> Option<(u32, u32)> {
     let mut pos = 2u64;
-    for _ in 0..max_segments {
+    for _ in 0..SOF_SEGMENTS {
         if pos + 4 > len {
             return None;
         }
@@ -158,6 +153,10 @@ pub(crate) fn sof_dims(
         }
         match seg[1] {
             m if is_sof(m) => {
+                // Marker (2), length (2), precision (1), height (2), width (2).
+                if pos + 9 > len {
+                    return None;
+                }
                 let mut dims = [0u8; 4];
                 // SOF payload: length (2), precision (1), height (2), width (2).
                 if r.read(start + pos + 5, &mut dims) != 4 {

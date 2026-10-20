@@ -163,7 +163,9 @@ fn moov_box_with(
 /// Creation time (seconds since 1904-01-01 UTC) and `tkhd` size of a video built by [`mp4_dated`].
 #[derive(Clone, Copy)]
 struct VideoMeta {
-    creation: u32,
+    /// `mvhd` and `tkhd` version 1 (64-bit times) instead of version 0.
+    v1: bool,
+    creation: u64,
     width: u32,
     height: u32,
 }
@@ -177,8 +179,15 @@ fn moov_box_full(
     meta: Option<VideoMeta>,
 ) -> Vec<u8> {
     let mut mvhd = vec![0u8; 100];
-    if let Some(m) = meta {
-        mvhd[4..8].copy_from_slice(&m.creation.to_be_bytes());
+    match meta {
+        Some(m) if m.v1 => {
+            // Version 1: 64-bit creation and modification times, 32-bit timescale, 64-bit duration.
+            mvhd = vec![0u8; 112];
+            mvhd[0] = 1;
+            mvhd[4..12].copy_from_slice(&m.creation.to_be_bytes());
+        }
+        Some(m) => mvhd[4..8].copy_from_slice(&(m.creation as u32).to_be_bytes()),
+        None => {}
     }
     let mvhd = bmff_box(b"mvhd", &mvhd);
     let mut stsz = vec![0; 4];
@@ -207,10 +216,13 @@ fn moov_box_full(
     let mdia = bmff_box(b"mdia", &[hdlr, bmff_box(b"minf", &stbl)].concat());
     let trak = match meta {
         Some(m) => {
-            // tkhd version 0: 84 bytes of payload; width and height are 16.16 fixed point at 76 and 80.
-            let mut tkhd = vec![0u8; 84];
-            tkhd[76..80].copy_from_slice(&(m.width << 16).to_be_bytes());
-            tkhd[80..84].copy_from_slice(&(m.height << 16).to_be_bytes());
+            // Width and height are 16.16 fixed point after the matrix: at 76 in version 0 (84 bytes of payload), at 88 in
+            // version 1 (96 bytes; the times and the duration are 64-bit).
+            let at = if m.v1 { 88 } else { 76 };
+            let mut tkhd = vec![0u8; at + 8];
+            tkhd[0] = u8::from(m.v1);
+            tkhd[at..at + 4].copy_from_slice(&(m.width << 16).to_be_bytes());
+            tkhd[at + 4..at + 8].copy_from_slice(&(m.height << 16).to_be_bytes());
             bmff_box(b"trak", &[bmff_box(b"tkhd", &tkhd), mdia].concat())
         }
         None => bmff_box(b"trak", &mdia),
@@ -237,9 +249,19 @@ pub fn mp4_with(opts: &Mp4Options, codec: &[u8; 4], payload: &[u8], chunks: &[u6
 /// Like [`mp4`], with the `mvhd` creation time set to `creation` (seconds since 1904-01-01 UTC) and a `tkhd` of
 /// `width` x `height` pixels in the video track.
 pub fn mp4_dated(opts: &Mp4Options, creation: u32, width: u32, height: u32) -> Vec<u8> {
+    dated(opts, false, u64::from(creation), width, height)
+}
+
+/// Like [`mp4_dated`] with version 1 `mvhd` and `tkhd` boxes (64-bit times).
+pub fn mp4_dated_v1(opts: &Mp4Options, creation: u64, width: u32, height: u32) -> Vec<u8> {
+    dated(opts, true, creation, width, height)
+}
+
+fn dated(opts: &Mp4Options, v1: bool, creation: u64, width: u32, height: u32) -> Vec<u8> {
     let mut payload = vec![0u8; opts.mdat_len];
     SplitMix64(opts.mdat_len as u64).fill(&mut payload);
     let meta = VideoMeta {
+        v1,
         creation,
         width,
         height,
@@ -717,6 +739,17 @@ pub fn cr3(seed: u64, exif: &TestExif) -> Vec<u8> {
 /// extents for both items into `mdat`); `mdat` with `image_len` random bytes for item 1 and the Exif item (4-byte offset
 /// prefix + TIFF built from `exif`).
 pub fn heic(image_len: usize, seed: u64, exif: &TestExif) -> Vec<u8> {
+    heic_with_tiff_offset(image_len, seed, exif, 0)
+}
+
+/// Like [`heic`], with the Exif item's offset prefix set to `tiff_offset` and that many junk bytes between the prefix and
+/// the TIFF header.
+pub fn heic_with_tiff_offset(
+    image_len: usize,
+    seed: u64,
+    exif: &TestExif,
+    tiff_offset: u32,
+) -> Vec<u8> {
     let mut ftyp = b"heic".to_vec();
     ftyp.extend_from_slice(&0u32.to_be_bytes());
     ftyp.extend_from_slice(b"mif1heic");
@@ -724,7 +757,8 @@ pub fn heic(image_len: usize, seed: u64, exif: &TestExif) -> Vec<u8> {
 
     let mut image = vec![0u8; image_len];
     SplitMix64(seed).fill(&mut image);
-    let mut exif_item = 0u32.to_be_bytes().to_vec();
+    let mut exif_item = tiff_offset.to_be_bytes().to_vec();
+    exif_item.extend(std::iter::repeat_n(0xEE, tiff_offset as usize));
     exif_item.extend(exif_tiff(exif));
 
     let full_box = |kind: &[u8; 4], version: u8, body: &[u8]| {

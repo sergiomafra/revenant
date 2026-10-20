@@ -185,6 +185,21 @@ fn mp4_creation_time_and_size() {
         );
         assert_eq!(i.preview, None);
     }
+    // Version 1 boxes (64-bit times): the track size sits 12 bytes further on.
+    for mov in [false, true] {
+        let opts = Mp4Options {
+            mdat_len: 4000,
+            moov_at_end: false,
+            mov,
+            mdat_64bit: true,
+        };
+        let bytes = testkit::mp4_dated_v1(&opts, unix + 2_082_844_800, 3840, 2160);
+        let kind = if mov { FileKind::Mov } else { FileKind::Mp4 };
+        let (source, f, _keep) = find(&bytes, kind);
+        let m = inspect(&source, &f).metadata;
+        assert_eq!(m.captured_at.as_deref(), Some("2024-05-06T07:08:09"));
+        assert_eq!((m.width, m.height), (Some(3840), Some(2160)));
+    }
     // A zero-sized track header gives no size.
     let flat = testkit::mp4_dated(
         &Mp4Options {
@@ -212,12 +227,38 @@ fn mp4_creation_time_and_size() {
 }
 
 #[test]
+fn a_finding_cut_inside_the_sof_has_no_preview() {
+    let jpeg = testkit::jpeg_with_exif(64, 48, 1, &exif());
+    let (source, f, _keep) = find(&jpeg, FileKind::Jpeg);
+    let sof = jpeg
+        .windows(2)
+        .position(|w| w == [0xFF, 0xC0] || w == [0xFF, 0xC2])
+        .unwrap() as u64;
+    // Height complete, width missing: the dimensions would read bytes past the finding.
+    for len in [sof + 7, sof + 8] {
+        let cut = Finding { len, ..f.clone() };
+        assert_eq!(inspect(&source, &cut).preview, None, "len {len}");
+    }
+    let whole = Finding { len: sof + 9, ..f };
+    assert_eq!(inspect(&source, &whole).preview.map(|p| p.width), Some(64));
+}
+
+#[test]
+fn heic_exif_item_with_a_tiff_offset_prefix() {
+    for offset in [6u32, 10] {
+        let heic = testkit::heic_with_tiff_offset(4000, 5, &exif(), offset);
+        let (source, f, _keep) = find(&heic, FileKind::Heic);
+        assert_exif(&inspect(&source, &f).metadata);
+    }
+}
+
+#[test]
 fn garbage_exif_fields_become_none() {
     let bad = TestExif {
         make: Some("Ac\u{e9}me".into()),
         model: Some("  ".into()),
         lens: Some("Len\u{1}s".into()),
-        serial: None,
+        serial: Some("\u{1}\u{2}\u{7f}".into()),
         iso: Some(0),
         date: Some("0000:00:00 00:00:00".into()),
     };
@@ -230,6 +271,19 @@ fn garbage_exif_fields_become_none() {
     );
     // Still a good JPEG: size and preview come from the SOF.
     assert_eq!((m.width, m.height), (Some(32), Some(32)));
+
+    // Empty and NUL-only strings.
+    for text in ["", "\0\0\0", "   \0  "] {
+        let e = TestExif {
+            make: Some(text.into()),
+            serial: Some(text.into()),
+            ..TestExif::default()
+        };
+        let jpeg = testkit::jpeg_with_exif(32, 32, 2, &e);
+        let (source, f, _keep) = find(&jpeg, FileKind::Jpeg);
+        let m = inspect(&source, &f).metadata;
+        assert_eq!((m.make, m.serial), (None, None), "{text:?}");
+    }
 
     // A date that parses but is not a real day, and one from before 1990.
     for date in [

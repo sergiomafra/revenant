@@ -517,11 +517,22 @@ pub(crate) fn cr3_first_chunk(moov: &[u8]) -> Option<(u64, u64)> {
     let stbl = child(trak, b"mdia", &mut garbled)
         .and_then(|m| child(m, b"minf", &mut garbled))
         .and_then(|m| child(m, b"stbl", &mut garbled))?;
-    let at = child(stbl, b"stco", &mut garbled)
-        .map(|p| chunk_offsets(p, false))
-        .or_else(|| child(stbl, b"co64", &mut garbled).map(|p| chunk_offsets(p, true)))?
-        .first()
-        .copied()?;
+    // version/flags (4), entry count (4), then the first entry.
+    let first = |p: &[u8], wide: bool| {
+        (be32(p.get(4..8)?) > 0)
+            .then(|| {
+                if wide {
+                    p.get(8..16).map(be64)
+                } else {
+                    p.get(8..12).map(|b| u64::from(be32(b)))
+                }
+            })
+            .flatten()
+    };
+    let at = match child(stbl, b"stco", &mut garbled) {
+        Some(p) => first(p, false)?,
+        None => first(child(stbl, b"co64", &mut garbled)?, true)?,
+    };
     let stsz = child(stbl, b"stsz", &mut garbled)?;
     let fixed = u64::from(be32(stsz.get(4..8)?));
     let len = if fixed != 0 {

@@ -47,8 +47,6 @@ pub struct Inspection {
     pub preview: Option<Preview>,
 }
 
-/// Marker segments looked through for a preview's SOF.
-const SOF_SEGMENTS: usize = 64;
 /// Earliest year accepted for a capture time (before digital cameras were common: a zeroed or reset clock).
 const MIN_YEAR: u32 = 1990;
 /// Seconds between 1904-01-01 (the QuickTime epoch) and 1970-01-01.
@@ -265,7 +263,7 @@ fn video_size(moov: &[u8]) -> Option<(u32, u32)> {
             // Width and height are 16.16 fixed point at the end of the box, after a 36-byte matrix.
             let at = match *tkhd.first()? {
                 0 => 76,
-                1 => 84,
+                1 => 88,
                 _ => return None,
             };
             let w = be32(tkhd.get(at..at + 4)?) >> 16;
@@ -286,7 +284,7 @@ fn best_preview(r: &mut Reader, file: Span, candidates: &[(u64, u64)]) -> Option
         if r.read(start, &mut magic) != 3 || magic != [0xFF, 0xD8, 0xFF] {
             continue;
         }
-        let Some((width, height)) = sof_dims(r, start, len, SOF_SEGMENTS) else {
+        let Some((width, height)) = sof_dims(r, start, len) else {
             continue;
         };
         let pixels = u64::from(width) * u64::from(height);
