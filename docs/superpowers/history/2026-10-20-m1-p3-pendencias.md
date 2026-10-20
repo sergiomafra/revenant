@@ -76,6 +76,33 @@ em `.superpowers/sdd/2026-10-20-m1-p3-fragmentos-e-velocidade/preflight.md`.
 - **Q11:** o pareamento aplica o filtro `c_min`/`c_end` antes de listar amostras, e um orçamento de 16.000.000 amostras
   listadas por varredura, cobrado pelo `stsz` antes de alocar (estouro ⇒ no máximo `Partial`). Custo: um cartão com mais
   de 16 milhões de amostras de vídeo listadas em `moov` órfãos tem pareamentos `Partial`.
+- **Q13 (revisão final):** o pareamento de vídeo exige `L1` ≤ o comprimento do achado `Damaged` (a varredura já o cortou
+  onde outro arquivo começa) e nenhum outro achado dentro do primeiro pedaço (senão não pareia); um achado que começa
+  dentro do segundo pedaço deixa o pareamento no máximo `Partial`, como uma cabeça corta um vídeo contíguo. A varredura
+  guarda o início de cada achado (8 B cada) para isso. Os quadros do próprio vídeo Motion-JPEG, que a varredura acha
+  como JPEG, não contam (como no vídeo MJPEG contíguo, regra P2). Sonda da revisão refeita (vídeo de 4000 amostras
+  partido em 2/5, foto de 23,5 KB gravada por cima): foto no segundo pedaço, vídeo `Intact` em 7 de 20 posições antes →
+  0 (7 `Partial`, 13 sem pareamento); no primeiro pedaço, 1 de 12 antes (`L1` = 836.096 com o achado cortado em
+  591.872) → 0 (nenhum pareado); a foto sai `Intact` em todas. Custo: um vídeo pareado com um arquivo alheio dentro
+  dos pedaços (legítimo ou não) sai `Partial`.
+- **Q14 (revisão final):** o aborto antecipado da emenda do JPEG virou rejeição certa. Em vez de 3 × a mediana das
+  fronteiras acima da emenda + 4 (acima da emenda de uma paisagem fica o céu: base minúscula, 7 de 56 junções reais
+  perdidas), compara com um limite superior da base final: a mediana das `n` fronteiras fora da emenda é no máximo a
+  `⌊n/2⌋`-ésima menor (a partir de 0) de quaisquer `k > ⌊n/2⌋` delas, e as de cima são algumas delas. Com a emenda na
+  metade de cima da imagem não há limite e a tentativa segue até o fim. O "3 × o máximo das de cima + 4" sugerido
+  também rejeitaria junções boas (teste sintético céu sobre textura). Auditoria nas 112 divisões reais (56 com a própria
+  cauda, 56 com cauda alheia): das 61 tentativas que passaram no teste final, a regra antiga derrubava 7 e a nova 0;
+  das 1178 tentativas que chegaram à linha de checagem, a antiga abortava 1093 e a nova 524. Custo: mais tentativas
+  completas em entrada hostil, ainda limitadas pelo Q8 (sondas da Tarefa 8 refeitas, abaixo).
+- **Quebra logo depois de um `FF` (achado nesta rodada):** o decodificador aponta o erro de um marcador no `FF`, um byte
+  antes do byte que não é da foto; quando esse `FF` fecha um setor, a fronteira logo depois dele (onde a foto quebra de
+  verdade) nunca era candidata. Corrigido (o limite `x` é o byte depois do erro); recuperou 2 das 56 divisões reais
+  (R6 em 7/10 e K-r em 4/10). Custo: nenhum (a janela de 4 fronteiras só anda um setor quando o `FF` fecha um setor).
+- **Recalibração da EOS Kiss F (Q14) não feita:** as divisões em 3/10 e 5/10 caem numa faixa de textura forte (fronteiras
+  46–83 da prévia, 3 a 9 vezes a mediana da imagem), e o teste final as rejeita. Comparar também com a mediana das 8
+  fronteiras logo acima da emenda as juntaria (56/56), mas colou uma cauda alheia de mesmo quadro a mais (4 em vez de 3
+  de 168, sondagem abaixo). Fica registrado: essas 2 divisões saem `Partial` contíguo, e o teste `real_samples` as lista
+  como exceção conhecida. Custo: uma foto partida numa faixa muito mais áspera que o resto da imagem não é remontada.
 - **Desvios aceitos da Tarefa 9:** a faixa de pontos de quebra começa no início da amostra `k − 1` (não no fim), e as
   amostras `k − 1` e `k` são conferidas através do `L1`; os candidatos levam o tamanho declarado lido na varredura e o
   orçamento de 1 GiB é cobrado pelas janelas de 1 MiB que um `moov` ocupa; teto extra de 2^24 passos de conferência de
@@ -116,6 +143,14 @@ trabalho de CPU). Um leitor de cartão SD entrega no máximo ~100 MB/s (UHS-I) a
 são feitos de ruído (~11 MB por foto 3000x2000, mais entropia que uma foto real); as 8 amostras reais de câmera seguem
 saindo cada uma como um achado `Intact` (8/8).
 
+Rodada final de correções (Q13, Q14): A/B intercalado com `eda94e9`, 16 threads, 1 GiB, melhor de 3, duas rodadas
+(antes → depois, MB/s): `dense-jpeg` 512,7 / 472,2 → 507,5 / 497,4; `cut-jpeg` 414,5 / 403,4 → 429,6 / 418,5. Sem
+diferença além da variação entre rodadas. Sondas hostis da Tarefa 8 refeitas (release, melhor de 3, mesmas imagens nos
+dois binários, duas rodadas): P1 64–67 ms → 64–67 ms; P2 391–405 ms → 425 ms; 16 cabeças com 33 KiB 214–238 ms →
+235–278 ms; 64 cabeças com 2 KiB 51–53 ms → 68–71 ms. Os limites do Q8 seguem valendo. O teste `real_samples` com as
+divisões: 54 de 56 juntadas `Intact` (eram 45 de 56 com estas imagens antes da rodada; 47 depois da correção do `FF`),
+as 2 da EOS Kiss F `Partial`, e 0 de 56 caudas alheias `Intact`.
+
 ## Pendências da 1.1 e da 1.2 fechadas nesta parte
 
 - 1.1: setores ruins relidos a cada `measure` → mapa de setores ruins compartilhado no cache (Tarefa 4).
@@ -128,6 +163,8 @@ saindo cada uma como um achado `Intact` (8/8).
 - 1.2: saúde dependente da posição perto do fim da origem → resolvida no teto e acima dele (Tarefa 2, Q2); abaixo do teto
   o fim da origem ainda conta, e isso está escrito no README.
 - 1.2: `confirms` do ISO BMFF aceitava o que `measure` recusa → agora confirma exatamente o que é mensurável (Tarefa 2).
+- 1.3 (revisão da Tarefa 9): faltava um teste de inspeção de um vídeo pareado com o `moov` no segundo pedaço → feito na
+  rodada final.
 - 1.2: comentários de `claim()`/`TiffInfo.data` → dizem que o corte vale para toda faixa (Tarefa 2).
 
 ## Pendências herdadas (adiadas por esta parte)
@@ -154,6 +191,15 @@ As outras pendências da 1.1 e da 1.2 com dono 1.4, 1.5, Módulo 2 ou sem dono s
   busca faz. Os metadados do sistema de arquivos são o único jeito de ver isso.
 - Primeiro pedaço com menos de 16 KiB não é remontado (Q8); segundo pedaço antes do primeiro, ou terminando depois da
   janela de 64 MiB, não é achado. Com o sistema de arquivos, os clusters dizem onde está o resto.
+- Quando a cauda da própria foto sumiu (sobrescrita) e a janela tem a cauda órfã de uma foto quase igual do mesmo quadro
+  (rajada), essa cauda pode ser a única candidata aprovada e a junção sai `Intact`: o Q1 não enxerga uma cauda que não
+  existe. Os clusters do sistema de arquivos resolvem.
+- Cauda alheia de mesmo quadro emendada num marcador de restart: sondagem nesta rodada com as 8 prévias reais
+  regravadas com restart a cada linha (`jpegtran -restart 1`) e caudas da mesma prévia espelhada ou girada
+  (`-flip vertical`, `-flip horizontal`, `-rotate 180`) começando na mesma linha de MCUs da emenda: 3 de 168 colagens
+  saem `Intact` (OM TG-7 girada, LX7 espelhada, K-r girada), com o código desta rodada (o teste final de emenda não
+  mudou nela). O teste de DC é a única defesa nesse caso (o README já diz que é ele que rejeita a cauda colada num
+  restart). Precisa de decisão do Sérgio: é o mesmo risco da rajada acima, mas com fotos diferentes do mesmo quadro.
 
 **Parte 1.5 (disco de verdade)**
 - Setor de varredura maior que 512 bytes: os detectores veem como ilegível o setor inteiro quando o aparelho falhou só
@@ -163,6 +209,8 @@ As outras pendências da 1.1 e da 1.2 com dono 1.4, 1.5, Módulo 2 ou sem dono s
   Num aparelho lento isso pode atrasar o cancelamento; medir com aparelho de verdade.
 - Passado o teto de 1.048.576 trechos ruins, setores ruins novos são relidos a cada recarga de janela (C9): medir num
   cartão que está morrendo.
+- As cargas do cache ignoram o cancelamento: uma janela que falha é relida setor a setor (até 2048 leituras) antes de a
+  varredura ver o cancelamento. Num aparelho lento isso atrasa o cancelamento; tratar junto com o disco de verdade.
 
 **Parte 1.6 (fragmentação avançada; dono escolhido pelo M12)**
 - Arquivos em 3 ou mais pedaços, JPEG e vídeo (a spec §5 pede "2+ pedaços"; esta parte cobre 2). Inclui a peça do meio de
@@ -179,13 +227,15 @@ As outras pendências da 1.1 e da 1.2 com dono 1.4, 1.5, Módulo 2 ou sem dono s
 - Com uma thread, a busca não acompanha um leitor UHS-II em cartão cheio de JPEG (102,8 MB/s): o app deve usar as threads
   padrão.
 
+**Por desenho (Q5), registrado**
+- Um setor ruim no segundo pedaço de uma foto impede a junção (os dados contados acabam no primeiro setor ilegível):
+  a foto fica `Partial` contígua (meia foto).
+
 **Menores, sem dono**
 - Os JPEGs do bench são feitos de ruído (~11 MB cada) e todos os RAWs do bench são little-endian; as afirmações de
   velocidade são conferidas também com as amostras reais.
 - RW2 com empacotamento desconhecido: um offset além do limite não marca a flag (diferente do caminho de `claim`); uma
   linha longa no README do core.
-- Falta um teste de inspeção fragmentada com cabeçalhos espalhados pelos pedaços (por exemplo um `moov` no segundo
-  pedaço).
 - Cabeças num bloco lido adiantado são medidas antes de se saber se um achado `Intact` anterior as cobre; o resultado é
   jogado fora (trabalho especulativo limitado ao read-ahead; o caso comum são as prévias de RAW).
 - A busca de `moov` roda na thread da varredura (~10% no cache de páginas); mover para as threads de trabalho se importar.

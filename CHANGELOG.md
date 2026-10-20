@@ -72,7 +72,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (over 210 megapixels) with a complete structure is partial instead of damaged.
 - The scan and the file detectors share what they read (a 256 MiB cache by default), so each sector of a card is read
   once (the search for the rest of a broken photo re-reads that photo, the 64 MiB after it and at most 64 MiB more; a
-  cache under about 128 MiB re-reads more), and known unreadable sectors are never retried (retrying a bad sector on a failing card can take seconds each time).
+  cache under about 128 MiB re-reads more), and known unreadable sectors are never retried (retrying a bad sector on a
+  failing card can take seconds each time).
 - Scanning uses every core: the card is still read in order, while the files found are checked in parallel. The results
   are the same, in the same order, whatever the number of threads; cancelling stops the scan without reporting anything
   more. The JPEG checks share a memory budget (512 MiB at once), so many large photos checked together cannot exhaust

@@ -127,7 +127,7 @@ crate-private). All positions are absolute 512-byte sector boundaries:
    piece and the DC seam test holds. The DC seam test compares the mean `|ΔDC|` between the luma blocks on both sides of the
    seam with the median of the other block-row boundaries: it passes iff the image has at least 4 block rows and the seam
    is at most 3 × that median + 4 (it is what rejects another photo's tail spliced at a restart marker, where the MCU count
-   alone would pass). A try stops after the MCU row below the seam when the seam is already sure to fail (ruling Q14):
+   alone would pass; not always, see "Not covered"). A try stops after the MCU row below the seam when the seam is already sure to fail (ruling Q14):
    rougher than 3 × the `⌊n/2⌋`-th smallest (from 0) of the boundary means above it + 4, `n` being the number of
    boundaries off the seam (their median, the final base, is at most that); with the seam in the upper half of the image
    there is no such bound (the rows below could be rougher than those above, as under a sky) and the try runs on. It also
@@ -156,9 +156,10 @@ scan does not wait for it. Memory per search: the luma DC values of the first pi
 1 MiB) and the first piece's last bytes (1 MiB), held by the measuring thread.
 
 Reading: each sector is read once from the source by the scan and the detectors (this is about reading the card; in
-memory the same bytes may be walked several times), except that a JPEG gap search re-reads, through the scan's cache: the photo's contiguous bytes (decoded again, scanned for erased sectors, and decoded once more up to an
-erased sector if there is one: at most 3 × 64 MiB), its 64 MiB window once, at most 64 MiB for the tries and the checks
-of files in the gap, and the two pieces once more to judge the reassembled photo (at most 64 MiB).
+memory the same bytes may be walked several times), except that a JPEG gap search re-reads, through the scan's cache:
+the photo's contiguous bytes (decoded again, scanned for erased sectors, and decoded once more up to an erased sector if
+there is one: at most 3 × 64 MiB), its 64 MiB window once, at most 64 MiB for the tries and the checks of files in the
+gap, and the two pieces once more to judge the reassembled photo (at most 64 MiB).
 
 Not covered: progressive, arithmetic-coded or 12-bit JPEGs (any frame the decoder does not cover), a first piece under
 16 KiB, three or more pieces, a second piece that lies before the first, a second piece that ends past the window, and
@@ -167,7 +168,13 @@ a photo of the same frame glued to the other's tail exactly on a restart marker 
 contiguous file (the MCU count and restart markers are all right, and a DC step below the seam threshold is not seen).
 More generally, the DC seam test runs only at the joins the search makes, never inside a contiguous file: a cut photo
 immediately followed, with no gap, by the tail of a near-identical photo of the same frame (same camera and settings)
-whose bytes decode exactly to EOI is a valid JPEG and comes out `Intact`. A photo split inside a band much rougher
+whose bytes decode exactly to EOI is a valid JPEG and comes out `Intact`. Likewise, when a photo's own tail is gone
+(overwritten) and its window holds the orphan tail of a near-identical photo of the same frame (a burst), that tail may
+be the only candidate that passes, and the join comes out `Intact`: uniqueness (Q1) cannot see a tail that is missing. The
+same holds for any photo of the same frame and restart interval whose tail starts in the seam's MCU row: spliced at a
+restart marker, it passes the DC seam test when its rows near the seam look enough like this photo's (3 of 168 such
+splices, built from mirrored or rotated real previews re-encoded with a restart every row, came out `Intact`).
+A photo split inside a band much rougher
 than the rest of the image is not put back together: the DC seam test compares the seam with the whole image's median
 (2 of 56 real preview splits in `tests/real_samples.rs`, both in the EOS Kiss F preview's textured middle, stay
 `Partial`; comparing with the rows next to the seam would join them, but would also glue one more same-frame foreign
@@ -232,8 +239,8 @@ reported as `Event::Updated` (same `id`, 2 pieces).
 Collection during the scan: every block the scan reads is searched for `moov` (keeping the last 15 bytes of each window, so
 a header across two windows or blocks is found too). This search runs on the scan thread, the one that reads the source:
 it costs about 10% of the page-cache throughput on images with few files (`noise`, `video` in the benchmark), far above
-what a card reader delivers, so it is accepted; it could move to the measuring threads later if it ever matters. A box start `q` is a candidate when its 16 bytes are a size in
-`[24, MOOV_MAX_LEN + 8]`, `moov`, any 4 bytes and `mvhd`. A candidate is dropped when its header overlaps a piece of a
+what a card reader delivers, so it is accepted; it could move to the measuring threads later if it ever matters. A box
+start `q` is a candidate when its 16 bytes are a size in `[24, MOOV_MAX_LEN + 8]`, `moov`, any 4 bytes and `mvhd`. A candidate is dropped when its header overlaps a piece of a
 finding that was `Intact` when added (rounded to whole sectors: those blocks may never be read, so keeping candidates
 there would depend on timing) or when it lies inside a non-`Damaged` MP4/MOV/CR3/HEIC finding (its own index). At most
 4096 candidates per block are looked at and 4096 per scan are kept (the first ones). The videos are the `Damaged`

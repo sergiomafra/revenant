@@ -32,7 +32,10 @@ Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.s
 
 ## Ambiente
 
-Mac Intel, Rust do Homebrew (sem `rustup`). Nunca rodar `brew install/upgrade` de toolchain; alvos extras só no CI.
+Mac Intel, Rust 1.99 instalado pelo Homebrew em `/usr/local/bin` (sem `rustup`); alvos extras só no CI. **O Homebrew não
+funciona mais neste Mac** (Sérgio, 20/10/2026): nunca rodar `brew`. Ferramentas como `ddrescue` ou `cargo-deny` não se
+instalam por ele; antes de compilar ou instalar qualquer ferramenta (`cargo install`, `make`, npm), conferir se o
+binário já existe (`which`, `~/.cargo/bin`, `target/release`) e reaproveitar. O Node vem do `fnm`.
 
 ## Armadilhas
 
