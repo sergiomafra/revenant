@@ -620,3 +620,70 @@ fn a_preview_inside_one_piece_has_no_pieces() {
         }]
     );
 }
+
+#[test]
+fn a_paired_video_inspects_its_moov_in_the_second_piece() {
+    // A camera video split before its moov (written last): the scan pairs the pieces, and inspect reads the creation time
+    // and size from the moov in the second piece, as for the whole file.
+    let mut v = testkit::avc_video(&testkit::AvcOptions {
+        samples: 120,
+        seed: 1,
+        mov: false,
+        mdat_pad: 0,
+        small_nals: true,
+    });
+    // mvhd version 0: the creation time follows the version and flags; tkhd version 0: width and height at 76.
+    let qt = (1_714_979_289u64 + 2_082_844_800) as u32;
+    let mvhd = v.moov.start + 16;
+    v.bytes[mvhd + 4..mvhd + 8].copy_from_slice(&qt.to_be_bytes());
+    let tkhd = v.moov.start
+        + v.bytes[v.moov.clone()]
+            .windows(4)
+            .position(|w| w == b"tkhd")
+            .unwrap()
+        + 4;
+    v.bytes[tkhd + 76..tkhd + 80].copy_from_slice(&(1920u32 << 16).to_be_bytes());
+    v.bytes[tkhd + 80..tkhd + 84].copy_from_slice(&(1080u32 << 16).to_be_bytes());
+    let (whole_source, whole, _keep) = find(&v.bytes, FileKind::Mp4);
+    assert_eq!(whole.health, Health::Intact);
+    let expected = inspect(&whole_source, &whole).metadata;
+    assert_eq!(expected.captured_at.as_deref(), Some("2024-05-06T07:08:09"));
+    assert_eq!((expected.width, expected.height), (Some(1920), Some(1080)));
+
+    let p = &v.mdat_payload;
+    let l1 = (p.start + p.len() * 2 / 5).div_ceil(512) * 512;
+    const SECOND: usize = 4 << 20;
+    let mut img = DiskImage::noise(8 << 20, 47);
+    img.put(AT, &v.bytes[..l1]).put(SECOND, &v.bytes[l1..]);
+    let file = img.save();
+    let source = FileSource::open(file.path()).unwrap();
+    let mut paired = Vec::new();
+    scan(
+        &source,
+        &all_formats(),
+        &ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |e| {
+            if let Event::Updated(f) = e {
+                paired.push(f);
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(paired.len(), 1, "{paired:?}");
+    let f = &paired[0];
+    assert_eq!(
+        f.fragments,
+        vec![
+            Fragment {
+                start: AT as u64,
+                len: l1 as u64
+            },
+            Fragment {
+                start: SECOND as u64,
+                len: (v.bytes.len() - l1) as u64
+            }
+        ]
+    );
+    assert_eq!(inspect(&source, f).metadata, expected);
+}
