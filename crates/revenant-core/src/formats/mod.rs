@@ -414,4 +414,49 @@ pub(crate) mod tests {
         assert_eq!(r.find_ff(2 * WINDOW as u64 + 901, u64::MAX), None);
         assert_eq!(r.find_ff(5 * WINDOW as u64, u64::MAX), None);
     }
+
+    /// Fails every read that touches the sector at `bad`.
+    struct BadSector {
+        inner: Mem,
+        bad: u64,
+    }
+
+    impl Source for BadSector {
+        fn len(&self) -> u64 {
+            self.inner.len()
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+            if offset < self.bad + SECTOR && offset + buf.len() as u64 > self.bad {
+                return Err(EngineError::Read {
+                    offset,
+                    cause: std::io::Error::other("injected"),
+                });
+            }
+            self.inner.read_at(offset, buf)
+        }
+        fn volume(&self) -> Option<VolumeId> {
+            None
+        }
+    }
+
+    #[test]
+    fn load_box_falls_back_to_sectors_on_a_read_error() {
+        let src = BadSector {
+            inner: Mem(vec![9u8; 8192]),
+            bad: 1536,
+        };
+        let mut r = Reader::new(&src);
+        let data = r.load_box(1024, 2048);
+        assert_eq!(data.len(), 2048);
+        assert!(data[..512].iter().all(|&b| b == 9));
+        assert!(
+            data[512..1024].iter().all(|&b| b == 0),
+            "the bad sector reads as zeros"
+        );
+        assert!(data[1024..].iter().all(|&b| b == 9));
+        assert!(r.bad_in(1024, 3072));
+        assert!(!r.bad_in(2048, 3072));
+        // Asked again, it is the same shared buffer.
+        assert!(Rc::ptr_eq(&data, &r.load_box(1024, 2048)));
+    }
 }

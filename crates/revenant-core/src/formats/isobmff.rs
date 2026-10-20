@@ -964,8 +964,9 @@ mod tests {
         let m = IsoBmff.measure(&src, AT as u64).unwrap();
         // The JPEG cuts the video before its index: the walk that learns the file's own starts must have read the index.
         assert_eq!(m.len, 512 * 3001);
-        // Window reads either side of the index (its header, what follows it) plus one direct read of the payload: 3. The
-        // index being loaded twice would make 4.
+        // The three reads that overlap the index: (1) the window read for the `moov` box header, (2) the window read of the
+        // header after the `moov` (its aligned window starts inside the index), (3) the single direct read of the payload.
+        // Loading the payload twice would make 4.
         let hits = src.hits.load(Ordering::SeqCst);
         assert!(hits <= 3, "{hits} reads overlap the moov");
     }

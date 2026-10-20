@@ -416,13 +416,38 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_ranges_still_all_have_to_vouch() {
-        let src = Mem(vec![0u8; 4096]);
+    fn overlapping_ranges_all_have_to_vouch() {
+        let good = revenant_testkit::jpeg(32, 32, 3, 0);
+        let l = good.len() as u64;
+        let other = revenant_testkit::jpeg(32, 32, 4, 0);
+        let lo = other.len() as u64;
+        let mut img = vec![0u8; 16384];
+        img[..good.len()].copy_from_slice(&good);
+        img[4096..4096 + other.len()].copy_from_slice(&other);
+        img[8192..8192 + good.len()].copy_from_slice(&good);
+        img[8192 + good.len()..8192 + 2 * good.len()].copy_from_slice(&good);
+        let src = Mem(img);
         let mut r = Reader::new(&src);
-        let mut own = OwnJpegs::new([(0, 1024), (512, 1024), (3000, 100)]);
-        // Inside two overlapping ranges, neither a JPEG: no vouching; outside every range: none either.
-        assert!(!own.vouch_for(&mut r, 700));
-        assert!(!own.vouch_for(&mut r, 2000));
-        assert!(!own.vouch_for(&mut r, 3050));
+
+        // A good JPEG [0, l) overlapped by a corrupted range (not a JPEG) starting halfway.
+        let mut own = OwnJpegs::new([(0, l), (l / 2, l)]);
+        assert!(own.vouch_for(&mut r, 100), "only the good JPEG contains it");
+        assert!(
+            !own.vouch_for(&mut r, l - 10),
+            "the corrupted range contains it too"
+        );
+
+        // Two good ranges over the same JPEG (the second runs past its EOI into zeros).
+        let mut own = OwnJpegs::new([(4096, lo), (4096, lo + 4)]);
+        assert!(
+            own.vouch_for(&mut r, 4096 + 10),
+            "both contain it and both decode"
+        );
+
+        // Two good JPEGs that merely touch: a head exactly on the boundary is inside neither.
+        let mut own = OwnJpegs::new([(8192, l), (8192 + l, l)]);
+        assert!(!own.vouch_for(&mut r, 8192 + l));
+        assert!(own.vouch_for(&mut r, 8192 + l + 10));
+        assert!(own.vouch_for(&mut r, 8192 + 10));
     }
 }
