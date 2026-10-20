@@ -15,6 +15,11 @@ pub use jpeg::{JPEG_MAX_LEN, Jpeg};
 pub use raf::Raf;
 pub use tiffraw::TiffRaw;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::OnceLock;
+
 use crate::source::Source;
 
 /// Kind of file a detector found.
@@ -138,12 +143,48 @@ pub fn all_formats() -> Vec<Box<dyn Format>> {
     ]
 }
 
+/// Every supported format, built once. The detectors use this instead of calling [`all_formats`] on every measurement.
+pub(crate) fn builtin() -> &'static [Box<dyn Format>] {
+    static FORMATS: OnceLock<Vec<Box<dyn Format>>> = OnceLock::new();
+    FORMATS.get_or_init(all_formats)
+}
+
 /// Bytes of a sector start shown to [`Format::recognizes`].
 pub(crate) const HEAD_LEN: usize = 16;
 /// Sector size used by the detectors: unreadable-sector granularity and "another file starts here" checks.
 pub(crate) const SECTOR: u64 = 512;
 /// Bytes read per window (a whole number of sectors).
 const WINDOW: usize = 1 << 20;
+/// Windows kept for reuse per thread (a measurement nests at most a few readers: `measure` and the `confirms` it calls).
+const POOL_MAX: usize = 4;
+/// Box payloads a [`Reader`] remembers (a measurement loads a `moov` and a `meta` at most).
+const LOADED_MAX: usize = 4;
+
+thread_local! {
+    static POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    /// Windows allocated fresh (not taken from the pool) on this thread, to test the reuse.
+    #[cfg(test)]
+    pub(crate) static FRESH_WINDOWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A 1 MiB window from this thread's pool, or a fresh one.
+fn take_window() -> Vec<u8> {
+    POOL.with(|p| p.borrow_mut().pop()).unwrap_or_else(|| {
+        #[cfg(test)]
+        FRESH_WINDOWS.with(|c| c.set(c.get() + 1));
+        vec![0; WINDOW]
+    })
+}
+
+fn give_back_window(buf: Vec<u8>) {
+    // `try_with`: during thread teardown the pool may be gone; the buffer is then simply freed.
+    let _ = POOL.try_with(|p| {
+        let mut pool = p.borrow_mut();
+        if pool.len() < POOL_MAX {
+            pool.push(buf);
+        }
+    });
+}
 
 /// Windowed, sector-aligned reader shared by the detectors. Never reads a file whole.
 pub(crate) struct Reader<'a> {
@@ -154,6 +195,14 @@ pub(crate) struct Reader<'a> {
     buf_len: usize,
     /// Starts of the unreadable sectors seen so far, sorted.
     bad: Vec<u64>,
+    /// Box payloads already loaded by [`Reader::load_box`], by `(offset, length)`.
+    loaded: HashMap<(u64, u64), Rc<Vec<u8>>>,
+}
+
+impl Drop for Reader<'_> {
+    fn drop(&mut self) {
+        give_back_window(std::mem::take(&mut self.buf));
+    }
 }
 
 impl<'a> Reader<'a> {
@@ -161,11 +210,48 @@ impl<'a> Reader<'a> {
         Self {
             source,
             len: source.len(),
-            buf: vec![0; WINDOW],
+            buf: take_window(),
             buf_start: 0,
             buf_len: 0,
             bad: Vec::new(),
+            loaded: HashMap::new(),
         }
+    }
+
+    /// The bytes `[at, at + len)` as one buffer, read at most once per reader (the same range asked again is shared).
+    /// Short only at the end of the source.
+    pub(crate) fn load_box(&mut self, at: u64, len: u64) -> Rc<Vec<u8>> {
+        if let Some(data) = self.loaded.get(&(at, len)) {
+            return Rc::clone(data);
+        }
+        let mut data = vec![0u8; len as usize];
+        // One read straight from the source (not through the window, which a walk keeps moving); on an error the window
+        // path re-reads it sector by sector and remembers the unreadable ones.
+        if self.source.read_at(at, &mut data).is_err() {
+            data.fill(0);
+            self.read(at, &mut data);
+        }
+        let data = Rc::new(data);
+        if self.loaded.len() < LOADED_MAX {
+            self.loaded.insert((at, len), Rc::clone(&data));
+        }
+        data
+    }
+
+    /// The first `0xFF` byte in `[from, end)`, or `None` if there is none before `end` or the source ends first.
+    pub(crate) fn find_ff(&mut self, from: u64, end: u64) -> Option<u64> {
+        let mut pos = from;
+        while pos < end && self.load(pos) {
+            let at = (pos - self.buf_start) as usize;
+            let stop = self
+                .buf_len
+                .min((end - self.buf_start).min(usize::MAX as u64) as usize);
+            if let Some(i) = memchr::memchr(0xFF, &self.buf[at..stop]) {
+                return Some(pos + i as u64);
+            }
+            pos = self.buf_start + stop as u64;
+        }
+        None
     }
 
     /// Makes `pos` part of the window. `false` only at (or past) the end of the source.
@@ -248,5 +334,84 @@ impl<'a> Reader<'a> {
     pub(crate) fn bad_in(&self, start: u64, end: u64) -> bool {
         let first = self.bad.partition_point(|&s| s + SECTOR <= start);
         self.bad.get(first).is_some_and(|&s| s < end)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::error::EngineError;
+    use crate::source::VolumeId;
+
+    pub(crate) struct Mem(pub Vec<u8>);
+
+    impl Source for Mem {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+            let start = (offset as usize).min(self.0.len());
+            let n = buf.len().min(self.0.len() - start);
+            buf[..n].copy_from_slice(&self.0[start..start + n]);
+            Ok(n)
+        }
+        fn volume(&self) -> Option<VolumeId> {
+            None
+        }
+    }
+
+    #[test]
+    fn reader_reuses_its_window() {
+        let src = Mem(vec![7u8; 4096]);
+        let before = FRESH_WINDOWS.with(|c| c.get());
+        for _ in 0..1000 {
+            let mut r = Reader::new(&src);
+            assert_eq!(r.byte(100), Some(7));
+            let mut out = [0u8; 8];
+            assert_eq!(r.read(0, &mut out), 8);
+        }
+        // Counter is per thread (unit tests run in parallel threads): at most the first reader allocates.
+        assert!(FRESH_WINDOWS.with(|c| c.get()) - before <= 1);
+        // Nested readers (as `confirms` inside `measure`) get their own windows and all go back, up to the cap.
+        {
+            let _a = Reader::new(&src);
+            let _b = Reader::new(&src);
+        }
+        let mid = FRESH_WINDOWS.with(|c| c.get());
+        for _ in 0..100 {
+            let _a = Reader::new(&src);
+            let _b = Reader::new(&src);
+        }
+        assert_eq!(FRESH_WINDOWS.with(|c| c.get()), mid);
+    }
+
+    #[test]
+    fn builtin_formats_are_built_once() {
+        assert!(std::ptr::eq(builtin(), builtin()));
+        assert_eq!(builtin().len(), all_formats().len());
+    }
+
+    #[test]
+    fn find_ff_crosses_windows_and_respects_bounds() {
+        let mut data = vec![0u8; 3 * WINDOW];
+        data[WINDOW + 5] = 0xFF;
+        data[2 * WINDOW + 900] = 0xFF;
+        let src = Mem(data);
+        let mut r = Reader::new(&src);
+        assert_eq!(r.find_ff(0, u64::MAX), Some(WINDOW as u64 + 5));
+        assert_eq!(
+            r.find_ff(WINDOW as u64 + 5, u64::MAX),
+            Some(WINDOW as u64 + 5)
+        );
+        assert_eq!(
+            r.find_ff(WINDOW as u64 + 6, u64::MAX),
+            Some(2 * WINDOW as u64 + 900)
+        );
+        // `end` is exclusive.
+        assert_eq!(r.find_ff(0, WINDOW as u64 + 5), None);
+        assert_eq!(r.find_ff(0, WINDOW as u64 + 6), Some(WINDOW as u64 + 5));
+        // Nothing before the end of the source.
+        assert_eq!(r.find_ff(2 * WINDOW as u64 + 901, u64::MAX), None);
+        assert_eq!(r.find_ff(5 * WINDOW as u64, u64::MAX), None);
     }
 }

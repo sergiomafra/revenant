@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, all_formats};
+use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, builtin};
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
@@ -257,9 +257,17 @@ pub(super) fn every_preview_health(r: &mut Reader, previews: &[(u64, u64)]) -> H
 pub(crate) struct OwnJpegs {
     /// `[start, end)` absolute, sorted.
     jpegs: Vec<(u64, u64)>,
-    /// The same ranges merged into disjoint ones.
-    merged: Vec<(u64, u64)>,
+    /// Runs of overlapping ranges merged into disjoint ones: `(start, end, first member, one past the last member)`, the
+    /// members being indexes into `jpegs`. Ranges that merely touch stay apart, so a head costs one search plus the
+    /// members of its own run, however many tiles a file has.
+    merged: Vec<(u64, u64, usize, usize)>,
     decodes: HashMap<(u64, u64), bool>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Members of a merged range examined by `vouch_for` on this thread.
+    static MEMBERS_EXAMINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl OwnJpegs {
@@ -271,11 +279,14 @@ impl OwnJpegs {
             .map(|(o, l)| (o, o.saturating_add(l)))
             .collect();
         jpegs.sort_unstable();
-        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(jpegs.len());
-        for &(s, e) in &jpegs {
+        let mut merged: Vec<(u64, u64, usize, usize)> = Vec::with_capacity(jpegs.len());
+        for (i, &(s, e)) in jpegs.iter().enumerate() {
             match merged.last_mut() {
-                Some(last) if s <= last.1 => last.1 = last.1.max(e),
-                _ => merged.push((s, e)),
+                Some(last) if s < last.1 => {
+                    last.1 = last.1.max(e);
+                    last.3 = i + 1;
+                }
+                _ => merged.push((s, e, i, i + 1)),
             }
         }
         Self {
@@ -288,14 +299,19 @@ impl OwnJpegs {
     /// Whether the file head at `pos` lies inside an own JPEG and every own JPEG containing it vouches for it (see the
     /// type).
     pub(crate) fn vouch_for(&mut self, r: &mut Reader, pos: u64) -> bool {
-        let i = self.merged.partition_point(|&(s, _)| s < pos);
+        let i = self.merged.partition_point(|&(s, ..)| s < pos);
         if i == 0 || pos >= self.merged[i - 1].1 {
             return false;
         }
+        let (_, _, first, last) = self.merged[i - 1];
         let decodes = &mut self.decodes;
-        self.jpegs
+        self.jpegs[first..last]
             .iter()
             .take_while(|&&(s, _)| s < pos)
+            .inspect(|_| {
+                #[cfg(test)]
+                MEMBERS_EXAMINED.with(|c| c.set(c.get() + 1));
+            })
             .filter(|&&(_, e)| pos < e)
             .all(|&(s, e)| {
                 // Over the JPEG size cap it is not decoded, so it cannot vouch for the head.
@@ -332,7 +348,7 @@ impl Format for Jpeg {
         let mut pos = header.scan_start;
 
         // Entropy-coded data. FF00 and RSTn are data; EOI ends the file.
-        let formats = all_formats();
+        let formats = builtin();
         let partial = |end: u64| Measurement {
             len: end - start,
             kind: FileKind::Jpeg,
@@ -346,7 +362,7 @@ impl Format for Jpeg {
             let Some(b) = r.byte(pos) else {
                 return Some(partial(pos));
             };
-            if pos.is_multiple_of(SECTOR) && r.file_starts_at(&formats, pos) {
+            if pos.is_multiple_of(SECTOR) && r.file_starts_at(formats, pos) {
                 return Some(partial(pos));
             }
             if b == 0xFF && r.byte(pos + 1) == Some(EOI) {
@@ -365,7 +381,48 @@ impl Format for Jpeg {
                     fragments: Vec::new(),
                 });
             }
-            pos += 1;
+            // Nothing happens between here and the next `FF`, the next sector start (where another file may begin), the size
+            // cap or the end of the source.
+            let stop = (pos / SECTOR + 1)
+                .saturating_mul(SECTOR)
+                .min(start + JPEG_MAX_LEN)
+                .min(r.len);
+            pos = r.find_ff(pos + 1, stop).unwrap_or(stop);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::tests::Mem;
+    use std::time::Instant;
+
+    #[test]
+    fn vouch_for_scales_with_touching_ranges() {
+        const N: u64 = 65_536;
+        let src = Mem(vec![0u8; (N * 512 + 1024) as usize]);
+        let mut r = Reader::new(&src);
+        let mut own = OwnJpegs::new((0..N).map(|i| (i * 512, 512)));
+        let before = MEMBERS_EXAMINED.with(|c| c.get());
+        let t = Instant::now();
+        for i in 0..N {
+            // Strictly inside tile i. Zeros do not decode, so none vouches.
+            assert!(!own.vouch_for(&mut r, i * 512 + 100));
+        }
+        let examined = MEMBERS_EXAMINED.with(|c| c.get()) - before;
+        assert!(examined as u64 <= 2 * N, "examined {examined}");
+        assert!(t.elapsed().as_secs_f64() < 2.0, "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn overlapping_ranges_still_all_have_to_vouch() {
+        let src = Mem(vec![0u8; 4096]);
+        let mut r = Reader::new(&src);
+        let mut own = OwnJpegs::new([(0, 1024), (512, 1024), (3000, 100)]);
+        // Inside two overlapping ranges, neither a JPEG: no vouching; outside every range: none either.
+        assert!(!own.vouch_for(&mut r, 700));
+        assert!(!own.vouch_for(&mut r, 2000));
+        assert!(!own.vouch_for(&mut r, 3050));
     }
 }

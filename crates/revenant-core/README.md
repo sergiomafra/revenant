@@ -58,6 +58,11 @@ once). When a window cannot be read it is re-read sector by sector: unreadable s
 only the end of the source ends a walk for lack of data. A file whose measured range contains an unreadable sector is never
 `Intact` (details per format below).
 
+Each reader takes its window from a small per-thread pool (at most 4 kept) and gives it back when dropped, so measuring
+allocates nothing after warm-up; the detectors share one list of formats built once; the JPEG entropy walk jumps from `FF` to
+`FF` (still checking every sector start it crosses for another file); a reader loads a `moov`/`meta` payload at most once per
+measurement, however many checks need it.
+
 `formats::Jpeg` follows the marker segments by their declared lengths (so the thumbnail embedded in an APP1/EXIF segment does
 not end the file; DAC and JPG markers count as segments, and `FF` fill bytes before a marker are skipped), requires DQT and SOF before SOS, and scans the entropy-coded data up to EOI (`FF D9`), up to
 `JPEG_MAX_LEN` (64 MiB). If the header walk breaks on an unreadable sector, the search for EOI continues from there. Health:

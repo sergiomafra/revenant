@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use super::jpeg::{OwnJpegs, preview_health};
-use super::{FileKind, Format, HEAD_LEN, Health, Measurement, Reader, SECTOR, all_formats};
+use super::{FileKind, Format, HEAD_LEN, Health, Measurement, Reader, SECTOR, builtin};
 use crate::source::Source;
 use crate::tiff::{TIFF_MAX_LEN, TiffInfo, type_size, walk};
 
@@ -122,11 +122,11 @@ impl Format for TiffRaw {
             .collect();
         // Nor is a head inside one of its own JPEGs while that JPEG still decodes (ruling P13).
         let mut own_jpegs = OwnJpegs::new(info.jpegs.iter().map(|&(o, l)| (start + o, l)));
-        let formats = all_formats();
+        let formats = builtin();
         let mut pos = (start / SECTOR + 1) * SECTOR;
         while pos < start + len {
             if !own.contains(&pos)
-                && r.file_starts_at(&formats, pos)
+                && r.file_starts_at(formats, pos)
                 && !own_jpegs.vouch_for(&mut r, pos)
             {
                 len = pos - start;

@@ -9,6 +9,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+memchr = "2"
 thiserror = "2"
 zune-core = "0.5.3"
 zune-jpeg = "0.5.15"

@@ -53,8 +53,10 @@
 //! extraction keeps it); anywhere else in the file an otherwise `Intact` file becomes `Partial`. A box header that cannot
 //! be read ends the walk there, like a cut (`Partial`, or `Damaged` without `moov`).
 
+use std::rc::Rc;
+
 use super::jpeg::{OwnJpegs, every_preview_health};
-use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, all_formats};
+use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, builtin};
 use crate::source::Source;
 
 /// Largest `moov` box the detector will load into memory.
@@ -291,8 +293,8 @@ impl Format for IsoBmff {
         if !self.recognizes(&head[..n]) {
             return None;
         }
-        let formats = all_formats();
-        let walk = walk_boxes(&mut r, &formats, start, true, &[], &mut OwnJpegs::default());
+        let formats = builtin();
+        let walk = walk_boxes(&mut r, formats, start, true, &[], &mut OwnJpegs::default());
         let first = judge(&mut r, start, &walk)?;
         if !walk.cut_in_mdat {
             return Some(first);
@@ -300,14 +302,7 @@ impl Format for IsoBmff {
         // Motion-JPEG stores one JPEG per frame in `mdat`, a CR3 keeps its full-size JPEG there and a HEIC may hold JPEG
         // items: those are the file's own, not another file. Walk the box headers again, without the checks inside
         // `mdat` (so this costs one read per box, not per sector), to learn the file's own data starts from its index.
-        let again = walk_boxes(
-            &mut r,
-            &formats,
-            start,
-            false,
-            &[],
-            &mut OwnJpegs::default(),
-        );
+        let again = walk_boxes(&mut r, formats, start, false, &[], &mut OwnJpegs::default());
         let own: Vec<u64> = own_starts(&mut r, &again)
             .iter()
             .map(|o| start + o)
@@ -328,7 +323,7 @@ impl Format for IsoBmff {
             } else {
                 OwnJpegs::default()
             };
-            let walk = walk_boxes(&mut r, &formats, start, true, &own, &mut jpegs);
+            let walk = walk_boxes(&mut r, formats, start, true, &own, &mut jpegs);
             return judge(&mut r, start, &walk);
         }
         Some(first)
@@ -482,13 +477,11 @@ fn heic_brand(r: &mut Reader, pos: u64, h: &BoxHeader, size: u64) -> bool {
         && &brand != b"crx "
 }
 
-/// Loads a box payload for parsing; `None` when it is over [`MOOV_MAX_LEN`].
-pub(crate) fn load(r: &mut Reader, at: u64, len: u64) -> Option<Vec<u8>> {
-    (len <= MOOV_MAX_LEN).then(|| {
-        let mut data = vec![0u8; len as usize];
-        r.read(at, &mut data);
-        data
-    })
+/// Loads a box payload for parsing; `None` when it is over [`MOOV_MAX_LEN`]. The reader keeps it: asking for the same
+/// `(at, len)` again (in a measurement, the `moov` is wanted by the judge, the own-start list and the CR3 JPEG lookup)
+/// does not read it again.
+pub(crate) fn load(r: &mut Reader, at: u64, len: u64) -> Option<Rc<Vec<u8>>> {
+    (len <= MOOV_MAX_LEN).then(|| r.load_box(at, len))
 }
 
 /// Judges a walked file: `None` if it is not a video, CR3 or HEIC at all.
@@ -897,4 +890,83 @@ fn chunk_offsets(payload: &[u8], wide: bool) -> Vec<u64> {
             if wide { be64(e) } else { u64::from(be32(e)) }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::EngineError;
+    use crate::formats::tests::Mem;
+    use crate::source::VolumeId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts the reads that overlap `[lo, hi)`.
+    struct Counting {
+        inner: Mem,
+        lo: u64,
+        hi: u64,
+        hits: AtomicUsize,
+    }
+
+    impl Source for Counting {
+        fn len(&self) -> u64 {
+            self.inner.len()
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+            if offset < self.hi && offset + buf.len() as u64 > self.lo {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.read_at(offset, buf)
+        }
+        fn volume(&self) -> Option<VolumeId> {
+            None
+        }
+    }
+
+    #[test]
+    fn moov_is_loaded_once_per_measure() {
+        const AT: usize = 8192;
+        const PAD: usize = 4 << 20;
+        // Motion-JPEG MOV, moov at the end; a real JPEG sits at a sector start of the mdat that is not a chunk.
+        let jpeg = revenant_testkit::jpeg(32, 32, 5, 0);
+        // The mdat is 3 MiB and the JPEG sits in its middle, so no scan window reaches the moov.
+        let jpeg_at = 484 + 512 * 3000; // file offset AT + 28 + jpeg_at: a sector start
+        let mut payload = vec![0x11u8; 3 << 20];
+        payload[jpeg_at..jpeg_at + jpeg.len()].copy_from_slice(&jpeg);
+        let mut video = revenant_testkit::mp4_with(
+            &revenant_testkit::Mp4Options {
+                mdat_len: 0,
+                moov_at_end: true,
+                mov: true,
+                mdat_64bit: false,
+            },
+            b"mjpa",
+            &payload,
+            &[0],
+        );
+        // Pad the moov with a 4 MiB `free` child and fix its size.
+        let moov_at = 28 + payload.len();
+        assert_eq!(&video[moov_at + 4..moov_at + 8], b"moov");
+        let size = u32::from_be_bytes(video[moov_at..moov_at + 4].try_into().unwrap()) as usize;
+        video[moov_at..moov_at + 4].copy_from_slice(&((size + PAD) as u32).to_be_bytes());
+        video.extend_from_slice(&(PAD as u32).to_be_bytes());
+        video.extend_from_slice(b"free");
+        video.resize(video.len() + PAD - 8, 0);
+
+        let mut image = vec![0u8; AT + video.len() + 4096];
+        image[AT..AT + video.len()].copy_from_slice(&video);
+        let src = Counting {
+            inner: Mem(image),
+            lo: (AT + moov_at) as u64,
+            hi: (AT + video.len()) as u64,
+            hits: AtomicUsize::new(0),
+        };
+        let m = IsoBmff.measure(&src, AT as u64).unwrap();
+        // The JPEG cuts the video before its index: the walk that learns the file's own starts must have read the index.
+        assert_eq!(m.len, 512 * 3001);
+        // Window reads either side of the index (its header, what follows it) plus one direct read of the payload: 3. The
+        // index being loaded twice would make 4.
+        let hits = src.hits.load(Ordering::SeqCst);
+        assert!(hits <= 3, "{hits} reads overlap the moov");
+    }
 }
