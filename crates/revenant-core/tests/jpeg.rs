@@ -17,7 +17,8 @@ fn whole_jpeg_measured_exactly() {
         Measurement {
             len: j.len() as u64,
             kind: FileKind::Jpeg,
-            health: Health::Intact
+            health: Health::Intact,
+            fragments: Vec::new()
         }
     );
 }

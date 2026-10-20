@@ -501,7 +501,14 @@ fn judge(r: &mut Reader, start: u64, w: &Walk) -> Option<Measurement> {
     }
     let (pos, kind) = (w.end, w.kind);
     let len = pos - start;
-    let measured = |health| Some(Measurement { len, kind, health });
+    let measured = |health| {
+        Some(Measurement {
+            len,
+            kind,
+            health,
+            fragments: Vec::new(),
+        })
+    };
 
     let Some((moov_at, moov_len)) = w.moov else {
         return measured(Health::Damaged);
@@ -789,7 +796,14 @@ fn judge_heic(r: &mut Reader, start: u64, w: &Walk) -> Option<Measurement> {
     }
     let (pos, kind) = (w.end, w.kind);
     let len = pos - start;
-    let measured = |health| Some(Measurement { len, kind, health });
+    let measured = |health| {
+        Some(Measurement {
+            len,
+            kind,
+            health,
+            fragments: Vec::new(),
+        })
+    };
 
     let Some((at, meta_len)) = w.meta else {
         return measured(Health::Damaged);

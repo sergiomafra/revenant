@@ -30,7 +30,8 @@ fn mp4_moov_at_end_is_intact() {
         Some(Measurement {
             len: v.len() as u64,
             kind: FileKind::Mp4,
-            health: Health::Intact
+            health: Health::Intact,
+            fragments: Vec::new()
         })
     );
 }
@@ -540,7 +541,8 @@ fn cr3_is_found_intact_with_kind_cr3() {
         Some(Measurement {
             len: v.len() as u64,
             kind: FileKind::Cr3,
-            health: Health::Intact
+            health: Health::Intact,
+            fragments: Vec::new()
         })
     );
     // The full-size JPEG in mdat starts at a sector boundary; it is the file's own, and the scan reports one file.
@@ -664,7 +666,8 @@ fn heic_is_found_intact_with_kind_heic() {
         Some(Measurement {
             len: v.len() as u64,
             kind: FileKind::Heic,
-            health: Health::Intact
+            health: Health::Intact,
+            fragments: Vec::new()
         })
     );
     assert_eq!(

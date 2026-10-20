@@ -34,6 +34,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `revenant-dev`: each finding's photo details (`make`, `model`, `lens`, `serial`, `iso`, `captured_at`, `width`,
   `height`) and embedded `preview` in its JSON line, and `--previews <dir>` to save each preview as
   `<name>.preview.jpg`.
+- A found file can be described as several pieces of the source (`fragments`), the groundwork for reassembling fragmented
+  photos and videos: extraction writes the pieces in order, photo details and previews are read across them, and
+  `revenant-dev` adds a `fragments` key to a `found` line (and its `preview`) only when there are pieces. Contiguous files
+  are unchanged.
 - Real camera samples: an opt-in test (and CI job) runs the engine over real CR2, CR3, NEF, ARW, RAF, DNG, ORF and RW2
   files (CC0, from raw.pixls.us), downloaded on demand by `scripts/fetch-samples.sh` and checked by SHA-256.
 

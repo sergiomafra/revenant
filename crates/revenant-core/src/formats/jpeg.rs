@@ -337,6 +337,7 @@ impl Format for Jpeg {
             len: end - start,
             kind: FileKind::Jpeg,
             health: Health::Partial,
+            fragments: Vec::new(),
         };
         loop {
             if pos - start >= JPEG_MAX_LEN {
@@ -361,6 +362,7 @@ impl Format for Jpeg {
                         Health::Damaged if header.has_dac => Health::Partial,
                         health => health,
                     },
+                    fragments: Vec::new(),
                 });
             }
             pos += 1;

@@ -48,6 +48,9 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   `captured_at` (`YYYY-MM-DDTHH:MM:SS`, camera-local time; for MP4/MOV the UTC creation time), `width`, `height`.
   `preview` is the embedded JPEG the results screen shows: its absolute range in the image (`start`, `len`) and its size
   (`width`, `height`); absent when there is none (MP4/MOV, HEIC).
+- `fragments`: present only when the file was found in pieces: `[{"start":…,"len":…},…]`, the absolute ranges in file
+  order (the first starts at `start`, the lengths sum to `len`). `preview` gets the same key under the same rule, and
+  `--previews` writes all of a preview's pieces in order. Contiguous files (every file today) have no `fragments` key.
 - With `--extract`, a `found` line gets `"file":"<path>"`. If extracting that one finding fails (for example
   `write_failed` when the folder is not writable), it gets `"error":"<code>"` instead and the scan continues.
 - With `--previews`, a `found` line that has a `preview` gets `"preview_file":"<path>"`, or `"preview_error":"<code>"`

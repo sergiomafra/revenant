@@ -115,6 +115,7 @@ impl Format for Raf {
             len,
             kind: FileKind::Raf,
             health,
+            fragments: Vec::new(),
         })
     }
 }

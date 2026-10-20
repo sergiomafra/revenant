@@ -1,6 +1,6 @@
 use revenant_core::formats::{FileKind, Health, all_formats};
 use revenant_core::source::FileSource;
-use revenant_core::{CancelToken, Event, Finding, ScanOptions, inspect, scan};
+use revenant_core::{CancelToken, Event, Finding, Fragment, ScanOptions, inspect, scan};
 use revenant_testkit as testkit;
 use testkit::{DiskImage, Mp4Options, TestExif, TiffRawOptions, TiffVariant};
 
@@ -438,6 +438,7 @@ fn noise_never_panics_for_any_kind() {
                 len,
                 kind,
                 health: Health::Partial,
+                fragments: Vec::new(),
             };
             let _ = inspect(&source, &f);
         }
@@ -509,6 +510,60 @@ fn cr3_health_is_judged_on_the_preview_inspect_shows() {
             (cr3.len() as u64, Health::Partial),
             "{name}"
         );
-        assert_eq!(inspect(&source, &f).preview, Some(shown), "{name}");
+        assert_eq!(inspect(&source, &f).preview, Some(shown.clone()), "{name}");
     }
+}
+
+#[test]
+fn fragmented_jpeg_inspects_like_the_whole_file() {
+    let jpeg = testkit::jpeg_with_exif(640, 480, 3, &exif());
+    let len = jpeg.len() as u64;
+    let split = (len / 2 / 512 + 1) * 512;
+    assert!(split < len);
+    let (contiguous_source, contiguous, _keep) = find(&jpeg, FileKind::Jpeg);
+    let whole = inspect(&contiguous_source, &contiguous);
+    assert!(whole.preview.is_some());
+
+    const SECOND: usize = 1 << 20;
+    let mut img = DiskImage::noise(SECOND + jpeg.len() + 8192, 41);
+    img.put(AT, &jpeg[..split as usize]);
+    img.put(SECOND, &jpeg[split as usize..]);
+    let file = img.save();
+    let source = FileSource::open(file.path()).unwrap();
+    let pieces = vec![
+        Fragment {
+            start: AT as u64,
+            len: split,
+        },
+        Fragment {
+            start: SECOND as u64,
+            len: len - split,
+        },
+    ];
+    let f = Finding {
+        id: 1,
+        start: AT as u64,
+        len,
+        kind: FileKind::Jpeg,
+        health: Health::Intact,
+        fragments: pieces.clone(),
+    };
+    let i = inspect(&source, &f);
+    assert_eq!(i.metadata, whole.metadata);
+    assert_exif(&i.metadata);
+    let p = i.preview.unwrap();
+    assert_eq!((p.start, p.len), (AT as u64, len));
+    assert_eq!((p.width, p.height), (640, 480));
+    assert_eq!(p.fragments, pieces);
+    assert_eq!(p.ranges(), pieces);
+    // The contiguous file's preview is one range with no pieces.
+    let wp = whole.preview.unwrap();
+    assert!(wp.fragments.is_empty());
+    assert_eq!(
+        wp.ranges(),
+        vec![Fragment {
+            start: AT as u64,
+            len
+        }]
+    );
 }

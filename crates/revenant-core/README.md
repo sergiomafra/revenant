@@ -31,11 +31,17 @@ path (device id on Unix, volume serial number on Windows), so extraction onto th
 scans `src/source/` to ensure no write-capable open flags are ever introduced, and another checks that the image's bytes and
 modification time are unchanged after a full scan that extracts every finding.
 
+`source::Fragmented::new(source, pieces)` is a read-only logical view of pieces (`Fragment { start, len }`, absolute ranges)
+of a source, in the given order: offset 0 is the first byte of the first piece and `len()` is the sum of the pieces' lengths.
+A read crosses pieces in order; a read error is the inner source's, so its offset is absolute in the inner source; a piece
+that runs past the inner source's end ends the view there (a short read); `volume()` is the inner source's.
+`absolute(start, len)` maps a logical range back to absolute pieces of the source, merging pieces that touch.
+
 ## Formats: JPEG
 
 `formats::Format` is the detector interface: `recognizes(head)` checks a signature at a sector start,
 `confirms(source, start)` validates the header there (cheap, never recursive, never measures the whole file), and
-`measure(source, start)` returns a `Measurement { len, kind, health }` found by walking the file's structure, or `None` when
+`measure(source, start)` returns a `Measurement { len, kind, health, fragments }` found by walking the file's structure, or `None` when
 the bytes are not a file of that format. `None` never means "could not read": a read error does not make a file vanish.
 `formats::all_formats()` lists the supported detectors. `FileKind::as_str()` gives a stable lowercase id (`"jpeg"`, `"mp4"`,
 `"mov"`).
@@ -251,6 +257,16 @@ CameraSettings IFD (0x2020 → 0x0101 start, 0x0102 length) go to `jpegs` when t
 JPEGs. Each MakerNote IFD is read with one read of at most 1024 entries; a MakerNote that does not parse adds nothing and
 is not an error (vendor data, not TIFF structure).
 
+## Findings in pieces
+
+A found file may be made of several pieces of the source (a fragmented file: another file was written in the middle of
+it). `Fragment { start, len }` (re-exported as `revenant_core::Fragment`) is one absolute range. `Measurement`, `Finding`
+and `Preview` carry `fragments: Vec<Fragment>` with one contract: empty for a contiguous file; otherwise at least 2 pieces
+in file order, the first starting at `start`, their lengths summing to `len`, no two overlapping. `start` is always the
+first piece's start and `len` the total length. `Finding::ranges()` and `Preview::ranges()` give `[Fragment { start, len }]`
+for a contiguous file, else the pieces. No detector produces pieces yet (reassembly comes later in this part); the scan
+copies a measurement's `fragments` into its finding.
+
 ## Inspect
 
 `inspect(source, &Finding) -> Inspection` reads what a found file says about itself: `Metadata` (make, model, lens, serial,
@@ -258,6 +274,11 @@ ISO, `captured_at` as `YYYY-MM-DDTHH:MM:SS`, width, height) and an optional `Pre
 embedded JPEG plus its size from the SOF, ready to show on the results screen). It never fails and never panics: what cannot
 be read is `None`, nothing is read outside the finding, and the walks reuse the detectors' caps (`TIFF_MAX_LEN`,
 `MOOV_MAX_LEN`, `JPEG_MAX_LEN`).
+
+A finding in pieces is inspected as one contiguous file read through a `source::Fragmented` view of its pieces (the same
+finding with `start` 0 and no pieces), so it gives the same details as the whole file would; the preview's logical range
+is then mapped back with `absolute()`: its `start` is its first absolute byte, and it gets `fragments` only when it spans
+more than one piece.
 
 | Kind                            | Details from                                                      | Preview                                              |
 | ------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------- |
@@ -305,8 +326,10 @@ nothing is ever overwritten; after 10,000 attempts it fails with `write_failed`)
 - Refuses with `destination_on_source` when the destination is on the source's volume (writing to a damaged card could destroy
   what is still recoverable). If the source's volume is unknown (`None`) extraction is allowed. If the destination's volume
   cannot be determined (e.g. the directory does not exist) it returns `open_failed` and writes nothing.
+- A finding in pieces is written as its pieces (`Finding::ranges()`) one after another, in file order; the file is still
+  named after `start` (the first piece's start).
 - A chunk that cannot be read is re-read sector by sector (512 bytes); only the unreadable sectors are written as zeros, so a
-  partial file comes out instead of none. The copy stops at the source's end, even if the finding's length runs past it.
+  partial file comes out instead of none. Each piece stops at the source's end, even if its length runs past it.
 - A write error returns `write_failed` and removes the incomplete file.
 
 ## Tested against real files

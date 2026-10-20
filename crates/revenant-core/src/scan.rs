@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::EngineError;
-use crate::formats::{FileKind, Format, Health};
+use crate::formats::{FileKind, Format, Fragment, Health};
 use crate::source::Source;
 
 /// Bytes of a sector start shown to `Format::recognizes`.
@@ -16,10 +16,31 @@ const HEAD_LEN: usize = 16;
 pub struct Finding {
     /// Sequential from 1, in discovery order.
     pub id: u64,
+    /// Where the file starts (the first piece's start when it is in pieces).
     pub start: u64,
+    /// Total length of the file (the sum of its pieces when it has any).
     pub len: u64,
     pub kind: FileKind,
     pub health: Health,
+    /// Empty for a contiguous file. Otherwise at least 2 pieces in file order: the first starts at `start`, the lengths
+    /// sum to `len`, no two overlap.
+    pub fragments: Vec<Fragment>,
+}
+
+impl Finding {
+    /// The file's byte ranges in file order: `[Fragment { start, len }]` for a contiguous file, else `fragments`.
+    pub fn ranges(&self) -> Vec<Fragment> {
+        ranges(self.start, self.len, &self.fragments)
+    }
+}
+
+/// `[Fragment { start, len }]` when `fragments` is empty, else `fragments`.
+pub(crate) fn ranges(start: u64, len: u64, fragments: &[Fragment]) -> Vec<Fragment> {
+    if fragments.is_empty() {
+        vec![Fragment { start, len }]
+    } else {
+        fragments.to_vec()
+    }
 }
 
 pub struct ScanOptions {
@@ -203,6 +224,7 @@ pub fn scan(
                         len: m.len,
                         kind: m.kind,
                         health: m.health,
+                        fragments: m.fragments,
                     };
                     pending.push_back((finding, end));
                     next_id += 1;

@@ -93,12 +93,23 @@ pub enum Health {
     Damaged,
 }
 
+/// One piece of a file: the absolute byte range `[start, start + len)` of the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Fragment {
+    pub start: u64,
+    pub len: u64,
+}
+
 /// Result of measuring a file at some offset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Measurement {
+    /// Total length of the file (the sum of its pieces when it has any).
     pub len: u64,
     pub kind: FileKind,
     pub health: Health,
+    /// Empty for a contiguous file. Otherwise at least 2 pieces in file order: the first starts at the measured start,
+    /// the lengths sum to `len`, no two overlap.
+    pub fragments: Vec<Fragment>,
 }
 
 pub trait Format: Send + Sync {

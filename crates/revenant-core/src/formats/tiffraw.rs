@@ -145,7 +145,12 @@ impl Format for TiffRaw {
                 info.jpegs.iter().map(|&(o, l)| (start + o, l)).collect();
             preview_health(&mut r, &previews)
         };
-        Some(Measurement { len, kind, health })
+        Some(Measurement {
+            len,
+            kind,
+            health,
+            fragments: Vec::new(),
+        })
     }
 }
 
