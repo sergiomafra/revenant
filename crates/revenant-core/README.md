@@ -179,9 +179,12 @@ and
   (`0xFFFFFFFF`, its StripByteCounts 0 or an unpacked size) and is ignored; the raw data starts at tag 0x0118 and has no
   length tag, so its length comes from the sensor size (tags 0x0002/0x0003) and packing: 16-byte packets of 14 pixels
   (RawFormat 4, 12-bit: DMC-FZ28, DMC-GF1, DMC-LX7, DC-G100) or 9 (RawFormat 5, 14-bit: DC-GH5S), rounded up to
-  0x4000-byte blocks. Only packings checked against real files are used: any other (RawFormat 5 at 12 bits included), a
-  sensor over 10^9 pixels or an overflowing size leaves the length unknown, and the file is measured up to its known
-  structure and is `Partial`. The preview is tag 0x002E (JpgFromRaw). Olympus/OM System ORF: the thumbnail and the
+  0x4000-byte blocks. Only packings checked against real files are used: any other (RawFormat 5 at 12 bits, and the
+  newer bodies' RawFormat 6 and 7, included) leaves the length unknown and the file `Partial`, but its raw data is still
+  claimed from tag 0x0118 up to a safe upper bound (2 bytes per pixel, rounded up to 0x4000 bytes), so the recovered
+  file keeps it; the next file inside that bound or the end of the source ends it as usual. A sensor over 10^9 pixels
+  or an overflowing size leaves the length unknown with no bound: the file is measured up to its known structure and is
+  `Partial`. The preview is tag 0x002E (JpgFromRaw). Olympus/OM System ORF: the thumbnail and the
   preview live in the MakerNote (see the TIFF reader below); the old `OLYMP\0` MakerNote (E-10 era, offsets relative to
   the TIFF) is not read, so those files keep only their other previews.
 - Known misread: the Sony DSLR-A100 (2006) ARW comes out `Damaged`, because its SubIFD pointer leads to scrambled data.

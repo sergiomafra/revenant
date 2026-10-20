@@ -481,17 +481,45 @@ fn panasonic_rw2_ignores_the_placeholder_strip() {
     );
 }
 
+/// Upper bound the engine claims for Panasonic raw data of an unknown packing (ruling P16): 2 bytes per pixel, rounded up
+/// to the 0x4000-byte block. 280 x 200 = 56,000 pixels -> 112,000 -> 114,688.
+const RW2_UNKNOWN_BOUND: u64 = 114_688;
+
+/// Scan result of an RW2 with an unknown packing: the RW2 itself, claimed up to the upper bound (ruling P16), and its own
+/// JpgFromRaw. The scan keeps examining heads inside a `Partial` finding (one broken file must not hide others), so the
+/// preview, which starts on a sector, is also reported on its own.
+fn assert_unknown_packing_keeps_the_raw_data(
+    f: &testkit::TiffRaw,
+    found: &[(u64, u64, FileKind, Health)],
+) {
+    let p = f.preview.clone().unwrap();
+    assert_eq!(
+        found,
+        [
+            (
+                8192,
+                f.raw.start as u64 + RW2_UNKNOWN_BOUND,
+                FileKind::Rw2,
+                Health::Partial
+            ),
+            (
+                8192 + p.start as u64,
+                p.len() as u64,
+                FileKind::Jpeg,
+                Health::Intact
+            ),
+        ]
+    );
+}
+
 /// Packings not checked against a real file (ruling P14), here format 5 at 12 bits (it would be 10 pixels per packet,
-/// 98,304 bytes), give an unknown length.
+/// 98,304 bytes), give an unknown length: Partial, but the raw data is kept up to the upper bound (ruling P16).
 #[test]
 fn panasonic_rw2_with_an_unverified_packing_is_partial() {
     let f = rw2(5, 12, 98_304);
-    let mut img = DiskImage::noise(8192 + f.bytes.len() + 8192, 21);
+    let mut img = DiskImage::noise(8192 + f.bytes.len() + 32_768, 21);
     img.put(8192, &f.bytes);
-    let found = scan_image(&img.save());
-    assert_eq!((found[0].0, found[0].2), (8192, FileKind::Rw2), "{found:?}");
-    assert_eq!(found[0].3, Health::Partial, "{found:?}");
-    assert!(found[0].1 <= f.raw.start as u64, "{found:?}");
+    assert_unknown_packing_keeps_the_raw_data(&f, &scan_image(&img.save()));
 }
 
 /// Overwrites tag `tag` of the little-endian IFD at `ifd` with a LONG holding `value`.
@@ -529,25 +557,57 @@ fn panasonic_rw2_with_a_hostile_sensor_size_is_partial() {
     }
 }
 
+/// The newer bodies' raw formats (6, 7) are not verified: the RW2 is Partial, but its raw data is claimed up to the upper
+/// bound (ruling P16), so the recovered file keeps it.
 #[test]
 fn panasonic_rw2_with_an_unknown_raw_format_is_partial() {
-    let f = rw2(7, 14, 100_000);
-    let mut img = DiskImage::noise(8192 + f.bytes.len() + 8192, 21);
-    img.put(8192, &f.bytes);
+    for format in [6, 7] {
+        let f = rw2(format, 14, 100_000);
+        let mut img = DiskImage::noise(8192 + f.bytes.len() + 32_768, 21);
+        img.put(8192, &f.bytes);
+        assert_unknown_packing_keeps_the_raw_data(&f, &scan_image(&img.save()));
+    }
+}
+
+/// The upper bound is only a bound: the next file inside it, or the end of the source, ends the RW2.
+#[test]
+fn panasonic_rw2_upper_bound_is_trimmed_by_the_next_file_and_the_source_end() {
+    let f = rw2(6, 12, 100_000);
+    let next = (8192 + f.bytes.len()).next_multiple_of(512);
+    assert!(((next - 8192) as u64) < f.raw.start as u64 + RW2_UNKNOWN_BOUND);
+    let jpeg = testkit::jpeg(32, 32, 5, 0);
+    let mut img = DiskImage::noise(next + 65_536, 21);
+    img.put(8192, &f.bytes).put(next, &jpeg);
     let found = scan_image(&img.save());
-    assert_eq!(found[0].0, 8192, "{found:?}");
-    assert_eq!(found[0].2, FileKind::Rw2);
-    assert_eq!(found[0].3, Health::Partial);
-    // Only the part whose extent is known (IFDs and preview), not the raw data.
-    let p = f.preview.clone().unwrap();
-    assert!(
-        found[0].1 >= p.end as u64 && found[0].1 <= f.raw.start as u64,
+    assert_eq!(
+        found[0],
+        (8192, (next - 8192) as u64, FileKind::Rw2, Health::Partial),
         "{found:?}"
     );
-    // A partial file does not hide the files inside it: its preview is reported on its own.
-    assert_eq!(found.len(), 2, "{found:?}");
-    assert_eq!(found[1].0, 8192 + p.start as u64);
-    assert_eq!(found[1].2, FileKind::Jpeg);
+    assert_eq!(
+        found.last(),
+        Some(&(
+            next as u64,
+            jpeg.len() as u64,
+            FileKind::Jpeg,
+            Health::Intact
+        )),
+        "{found:?}"
+    );
+
+    let mut img = DiskImage::noise(8192 + f.bytes.len() + 1000, 21);
+    img.put(8192, &f.bytes);
+    let found = scan_image(&img.save());
+    assert_eq!(
+        found[0],
+        (
+            8192,
+            f.bytes.len() as u64 + 1000,
+            FileKind::Rw2,
+            Health::Partial
+        ),
+        "{found:?}"
+    );
 }
 
 /// Real ORFs (E-PL2, E-M10 Mark II, TG-7) keep a thumbnail and the preview inside the MakerNote, both on sector starts.

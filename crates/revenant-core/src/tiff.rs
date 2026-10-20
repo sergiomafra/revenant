@@ -69,7 +69,8 @@ pub(crate) struct TiffInfo {
     /// MakerNote. Lossless JPEG (SOF3, as in CR2 raw slices and lossless DNG) lands in `data`, as does a JPEG whose SOF
     /// is not found in the first [`SOF_SEGMENTS`] (64) marker segments.
     pub jpegs: Vec<(u64, u64)>,
-    /// Other strip/tile ranges (raw data), and Panasonic's raw data (RW2 tag 0x0118, length from the sensor size).
+    /// Other strip/tile ranges (raw data), and Panasonic's raw data (RW2 tag 0x0118, length from the sensor size and
+    /// packing, or an upper bound for an unknown packing: see `finish_panasonic`).
     pub data: Vec<(u64, u64)>,
     /// IFD entries processed (test observation of the entry cap).
     #[cfg(test)]
@@ -146,6 +147,13 @@ struct PanasonicTags {
 /// Largest sensor accepted for a Panasonic raw length (far above any real camera).
 const PANASONIC_MAX_PIXELS: u64 = 1_000_000_000;
 
+/// Sensor pixel count from the Panasonic size tags; `None` for a missing or zero size or more than
+/// [`PANASONIC_MAX_PIXELS`].
+fn panasonic_pixels(t: &PanasonicTags) -> Option<u64> {
+    let pixels = u64::from(t.width?).checked_mul(u64::from(t.height?))?;
+    (pixels > 0 && pixels <= PANASONIC_MAX_PIXELS).then_some(pixels)
+}
+
 /// Length of Panasonic packed raw data: 16-byte packets of `n` pixels, the whole rounded up to [`PANASONIC_BLOCK`]. Only
 /// packings checked against real files are known (ruling P14): raw format 4 at 12 bits, 14 pixels per packet (DMC-FZ28,
 /// DMC-GF1, DMC-LX7 twice, DC-G100), and raw format 5 at 14 bits, 9 pixels per packet (DC-GH5S). `None` (length unknown)
@@ -156,13 +164,17 @@ fn panasonic_raw_len(t: &PanasonicTags) -> Option<u64> {
         (5, 14) => 9,
         _ => return None,
     };
-    let pixels = u64::from(t.width?).checked_mul(u64::from(t.height?))?;
-    if pixels == 0 || pixels > PANASONIC_MAX_PIXELS {
-        return None;
-    }
-    pixels
+    panasonic_pixels(t)?
         .div_ceil(per_packet)
         .checked_mul(16)?
+        .checked_next_multiple_of(PANASONIC_BLOCK)
+}
+
+/// Upper bound on the length of Panasonic raw data of an unknown packing (ruling P16): 2 bytes per pixel (no packing
+/// stores more than 16 bits a pixel), rounded up to [`PANASONIC_BLOCK`]. `None` when the sensor size is unusable.
+fn panasonic_raw_bound(t: &PanasonicTags) -> Option<u64> {
+    panasonic_pixels(t)?
+        .checked_mul(2)?
         .checked_next_multiple_of(PANASONIC_BLOCK)
 }
 
@@ -636,7 +648,10 @@ impl Walker<'_, '_> {
     }
 
     /// Panasonic's JpgFromRaw and raw data (RW2 IFD0): the raw data has no length tag, so its length comes from the
-    /// sensor size and packing ([`panasonic_raw_len`]); an unknown packing leaves the walk `truncated`.
+    /// sensor size and packing ([`panasonic_raw_len`]). An unknown packing leaves the walk `truncated` (ruling P14) but
+    /// still claims the raw data up to [`panasonic_raw_bound`], clamped to the limit without flagging it (the bound is an
+    /// estimate, not a declared extent), so a recovered RW2 keeps it (ruling P16); the caller's cut check and the end of
+    /// the source trim it. With no usable sensor size nothing is claimed.
     fn finish_panasonic(&mut self, t: &PanasonicTags) {
         if let Some((o, l)) = t.jpeg
             && self.room()
@@ -649,6 +664,14 @@ impl Walker<'_, '_> {
         };
         let Some(l) = panasonic_raw_len(t) else {
             self.info.truncated = true;
+            if let Some(bound) = panasonic_raw_bound(t)
+                && o < self.limit
+                && self.room()
+            {
+                let end = o.saturating_add(bound).min(self.limit);
+                self.info.end = self.info.end.max(end);
+                self.info.data.push((o, end - o));
+            }
             return;
         };
         if self.claim(o, l) {
