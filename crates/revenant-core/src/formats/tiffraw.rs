@@ -103,16 +103,14 @@ impl Format for TiffRaw {
         let (head, n) = r.head(start);
         let (_, magic, _) = header(&head[..n])?;
         let available = source.len().saturating_sub(start);
+        // The limit is the end of the source (at most the cap). A range that starts at or past the cap is a structural
+        // error wherever the source ends (`starts_past_cap`); any other range past the limit is a cut file: `walk` clamps a
+        // range that starts inside to the limit, so `info.end` covers exactly what is there.
         let info = walk(&mut r, start, available.min(TIFF_MAX_LEN))?;
         let kind = kind_of(&head[..n], magic, &info);
-
-        // Structure that continues past the end of the source is a cut file; `walk` clamps a range that starts inside to the
-        // limit, so `info.end` covers exactly what is there. Past the 1 GiB cap the source is larger than the limit, so
-        // that is a real structural error.
-        let source_ended = info.past_limit && available < TIFF_MAX_LEN;
-        let damaged = info.structural || (info.past_limit && !source_ended);
+        let damaged = info.structural || info.starts_past_cap;
         let mut len = info.end;
-        let mut cut = source_ended;
+        let mut cut = info.past_limit;
         // The starts of the file's own previews and JPEG-coded strips/tiles (which begin with FF D8) are not other files.
         // An uncompressed or vendor-coded strip never begins with a JPEG, so a JPEG at its start is another file.
         let own: HashSet<u64> = info

@@ -740,3 +740,31 @@ fn raw_photo_among_other_files_hides_its_own_preview_only() {
         ]
     );
 }
+
+#[test]
+fn stray_ftyp_does_not_cut_a_jpeg() {
+    let jpeg = testkit::jpeg(640, 480, 31, 0);
+    let at = 4096usize;
+    // A sector start inside the scan data, past the headers.
+    let stray = (at + jpeg.len() / 2).next_multiple_of(512);
+    let mut ftyp = 20u32.to_be_bytes().to_vec();
+    ftyp.extend_from_slice(b"ftypisom\0\0\0\0isom");
+    let mut free = 8u32.to_be_bytes().to_vec();
+    free.extend_from_slice(b"free");
+    let mut img = DiskImage::zeros(at + jpeg.len() + 8192);
+    img.put(at, &jpeg).put(stray, &ftyp).put(stray + 20, &free);
+    let img = img.save();
+    let (r, events) = run(
+        &FileSource::open(img.path()).unwrap(),
+        &ScanOptions::default(),
+    );
+    r.unwrap();
+    let files: Vec<(u64, u64)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Found(f) => Some((f.start, f.len)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(files, vec![(at as u64, jpeg.len() as u64)]);
+}

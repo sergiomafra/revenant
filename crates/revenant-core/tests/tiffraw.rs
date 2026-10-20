@@ -457,7 +457,8 @@ fn bad_offset_does_not_claim_the_rest_of_the_source() {
     let img = DiskImage::noise(64 * MIB, 13).put(0, &bytes).save();
     let source = FileSource::open(img.path()).unwrap();
     let m = TiffRaw.measure(&source, 0).unwrap();
-    assert_eq!(m.health, Health::Partial);
+    // 0x7FFF_0000 lies past the 1 GiB cap: malformed, wherever the source ends.
+    assert_eq!(m.health, Health::Damaged);
     // The bad strip is not counted: the file ends where its real structure does, not at the end of the source.
     assert!(m.len <= bytes.len() as u64, "len {}", m.len);
     assert!(m.len >= raw.preview.unwrap().end as u64);
@@ -724,4 +725,78 @@ fn olympus_makernote_preview_decides_the_health() {
     assert_eq!(found[0].0, 8192, "{found:?}");
     assert_eq!(found[0].1, f.bytes.len() as u64, "{found:?}");
     assert_eq!(found[0].3, Health::Partial, "{found:?}");
+}
+
+/// Bytes from `data`, zeros past it, up to `len` (a multi-GiB source without the disk space).
+struct SparseSource {
+    data: Vec<u8>,
+    len: u64,
+}
+
+impl Source for SparseSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        let n = (self.len.saturating_sub(offset) as usize).min(buf.len());
+        for (i, b) in buf[..n].iter_mut().enumerate() {
+            *b = self
+                .data
+                .get(offset as usize + i)
+                .copied()
+                .unwrap_or_default();
+        }
+        Ok(n)
+    }
+
+    fn volume(&self) -> Option<VolumeId> {
+        None
+    }
+}
+
+/// An ARW whose raw StripOffsets is patched to `offset`.
+fn arw_with_strip_offset(offset: u32) -> Vec<u8> {
+    let raw = testkit::tiff_raw(&opts(TiffVariant::Arw, false));
+    let mut bytes = raw.bytes.clone();
+    let n = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let sub = (0..n)
+        .map(|i| 8 + 2 + 12 * i)
+        .find(|&e| u16::from_le_bytes([bytes[e], bytes[e + 1]]) == 0x014A)
+        .map_or(8, |e| {
+            u32::from_le_bytes(bytes[e + 8..e + 12].try_into().unwrap()) as usize
+        });
+    patch_entry(&mut bytes, sub, 0x0111, offset);
+    bytes
+}
+
+#[test]
+fn corrupt_offset_past_the_cap_is_damaged_wherever_the_source_ends() {
+    let bytes = arw_with_strip_offset(0x5000_0000); // 1.25 GiB, past the 1 GiB cap
+    for len in [bytes.len() as u64 + 4096, 3 << 30] {
+        let source = SparseSource {
+            data: bytes.clone(),
+            len,
+        };
+        let m = TiffRaw.measure(&source, 0).unwrap();
+        assert_eq!(m.health, Health::Damaged, "source of {len} bytes");
+    }
+}
+
+#[test]
+fn offset_past_the_source_end_below_the_cap_is_partial() {
+    let bytes = arw_with_strip_offset(bytes_len_plus(1 << 20));
+    let source = SparseSource {
+        data: bytes.clone(),
+        len: bytes.len() as u64 + 4096,
+    };
+    let m = TiffRaw.measure(&source, 0).unwrap();
+    assert_eq!(m.health, Health::Partial);
+}
+
+fn bytes_len_plus(extra: u32) -> u32 {
+    testkit::tiff_raw(&opts(TiffVariant::Arw, false))
+        .bytes
+        .len() as u32
+        + extra
 }

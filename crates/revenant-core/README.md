@@ -42,9 +42,10 @@ the bytes are not a file of that format. `None` never means "could not read": a 
 
 "Another file starts here" (used to cut a JPEG's scan data or an `mdat` at a sector start) means a format both `recognizes`
 the head and `confirms` it, so a random byte pattern that merely looks like a signature can no longer cut a file. JPEG
-confirms with the header walk up to SOS with DQT and SOF present (no scan-data walk); ISO BMFF confirms with a valid `ftyp`
-followed by a parseable header of an accepted box type (a header that falls in an unreadable sector does not refute it, so it
-confirms, as for JPEG). JPEG's `confirms` walks at most 1 MiB of header. `scan` still uses `recognizes` plus `measure` for its candidates.
+confirms with the header walk up to SOS with DQT and SOF present (no scan-data walk); ISO BMFF confirms exactly what `measure`
+accepts, by a header-only walk from the `ftyp` (at most 64 top-level box headers, no payload reads, no recursion): it meets
+an `mdat`, or the `ftyp` has a HEIC brand and a `meta` is met, or a box header falls in an unreadable sector (it does not
+refute the file, as for JPEG). A lone `ftyp` + `free` is not a video and no longer cuts another file. JPEG's `confirms` walks at most 1 MiB of header. `scan` still uses `recognizes` plus `measure` for its candidates.
 
 Detectors read the source through one shared reader, in 1 MiB windows aligned to 512-byte sectors (never a whole file at
 once). When a window cannot be read it is re-read sector by sector: unreadable sectors read as zeros and are remembered, and
@@ -177,9 +178,12 @@ and
 - Kind: the `CR` marker at byte 8 gives CR2; the ORF and RW2 magics give ORF and RW2; `DNGVersion` gives DNG; Make
   starting with `NIKON` gives NEF and `SONY` gives ARW; anything else is a generic TIFF.
 - Length: the extent from `tiff::walk` (furthest byte any IFD, value or strip references), walked with the end of the
-  source as its limit: structure that continues past the end of the source is a cut file (`Partial`), not a damaged one;
+  source as its limit, so structure that continues past the end of the source is a cut file (`Partial`), not a damaged one;
   a strip that starts inside the source is kept up to its end, while one that starts beyond it is not counted (a
-  corrupted offset never claims the rest of the source). The file is cut at the first 512-aligned sector inside it where
+  corrupted offset never claims the rest of the source). The health does not depend on where the source ends: a range
+  that starts at or past `TIFF_MAX_LEN` (1 GiB) is a structural error (`Damaged`) whether the card ends right after the file
+  or 3 GiB later, and one that starts below the cap and runs past the end of the source (or past the cap) is a cut
+  (`Partial`). The file is cut at the first 512-aligned sector inside it where
   another file starts, except at the starts of its own embedded previews and of its JPEG-coded strips/tiles (Compression
   6, 7 or 34892: a lossy-JPEG tile, such as a DNG's, legitimately begins with FF D8 and confirms; lossless JPEG has no DQT,
   so it never confirms) and inside its own embedded JPEGs (the EXIF thumbnail in a preview's APP1) as long as
@@ -214,7 +218,7 @@ and
 
 `tiff::walk` (and `walk_exif_ifd`, for a TIFF whose IFD0 is itself an Exif IFD, as in a CR3's `CMT2`) is the crate-private reader the TIFF-based RAW formats (CR2, NEF, ARW, DNG, ORF, RW2) share. It takes a
 `Reader`, the absolute position of the TIFF header and a limit (at most `TIFF_MAX_LEN`, 1 GiB), and returns a `TiffInfo`:
-the extent (`end`, relative to the header), Make/Model/lens/serial/ISO/DateTimeOriginal, the largest image size, whether
+the extent (`end`, relative to the header; the limit clamps every range, whatever references it, and `starts_past_cap` tells a range starting at or past `TIFF_MAX_LEN` from a mere cut), Make/Model/lens/serial/ISO/DateTimeOriginal, the largest image size, whether
 `DNGVersion` is present, the embedded JPEG ranges (`JPEGInterchangeFormat`, strips/tiles of Compression 6/7 starting
 with FF D8, Panasonic's JpgFromRaw and an Olympus MakerNote's JPEGs) and the other strip/tile ranges (raw data, including
 Panasonic's raw data). Header magics `II*\0`, `MM\0*`, `IIRO`, `IIRS`, `MMOR`, `IIU\0`

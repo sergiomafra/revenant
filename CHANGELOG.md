@@ -39,6 +39,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The health of a RAW with a corrupt offset no longer depends on where the card ends: an offset past 1 GiB is damaged
+  wherever the source ends, and one below that reaching past the end is partial.
+- A stray MP4 signature (an `ftyp` header with no video behind it) no longer cuts a photo that was written over it.
 - A random byte pattern that looks like a JPEG or MP4 signature no longer cuts another file: "another file starts here" now
   requires a valid header, not just a signature.
 - A complete video followed by an unreadable sector stays intact; Motion-JPEG videos (`mjpa`, `mjpb`, `jpeg`) are no longer

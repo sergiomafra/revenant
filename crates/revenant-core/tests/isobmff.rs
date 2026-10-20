@@ -456,8 +456,12 @@ fn confirms_a_header_in_an_unreadable_sector_like_jpeg_does() {
     };
     // Not provably a non-file: an unreadable sector does not refute it.
     assert!(IsoBmff.confirms(&source, AT as u64));
-    // The same bytes, readable and valid, confirm too; readable zeros do not.
-    assert!(IsoBmff.confirms(&FileSource::open(img.path()).unwrap(), AT as u64));
+    // Readable, an ftyp + free alone is not a video (`measure` rejects it); with an mdat it is; readable zeros are not.
+    assert!(!IsoBmff.confirms(&FileSource::open(img.path()).unwrap(), AT as u64));
+    let mut with_mdat = v.clone();
+    with_mdat.splice(512.., bx(b"mdat", &[1; 32]));
+    let img2 = DiskImage::zeros(AT + 4096).put(AT, &with_mdat).save();
+    assert!(IsoBmff.confirms(&FileSource::open(img2.path()).unwrap(), AT as u64));
     let img = DiskImage::zeros(AT + 4096).put(AT, &v[..512]).save();
     assert!(!IsoBmff.confirms(&FileSource::open(img.path()).unwrap(), AT as u64));
 }
@@ -1045,4 +1049,54 @@ fn foreign_jpeg_inside_the_cr3_full_size_jpeg_cuts_it() {
         )),
         "{found:?}"
     );
+}
+
+fn ftyp(brand: &[u8; 4]) -> Vec<u8> {
+    let mut p = brand.to_vec();
+    p.extend_from_slice(&[0; 4]);
+    p.extend_from_slice(brand);
+    bx(b"ftyp", &p)
+}
+
+#[test]
+fn confirms_agrees_with_measure() {
+    let cat = |parts: &[Vec<u8>]| parts.concat();
+    let layouts: Vec<(&str, Vec<u8>, bool)> = vec![
+        (
+            "ftyp+free",
+            cat(&[ftyp(b"isom"), bx(b"free", &[0; 8])]),
+            false,
+        ),
+        (
+            "ftyp+free+mdat",
+            cat(&[ftyp(b"isom"), bx(b"free", &[0; 8]), bx(b"mdat", &[7; 64])]),
+            true,
+        ),
+        (
+            "ftyp+moov",
+            cat(&[ftyp(b"isom"), bx(b"moov", &[0; 32])]),
+            false,
+        ),
+        ("mp4", testkit::mp4(&opts()), true),
+        (
+            "heic",
+            testkit::heic(20_000, 5, &testkit::TestExif::default()),
+            true,
+        ),
+        (
+            "heic brand + free",
+            cat(&[ftyp(b"heic"), bx(b"free", &[0; 8])]),
+            false,
+        ),
+    ];
+    for (name, bytes, expected) in layouts {
+        let img = DiskImage::noise(AT + bytes.len() + 20_000, 9)
+            .put(AT, &bytes)
+            .save();
+        let src = FileSource::open(img.path()).unwrap();
+        let confirms = IsoBmff.confirms(&src, AT as u64);
+        let measured = IsoBmff.measure(&src, AT as u64);
+        assert_eq!(confirms, measured.is_some(), "{name}: confirms vs measure");
+        assert_eq!(confirms, expected, "{name}");
+    }
 }

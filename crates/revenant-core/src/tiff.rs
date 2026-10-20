@@ -42,9 +42,13 @@ pub(crate) struct TiffInfo {
     /// (a tag repeated within one IFD is ignored, not an error: real cameras occasionally do it).
     pub garbled: bool,
     /// Part of `garbled`: some offset or range lay beyond the limit passed to `walk` (a range that starts inside is recorded
-    /// clamped to the limit, one that starts beyond it is not counted). When the caller's limit is the end
-    /// of the source, this means the structure continues past the end of the data, not that it is malformed.
+    /// clamped to the limit, one that starts beyond it is not counted). The clamp applies to every range, whatever
+    /// references it. When the caller's limit is the end of the source (below the cap), this means the structure continues
+    /// past the end of the data (a cut file), unless `starts_past_cap`.
     pub past_limit: bool,
+    /// Part of `past_limit`: some offset or range starts at or past [`TIFF_MAX_LEN`], wherever the caller's limit is.
+    /// That is malformed, not cut, so a RAW's health does not depend on where the source ends.
+    pub starts_past_cap: bool,
     /// Part of `garbled`: an error other than `past_limit` (cycle, unknown type, short value block, offset below 8).
     pub structural: bool,
     /// A size cap was hit (too many IFDs, entries, SubIFDs, strips, per-walk strip budget, a string longer than 256
@@ -267,6 +271,7 @@ impl Walker<'_, '_> {
             _ => {
                 self.info.garbled = true;
                 self.info.past_limit = true;
+                self.info.starts_past_cap |= off >= TIFF_MAX_LEN;
                 if off < self.limit {
                     // Starts inside, ends past the limit: what lies inside still counts.
                     self.info.end = self.info.end.max(self.limit);
@@ -305,6 +310,7 @@ impl Walker<'_, '_> {
         if off.saturating_add(2) > self.limit {
             self.info.garbled = true;
             self.info.past_limit = true;
+            self.info.starts_past_cap |= off.saturating_add(2) > TIFF_MAX_LEN;
             return;
         }
         let Some(declared) = self.read_u16(off) else {

@@ -54,7 +54,7 @@
 //! be read ends the walk there, like a cut (`Partial`, or `Damaged` without `moov`).
 
 use super::jpeg::{OwnJpegs, every_preview_health};
-use super::{FileKind, Format, HEAD_LEN, Health, Measurement, Reader, SECTOR, all_formats};
+use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, all_formats};
 use crate::source::Source;
 
 /// Largest `moov` box the detector will load into memory.
@@ -243,17 +243,44 @@ impl Format for IsoBmff {
         head.len() >= 8 && &head[4..8] == b"ftyp" && (8..=4096).contains(&be32(head))
     }
 
+    /// Whether [`measure`](Format::measure) would accept the file, by a header-only walk of at most [`CONFIRM_BOXES`]
+    /// top-level boxes (no payload reads, no `file_starts_at`): it meets an `mdat`, or the `ftyp` has a HEIC brand and a
+    /// `meta` follows, or a box header falls in an unreadable sector.
     fn confirms(&self, source: &dyn Source, start: u64) -> bool {
         let mut r = Reader::new(source);
         let (head, n) = r.head(start);
         if !self.recognizes(&head[..n]) {
             return false;
         }
-        let next_at = start + u64::from(be32(&head));
-        let (next, n) = r.head(next_at);
-        // Like JPEG's `confirms`: a header that falls in an unreadable sector (read as zeros) is not proof that this is
-        // not a video, so it confirms.
-        parse_header(&next[..n]).is_some() || r.bad_in(next_at, next_at + HEAD_LEN as u64)
+        let source_len = source.len();
+        let mut heic = false;
+        let mut pos = start;
+        for _ in 0..CONFIRM_BOXES {
+            if pos >= source_len {
+                return false;
+            }
+            let (head, n) = r.head(pos);
+            let Some(h) = parse_header(&head[..n]) else {
+                // Like JPEG's `confirms`: a header in an unreadable sector (read as zeros) is not proof of a non-video.
+                return r.bad_in(pos, pos + n as u64);
+            };
+            match &h.kind {
+                b"ftyp" if pos != start => return false,
+                b"ftyp" => {
+                    let size = h.size.unwrap_or(0);
+                    heic = size >= 12 && heic_brand(&mut r, pos, &h, size);
+                }
+                b"mdat" => return true,
+                b"meta" if heic => return true,
+                _ => {}
+            }
+            // Only `mdat` may have no size; a box that overruns the source ends the walk, as in `measure`.
+            let Some(size) = h.size else {
+                return false;
+            };
+            pos = pos.saturating_add(size);
+        }
+        false
     }
 
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement> {
@@ -330,6 +357,8 @@ struct Walk {
 const MAX_UUIDS: usize = 16;
 /// Compatible brands read from `ftyp`.
 const MAX_BRANDS: usize = 64;
+/// Top-level boxes that [`IsoBmff::confirms`] looks at.
+const CONFIRM_BOXES: usize = 64;
 const HEIC_BRANDS: [&[u8; 4]; 6] = [b"heic", b"heix", b"heim", b"heis", b"mif1", b"msf1"];
 
 /// Walks the top-level boxes of the file at `start`. With `inner_checks`, every sector start inside `mdat` where a file
@@ -410,15 +439,7 @@ fn walk_boxes(
                 } else if &brand == b"crx " {
                     w.kind = FileKind::Cr3;
                 }
-                // Compatible brands follow the 4-byte minor version.
-                let mut compat =
-                    vec![0u8; (size.saturating_sub(16) as usize / 4).min(MAX_BRANDS) * 4];
-                r.read(pos + 16, &mut compat);
-                let listed = |b: &[u8]| HEIC_BRANDS.iter().any(|h| h.as_slice() == b);
-                w.heic_brand = (listed(&brand) || compat.chunks(4).any(listed))
-                    && &brand != b"avif"
-                    && &brand != b"avis"
-                    && &brand != b"crx ";
+                w.heic_brand = heic_brand(r, pos, &h, size);
             }
             b"mdat" => w.has_mdat = true,
             b"moof" => w.has_moof = true,
@@ -442,6 +463,21 @@ fn walk_boxes(
         w.kind = FileKind::Heic;
     }
     w
+}
+
+/// Whether the `ftyp` at `pos` (declared `size`) lists a HEIC brand, as the major or a compatible brand, and is not an
+/// AVIF or CR3.
+fn heic_brand(r: &mut Reader, pos: u64, h: &BoxHeader, size: u64) -> bool {
+    let mut brand = [0u8; 4];
+    r.read(pos + h.header_len, &mut brand);
+    // Compatible brands follow the 4-byte minor version.
+    let mut compat = vec![0u8; (size.saturating_sub(16) as usize / 4).min(MAX_BRANDS) * 4];
+    r.read(pos + 16, &mut compat);
+    let listed = |b: &[u8]| HEIC_BRANDS.iter().any(|h| h.as_slice() == b);
+    (listed(&brand) || compat.chunks(4).any(listed))
+        && &brand != b"avif"
+        && &brand != b"avis"
+        && &brand != b"crx "
 }
 
 /// Loads a box payload for parsing; `None` when it is over [`MOOV_MAX_LEN`].
