@@ -18,8 +18,6 @@ pub(crate) const CACHE_WINDOW: usize = 1 << 20;
 /// Most merged runs the bad map remembers. Past it, new unreadable sectors are not remembered: they are read again when
 /// their window is loaded again (slower, same results).
 const MAX_BAD_RUNS: usize = 1 << 20;
-/// Buffers of evicted windows kept for the next loads, so a long scan does not map fresh memory for every window.
-const MAX_SPARE: usize = 4;
 /// Most merged runs of coverage kept; the lowest are dropped past it (a dropped run only means a block is read again).
 const MAX_COVERAGE_RUNS: usize = 1 << 16;
 
@@ -116,8 +114,20 @@ struct State {
     bad: Runs,
     /// Windows fully resolved with every unreadable sector in them remembered.
     coverage: Runs,
-    /// Buffers of evicted windows nobody holds any more (at most `MAX_SPARE`).
-    spare: Vec<Vec<u8>>,
+}
+
+impl State {
+    /// Drops the least recently used window, returning it; `None` when no window is loaded.
+    fn evict_oldest(&mut self) -> Option<Arc<Window>> {
+        let (_, victim) = self.lru.pop_first()?;
+        match self.slots.remove(&victim) {
+            Some(Slot::Ready(w, _)) => {
+                self.resident -= w.data.len();
+                Some(w)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A read-only memoizing view of a source. `Send + Sync`: any number of threads may read through it at once, and a
@@ -211,7 +221,18 @@ impl<'a> CachedSource<'a> {
         let want = (self.len - start).min(self.window) as usize;
         st.slots.insert(index, Slot::Loading);
         let known = st.bad.within(start, start + want as u64);
-        let buf = st.spare.pop().unwrap_or_default();
+        // Make room before loading: the evicted window's buffer (when nobody else holds it) becomes this window's, so a long
+        // scan does not map fresh memory for every window and nothing is kept outside `resident` but in-flight loads.
+        let mut buf = Vec::new();
+        while st.resident + want > self.capacity
+            && let Some(w) = st.evict_oldest()
+        {
+            if buf.capacity() == 0
+                && let Ok(w) = Arc::try_unwrap(w)
+            {
+                buf = w.data;
+            }
+        }
         drop(st);
 
         let mut guard = LoadingGuard {
@@ -240,22 +261,14 @@ impl<'a> CachedSource<'a> {
         state
             .slots
             .insert(index, Slot::Ready(Arc::clone(&window), state.tick));
-        while state.resident > self.capacity {
-            let Some((&oldest, &victim)) = state.lru.first_key_value() else {
-                break;
-            };
-            if victim == index {
-                break;
-            }
-            state.lru.remove(&oldest);
-            if let Some(Slot::Ready(w, _)) = state.slots.remove(&victim) {
-                state.resident -= w.data.len();
-                if let Ok(w) = Arc::try_unwrap(w)
-                    && state.spare.len() < MAX_SPARE
-                {
-                    state.spare.push(w.data);
-                }
-            }
+        // Concurrent loads may have filled the room made above.
+        while state.resident > self.capacity
+            && state
+                .lru
+                .first_key_value()
+                .is_some_and(|(_, &v)| v != index)
+        {
+            state.evict_oldest();
         }
         guard.armed = false;
         drop(st);
@@ -339,8 +352,9 @@ impl<'a> CachedSource<'a> {
         self
     }
 
+    /// Bytes of window data the cache holds (loaded windows; no buffer is kept outside them).
     #[cfg(test)]
-    fn resident(&self) -> usize {
+    fn held(&self) -> usize {
         self.lock().resident
     }
 
@@ -591,9 +605,9 @@ mod tests {
         let cache = CachedSource::new(&inner, 512, 8 * MIB as usize);
         for at in (0..64 * MIB).step_by(256 * 1024) {
             read(&cache, at, 256 * 1024).unwrap();
-            assert!(cache.resident() <= 8 * MIB as usize);
+            assert!(cache.held() <= 8 * MIB as usize);
         }
-        assert!(cache.resident() > 0);
+        assert_eq!(cache.held(), 8 * MIB as usize);
     }
 
     #[test]

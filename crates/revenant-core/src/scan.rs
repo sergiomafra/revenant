@@ -66,7 +66,8 @@ pub(crate) fn ranges(start: u64, len: u64, fragments: &[Fragment]) -> Vec<Fragme
 }
 
 pub struct ScanOptions {
-    /// Granularity of candidate starts and of unreadable-region handling, in bytes.
+    /// Granularity of candidate starts and of unreadable-region handling, in bytes. Above 512, the detectors see a sector that
+    /// failed only in part as wholly unreadable (health stays conservative).
     pub sector: u64,
     /// Bytes read per block (rounded down to a whole number of sectors, at least one).
     pub block: usize,

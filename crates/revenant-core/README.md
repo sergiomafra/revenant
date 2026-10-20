@@ -305,10 +305,14 @@ file never hides the rest of the disk; a damaged file may then overlap another f
 (not just the block), so files may cross block boundaries.
 
 Reading once: the scan and every `measure` read through one shared cache (`CachedSource`, crate-private) of
-`ScanOptions::cache_bytes` (default 256 MiB; values below 1 MiB are raised to it). Each sector is read once by the scan and
-the detectors; a JPEG gap search may re-read up to its 64 MiB window. The cache reads the source in aligned 1 MiB windows
-(rounded down to whole sectors) and keeps the most recently used ones up to `cache_bytes`. A window that cannot be read in
-one go is resolved sector by sector (scan sector size); each unreadable sector is remembered in a shared bad-sector map, and
+`ScanOptions::cache_bytes` (default 256 MiB; values below 1 MiB are raised to it). For files that fit in the cache, each
+sector is read once by the scan and the detectors; a JPEG gap search may re-read up to its 64 MiB window, and a `Partial` or
+`Damaged` finding larger than the cache may be read again (the scan keeps examining heads inside it, so it reads its blocks
+itself). The cache reads the source in aligned 1 MiB windows (rounded down to whole sectors) and keeps the most recently used
+ones up to `cache_bytes`; a window being loaded is not counted yet, so each reading thread can hold one more window on top.
+The buffer of an evicted window is reused by the load that evicted it. A window that cannot be read in
+one go is resolved sector by sector (scan sector size: with a sector above 512, the detectors see a scan sector that failed
+only in part as wholly unreadable, which only makes health more conservative); each unreadable sector is remembered in a shared bad-sector map, and
 a read that overlaps it fails every time without touching the source again, also when its window is loaded again after
 being evicted (the load reads around the known bad runs). The map keeps at most 1,048,576 merged runs; past that, new
 unreadable sectors are not remembered and are read again when their window is loaded again (slower, with the same results
