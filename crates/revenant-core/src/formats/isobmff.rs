@@ -256,29 +256,29 @@ impl Format for IsoBmff {
         let formats = all_formats();
         let walk = walk_boxes(&mut r, &formats, start, true, &[]);
         let first = judge(&mut r, start, &walk)?;
-        if walk.cut_in_mdat {
-            // Motion-JPEG stores one JPEG per frame in `mdat`, a CR3 keeps its full-size JPEG there and a HEIC may hold
-            // JPEG items: those are the file's own, not another file. Walk again without the checks inside `mdat` to
-            // learn the file's own data from its index.
-            let again = walk_boxes(&mut r, &formats, start, false, &[]);
-            if matches!(again.kind, FileKind::Cr3 | FileKind::Heic) {
-                // Skip the file's own data starts: only a head that is not one ends the file (and a damaged or partial
-                // index keeps its own health).
-                let own: Vec<u64> = own_starts(&mut r, &again)
-                    .iter()
-                    .map(|o| start + o)
-                    .collect();
-                if !own.is_empty() {
-                    let walk = walk_boxes(&mut r, &formats, start, true, &own);
-                    return judge(&mut r, start, &walk);
-                }
-            } else if let Some(full) = judge(&mut r, start, &again)
-                && full.health == Health::Intact
-                && heads_are_own(&mut r, start, &again)
-            {
-                // A Motion-JPEG video whose whole index checks out and whose every head is one of its frames.
-                return Some(full);
-            }
+        if !walk.cut_in_mdat {
+            return Some(first);
+        }
+        // Motion-JPEG stores one JPEG per frame in `mdat`, a CR3 keeps its full-size JPEG there and a HEIC may hold JPEG
+        // items: those are the file's own, not another file. Walk the box headers again, without the checks inside
+        // `mdat` (so this costs one read per box, not per sector), to learn the file's own data starts from its index.
+        let again = walk_boxes(&mut r, &formats, start, false, &[]);
+        let own: Vec<u64> = own_starts(&mut r, &again)
+            .iter()
+            .map(|o| start + o)
+            .collect();
+        let exempt = !own.is_empty()
+            && match again.kind {
+                // A damaged or partial index keeps its own health in the walk below.
+                FileKind::Cr3 | FileKind::Heic => true,
+                // Motion-JPEG (ruling P2): only when the uncut index is Intact.
+                _ => judge(&mut r, start, &again).is_some_and(|m| m.health == Health::Intact),
+            };
+        if exempt {
+            // Skip the file's own data starts: the first head that is not one ends the file (for Motion-JPEG, a video
+            // whose every head is one of its frames is whole).
+            let walk = walk_boxes(&mut r, &formats, start, true, &own);
+            return judge(&mut r, start, &walk);
         }
         Some(first)
     }
@@ -294,8 +294,6 @@ struct Walk {
     unreadable_header: bool,
     /// The walk ended because another file starts inside an `mdat`.
     cut_in_mdat: bool,
-    /// Every sector start inside an `mdat` where a file starts (only collected without the checks inside `mdat`).
-    heads: Vec<u64>,
     /// Payload offset and length of the first `moov`.
     moov: Option<(u64, u64)>,
     /// Payload offset and length of the first top-level `meta`.
@@ -330,7 +328,6 @@ fn walk_boxes(
         truncated: false,
         unreadable_header: false,
         cut_in_mdat: false,
-        heads: Vec::new(),
         moov: None,
         meta: None,
         uuids: Vec::new(),
@@ -371,14 +368,6 @@ fn walk_boxes(
         }
         let mut size = size.min(available);
         let mut cut = false;
-        if !inner_checks && &h.kind == b"mdat" {
-            let end = pos + size;
-            let mut from = pos;
-            while let Some(next) = next_file_inside(r, formats, from, end, &[]) {
-                w.heads.push(next);
-                from = next;
-            }
-        }
         if inner_checks
             && &h.kind == b"mdat"
             && let Some(next) = next_file_inside(r, formats, pos, pos + size, own)
@@ -798,15 +787,6 @@ fn own_starts(r: &mut Reader, w: &Walk) -> Vec<u64> {
     }
     starts.sort_unstable();
     starts
-}
-
-/// Whether every file head found inside `mdat` is one of the file's own data starts (see [`own_starts`]).
-fn heads_are_own(r: &mut Reader, start: u64, w: &Walk) -> bool {
-    let starts = own_starts(r, w);
-    !starts.is_empty()
-        && w.heads
-            .iter()
-            .all(|h| starts.binary_search(&(h - start)).is_ok())
 }
 
 /// All chunk offsets of an `stco` (32-bit) or `co64` (64-bit) payload, bounded by the table's actual size.

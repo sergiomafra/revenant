@@ -847,3 +847,97 @@ fn zero_size_iloc_fields_are_bounded() {
     assert_eq!(m.kind, FileKind::Heic);
     assert_ne!(m.health, Health::Intact);
 }
+
+/// In-memory source that counts the bytes it hands out.
+struct Counting {
+    bytes: Vec<u8>,
+    read: std::sync::atomic::AtomicU64,
+}
+
+impl Source for Counting {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        let start = (offset as usize).min(self.bytes.len());
+        let n = buf.len().min(self.bytes.len() - start);
+        buf[..n].copy_from_slice(&self.bytes[start..start + n]);
+        self.read
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+
+    fn volume(&self) -> Option<VolumeId> {
+        None
+    }
+}
+
+/// A moov-first video whose `mdat` has size 0 (it runs to the end of the source), a JPEG on the next sector after it, and
+/// `tail` bytes of noise after that. Returns the measurement, the bytes read and where the JPEG is.
+fn measure_size_zero_mdat(codec: &[u8; 4], tail: usize) -> (Measurement, u64, usize) {
+    let mut v = testkit::mp4_with(
+        &Mp4Options {
+            moov_at_end: false,
+            ..opts()
+        },
+        codec,
+        &[0x33; 3000],
+        &[0],
+    );
+    let mdat = find(&v, b"mdat") - 4;
+    v[mdat..mdat + 4].copy_from_slice(&0u32.to_be_bytes());
+    let jpeg_at = (AT + v.len()).next_multiple_of(512);
+    let jpeg = testkit::jpeg(32, 32, 3, 0);
+    let mut img = DiskImage::noise(jpeg_at + jpeg.len() + tail, 31);
+    img.put(AT, &v).put(jpeg_at, &jpeg);
+    let file = img.save();
+    let src = Counting {
+        bytes: std::fs::read(file.path()).unwrap(),
+        read: Default::default(),
+    };
+    let m = IsoBmff.measure(&src, AT as u64).unwrap();
+    (m, src.read.into_inner(), jpeg_at)
+}
+
+/// A size-0 `mdat` cut by the next file is not walked again to the end of the source: the work does not grow with what
+/// lies after the cut (a card full of recordings cut this way made the scan quadratic).
+#[test]
+fn size_zero_mdat_cut_does_not_rewalk_the_rest_of_the_source() {
+    for codec in [b"avc1", b"mjpa"] {
+        let started = std::time::Instant::now();
+        let (small, small_read, jpeg_at) = measure_size_zero_mdat(codec, 8 << 20);
+        let (large, large_read, _) = measure_size_zero_mdat(codec, 64 << 20);
+        let name = String::from_utf8_lossy(codec);
+        assert!(
+            started.elapsed().as_secs_f32() < 10.0,
+            "{name}: took {:?}",
+            started.elapsed()
+        );
+        for m in [small, large] {
+            assert_eq!(
+                (m.len, m.health),
+                ((jpeg_at - AT) as u64, Health::Intact),
+                "{name}"
+            );
+        }
+        assert!(
+            large_read < 3 * small_read,
+            "{name}: read {small_read} bytes with an 8 MiB tail, {large_read} with 64 MiB"
+        );
+    }
+}
+
+/// The Motion-JPEG exception is for video tracks: an `mjpa` sample entry in a track whose handler is not `vide` does not
+/// make its chunks the file's own frames.
+#[test]
+fn motion_jpeg_exception_needs_a_video_track() {
+    let (mut video, _) = mjpeg_layout(b"mjpa", None);
+    let vide = find(&video, b"vide");
+    video[vide..vide + 4].copy_from_slice(b"soun");
+    let img = DiskImage::noise(AT + video.len() + 20_000, 11)
+        .put(AT, &video)
+        .save();
+    let m = measure(&img).unwrap();
+    assert_eq!((m.len, m.health), (512, Health::Damaged));
+}

@@ -11,7 +11,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from a real decode.
 - MP4/MOV video detection: exact length from the box structure, health from the `moov` chunk and sample tables; a video
   whose size was never written (battery died mid-recording) or whose data was partly overwritten ends where the next file
-  starts.
+  starts. A cut-off recording is measured in time proportional to the recording, not to the rest of the card.
 - TIFF-based RAW photo detection (CR2, NEF, ARW, DNG, ORF, RW2) and generic TIFF: exact length from the IFD structure, health
   from the embedded JPEG preview (the raw data itself cannot be verified, so a RAW without a decodable preview is partial).
   Panasonic RW2 raw data, which has no length tag, is measured from the sensor size and packing (a packing not yet checked

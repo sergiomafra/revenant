@@ -84,10 +84,12 @@ Walk boundaries: `ftyp` is accepted only as the first box. Once both `moov` and 
 ends it, and a trailing box that overruns the source is left out. The walk also stops at a box that starts on a 512-byte sector
 where a recognized file starts. Inside `mdat`, every 512-byte sector start (absolute offset) is checked as well: where a
 recognized file of any format starts, the video ends there. An `mdat` whose declared size is cut this way counts as a box
-declared larger than what exists (below). Motion-JPEG exception: if the walk was cut inside `mdat`, the video is measured again without the checks inside `mdat`, and
-that measurement is used only if (a) its index health is `Intact`, (b) a video track (`hdlr` `vide`) has a first `stsd`
-entry of `mjpa`, `mjpb` or `jpeg`, and (c) every confirmed file head inside `mdat` lies exactly at one of that track's chunk
-offsets (`stco`/`co64`); a photo written over the video is not at a chunk offset, so the cut stays. Chunk offsets are relative to the start of the file (its `ftyp`), not to the source.
+declared larger than what exists (below). Motion-JPEG exception: if the walk was cut inside `mdat`, the box headers are
+walked again without the checks inside `mdat` (one read per box, so a cut-off recording does not cost a pass over the rest
+of the source), and if (a) that uncut index is `Intact` and (b) a video track (`hdlr` `vide`) has a first `stsd` entry of
+`mjpa`, `mjpb` or `jpeg`, the video is walked once more with the checks inside `mdat` skipping that track's chunk offsets
+(`stco`/`co64`): the first confirmed file head that is not one of them ends the video. A video whose every head is one of
+its frames is whole; a photo written over the video is not at a chunk offset, so it still cuts it. Chunk offsets are relative to the start of the file (its `ftyp`), not to the source.
 
 - No `mdat`: not a video (`None`).
 - No `moov`: `Damaged` (the media data is there but not the index; rebuilding it is a later product milestone).
