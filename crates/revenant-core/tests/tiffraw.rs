@@ -1,0 +1,289 @@
+use revenant_core::formats::{FileKind, Format, Health, TiffRaw, all_formats};
+use revenant_core::source::{FileSource, Source, VolumeId};
+use revenant_core::{CancelToken, EngineError, Event, ScanOptions, scan};
+use revenant_testkit as testkit;
+use testkit::{DiskImage, TestExif, TiffRawOptions, TiffVariant};
+
+const MIB: usize = 1024 * 1024;
+
+/// Wraps a source and fails every read that touches `[bad.0, bad.1)`.
+struct FailingSource {
+    inner: FileSource,
+    bad: (u64, u64),
+}
+
+impl Source for FailingSource {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        if offset < self.bad.1 && offset + buf.len() as u64 > self.bad.0 {
+            return Err(EngineError::Read {
+                offset,
+                cause: std::io::Error::other("injected"),
+            });
+        }
+        self.inner.read_at(offset, buf)
+    }
+
+    fn volume(&self) -> Option<VolumeId> {
+        None
+    }
+}
+
+fn opts(variant: TiffVariant, big_endian: bool) -> TiffRawOptions {
+    TiffRawOptions {
+        variant,
+        big_endian,
+        raw_len: 120_000,
+        seed: 7,
+        preview: Some((160, 120)),
+        preview_sector_aligned: false,
+        exif: TestExif::default(),
+    }
+}
+
+fn scan_all(source: &dyn Source) -> Vec<(u64, u64, FileKind, Health)> {
+    let mut out = Vec::new();
+    scan(
+        source,
+        &all_formats(),
+        &ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |e| {
+            if let Event::Found(f) = e {
+                out.push((f.start, f.len, f.kind, f.health));
+            }
+        },
+    )
+    .unwrap();
+    out
+}
+
+fn scan_image(img: &tempfile::NamedTempFile) -> Vec<(u64, u64, FileKind, Health)> {
+    scan_all(&FileSource::open(img.path()).unwrap())
+}
+
+#[test]
+fn every_variant_is_found_with_its_kind() {
+    let cases = [
+        (TiffVariant::Cr2, FileKind::Cr2),
+        (TiffVariant::Nef, FileKind::Nef),
+        (TiffVariant::Arw, FileKind::Arw),
+        (TiffVariant::Dng, FileKind::Dng),
+        (TiffVariant::Orf, FileKind::Orf),
+        (TiffVariant::Rw2, FileKind::Rw2),
+        (TiffVariant::Plain, FileKind::Tiff),
+    ];
+    for (variant, kind) in cases {
+        for big_endian in [false, true] {
+            let raw = testkit::tiff_raw(&opts(variant, big_endian));
+            let img = DiskImage::noise(MIB, 3).put(8192, &raw.bytes).save();
+            assert_eq!(
+                scan_image(&img),
+                vec![(8192, raw.bytes.len() as u64, kind, Health::Intact)],
+                "{variant:?} be={big_endian}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_with_sector_aligned_preview_is_one_file() {
+    for variant in [TiffVariant::Cr2, TiffVariant::Nef, TiffVariant::Dng] {
+        let mut o = opts(variant, false);
+        o.preview_sector_aligned = true;
+        let raw = testkit::tiff_raw(&o);
+        assert_eq!(raw.preview.as_ref().unwrap().start % 512, 0);
+        let img = DiskImage::noise(MIB, 4).put(4096, &raw.bytes).save();
+        let found = scan_image(&img);
+        assert_eq!(found.len(), 1, "{variant:?}: {found:?}");
+        assert_eq!(found[0].3, Health::Intact);
+        assert_eq!(found[0].1, raw.bytes.len() as u64);
+    }
+}
+
+#[test]
+fn raw_cut_by_next_file_is_partial() {
+    let raw = testkit::tiff_raw(&opts(TiffVariant::Nef, false));
+    let start = 8192usize;
+    let cut = (start + raw.raw.start + 30_000).div_ceil(512) * 512;
+    let jpeg = testkit::jpeg(64, 64, 9, 0);
+    let img = DiskImage::noise(MIB, 5)
+        .put(start, &raw.bytes)
+        .put(cut, &jpeg)
+        .save();
+    assert_eq!(
+        scan_image(&img),
+        vec![
+            (
+                start as u64,
+                (cut - start) as u64,
+                FileKind::Nef,
+                Health::Partial
+            ),
+            (
+                cut as u64,
+                jpeg.len() as u64,
+                FileKind::Jpeg,
+                Health::Intact
+            ),
+        ]
+    );
+}
+
+#[test]
+fn raw_cut_by_the_end_of_the_source_is_partial() {
+    let raw = testkit::tiff_raw(&opts(TiffVariant::Arw, true));
+    let keep = raw.bytes.len() - 5000;
+    let img = DiskImage::zeros(8192 + keep)
+        .put(8192, &raw.bytes[..keep])
+        .save();
+    let found = scan_image(&img);
+    assert_eq!(
+        found,
+        vec![(8192, keep as u64, FileKind::Arw, Health::Partial)]
+    );
+}
+
+#[test]
+fn random_head_inside_raw_data_does_not_cut() {
+    let raw = testkit::tiff_raw(&opts(TiffVariant::Cr2, false));
+    let start = 8192usize;
+    let at1 = (start + raw.raw.start + 10_000).div_ceil(512) * 512;
+    let at2 = at1 + 1024;
+    let at3 = at1 + 2048;
+    let mut tiff_like = b"II*\0\x08\0\0\0".to_vec();
+    tiff_like.extend([0xAA; 64]);
+    let mut jpeg_like = vec![0xFF, 0xD8, 0xFF, 0xE1];
+    jpeg_like.extend([0xAA; 64]);
+    let mut big = b"MM\0*\0\0\0\x08".to_vec();
+    big.extend([0xAA; 64]);
+    let img = DiskImage::noise(MIB, 6)
+        .put(start, &raw.bytes)
+        .put(at1, &tiff_like)
+        .put(at2, &jpeg_like)
+        .put(at3, &big)
+        .save();
+    // The planted bytes are inside the file's raw data, so the file is no longer a clean copy of the original, but its
+    // structure is complete and its preview still decodes.
+    assert_eq!(
+        scan_image(&img),
+        vec![(
+            start as u64,
+            raw.bytes.len() as u64,
+            FileKind::Cr2,
+            Health::Intact
+        )]
+    );
+}
+
+#[test]
+fn raw_strip_starting_with_a_jpeg_at_a_sector_start_does_not_cut() {
+    // Lossless-JPEG raw tiles start with FF D8. When a strip starts on a sector boundary, the scan must not take it
+    // for another file. Search for a Model length that puts the raw strip on a sector boundary.
+    let j = testkit::jpeg(16, 16, 11, 0);
+    let mut found_case = false;
+    for n in 0..1200usize {
+        let mut o = opts(TiffVariant::Dng, false);
+        o.preview = None;
+        o.exif.model = Some("M".repeat(n));
+        o.raw_len = 20_000;
+        let mut raw = testkit::tiff_raw(&o);
+        if !raw.raw.start.is_multiple_of(512) {
+            continue;
+        }
+        let at = raw.raw.start;
+        raw.bytes[at..at + j.len()].copy_from_slice(&j);
+        let img = DiskImage::noise(MIB, 8).put(8192, &raw.bytes).save();
+        let found = scan_image(&img);
+        // The file has no preview, so it is Partial and the JPEG at its strip is reported too; what matters is that the
+        // file is not cut there.
+        assert_eq!(found[0].0, 8192, "n={n}: {found:?}");
+        assert_eq!(found[0].1, raw.bytes.len() as u64, "n={n}: {found:?}");
+        found_case = true;
+        break;
+    }
+    assert!(found_case, "no model length aligned the raw strip");
+}
+
+#[test]
+fn raw_without_preview_is_partial() {
+    let mut o = opts(TiffVariant::Nef, false);
+    o.preview = None;
+    let raw = testkit::tiff_raw(&o);
+    let img = DiskImage::noise(MIB, 4).put(4096, &raw.bytes).save();
+    assert_eq!(
+        scan_image(&img),
+        vec![(4096, raw.bytes.len() as u64, FileKind::Nef, Health::Partial)]
+    );
+}
+
+#[test]
+fn preview_that_does_not_decode_cleanly_is_partial() {
+    // Same corruptions as the JPEG tests: lenient-only decode, and no decode at all. The raw data may still be fine.
+    let corruptions: [(&str, Vec<u8>); 2] = [
+        ("lenient only", [0xFF, 0x01].repeat(4)),
+        ("undecodable", [0xFF, 0xC4].repeat(32)),
+    ];
+    for (name, patch) in corruptions {
+        let mut o = opts(TiffVariant::Nef, false);
+        o.preview = Some((640, 480));
+        let raw = testkit::tiff_raw(&o);
+        let p = raw.preview.clone().unwrap();
+        let mut bytes = raw.bytes.clone();
+        let mid = (p.start + p.end) / 2;
+        bytes[mid..mid + patch.len()].copy_from_slice(&patch);
+        let img = DiskImage::noise(MIB, 4).put(4096, &bytes).save();
+        let found = scan_image(&img);
+        assert_eq!(found.len(), 1, "{name}: {found:?}");
+        assert_eq!(found[0].3, Health::Partial, "{name}");
+        assert_eq!(found[0].1, bytes.len() as u64, "{name}");
+    }
+}
+
+#[test]
+fn garbled_ifd_is_damaged() {
+    for (variant, ifd0) in [(TiffVariant::Nef, 8usize), (TiffVariant::Cr2, 16)] {
+        let raw = testkit::tiff_raw(&opts(variant, false));
+        let mut bytes = raw.bytes.clone();
+        bytes[ifd0..ifd0 + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let img = DiskImage::noise(MIB, 4).put(4096, &bytes).save();
+        let source = FileSource::open(img.path()).unwrap();
+        let m = TiffRaw.measure(&source, 4096).unwrap();
+        assert_eq!(m.health, Health::Damaged, "{variant:?}");
+    }
+}
+
+#[test]
+fn unreadable_sector_in_raw_data_is_partial() {
+    let raw = testkit::tiff_raw(&opts(TiffVariant::Nef, false));
+    let start = 8192usize;
+    let bad = (start + raw.raw.start + 20_000).div_ceil(512) * 512;
+    let img = DiskImage::noise(MIB, 4).put(start, &raw.bytes).save();
+    let source = FailingSource {
+        inner: FileSource::open(img.path()).unwrap(),
+        bad: (bad as u64, bad as u64 + 512),
+    };
+    // Through the detector alone (it must notice the sector while looking for the next file) ...
+    let m = TiffRaw.measure(&source, start as u64).unwrap();
+    assert_eq!(m.health, Health::Partial);
+    assert_eq!(m.len, raw.bytes.len() as u64);
+    // ... and through the scan.
+    let found = scan_all(&source);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].3, Health::Partial);
+}
+
+#[test]
+fn not_a_tiff_is_none() {
+    let img = DiskImage::noise(MIB, 4).save();
+    let source = FileSource::open(img.path()).unwrap();
+    assert!(TiffRaw.measure(&source, 0).is_none());
+    assert!(!TiffRaw.recognizes(b"II*\0\x04\0\0\0"));
+    assert!(!TiffRaw.recognizes(b"II*\0"));
+    assert!(TiffRaw.recognizes(b"II*\0\x08\0\0\0"));
+    assert!(TiffRaw.recognizes(b"MM\0*\x00\x10\0\0"));
+    assert!(!TiffRaw.recognizes(b"MM\0*\x10\0\0\0")); // IFD0 at 256 MiB
+}

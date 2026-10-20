@@ -117,7 +117,7 @@ fn try_decode(data: &[u8], strict: bool) -> Option<bool> {
 /// Health of a complete (EOI-terminated) JPEG: strict decode succeeds -> Intact; only the lenient decode succeeds ->
 /// Partial (salvageable); neither -> Damaged. Oversized images are not decoded: complete structure -> Partial (not fully verifiable). With unreadable sectors
 /// (decoded as zeros) a successful decode, strict or lenient, gives at most Partial.
-fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
+pub(super) fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
     let mut data = vec![0u8; len as usize];
     r.read(start, &mut data);
     let unreadable = r.bad_in(start, start + len);
@@ -128,6 +128,37 @@ fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
         None => Health::Partial, // too large to decode: structure complete, content not verifiable
         Some(_) => Health::Damaged,
     }
+}
+
+/// Pixel count (width x height) from the first SOF of the JPEG of `len` bytes at `start`, looking at the first 16
+/// marker segments. `None` if no SOF is found there.
+pub(super) fn sof_pixels(r: &mut Reader, start: u64, len: u64) -> Option<u64> {
+    let mut pos = 2u64;
+    for _ in 0..16 {
+        if pos + 4 > len {
+            return None;
+        }
+        let mut seg = [0u8; 4];
+        if r.read(start + pos, &mut seg) != 4 || seg[0] != 0xFF {
+            return None;
+        }
+        match seg[1] {
+            m if is_sof(m) => {
+                let mut dims = [0u8; 4];
+                // SOF payload: length (2), precision (1), height (2), width (2).
+                if r.read(start + pos + 5, &mut dims) != 4 {
+                    return None;
+                }
+                let h = u64::from(u16::from_be_bytes([dims[0], dims[1]]));
+                let w = u64::from(u16::from_be_bytes([dims[2], dims[3]]));
+                return Some(w * h);
+            }
+            SOS | EOI => return None,
+            0xFF => pos += 1,
+            _ => pos += 2 + u64::from(u16::from_be_bytes([seg[2], seg[3]])).max(2),
+        }
+    }
+    None
 }
 
 impl Format for Jpeg {

@@ -108,6 +108,23 @@ Unreadable sectors:
   no `moov` was seen before it). A header that cannot be read after a complete video (`moov` and `mdat` both seen) is only
   what follows the file: the video stays `Intact` (if nothing else is wrong).
 
+## Formats: TIFF-based RAW
+
+`TiffRaw` finds CR2, NEF, ARW, DNG, ORF, RW2 and generic TIFF (kinds `Cr2`, `Nef`, `Arw`, `Dng`, `Orf`, `Rw2`, `Tiff`;
+extensions `cr2`, `nef`, `arw`, `dng`, `orf`, `rw2`, `tif`). It recognizes the TIFF magics with an IFD0 offset between 8 and
+64 MiB; `confirms` (used for "another file starts here") requires IFD0 to hold at least 3 entries, all of a valid type.
+
+- Kind: the `CR` marker at byte 8 gives CR2; the ORF and RW2 magics give ORF and RW2; `DNGVersion` gives DNG; Make starting
+  with `NIKON` gives NEF and `SONY` gives ARW; anything else is a generic TIFF.
+- Length: the extent from `tiff::walk` (furthest byte any IFD, value or strip references). The file is cut at the first
+  512-aligned sector inside it where another file starts, except at the starts of its own embedded previews and raw
+  strips/tiles (a lossless-JPEG tile legitimately begins with FF D8), and at the end of the source; either makes it `Partial`.
+- Health: `Damaged` when the IFD structure is malformed (`garbled`). `Partial` when cut, when a sector inside is unreadable,
+  when a size cap was hit (`truncated`, for example a huge legitimate DNG), when there is no embedded JPEG preview, or when the
+  largest preview (by SOF pixel count) decodes only leniently or not at all (the raw data may still be fine). `Intact` only
+  when the largest preview decodes strictly. There is no RAW decoder, so the raw data itself is never verified.
+- Inside an `Intact` RAW the scan suppresses heads, so its embedded previews are not reported separately.
+
 ## TIFF reader (internal)
 
 `tiff::walk` is the crate-private reader the TIFF-based RAW formats (CR2, NEF, ARW, DNG, ORF, RW2) share. It takes a
@@ -119,10 +136,10 @@ are accepted; BigTIFF and anything else gives `None`.
 
 It follows the IFD chain, SubIFDs, Exif, GPS (extent only) and Interop IFDs; the next pointer of Exif/GPS/Interop IFDs is
 not followed. The data is hostile, so everything is bounded. Each IFD is visited once, a tag counts once per IFD (repeats
-are ignored), and every value block is read with a single read. Caps: 64 IFDs, 1024 entries per IFD, 65,536 strip/tile
+are ignored, without raising `garbled`: real cameras occasionally repeat tags), and every value block is read with a single read. Caps: 64 IFDs, 1024 entries per IFD, 65,536 strip/tile
 values per tag, 262,144 per walk (which also bounds `data` + `jpegs`), 16 SubIFDs per tag and 256 bytes per string. Two flags report trouble: `garbled` for structural errors (cycle, offset or value range past the
-limit, unknown type, short value block, repeated tag; the entry is skipped and never extends `end`) and `truncated` for hitting
-a size cap (the walk is incomplete, not malformed). Callers treat either as "not fully verifiable" (`Partial`). First value
+limit, unknown type, short value block; the entry is skipped and never extends `end`) and `truncated` for hitting
+a size cap (the walk is incomplete, not malformed). `garbled` makes a file `Damaged`; `truncated` at best `Partial`. First value
 wins for Make/Model/lens/serial/ISO/date. Each IFD is classified once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 go to `jpegs`; lossless JPEG (SOF3) is `data`.
 
 ## Scan

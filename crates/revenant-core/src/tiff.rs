@@ -11,7 +11,6 @@ use std::collections::HashSet;
 use crate::formats::Reader;
 
 /// Largest TIFF extent accepted (offsets past it are structural errors).
-#[allow(dead_code)] // used by Task 3/5
 pub(crate) const TIFF_MAX_LEN: u64 = 1 << 30;
 /// IFDs visited per TIFF.
 const MAX_IFDS: usize = 64;
@@ -41,7 +40,7 @@ pub(crate) struct TiffInfo {
     /// Furthest byte referenced, relative to the TIFF header.
     pub end: u64,
     /// A structural error was hit: cycle, offset or value range past the limit, unknown type, truncated value block,
-    /// or a tag repeated within one IFD (the repeat is ignored).
+    /// (a tag repeated within one IFD is ignored, not an error: real cameras occasionally do it).
     pub garbled: bool,
     /// A size cap was hit (too many IFDs, entries, SubIFDs, strips, per-walk strip budget, a string longer than 256
     /// bytes without NUL): the walk is incomplete but not malformed.
@@ -84,7 +83,7 @@ enum Kind {
     Gps,
 }
 
-fn type_size(typ: u16) -> Option<u64> {
+pub(crate) fn type_size(typ: u16) -> Option<u64> {
     match typ {
         1 | 2 | 6 | 7 => Some(1),
         3 | 8 => Some(2),
@@ -118,7 +117,6 @@ struct ImageTags {
 
 /// Walks the TIFF whose header is at absolute `base` (offsets are relative to `base`). `limit` caps every offset
 /// (min([`TIFF_MAX_LEN`], what the caller allows, e.g. an APP1 payload length)). `None` if the header is not TIFF.
-#[allow(dead_code)] // used by Task 3/5
 pub(crate) fn walk(r: &mut Reader, base: u64, limit: u64) -> Option<TiffInfo> {
     let limit = limit.min(TIFF_MAX_LEN);
     let mut head = [0u8; 8];
@@ -276,8 +274,7 @@ impl Walker<'_, '_> {
         let typ = self.u16_of([raw[2], raw[3]]);
         let count = self.u32_of([raw[4], raw[5], raw[6], raw[7]]);
         if !seen.insert(tag) {
-            self.info.garbled = true; // only the first occurrence counts
-            return;
+            return; // only the first occurrence counts
         }
         let Some(size) = type_size(typ) else {
             self.info.garbled = true;
@@ -749,11 +746,6 @@ mod tests {
             ("bad type", vec![entry(0x0100, 0, 1 << 31, 0)], 0),
             ("far value", vec![entry(0x010F, 2, 100, 0xFFFF_0000)], 0),
             ("huge count", vec![entry(0x0111, 4, 0xFFFF_FFFF, 100)], 0),
-            (
-                "duplicate tag",
-                vec![entry(0x0100, 4, 1, 5), entry(0x0100, 4, 1, 6)],
-                0,
-            ),
             ("exif -> ifd0", vec![entry(0x8769, 4, 1, 8)], 0),
         ];
         for (name, entries, next) in cases {
@@ -763,9 +755,11 @@ mod tests {
             assert!(!i.truncated, "{name}");
             assert!(started.elapsed().as_secs_f32() < 1.0, "{name}");
         }
-        // The first of two duplicates is the one used.
+        // The first of two duplicates is the one used, and the repeat is not an error.
         let dup = ifd_bytes(&[entry(0x0100, 4, 1, 5), entry(0x0100, 4, 1, 6)], 0);
-        assert_eq!(walk_all(&file(4096, &[(8, dup)])).unwrap().width, Some(5));
+        let i = walk_all(&file(4096, &[(8, dup)])).unwrap();
+        assert_eq!(i.width, Some(5));
+        assert!(!i.garbled && !i.truncated);
         // A clean tiny TIFF is not flagged.
         let i = walk_all(&file(4096, &[(8, ifd_bytes(&[], 0))])).unwrap();
         assert!(!i.garbled && !i.truncated);

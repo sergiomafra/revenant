@@ -707,3 +707,36 @@ fn photo_over_motion_jpeg_mdat_is_still_found() {
         ]
     );
 }
+
+#[test]
+fn raw_photo_among_other_files_hides_its_own_preview_only() {
+    let before = testkit::jpeg(64, 64, 21, 0);
+    let raw = testkit::tiff_raw(&testkit::TiffRawOptions {
+        variant: testkit::TiffVariant::Cr2,
+        big_endian: false,
+        raw_len: 200_000,
+        seed: 22,
+        preview: Some((160, 120)),
+        preview_sector_aligned: true,
+        exif: testkit::TestExif::default(),
+    });
+    let after = testkit::jpeg(64, 64, 23, 0);
+    let raw_at = 2 * MIB;
+    let after_at = (raw_at + raw.bytes.len()).div_ceil(512) * 512;
+    let file = DiskImage::noise(4 * MIB, 24)
+        .put(MIB, &before)
+        .put(raw_at, &raw.bytes)
+        .put(after_at, &after)
+        .save();
+    let source = FileSource::open(file.path()).unwrap();
+    let (r, events) = run(&source, &ScanOptions::default());
+    assert_eq!(r.unwrap().found, 3);
+    assert_eq!(
+        found(&events),
+        vec![
+            (MIB as u64, FileKind::Jpeg, Health::Intact),
+            (raw_at as u64, FileKind::Cr2, Health::Intact),
+            (after_at as u64, FileKind::Jpeg, Health::Intact),
+        ]
+    );
+}

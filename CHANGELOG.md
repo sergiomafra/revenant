@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - MP4/MOV video detection: exact length from the box structure, health from the `moov` chunk and sample tables; a video
   whose size was never written (battery died mid-recording) or whose data was partly overwritten ends where the next file
   starts.
+- TIFF-based RAW photo detection (CR2, NEF, ARW, DNG, ORF, RW2) and generic TIFF: exact length from the IFD structure, health
+  from the embedded JPEG preview (the raw data itself cannot be verified, so a RAW without a decodable preview is partial).
 - Sector scan of a disk image (including formatted cards) with progress, cancellation and unreadable-region reporting; each
   file is classified as intact, partial or damaged. Unreadable sectors never hide a file (a file containing one is never
   intact), and files inside a partial or damaged file are still found.
