@@ -800,3 +800,19 @@ fn bytes_len_plus(extra: u32) -> u32 {
         .len() as u32
         + extra
 }
+
+#[test]
+fn ifd_offset_past_the_cap_is_damaged_wherever_the_source_ends() {
+    let raw = testkit::tiff_raw(&opts(TiffVariant::Arw, false));
+    let mut bytes = raw.bytes.clone();
+    // IFD0's SubIFD pointer (or its next-IFD link) now points to an IFD past the 1 GiB cap.
+    patch_entry(&mut bytes, 8, 0x014A, 0x5000_0000);
+    for len in [bytes.len() as u64 + 4096, 3 << 30] {
+        let source = SparseSource {
+            data: bytes.clone(),
+            len,
+        };
+        let m = TiffRaw.measure(&source, 0).unwrap();
+        assert_eq!(m.health, Health::Damaged, "source of {len} bytes");
+    }
+}

@@ -39,8 +39,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- The health of a RAW with a corrupt offset no longer depends on where the card ends: an offset past 1 GiB is damaged
-  wherever the source ends, and one below that reaching past the end is partial.
+- A RAW with a corrupt offset at or past 1 GiB is damaged wherever the card ends (it used to be partial on a short card).
+  Below 1 GiB the end of the card still matters: an offset past the end is a cut file (partial), while the same offset on a
+  longer card is counted.
 - A stray MP4 signature (an `ftyp` header with no video behind it) no longer cuts a photo that was written over it.
 - A random byte pattern that looks like a JPEG or MP4 signature no longer cuts another file: "another file starts here" now
   requires a valid header, not just a signature.

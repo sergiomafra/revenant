@@ -180,10 +180,10 @@ and
 - Length: the extent from `tiff::walk` (furthest byte any IFD, value or strip references), walked with the end of the
   source as its limit, so structure that continues past the end of the source is a cut file (`Partial`), not a damaged one;
   a strip that starts inside the source is kept up to its end, while one that starts beyond it is not counted (a
-  corrupted offset never claims the rest of the source). The health does not depend on where the source ends: a range
-  that starts at or past `TIFF_MAX_LEN` (1 GiB) is a structural error (`Damaged`) whether the card ends right after the file
-  or 3 GiB later, and one that starts below the cap and runs past the end of the source (or past the cap) is a cut
-  (`Partial`). The file is cut at the first 512-aligned sector inside it where
+  corrupted offset never claims the rest of the source). Position independence holds only
+  at the cap: a range or IFD that starts at or past `TIFF_MAX_LEN` (1 GiB) is a structural error (`Damaged`) wherever the
+  source ends. Below the cap the source's end still matters: a range that starts past the source's end is a cut
+  (`Partial`) and is not counted, while the same range on a longer source is counted as part of the file. The file is cut at the first 512-aligned sector inside it where
   another file starts, except at the starts of its own embedded previews and of its JPEG-coded strips/tiles (Compression
   6, 7 or 34892: a lossy-JPEG tile, such as a DNG's, legitimately begins with FF D8 and confirms; lossless JPEG has no DQT,
   so it never confirms) and inside its own embedded JPEGs (the EXIF thumbnail in a preview's APP1) as long as

@@ -245,7 +245,7 @@ impl Format for IsoBmff {
 
     /// Whether [`measure`](Format::measure) would accept the file, by a header-only walk of at most [`CONFIRM_BOXES`]
     /// top-level boxes (no payload reads, no `file_starts_at`): it meets an `mdat`, or the `ftyp` has a HEIC brand and a
-    /// `meta` follows, or a box header falls in an unreadable sector.
+    /// `meta` is met with no `moov`, or a box header falls in an unreadable sector.
     fn confirms(&self, source: &dyn Source, start: u64) -> bool {
         let mut r = Reader::new(source);
         let (head, n) = r.head(start);
@@ -253,11 +253,11 @@ impl Format for IsoBmff {
             return false;
         }
         let source_len = source.len();
-        let mut heic = false;
+        let (mut heic, mut meta, mut moov) = (false, false, false);
         let mut pos = start;
         for _ in 0..CONFIRM_BOXES {
             if pos >= source_len {
-                return false;
+                break;
             }
             let (head, n) = r.head(pos);
             let Some(h) = parse_header(&head[..n]) else {
@@ -271,16 +271,18 @@ impl Format for IsoBmff {
                     heic = size >= 12 && heic_brand(&mut r, pos, &h, size);
                 }
                 b"mdat" => return true,
-                b"meta" if heic => return true,
+                b"meta" => meta = true,
+                b"moov" => moov = true,
                 _ => {}
             }
             // Only `mdat` may have no size; a box that overruns the source ends the walk, as in `measure`.
             let Some(size) = h.size else {
-                return false;
+                break;
             };
             pos = pos.saturating_add(size);
         }
-        false
+        // A HEIC is a `meta` in a file without `moov` (an MP4 that merely lists `mif1` has one).
+        heic && meta && !moov
     }
 
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement> {

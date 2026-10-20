@@ -1084,6 +1084,21 @@ fn confirms_agrees_with_measure() {
             true,
         ),
         (
+            "isom + meta",
+            cat(&[ftyp(b"isom"), bx(b"meta", &[0; 16])]),
+            false,
+        ),
+        (
+            "heic + moov + meta",
+            cat(&[ftyp(b"heic"), bx(b"moov", &[0; 16]), bx(b"meta", &[0; 16])]),
+            false,
+        ),
+        (
+            "heic + meta + moov",
+            cat(&[ftyp(b"heic"), bx(b"meta", &[0; 16]), bx(b"moov", &[0; 16])]),
+            false,
+        ),
+        (
             "heic brand + free",
             cat(&[ftyp(b"heic"), bx(b"free", &[0; 8])]),
             false,

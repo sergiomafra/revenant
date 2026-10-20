@@ -310,7 +310,7 @@ impl Walker<'_, '_> {
         if off.saturating_add(2) > self.limit {
             self.info.garbled = true;
             self.info.past_limit = true;
-            self.info.starts_past_cap |= off.saturating_add(2) > TIFF_MAX_LEN;
+            self.info.starts_past_cap |= off >= TIFF_MAX_LEN;
             return;
         }
         let Some(declared) = self.read_u16(off) else {
