@@ -231,6 +231,23 @@ pub(super) fn preview_health(r: &mut Reader, previews: &[(u64, u64)]) -> Health 
     }
 }
 
+/// Like [`preview_health`], but every JPEG (`(absolute offset, length)` each) must have a measurable size and decode
+/// strictly for `Intact`, not just the largest. For a file whose walk cannot see file heads inside one of its JPEGs (a
+/// CR3's `PRVW`), where a broken JPEG is the only sign that something was written over it. No JPEG at all is `Partial`.
+pub(super) fn every_preview_health(r: &mut Reader, previews: &[(u64, u64)]) -> Health {
+    if previews.is_empty() {
+        return Health::Partial;
+    }
+    for &(o, l) in previews {
+        if !matches!(sof_pixels(r, o, l), Some(p) if p > 0 && l <= JPEG_MAX_LEN)
+            || decode_health(r, o, l) != Health::Intact
+        {
+            return Health::Partial;
+        }
+    }
+    Health::Intact
+}
+
 /// A file's own embedded JPEGs, for deciding whether a file head inside one of them is the file's own data (ruling P13):
 /// the EXIF thumbnail in a preview's APP1 is a complete JPEG, and it may start on a sector. Such a head is the file's own
 /// while every own JPEG containing it is at most [`JPEG_MAX_LEN`] long and still decodes strictly; a file written over

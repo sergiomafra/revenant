@@ -88,9 +88,13 @@ reproduzem a estrutura:
 - O MakerNote antigo `OLYMP\0` da Olympus (E-10 e afins, offsets relativos ao TIFF) não é lido.
 - Não há HEIC real: nenhuma amostra com licença CC0/domínio público verificável foi achada.
 
-- **Aberto antes do merge (P18 revisto):** com a regra "a maior prévia decide" no CR3, um arquivo pequeno gravado dentro
-  da prévia PRVW some, e o CR3 aparece Íntegro (reproduzido). Correção pequena: enquanto a leitura do CR3 não procurar
-  cabeçalhos dentro do `uuid` da PRVW, uma PRVW quebrada mantém o CR3 no máximo Parcial. Teste com a sonda do revisor.
+- **P18 (revisto; corrigido em `fix/cr3-prvw`):** a regra "a maior prévia decide" no CR3 escondia um arquivo pequeno
+  gravado dentro da prévia PRVW e deixava o CR3 Íntegro (reproduzido). Como a leitura do CR3 só procura cabeçalhos dentro
+  do `mdat`, e a PRVW fica num `uuid` antes dele, uma PRVW quebrada é o único sinal de que algo foi gravado ali. Regra
+  atual: o CR3 só é Íntegro se a PRVW e o JPEG de tamanho total (quando existe) decodificarem em modo estrito, ambos com
+  tamanho mensurável; PRVW ausente, fora da caixa, não mensurável ou que não decodifica deixa o CR3 no máximo Parcial, e o
+  scan continua olhando dentro dele (só um achado Íntegro suprime). O `inspect` segue mostrando a maior prévia. Teste:
+  `file_written_inside_cr3_prvw_is_found`.
 - **P17:** um RW2 Parcial continua tendo o JpgFromRaw dele relatado como um achado separado (só um achado Íntegro esconde o
   que há dentro dele, como no R10 da 1.1). Deduplicação na Parte 1.4.
 
@@ -109,6 +113,9 @@ reproduzem a estrutura:
 - JPEG acima de 64 MiB perde as dimensões na inspeção.
 
 **Menores, sem dono**
+- CR3: bytes que sobrescrevem só o SOI do JPEG de tamanho total (sem formar um cabeçalho reconhecido) tiram esse JPEG dos
+  candidatos, e o CR3 segue Íntegro só pela PRVW. Possível regra futura: exigir um JPEG na primeira trilha quando a entrada
+  de amostra diz que ela é JPEG.
 - Testes que faltam: o ramo do limite de iterações do `iloc`; a guarda `room()`.
   O teste `zero_size` do HEIC aceita qualquer coisa diferente de Íntegro (mais frouxo que Parcial).
 - `random_head_inside_mdat` depende do ruído semeado.

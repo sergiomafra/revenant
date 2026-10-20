@@ -120,12 +120,15 @@ HEIC brand (`heic heix heim heis mif1 msf1`) as major or compatible brand, with 
 major
 brand is never HEIC.
 
-- CR3: the `moov`/`stco`/`stsz` rules above apply unchanged (a CR3 has `trak`s). In addition its JPEGs are judged like
-  a TIFF RAW's previews (the raw image itself is never verified): the `PRVW` JPEG in the top-level `uuid`
+- CR3: the `moov`/`stco`/`stsz` rules above apply unchanged (a CR3 has `trak`s). In addition both of its JPEGs must
+  decode strictly (the raw image itself is never verified) for `Intact`: the `PRVW` JPEG in the top-level `uuid`
   `eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16` and the full-size JPEG (the first chunk of the first track, when it starts with
-  a JPEG SOI), the same two `inspect` picks its preview from. The largest (by SOF pixel count) must decode strictly for
-  `Intact`; one whose size cannot be measured, a largest one that decodes leniently or not at all, or no `PRVW` (or one
-  whose size field does not fit its box) is `Partial`. The `PRVW` field layout comes from public format notes and the testkit, not yet from real files.
+  a JPEG SOI), each of a measurable size. A missing `PRVW` (or one whose size field does not fit its box), a `PRVW` or
+  full-size JPEG that is unmeasurable, decodes leniently or does not decode is `Partial`. This is not "the largest
+  decides" as for a TIFF RAW: the `PRVW` sits in a `uuid` before `mdat` and the CR3 walk checks file heads only inside
+  `mdat`, so a broken `PRVW` is the only sign that a file was written over it; `Partial` keeps the scan looking for heads
+  inside it (only `Intact` suppresses that). `inspect` still shows the larger of the two as the preview. The `PRVW`
+  field layout comes from public format notes and the testkit, not yet from real files.
 - HEIC: needs a `meta` (at most 16 MiB) whose `iloc` (versions 0, 1, 2; offset, length, base offset and index sizes of
   0, 4 or 8 bytes) lists the items' extents. `Intact` when every extent (construction method 0, data reference 0,
   offsets absolute in the file) ends inside the measured file; `Partial` when one ends past it (or the file is cut, or
