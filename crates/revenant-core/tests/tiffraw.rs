@@ -243,17 +243,124 @@ fn preview_that_does_not_decode_cleanly_is_partial() {
     }
 }
 
+/// Overwrites the 4-byte value of the entry with `tag` in the little-endian IFD at `ifd`.
+fn patch_entry(bytes: &mut [u8], ifd: usize, tag: u16, value: u32) {
+    let n = u16::from_le_bytes([bytes[ifd], bytes[ifd + 1]]) as usize;
+    for i in 0..n {
+        let e = ifd + 2 + 12 * i;
+        if u16::from_le_bytes([bytes[e], bytes[e + 1]]) == tag {
+            bytes[e + 8..e + 12].copy_from_slice(&value.to_le_bytes());
+            return;
+        }
+    }
+    panic!("tag {tag:#x} not found");
+}
+
 #[test]
-fn garbled_ifd_is_damaged() {
+fn garbled_structure_behind_a_valid_ifd0_is_damaged() {
     for (variant, ifd0) in [(TiffVariant::Nef, 8usize), (TiffVariant::Cr2, 16)] {
         let raw = testkit::tiff_raw(&opts(variant, false));
         let mut bytes = raw.bytes.clone();
-        bytes[ifd0..ifd0 + 2].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        // The SubIFD pointer points back at IFD0: a cycle. IFD0 itself still confirms.
+        patch_entry(&mut bytes, ifd0, 0x014A, ifd0 as u32);
         let img = DiskImage::noise(MIB, 4).put(4096, &bytes).save();
         let source = FileSource::open(img.path()).unwrap();
+        assert!(TiffRaw.confirms(&source, 4096));
         let m = TiffRaw.measure(&source, 4096).unwrap();
         assert_eq!(m.health, Health::Damaged, "{variant:?}");
     }
+}
+
+#[test]
+fn random_tiff_magic_on_noise_is_not_a_finding() {
+    for (head, big) in [(b"II*\0", false), (b"MM\0*", true)] {
+        let mut start = head.to_vec();
+        let ifd0: u32 = 4096;
+        start.extend(if big {
+            ifd0.to_be_bytes()
+        } else {
+            ifd0.to_le_bytes()
+        });
+        let img = DiskImage::noise(MIB, 12).put(8192, &start).save();
+        let source = FileSource::open(img.path()).unwrap();
+        assert!(TiffRaw.recognizes(&start));
+        assert!(TiffRaw.measure(&source, 8192).is_none());
+        assert!(scan_all(&source).is_empty(), "{:?}", scan_all(&source));
+    }
+}
+
+#[test]
+fn structure_past_the_end_of_the_source_is_partial_not_damaged() {
+    let mut o = opts(TiffVariant::Nef, false);
+    o.exif.iso = Some(100);
+    let raw = testkit::tiff_raw(&o);
+    let mut bytes = raw.bytes.clone();
+    // The Exif IFD lies beyond the end of the source.
+    let beyond = (bytes.len() + 100_000) as u32;
+    patch_entry(&mut bytes, 8, 0x8769, beyond);
+    let img = DiskImage::zeros(8192 + bytes.len())
+        .put(8192, &bytes)
+        .save();
+    let source = FileSource::open(img.path()).unwrap();
+    let m = TiffRaw.measure(&source, 8192).unwrap();
+    assert_eq!((m.len, m.health), (bytes.len() as u64, Health::Partial));
+    assert_eq!(m.kind, FileKind::Nef);
+}
+
+/// Appends IFD1 (JPEGInterchangeFormat pointing at `second`) and `second` itself to a little-endian file whose IFD0 is
+/// at 8, and chains IFD1 after IFD0.
+fn with_second_preview(mut bytes: Vec<u8>, second: &[u8]) -> Vec<u8> {
+    let n = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let next_at = 8 + 2 + 12 * n;
+    let ifd1 = bytes.len() as u32;
+    bytes[next_at..next_at + 4].copy_from_slice(&ifd1.to_le_bytes());
+    let entry = |tag: u16, v: u32| {
+        let mut e = Vec::new();
+        e.extend(tag.to_le_bytes());
+        e.extend(4u16.to_le_bytes());
+        e.extend(1u32.to_le_bytes());
+        e.extend(v.to_le_bytes());
+        e
+    };
+    bytes.extend(2u16.to_le_bytes());
+    bytes.extend(entry(0x0201, ifd1 + 30));
+    bytes.extend(entry(0x0202, second.len() as u32));
+    bytes.extend([0; 4]);
+    bytes.extend_from_slice(second);
+    bytes
+}
+
+fn health_with_previews(big: impl Fn(&mut [u8]), small: (u32, u32)) -> Health {
+    let mut o = opts(TiffVariant::Nef, false);
+    o.preview = Some((640, 480));
+    let raw = testkit::tiff_raw(&o);
+    let mut bytes = raw.bytes.clone();
+    let p = raw.preview.clone().unwrap();
+    big(&mut bytes[p]);
+    let bytes = with_second_preview(bytes, &testkit::jpeg(small.0, small.1, 31, 0));
+    let img = DiskImage::noise(MIB, 4).put(4096, &bytes).save();
+    let found = scan_image(&img);
+    assert_eq!(found[0].0, 4096, "{found:?}");
+    assert_eq!(found[0].1, bytes.len() as u64, "{found:?}");
+    found[0].3
+}
+
+#[test]
+fn the_largest_preview_decides_the_health() {
+    // Sanity: two valid previews.
+    assert_eq!(health_with_previews(|_| {}, (32, 32)), Health::Intact);
+    // (a) Big preview decodes only leniently, small one is valid: the big one decides.
+    let lenient = |p: &mut [u8]| {
+        let mid = p.len() / 2;
+        p[mid..mid + 8].copy_from_slice(&[0xFF, 0x01].repeat(4));
+    };
+    assert_eq!(health_with_previews(lenient, (32, 32)), Health::Partial);
+    // (b) Big preview with an unreadable SOF (size zero), small one valid: no thumbnail may vouch for the file.
+    let no_size = |p: &mut [u8]| {
+        let sof = p.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+        p[sof + 5..sof + 9].fill(0);
+    };
+    assert_eq!(health_with_previews(no_size, (32, 32)), Health::Partial);
 }
 
 #[test]

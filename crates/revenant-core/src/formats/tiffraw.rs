@@ -97,15 +97,24 @@ impl Format for TiffRaw {
     }
 
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement> {
+        // Random bytes that merely look like a TIFF header are not a (damaged) file.
+        if !self.confirms(source, start) {
+            return None;
+        }
         let mut r = Reader::new(source);
         let (head, n) = r.head(start);
         let (_, magic, _) = header(&head[..n])?;
-        let info = walk(&mut r, start, TIFF_MAX_LEN)?;
+        let available = source.len().saturating_sub(start);
+        let info = walk(&mut r, start, available.min(TIFF_MAX_LEN))?;
         let kind = kind_of(&head[..n], magic, &info);
 
-        let available = source.len().saturating_sub(start);
-        let mut len = info.end.min(available);
-        let mut cut = info.end > available;
+        // Structure that continues past the end of the source is a cut file (everything up to the end is kept, since a
+        // strip that starts inside the source is not recorded when it ends past it). Past the 1 GiB cap the source is
+        // larger than the limit, so that is a real structural error.
+        let source_ended = info.past_limit && available < TIFF_MAX_LEN;
+        let damaged = info.structural || (info.past_limit && !source_ended);
+        let mut len = if source_ended { available } else { info.end };
+        let mut cut = source_ended;
         // The starts of the file's own previews and raw strips/tiles are not other files.
         let own: HashSet<u64> = info
             .jpegs
@@ -124,7 +133,7 @@ impl Format for TiffRaw {
             pos += SECTOR;
         }
 
-        let health = if info.garbled {
+        let health = if damaged {
             Health::Damaged
         } else if cut || info.truncated || r.bad_in(start, start + len) {
             Health::Partial
@@ -148,15 +157,22 @@ fn kind_of(head: &[u8], magic: Magic, info: &TiffInfo) -> FileKind {
     }
 }
 
-/// Content check of a structurally complete file: only the largest embedded preview can be verified.
+/// Content check of a structurally complete file: only the largest embedded preview can be verified. The largest is
+/// chosen over all previews; if the size of any of them cannot be measured (no SOF, zero size, over the decode cap), a
+/// small thumbnail must not vouch for the file, so it is `Partial`.
 fn preview_health(r: &mut Reader, start: u64, info: &TiffInfo) -> Health {
-    let best = info
-        .jpegs
-        .iter()
-        .filter(|&&(_, l)| l <= JPEG_MAX_LEN)
-        .max_by_key(|&&(o, l)| sof_pixels(r, start + o, l).unwrap_or(0));
+    let mut best: Option<(u64, u64, u64)> = None; // (pixels, offset, len)
+    for &(o, l) in &info.jpegs {
+        let pixels = match sof_pixels(r, start + o, l) {
+            Some(p) if p > 0 && l <= JPEG_MAX_LEN => p,
+            _ => return Health::Partial,
+        };
+        if best.is_none_or(|(p, _, _)| pixels > p) {
+            best = Some((pixels, o, l));
+        }
+    }
     match best {
-        Some(&(o, l)) if decode_health(r, start + o, l) == Health::Intact => Health::Intact,
+        Some((_, o, l)) if decode_health(r, start + o, l) == Health::Intact => Health::Intact,
         _ => Health::Partial,
     }
 }

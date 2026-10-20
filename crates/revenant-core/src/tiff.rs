@@ -42,6 +42,11 @@ pub(crate) struct TiffInfo {
     /// A structural error was hit: cycle, offset or value range past the limit, unknown type, truncated value block,
     /// (a tag repeated within one IFD is ignored, not an error: real cameras occasionally do it).
     pub garbled: bool,
+    /// Part of `garbled`: some offset or range lay beyond the limit passed to `walk`. When the caller's limit is the end
+    /// of the source, this means the structure continues past the end of the data, not that it is malformed.
+    pub past_limit: bool,
+    /// Part of `garbled`: an error other than `past_limit` (cycle, unknown type, short value block, offset below 8).
+    pub structural: bool,
     /// A size cap was hit (too many IFDs, entries, SubIFDs, strips, per-walk strip budget, a string longer than 256
     /// bytes without NUL): the walk is incomplete but not malformed.
     pub truncated: bool,
@@ -71,6 +76,13 @@ pub(crate) struct TiffInfo {
     /// IFDs visited (test observation of the IFD cap).
     #[cfg(test)]
     pub ifds_seen: usize,
+}
+
+impl TiffInfo {
+    fn hard_garbled(&mut self) {
+        self.garbled = true;
+        self.structural = true;
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -189,6 +201,7 @@ impl Walker<'_, '_> {
             }
             _ => {
                 self.info.garbled = true;
+                self.info.past_limit = true;
                 false
             }
         }
@@ -199,7 +212,7 @@ impl Walker<'_, '_> {
         let mut pending: Vec<(u64, Kind)> = vec![(first, Kind::Image)];
         while let Some((off, kind)) = pending.pop() {
             if visited.contains(&off) {
-                self.info.garbled = true; // cycle
+                self.info.hard_garbled(); // cycle
                 continue;
             }
             if visited.len() >= MAX_IFDS {
@@ -216,12 +229,17 @@ impl Walker<'_, '_> {
     }
 
     fn ifd(&mut self, off: u64, kind: Kind, pending: &mut Vec<(u64, Kind)>) {
-        if off < 8 || off.saturating_add(2) > self.limit {
+        if off < 8 {
+            self.info.hard_garbled();
+            return;
+        }
+        if off.saturating_add(2) > self.limit {
             self.info.garbled = true;
+            self.info.past_limit = true;
             return;
         }
         let Some(declared) = self.read_u16(off) else {
-            self.info.garbled = true;
+            self.info.hard_garbled();
             return;
         };
         let n = declared.min(MAX_ENTRIES);
@@ -267,7 +285,7 @@ impl Walker<'_, '_> {
         }
         let mut raw = [0u8; 8];
         if self.r.read(self.abs(at), &mut raw) < 8 {
-            self.info.garbled = true;
+            self.info.hard_garbled();
             return;
         }
         let tag = self.u16_of([raw[0], raw[1]]);
@@ -277,7 +295,7 @@ impl Walker<'_, '_> {
             return; // only the first occurrence counts
         }
         let Some(size) = type_size(typ) else {
-            self.info.garbled = true;
+            self.info.hard_garbled();
             return;
         };
         let total = size * u64::from(count);
@@ -285,7 +303,7 @@ impl Walker<'_, '_> {
             at + 8
         } else {
             let Some(o) = self.read_u32(at + 8) else {
-                self.info.garbled = true;
+                self.info.hard_garbled();
                 return;
             };
             if !self.claim(u64::from(o), total) {
@@ -381,7 +399,7 @@ impl Walker<'_, '_> {
             3 => 2,
             4 | 13 => 4,
             _ => {
-                self.info.garbled = true;
+                self.info.hard_garbled();
                 return Vec::new();
             }
         };
@@ -393,7 +411,7 @@ impl Walker<'_, '_> {
         let mut buf = vec![0u8; n as usize * size];
         let got = self.r.read(self.abs(at), &mut buf);
         if got < buf.len() {
-            self.info.garbled = true;
+            self.info.hard_garbled();
         }
         buf[..got]
             .chunks_exact(size)
@@ -755,6 +773,15 @@ mod tests {
             assert!(!i.truncated, "{name}");
             assert!(started.elapsed().as_secs_f32() < 1.0, "{name}");
         }
+        // Past the limit is told apart from other structural errors (a cut file vs a malformed one).
+        let far = ifd_bytes(
+            &[entry(0x0111, 4, 1, 0xFFFF_0000), entry(0x0117, 4, 1, 100)],
+            0,
+        );
+        let i = walk_all(&file(4096, &[(8, far)])).unwrap();
+        assert!(i.garbled && i.past_limit && !i.structural);
+        let cycle = walk_all(&file(4096, &[(8, ifd_bytes(&[], 8))])).unwrap();
+        assert!(cycle.garbled && cycle.structural && !cycle.past_limit);
         // The first of two duplicates is the one used, and the repeat is not an error.
         let dup = ifd_bytes(&[entry(0x0100, 4, 1, 5), entry(0x0100, 4, 1, 6)], 0);
         let i = walk_all(&file(4096, &[(8, dup)])).unwrap();

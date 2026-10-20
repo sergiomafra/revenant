@@ -114,15 +114,21 @@ Unreadable sectors:
 extensions `cr2`, `nef`, `arw`, `dng`, `orf`, `rw2`, `tif`). It recognizes the TIFF magics with an IFD0 offset between 8 and
 64 MiB; `confirms` (used for "another file starts here") requires IFD0 to hold at least 3 entries, all of a valid type.
 
+- A head that does not `confirm` is not a file: `measure` returns `None`, so random bytes that look like a TIFF header
+  never become (damaged) findings.
 - Kind: the `CR` marker at byte 8 gives CR2; the ORF and RW2 magics give ORF and RW2; `DNGVersion` gives DNG; Make starting
   with `NIKON` gives NEF and `SONY` gives ARW; anything else is a generic TIFF.
-- Length: the extent from `tiff::walk` (furthest byte any IFD, value or strip references). The file is cut at the first
+- Length: the extent from `tiff::walk` (furthest byte any IFD, value or strip references), walked with the end of the
+  source as its limit: structure that continues past the end of the source is a cut file (`Partial`, length up to the end
+  of the source), not a damaged one. The file is cut at the first
   512-aligned sector inside it where another file starts, except at the starts of its own embedded previews and raw
   strips/tiles (a lossless-JPEG tile legitimately begins with FF D8), and at the end of the source; either makes it `Partial`.
-- Health: `Damaged` when the IFD structure is malformed (`garbled`). `Partial` when cut, when a sector inside is unreadable,
-  when a size cap was hit (`truncated`, for example a huge legitimate DNG), when there is no embedded JPEG preview, or when the
-  largest preview (by SOF pixel count) decodes only leniently or not at all (the raw data may still be fine). `Intact` only
-  when the largest preview decodes strictly. There is no RAW decoder, so the raw data itself is never verified.
+- Health: `Damaged` when the IFD structure is malformed (a cycle, an unknown type, and so on). `Partial` when cut, when a
+  sector inside is unreadable, when a size cap was hit (`truncated`, for example a huge legitimate DNG), when there is no
+  embedded JPEG preview, or when the largest preview (by SOF pixel count, over all previews) decodes only leniently or not
+  at all (the raw data may still be fine). If the size of any preview cannot be measured (no SOF, zero size, over the
+  decode cap) no smaller one may vouch for the file, so it is `Partial`. `Intact` only when the largest preview decodes
+  strictly. There is no RAW decoder, so the raw data itself is never verified.
 - Inside an `Intact` RAW the scan suppresses heads, so its embedded previews are not reported separately.
 
 ## TIFF reader (internal)
@@ -136,11 +142,17 @@ are accepted; BigTIFF and anything else gives `None`.
 
 It follows the IFD chain, SubIFDs, Exif, GPS (extent only) and Interop IFDs; the next pointer of Exif/GPS/Interop IFDs is
 not followed. The data is hostile, so everything is bounded. Each IFD is visited once, a tag counts once per IFD (repeats
-are ignored, without raising `garbled`: real cameras occasionally repeat tags), and every value block is read with a single read. Caps: 64 IFDs, 1024 entries per IFD, 65,536 strip/tile
-values per tag, 262,144 per walk (which also bounds `data` + `jpegs`), 16 SubIFDs per tag and 256 bytes per string. Two flags report trouble: `garbled` for structural errors (cycle, offset or value range past the
-limit, unknown type, short value block; the entry is skipped and never extends `end`) and `truncated` for hitting
-a size cap (the walk is incomplete, not malformed). `garbled` makes a file `Damaged`; `truncated` at best `Partial`. First value
-wins for Make/Model/lens/serial/ISO/date. Each IFD is classified once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 go to `jpegs`; lossless JPEG (SOF3) is `data`.
+are ignored, without raising `garbled`: real cameras occasionally repeat tags), and every value block is read with a single
+read. Caps: 64 IFDs, 1024 entries per IFD, 65,536 strip/tile values per tag, 262,144 per walk (which also bounds `data` +
+`jpegs`), 16 SubIFDs per tag and 256 bytes per string.
+
+Two flags report trouble. `garbled` is a structural error (cycle, offset or value range past the limit, unknown type, short
+value block; the entry is skipped and never extends `end`); within it, `past_limit` marks ranges beyond the limit passed in
+(for a caller whose limit is the end of the source, a cut file) and `structural` marks every other error (a malformed
+file). `truncated` is a size cap hit (the walk is incomplete, not malformed). Callers make `structural` files `Damaged`
+and treat `truncated` as at best `Partial`. First value wins for Make/Model/lens/serial/ISO/date. Each IFD is classified
+once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 go to `jpegs`; lossless JPEG (SOF3) is
+`data`.
 
 ## Scan
 
