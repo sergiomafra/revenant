@@ -76,6 +76,10 @@ Images (files go back to back, each at the next 512-byte boundary, the rest is s
 The numbers are page-cache throughput (the first write leaves the image in the cache): an upper bound for a card reader,
 not a prediction of it.
 
+Compare only runs of the same `--size-mib`; the baseline is 1024 MiB. `--runs 1` may under-report, because the first run
+can overlap the writeback of the image. The `dense-jpeg` images are noise-encoded (about 11 MB per 3000x2000 file, more
+entropy than real photos), so cross-check final speed claims with the real samples.
+
 ## Making a card image (read-only)
 
 Work on an image of the card, not on the card itself. Imaging only reads from the card.

@@ -40,7 +40,10 @@ pub fn run_bench(
         None => tempfile::tempdir(),
     }
     .map_err(io_err)?;
-    let bytes = size_mib * 1024 * 1024;
+    let bytes = size_mib
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| io_err(std::io::Error::other("size too large")))?;
+    let formats = all_formats();
     for &kind in images {
         let path = tmp.path().join(format!("{}.img", kind.name()));
         let placed = {
@@ -55,7 +58,7 @@ pub fn run_bench(
             let start = Instant::now();
             let summary = scan(
                 &source,
-                &all_formats(),
+                &formats,
                 &ScanOptions::default(),
                 &CancelToken::default(),
                 &mut |_| {},

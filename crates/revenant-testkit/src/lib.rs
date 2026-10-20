@@ -1164,4 +1164,12 @@ mod bench_tests {
         }
         assert_eq!(BenchImage::parse("nope"), None);
     }
+
+    #[test]
+    fn bench_images_are_deterministic() {
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        write_bench_image(BenchImage::DenseJpeg, 16 << 20, &mut a).unwrap();
+        write_bench_image(BenchImage::DenseJpeg, 16 << 20, &mut b).unwrap();
+        assert!(a == b);
+    }
 }

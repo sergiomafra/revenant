@@ -353,9 +353,14 @@ fn bench_reports_each_image() {
 
 #[test]
 fn bench_rejects_an_unknown_image() {
+    let dir = tempfile::tempdir().unwrap();
     Command::cargo_bin("revenant-dev")
         .unwrap()
-        .args(["bench", "--images", "bogus"])
+        .args(["bench", "--images", "noise,bogus", "--dir"])
+        .arg(dir.path())
         .assert()
-        .code(2);
+        .code(2)
+        .stdout("")
+        .stderr(predicates::str::contains("unknown image 'bogus'"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }

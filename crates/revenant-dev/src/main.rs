@@ -47,7 +47,7 @@ enum Command {
     /// Measure scan throughput on synthetic images written to a temp dir (page-cache speed, not a card reader's).
     Bench {
         /// Size of each image in MiB.
-        #[arg(long, value_name = "N", default_value_t = 1024)]
+        #[arg(long, value_name = "N", default_value_t = 1024, value_parser = clap::value_parser!(u64).range(1..=1_048_576))]
         size_mib: u64,
         /// Scans per image; the best run is reported.
         #[arg(long, value_name = "N", default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
