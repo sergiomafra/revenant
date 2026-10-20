@@ -96,6 +96,9 @@ pub struct ScanOptions {
     pub block: usize,
     /// Bytes of recently read data the scan and the detectors share, so each sector is read from the source once (values
     /// below 1 MiB are raised to it). The read-ahead is sized to fit in it (see [`ScanOptions::lookahead_blocks`]).
+    /// "Once" needs room for the work in flight: from about 128 MiB on (the default is 256 MiB). Smaller caches evict
+    /// windows still needed and read them again: with 32 MiB the 1 GiB `cut-jpeg` bench image is read 9.46 times over
+    /// with 1 thread (5.94 with 16), with 64 MiB 3.63 (2.78) times.
     pub cache_bytes: usize,
     /// Threads that measure candidate files: 0 (the default) means one per available core, at most 16; 1 measures on
     /// the scan thread itself; other values are capped at 64. The events are the same for any value.

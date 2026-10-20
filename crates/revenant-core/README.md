@@ -494,7 +494,12 @@ from the source by the scan and the detectors; a JPEG gap search re-reads the ph
 the `moov`s it loads (at most 1 GiB) and the samples it checks again (see "Video with a separated index"), and a
 `Partial` or
 `Damaged` finding larger than the cache may be read again (the scan keeps examining heads inside it, so it reads its blocks
-itself). The cache reads the source in aligned 1 MiB windows (rounded down to whole sectors) and keeps the most recently used
+itself). All of this holds only when the cache is large enough for the work in flight (the read-ahead, the file each
+measuring thread is reading and a gap search's 64 MiB window): with less, windows are evicted before the detectors that
+need them are done and are read again. Measured with a byte-counting source on the 1 GiB `cut-jpeg` bench image (a gap
+search for each of its 95 photos), the source is read 9.46 × with a 32 MiB cache (1 thread; 5.94 × with 16), 3.63 ×
+(2.78 ×) with 64 MiB, and 1.00 × from 128 MiB on; `dense-jpeg` is read 1.00 × even with 32 MiB. Keep the default
+(256 MiB), or at least about 128 MiB. The cache reads the source in aligned 1 MiB windows (rounded down to whole sectors) and keeps the most recently used
 ones up to `cache_bytes`; a window being loaded is not counted yet, so each reading thread can hold one more window on top.
 The buffer of an evicted window is reused by the load that evicted it. A window that cannot be read in
 one go is resolved sector by sector (scan sector size: with a sector above 512, the detectors see a scan sector that failed
