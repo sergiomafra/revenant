@@ -42,7 +42,8 @@ pub(crate) struct TiffInfo {
     /// A structural error was hit: cycle, offset or value range past the limit, unknown type, truncated value block,
     /// (a tag repeated within one IFD is ignored, not an error: real cameras occasionally do it).
     pub garbled: bool,
-    /// Part of `garbled`: some offset or range lay beyond the limit passed to `walk`. When the caller's limit is the end
+    /// Part of `garbled`: some offset or range lay beyond the limit passed to `walk` (a range that starts inside is recorded
+    /// clamped to the limit, one that starts beyond it is not counted). When the caller's limit is the end
     /// of the source, this means the structure continues past the end of the data, not that it is malformed.
     pub past_limit: bool,
     /// Part of `garbled`: an error other than `past_limit` (cycle, unknown type, short value block, offset below 8).
@@ -202,6 +203,10 @@ impl Walker<'_, '_> {
             _ => {
                 self.info.garbled = true;
                 self.info.past_limit = true;
+                if off < self.limit {
+                    // Starts inside, ends past the limit: what lies inside still counts.
+                    self.info.end = self.info.end.max(self.limit);
+                }
                 false
             }
         }
@@ -484,10 +489,14 @@ impl Walker<'_, '_> {
     fn finish_image(&mut self, t: &ImageTags) {
         if let (Some(o), Some(l)) = (t.jpeg_offset, t.jpeg_len)
             && l > 0
-            && self.claim(o, l)
-            && self.room()
         {
-            self.info.jpegs.push((o, l));
+            if self.claim(o, l) {
+                if self.room() {
+                    self.info.jpegs.push((o, l));
+                }
+            } else if o < self.limit && self.room() {
+                self.info.data.push((o, self.limit - o)); // clamped: truncated by the limit
+            }
         }
         let jpeg_compression = matches!(t.compression, Some(6 | 7));
         let mut kind: Option<bool> = None;
@@ -496,9 +505,21 @@ impl Walker<'_, '_> {
             (&t.tile_offsets, &t.tile_counts),
         ] {
             for (&o, &l) in offsets.iter().zip(counts.iter()) {
-                if l == 0 || !self.claim(o, l) {
+                if l == 0 {
                     continue;
                 }
+                let l = if self.claim(o, l) {
+                    l
+                } else if o < self.limit {
+                    // Clamped to the limit: the part inside is recorded as raw data (it cannot be classified).
+                    if !self.room() {
+                        return;
+                    }
+                    self.info.data.push((o, self.limit - o));
+                    continue;
+                } else {
+                    continue;
+                };
                 if !self.room() {
                     return;
                 }

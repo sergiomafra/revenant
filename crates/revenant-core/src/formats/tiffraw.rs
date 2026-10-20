@@ -108,12 +108,12 @@ impl Format for TiffRaw {
         let info = walk(&mut r, start, available.min(TIFF_MAX_LEN))?;
         let kind = kind_of(&head[..n], magic, &info);
 
-        // Structure that continues past the end of the source is a cut file (everything up to the end is kept, since a
-        // strip that starts inside the source is not recorded when it ends past it). Past the 1 GiB cap the source is
-        // larger than the limit, so that is a real structural error.
+        // Structure that continues past the end of the source is a cut file; `walk` clamps a range that starts inside to the
+        // limit, so `info.end` covers exactly what is there. Past the 1 GiB cap the source is larger than the limit, so
+        // that is a real structural error.
         let source_ended = info.past_limit && available < TIFF_MAX_LEN;
         let damaged = info.structural || (info.past_limit && !source_ended);
-        let mut len = if source_ended { available } else { info.end };
+        let mut len = info.end;
         let mut cut = source_ended;
         // The starts of the file's own previews and raw strips/tiles are not other files.
         let own: HashSet<u64> = info

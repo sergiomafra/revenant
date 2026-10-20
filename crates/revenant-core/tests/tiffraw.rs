@@ -394,3 +394,36 @@ fn not_a_tiff_is_none() {
     assert!(TiffRaw.recognizes(b"MM\0*\x00\x10\0\0"));
     assert!(!TiffRaw.recognizes(b"MM\0*\x10\0\0\0")); // IFD0 at 256 MiB
 }
+
+#[test]
+fn bad_offset_does_not_claim_the_rest_of_the_source() {
+    let raw = testkit::tiff_raw(&opts(TiffVariant::Nef, false));
+    let mut bytes = raw.bytes.clone();
+    // Find the SubIFD (IFD0 is at 8) and point its only strip far past the end of the source.
+    let n = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let sub = (0..n)
+        .map(|i| 8 + 2 + 12 * i)
+        .find(|&e| u16::from_le_bytes([bytes[e], bytes[e + 1]]) == 0x014A)
+        .map(|e| u32::from_le_bytes(bytes[e + 8..e + 12].try_into().unwrap()) as usize)
+        .unwrap();
+    patch_entry(&mut bytes, sub, 0x0111, 0x7FFF_0000);
+    let img = DiskImage::noise(64 * MIB, 13).put(0, &bytes).save();
+    let source = FileSource::open(img.path()).unwrap();
+    let m = TiffRaw.measure(&source, 0).unwrap();
+    assert_eq!(m.health, Health::Partial);
+    // The bad strip is not counted: the file ends where its real structure does, not at the end of the source.
+    assert!(m.len <= bytes.len() as u64, "len {}", m.len);
+    assert!(m.len >= raw.preview.unwrap().end as u64);
+}
+
+#[test]
+fn raw_cut_by_source_end_keeps_partial_strip() {
+    let raw = testkit::tiff_raw(&opts(TiffVariant::Nef, false));
+    let keep = raw.raw.start + 50_000; // the strip starts inside the source and ends past it
+    let img = DiskImage::zeros(4096 + keep)
+        .put(4096, &raw.bytes[..keep])
+        .save();
+    let source = FileSource::open(img.path()).unwrap();
+    let m = TiffRaw.measure(&source, 4096).unwrap();
+    assert_eq!((m.len, m.health), (keep as u64, Health::Partial));
+}

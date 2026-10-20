@@ -119,10 +119,11 @@ extensions `cr2`, `nef`, `arw`, `dng`, `orf`, `rw2`, `tif`). It recognizes the T
 - Kind: the `CR` marker at byte 8 gives CR2; the ORF and RW2 magics give ORF and RW2; `DNGVersion` gives DNG; Make starting
   with `NIKON` gives NEF and `SONY` gives ARW; anything else is a generic TIFF.
 - Length: the extent from `tiff::walk` (furthest byte any IFD, value or strip references), walked with the end of the
-  source as its limit: structure that continues past the end of the source is a cut file (`Partial`, length up to the end
-  of the source), not a damaged one. The file is cut at the first
-  512-aligned sector inside it where another file starts, except at the starts of its own embedded previews and raw
-  strips/tiles (a lossless-JPEG tile legitimately begins with FF D8), and at the end of the source; either makes it `Partial`.
+  source as its limit: structure that continues past the end of the source is a cut file (`Partial`), not a damaged one; a
+  strip that starts inside the source is kept up to its end, while one that starts beyond it is not counted (a corrupted
+  offset never claims the rest of the source). The file is cut at the first 512-aligned sector inside it where another
+  file starts, except at the starts of its own embedded previews and raw strips/tiles (a lossless-JPEG tile legitimately
+  begins with FF D8), and at the end of the source; either makes it `Partial`.
 - Health: `Damaged` when the IFD structure is malformed (a cycle, an unknown type, and so on). `Partial` when cut, when a
   sector inside is unreadable, when a size cap was hit (`truncated`, for example a huge legitimate DNG), when there is no
   embedded JPEG preview, or when the largest preview (by SOF pixel count, over all previews) decodes only leniently or not
@@ -148,7 +149,8 @@ read. Caps: 64 IFDs, 1024 entries per IFD, 65,536 strip/tile values per tag, 262
 
 Two flags report trouble. `garbled` is a structural error (cycle, offset or value range past the limit, unknown type, short
 value block; the entry is skipped and never extends `end`); within it, `past_limit` marks ranges beyond the limit passed in
-(for a caller whose limit is the end of the source, a cut file) and `structural` marks every other error (a malformed
+(for a caller whose limit is the end of the source, a cut file; a range starting inside is recorded clamped to
+the limit, one starting beyond is not counted) and `structural` marks every other error (a malformed
 file). `truncated` is a size cap hit (the walk is incomplete, not malformed). Callers make `structural` files `Damaged`
 and treat `truncated` as at best `Partial`. First value wins for Make/Model/lens/serial/ISO/date. Each IFD is classified
 once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 go to `jpegs`; lossless JPEG (SOF3) is
