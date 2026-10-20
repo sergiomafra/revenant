@@ -38,8 +38,6 @@ jobs:
   samples:
     name: real camera samples
     runs-on: ubuntu-latest
-    # Downloads from raw.pixls.us: an outage of that site must not fail the build.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -47,9 +45,14 @@ jobs:
         with:
           path: samples/cache
           key: samples-${{ hashFiles('samples/samples.toml') }}
+      # Downloads from raw.pixls.us: an outage of that site must not fail the build, so only this step may fail, and the
+      # test is skipped without the samples. A failing test (a real-sample regression) fails the build.
       - name: Fetch samples
+        id: fetch
+        continue-on-error: true
         run: scripts/fetch-samples.sh
       - name: Test
+        if: steps.fetch.outcome == 'success'
         run: cargo test -p revenant-core --test real_samples -- --ignored --nocapture
         env:
           REVENANT_SAMPLES: samples/cache

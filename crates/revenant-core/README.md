@@ -314,7 +314,8 @@ scripts/fetch-samples.sh
 REVENANT_SAMPLES=samples/cache cargo test -p revenant-core --test real_samples -- --ignored
 ```
 
-CI runs it in the `samples` job. There is no HEIC sample: none with a verifiable CC0/public-domain license was found.
+CI runs it in the `samples` job: a failed download (raw.pixls.us down) skips the test without failing the build, while
+a failing test fails it. There is no HEIC sample: none with a verifiable CC0/public-domain license was found.
 
 ## Trying it
 
