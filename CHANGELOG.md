@@ -40,7 +40,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   are unchanged.
 - A photo split in two pieces on the card (another file was written in the middle of it) is put back together: the rest of
   the photo is searched for in the next 64 MiB, and the photo is recovered whole, its pieces in order. It is reported
-  intact only when exactly one continuation fits; otherwise it is partial.
+  intact only when exactly one continuation fits and every possible one was tried; otherwise it is partial (for example
+  two photos from one camera written interleaved). The search is bounded (a first piece of at least 16 KiB, at most
+  4096 tries reading at most 64 MiB) and stops at once when the scan is cancelled.
 - Real camera samples: an opt-in test (and CI job) runs the engine over real CR2, CR3, NEF, ARW, RAF, DNG, ORF and RW2
   files (CC0, from raw.pixls.us), downloaded on demand by `scripts/fetch-samples.sh` and checked by SHA-256.
 
@@ -59,9 +61,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cut by the JPEG frames inside their data.
 - JPEGs with DAC/JPG segments or `FF` fill bytes before a marker are measured instead of skipped; a JPEG too large to decode
   (over 210 megapixels) with a complete structure is partial instead of damaged.
-- The scan and the file detectors share what they read, so each sector of a card is read once (a JPEG gap search may
-  re-read up to its 64 MiB window), and known unreadable sectors are never retried (retrying a bad sector on a failing card
-  can take seconds each time).
+- The scan and the file detectors share what they read, so each sector of a card is read once (the search for the rest
+  of a broken photo re-reads that photo, the 64 MiB after it and at most 64 MiB more), and known unreadable sectors are
+  never retried (retrying a bad sector on a failing card can take seconds each time).
 - Scanning uses every core: the card is still read in order, while the files found are checked in parallel (5x faster on
   the photo-dense benchmark on an 8-core / 16-thread machine). The results are the same, in the same order, whatever the number of
   threads; cancelling stops the scan without reporting anything more. The JPEG checks share a memory budget (512 MiB at
@@ -73,6 +75,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reported intact (the decoder used for the check fills in what is missing), as a file of its own or as a RAW's preview.
   Common JPEGs are now verified by Revenant's own decoder, which checks every block is there (and is faster); such a
   photo is partial, and put back together when the rest of it is found.
-
+- A file written in the space a RAW reserves for its preview, past the preview's end, was hidden as part of the RAW; it
+  is now found.
 - A small file written inside a Canon CR3's `PRVW` preview was hidden and the CR3 reported intact; a CR3 is now intact only
   if both its preview and its full-size JPEG decode, so the file inside is found.

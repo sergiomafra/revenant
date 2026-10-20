@@ -229,6 +229,8 @@ pub(crate) struct Reader<'a> {
     bad: Vec<u64>,
     /// Box payloads already loaded by [`Reader::load_box`], by `(offset, length)`.
     loaded: HashMap<(u64, u64), Rc<Vec<u8>>>,
+    /// Bytes read per load (at most [`WINDOW`]).
+    window: usize,
 }
 
 impl Drop for Reader<'_> {
@@ -247,7 +249,16 @@ impl<'a> Reader<'a> {
             buf_len: 0,
             bad: Vec::new(),
             loaded: HashMap::new(),
+            window: WINDOW,
         }
+    }
+
+    /// A reader that reads at most `window` bytes (rounded to whole sectors, at least one) per load, for walks that
+    /// often stop early (the JPEG gap search's tries).
+    pub(crate) fn with_window(source: &'a dyn Source, window: usize) -> Self {
+        let mut r = Self::new(source);
+        r.window = (window / SECTOR as usize).clamp(1, WINDOW / SECTOR as usize) * SECTOR as usize;
+        r
     }
 
     /// The bytes `[at, at + len)` as one buffer, read at most once per reader (the same range asked again is shared).
@@ -295,7 +306,7 @@ impl<'a> Reader<'a> {
             return false;
         }
         let start = pos - pos % SECTOR;
-        let want = (self.len - start).min(WINDOW as u64) as usize;
+        let want = (self.len - start).min(self.window as u64) as usize;
         self.buf_start = start;
         self.buf_len = match self.source.read_at(start, &mut self.buf[..want]) {
             Ok(n) => n,

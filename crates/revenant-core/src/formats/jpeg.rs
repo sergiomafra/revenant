@@ -139,17 +139,26 @@ thread_local! {
 ///
 /// With unreadable sectors (read as zeros) inside, a success of either kind gives at most `Partial`.
 pub(super) fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
+    verify(r, start, len).0
+}
+
+/// [`decode_health`], with where the JPEG's data ends when our decoder walked it to its EOI (just past `FF D9`, which
+/// may lie before `start + len` for a range declared longer than the JPEG); `None` when that is not known.
+fn verify(r: &mut Reader, start: u64, len: u64) -> (Health, Option<u64>) {
     let end = start.saturating_add(len);
     let walked = walk_header(r, start, len).and_then(|header| {
         let frame = jpeg_entropy::frame(r, start, header.scan_start)?;
         let run = jpeg_entropy::decode(r, &frame, frame.start(header.scan_start), end, false);
-        Some(matches!(run.end, jpeg_entropy::End::Eoi { .. }))
+        Some(match run.end {
+            jpeg_entropy::End::Eoi { at } => Some(at + 2),
+            _ => None,
+        })
     });
     match walked {
-        Some(true) if r.bad_in(start, end) => Health::Partial,
-        Some(true) => Health::Intact,
-        Some(false) => zune_health(r, start, len, false),
-        None => zune_health(r, start, len, true),
+        Some(Some(eoi)) if r.bad_in(start, end) => (Health::Partial, Some(eoi)),
+        Some(Some(eoi)) => (Health::Intact, Some(eoi)),
+        Some(None) => (zune_health(r, start, len, false), None),
+        None => (zune_health(r, start, len, true), None),
     }
 }
 
@@ -363,7 +372,8 @@ pub(crate) struct OwnJpegs {
     /// members being indexes into `jpegs`. Ranges that merely touch stay apart, so a head costs one search plus the
     /// members of its own run, however many tiles a file has.
     merged: Vec<(u64, u64, usize, usize)>,
-    decodes: HashMap<(u64, u64), bool>,
+    /// Per own JPEG: `None` if it does not vouch, else the end of the data it vouches for (its EOI when known).
+    decodes: HashMap<(u64, u64), Option<u64>>,
 }
 
 #[cfg(test)]
@@ -416,10 +426,18 @@ impl OwnJpegs {
             })
             .filter(|&&(_, e)| pos < e)
             .all(|&(s, e)| {
-                // Over the JPEG size cap it is not decoded, so it cannot vouch for the head.
-                *decodes.entry((s, e)).or_insert_with(|| {
-                    e - s <= JPEG_MAX_LEN && decode_health(r, s, e - s) == Health::Intact
-                })
+                // Over the JPEG size cap it is not decoded, so it cannot vouch for the head; nor for one past its EOI,
+                // in the rest of a range declared longer than the JPEG.
+                let vouched = *decodes.entry((s, e)).or_insert_with(|| {
+                    if e - s > JPEG_MAX_LEN {
+                        return None;
+                    }
+                    match verify(r, s, e - s) {
+                        (Health::Intact, eoi) => Some(eoi.unwrap_or(e)),
+                        _ => None,
+                    }
+                });
+                vouched.is_some_and(|end| pos < end)
             })
     }
 }
@@ -474,7 +492,7 @@ impl Format for Jpeg {
 
 /// The JPEG at `start` as one contiguous run of bytes: up to its `EOI`, or cut by another file's head, the end of the
 /// source or [`JPEG_MAX_LEN`].
-fn contiguous(r: &mut Reader, start: u64, header: &Header) -> Measurement {
+pub(super) fn contiguous(r: &mut Reader, start: u64, header: &Header) -> Measurement {
     let mut pos = header.scan_start;
 
     // Entropy-coded data. FF00 and RSTn are data; EOI ends the file.
@@ -626,6 +644,24 @@ mod tests {
         let scan_start = walk_header(&mut r, 0, JPEG_MAX_LEN).unwrap().scan_start;
         assert!(jpeg_entropy::frame(&mut r, 0, scan_start).is_none());
         assert_ne!(decode_health(&mut r, 0, j.len() as u64), Health::Intact);
+    }
+
+    #[test]
+    fn a_head_between_a_previews_eoi_and_its_declared_end_is_not_vouched_for() {
+        // A preview whose declared range runs 4 KiB past its EOI, and another file's head in that slack: the head is not
+        // the preview's data, so it must not be hidden.
+        let j = revenant_testkit::jpeg_smooth(256, 192, 3);
+        let foreign_at = (j.len() + 2).next_multiple_of(512);
+        let declared = foreign_at + 4096;
+        let mut img = vec![0u8; declared + 4096];
+        img[..j.len()].copy_from_slice(&j);
+        let other = revenant_testkit::jpeg(32, 32, 4, 0);
+        img[foreign_at..foreign_at + other.len()].copy_from_slice(&other);
+        let src = Mem(img);
+        let mut r = Reader::new(&src);
+        let mut own = OwnJpegs::new([(0, declared as u64)]);
+        assert!(own.vouch_for(&mut r, 512), "inside the preview's data");
+        assert!(!own.vouch_for(&mut r, foreign_at as u64), "past its EOI");
     }
 
     #[test]

@@ -83,7 +83,8 @@ const MAX_THREADS: usize = 64;
 /// and each measuring thread) one window being loaded (1 MiB) and a pool of at most 4 reader windows (4 MiB) kept
 /// between measurements, plus the validation decodes of every scan in the process (the budget counts at most 512 MiB
 /// at once: the JPEG bytes and the 1-byte-per-pixel output; the decoder's internal buffers, such as a progressive
-/// image's coefficients, come on top) and what each running measurement holds (for example a `moov` of at most 16 MiB),
+/// image's coefficients, come on top) and what each running measurement holds (for example a `moov` of at most 16 MiB,
+/// or a JPEG gap search's DC values, about 3 × 13 MiB at 210 megapixels, plus 3 MiB),
 /// plus about 200 B per recognized sector start in the read-ahead (at most lookahead × block / sector of them). So with
 /// the defaults on a 16-thread machine, about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
 pub struct ScanOptions {

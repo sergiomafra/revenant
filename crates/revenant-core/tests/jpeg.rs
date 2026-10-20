@@ -670,11 +670,14 @@ fn restart_marker(j: &[u8], k: usize) -> usize {
 #[test]
 fn tail_spliced_at_a_restart_marker_needs_the_dc_seam() {
     // Restart markers every MCU row: DC predictors reset there, so any photo of the same geometry and tables continues
-    // validly at its own 16th marker with the exact MCU count. Only the DC seam tells the photo's own tail from another's.
-    let dc_a = |bx: u32, by: u32| bx as i16 * 2 + by as i16 * 3 - 100;
-    let dc_b = |bx: u32, by: u32| 400 - bx as i16 * 2 - by as i16 * 3;
-    let a = testkit::jpeg_gray_dc(512, 256, 64, &dc_a);
-    let b = testkit::jpeg_gray_dc(512, 256, 64, &dc_b);
+    // validly at its own k-th marker with the exact MCU count. Only the DC seam tells the photo's own tail from another's.
+    // Rows of 8191 blocks whose DC alternates by 1600 take about 24 KiB each, so a first piece of one row is long enough
+    // to be searched; vertically the DC changes by 3 per row, and photo b sits about 50 above photo a.
+    let alt = |bx: u32| if bx.is_multiple_of(2) { 800 } else { -800 };
+    let dc_a = |bx: u32, by: u32| alt(bx) + by as i16 * 3 - 50;
+    let dc_b = |bx: u32, by: u32| alt(bx) - by as i16 * 3 + 100;
+    let a = testkit::jpeg_gray_dc(65528, 256, 8191, &dc_a);
+    let b = testkit::jpeg_gray_dc(65528, 256, 8191, &dc_b);
     // At the 16th marker the seam is judged right after its row (against the rows above); at the 1st, with no row above,
     // only once the whole image is decoded.
     for k in [16, 1] {
@@ -682,6 +685,7 @@ fn tail_spliced_at_a_restart_marker_needs_the_dc_seam() {
         // The first piece ends right before the marker, on a sector boundary.
         let start = 64 * KIB - pa % 512 + 512;
         assert_eq!((start + pa) % 512, 0);
+        assert!(pa >= 16 * KIB, "{pa}");
         let image = |tail: &[u8]| {
             let mut img = DiskImage::noise(8 * MIB, 5);
             img.put(start, &a[..pa]).put(3 * MIB, tail);
@@ -723,4 +727,65 @@ fn photo_glued_to_a_wrong_tail_is_not_intact() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn two_photos_written_interleaved_are_never_intact() {
+    // Photos a and b of one frame (restart marker every MCU, DC values k apart), written a[..c] | b[..c] | a[c..] | b[c..]:
+    // a's own tail lies behind b's first piece, whose sectors share a's EOI, so a search that stopped after the first
+    // few of them would find only b's tail. Glued on a restart marker below the seam threshold, it passes; it must not be
+    // called Intact (ruling Q7).
+    let dc_a = |bx: u32, by: u32| (bx as i16 / 4) + (by as i16 / 4) - 100;
+    for k in [3i16, 5, 7] {
+        let dc_b = move |bx: u32, by: u32| dc_a(bx, by) + k;
+        let a = testkit::jpeg_gray_dc(1024, 768, 1, &dc_a);
+        let b = testkit::jpeg_gray_dc(1024, 768, 1, &dc_b);
+        for c in [3072usize, 7168, 16384, 20480, 24576, 28672] {
+            let pb = START + c;
+            let pa2 = pb + c;
+            let pb2 = (pa2 + a.len() - c).next_multiple_of(512);
+            let mut img = DiskImage::zeros(pb2 + b.len() + 8192);
+            img.put(START, &a[..c])
+                .put(pb, &b[..c])
+                .put(pa2, &a[c..])
+                .put(pb2, &b[c..]);
+            let m = measure_at_start(&img);
+            assert_ne!(m.health, Health::Intact, "k {k}, c {c}: {m:?}");
+        }
+    }
+}
+
+#[test]
+fn a_search_reads_at_most_its_window_and_its_budget() {
+    // Half a photo, then 64 MiB of bytes that are not entropy-coded data but hold no marker, with an EOI every 128 KiB:
+    // every candidate's second piece is long, so each try's reader loads a full read window before the decode fails.
+    // Unbounded, 4096 tries would read 256 MiB; the search's budget stops the tries at 64 MiB.
+    let (a, c) = smooth_photo();
+    let mut img = a[..c].to_vec();
+    let mut block = vec![0xFEu8; 128 * KIB];
+    for (i, b) in block.iter_mut().enumerate() {
+        if i % 509 == 0 {
+            *b = 0xFD; // no sector of one repeated value
+        }
+    }
+    let n = block.len();
+    block[n - 2..].copy_from_slice(&[0xFF, 0xD9]);
+    while img.len() < c + 65 * MIB {
+        img.extend_from_slice(&block);
+    }
+    let file = DiskImage::zeros(img.len()).put(0, &img).save();
+    let source = Counting {
+        inner: FileSource::open(file.path()).unwrap(),
+        bytes: Default::default(),
+    };
+    let m = Jpeg.measure(&source, 0).expect("a JPEG");
+    assert_ne!(m.health, Health::Intact, "{m:?}");
+    let read = source.bytes.load(std::sync::atomic::Ordering::Relaxed);
+    // The contiguous walk's first window (1 MiB), the 64 MiB window pass, the tries' 64 MiB budget and one try's last
+    // load past it.
+    assert!(
+        read <= (1 + 64 + 64 + 1) * MIB as u64,
+        "{} MiB read",
+        read / MIB as u64
+    );
 }

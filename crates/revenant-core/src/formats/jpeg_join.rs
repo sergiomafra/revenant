@@ -4,13 +4,18 @@
 //! our entropy decoder walks the two pieces to the exact MCU count with `EOI` right after it, and the DC values of the
 //! blocks on both sides of the seam agree as well as the rest of the image does.
 //!
-//! Bounds: the window is [`JPEG_GAP_MAX`] bytes (one record per sector), at most [`MAX_JOIN_TRIES`] joins are decoded
-//! and at most [`JOIN_BYTES_MAX`] bytes of continuations in total. A try whose MCU row after the seam fails the seam test
-//! stops there. The search looks at the scan's cancel flag every MiB of the window and before every try.
+//! Bounds: the first piece is at least [`MIN_FIRST_PIECE`]; the window is [`JPEG_GAP_MAX`] bytes (one record per sector);
+//! at most [`MAX_JOIN_TRIES`] joins are decoded and the tries read at most [`JOIN_BYTES_MAX`] bytes in all. A try whose
+//! MCU row after the seam fails the seam test stops there, and so does a try reaching a decoder state a failed try
+//! reached over the same bytes. The search looks at the scan's cancel flag every MiB of the window, before every try and
+//! at every MCU row of a try.
 
-use super::jpeg::{JPEG_MAX_LEN, data_end};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::jpeg::{JPEG_MAX_LEN, Jpeg, contiguous, data_end, walk_header};
 use super::jpeg_entropy::{self, Cursor, End, Frame};
-use super::{Fragment, Reader, SECTOR, builtin, cancelled};
+use super::{Format, Fragment, Health, Reader, SECTOR, builtin, cancelled};
 use crate::EngineError;
 use crate::source::{Fragmented, Source, VolumeId};
 
@@ -23,8 +28,16 @@ const PER_EOI: usize = 4;
 /// Joins decoded at most. The search is exhaustive: hitting this cap means a continuation may have gone untried, so the
 /// result cannot be unique.
 pub(crate) const MAX_JOIN_TRIES: usize = 4096;
-/// Bytes of continuations decoded at most, over every try (same meaning as [`MAX_JOIN_TRIES`] when hit).
-const JOIN_BYTES_MAX: u64 = 256 << 20;
+/// Bytes the tries (and the checks of the files in the gap) may read from the source, per search (same meaning as
+/// [`MAX_JOIN_TRIES`] when hit).
+const JOIN_BYTES_MAX: u64 = 64 << 20;
+/// Shortest first piece a search starts from: a few sectors of a photo hold too little of it to recover, and every head
+/// with a frame could otherwise start a search (ruling Q8).
+const MIN_FIRST_PIECE: u64 = 16 << 10;
+/// Bytes a try's reader loads at a time (most tries stop within a few rows).
+const TRY_WINDOW: usize = 64 << 10;
+/// Decoder states remembered from failed tries (see [`Memo`]).
+const MEMO_MAX: usize = 16_384;
 /// Window sectors examined between two looks at the cancel flag (1 MiB).
 const SECTORS_PER_CANCEL_CHECK: u64 = 2048;
 /// Most first-piece bytes kept in memory for the tries.
@@ -38,6 +51,8 @@ const BAD: u64 = u64::MAX - 1;
 thread_local! {
     /// Joins decoded by `join` on this thread.
     pub(crate) static TRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Tries stopped by a state a failed try reached, on this thread.
+    pub(crate) static MEMO_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A JPEG put back together from two pieces.
@@ -91,7 +106,7 @@ pub(crate) fn join(r: &mut Reader, start: u64, scan_start: u64, cut: u64) -> Opt
     let last_sector = x - x % SECTOR;
     let breaks: Vec<Break> = (0..BREAK_BACK)
         .filter_map(|k| last_sector.checked_sub(k * SECTOR))
-        .filter(|&c| c > scan_start && c + BREAK_BACK * SECTOR > x)
+        .filter(|&c| c > scan_start && c + BREAK_BACK * SECTOR > x && c - start >= MIN_FIRST_PIECE)
         .filter_map(|c1| {
             let cur = run0.resume.iter().rev().find(|c| c.pos <= c1)?.clone();
             let seam_row_top =
@@ -125,12 +140,17 @@ pub(crate) fn join(r: &mut Reader, start: u64, scan_start: u64, cut: u64) -> Opt
         inner: r.source,
         at: tail_from,
         bytes: tail,
+        read: AtomicU64::new(0),
     };
 
-    let candidates = window(r, lowest)?;
+    let Window {
+        candidates,
+        truncated,
+        heads,
+    } = window(r, lowest)?;
 
     let mut tries = 0usize;
-    let mut bytes = 0u64;
+    let mut memo = Memo::default();
     let mut first: Option<(u64, u64, u64)> = None;
     let mut passes = 0usize;
     let mut exhausted = true;
@@ -142,7 +162,7 @@ pub(crate) fn join(r: &mut Reader, start: u64, scan_start: u64, cut: u64) -> Opt
             if cancelled() {
                 return None;
             }
-            if tries >= max_tries() || bytes >= JOIN_BYTES_MAX {
+            if tries >= max_tries() || source.read() >= JOIN_BYTES_MAX {
                 exhausted = false;
                 break 'search;
             }
@@ -159,16 +179,35 @@ pub(crate) fn join(r: &mut Reader, start: u64, scan_start: u64, cut: u64) -> Opt
                     len: e + 2 - g,
                 },
             ];
-            if try_join(&source, &frame, &run0.dc[..], bpm, b, pieces, &mut bytes) {
-                passes += 1;
-                if first.is_some() {
-                    break 'search; // a second pass: the result is at most `Partial` whatever else passes
+            match try_join(&source, &frame, &run0.dc[..], bpm, b, pieces, &mut memo) {
+                Try::Pass => {
+                    passes += 1;
+                    if first.is_some() {
+                        break 'search; // a second pass: the result is at most `Partial` whatever else passes
+                    }
+                    first = Some((b.c1, g, e));
                 }
-                first = Some((b.c1, g, e));
+                Try::Fail => {}
+                Try::Unknown if cancelled() => return None,
+                Try::Unknown => {
+                    exhausted = false; // the budget ran out inside this try
+                    break 'search;
+                }
             }
         }
     }
     let (c1, g, e) = first?;
+    // Q7: an EOI whose sectors were not all tried (more than PER_EOI of them) may hide a continuation, unless it is the
+    // passing continuation's own (the rest are inside it) or those sectors belong to a file in the gap that is whole on
+    // its own and coded differently from this photo.
+    let mut unique = passes == 1 && exhausted;
+    if unique {
+        let mut checked = HashMap::new();
+        unique = truncated
+            .iter()
+            .filter(|t| t.1 != e)
+            .all(|&(g0, te)| explained(&source, &frame, &heads, g0, te, &mut checked));
+    }
     let fragments = [
         Fragment {
             start,
@@ -182,10 +221,61 @@ pub(crate) fn join(r: &mut Reader, start: u64, scan_start: u64, cut: u64) -> Opt
     Some(Joined {
         fragments,
         len: fragments[0].len + fragments[1].len,
-        unique: passes == 1 && exhausted,
+        unique,
     })
 }
 
+/// Whether the sectors of the EOI at `e` whose first one is `g0` belong to a file in the gap: the last file head before
+/// `g0` is a JPEG measured whole (`Intact`) on its own, contiguously up to that EOI, with a frame other than `frame` (the
+/// same frame could hold this photo's continuation: two photos of one camera written interleaved). Each head is
+/// measured once (`checked`), through `source`, so it counts against the search's read budget.
+fn explained(
+    source: &Overlay,
+    frame: &Frame,
+    heads: &[u64],
+    g0: u64,
+    e: u64,
+    checked: &mut HashMap<u64, Option<u64>>,
+) -> bool {
+    let i = heads.partition_point(|&h| h < g0);
+    let Some(&h) = i.checked_sub(1).and_then(|i| heads.get(i)) else {
+        return false;
+    };
+    let end = *checked.entry(h).or_insert_with(|| {
+        if source.read() >= JOIN_BYTES_MAX {
+            return None;
+        }
+        let mut hr = Reader::new(source);
+        let (head, n) = hr.head(h);
+        if !Jpeg.recognizes(&head[..n]) {
+            return None;
+        }
+        let header = walk_header(&mut hr, h, JPEG_MAX_LEN)?;
+        if jpeg_entropy::frame(&mut hr, h, header.scan_start).as_ref() == Some(frame) {
+            return None;
+        }
+        let m = contiguous(&mut hr, h, &header);
+        (m.health == Health::Intact).then_some(h + m.len)
+    });
+    end == Some(e + 2)
+}
+
+/// How a try ended.
+enum Try {
+    Pass,
+    Fail,
+    /// Cancelled, or the read budget ran out inside it.
+    Unknown,
+}
+
+/// A decoder state inside a second piece: the absolute position of the next byte, the EOI the piece ends at, and the
+/// state's [`Cursor::key`]. The rest of the walk from it reads the same bytes and ends the same way, whatever came before.
+type MemoKey = (u64, u64, (u64, u64, u32, [i32; 4]));
+
+/// States that failed tries passed through at MCU-row boundaries (at most [`MEMO_MAX`]): a later try reaching one fails
+/// the same way, so it stops there (tries that share the EOI often fall into step a few rows after their seams).
+#[derive(Default)]
+struct Memo(HashSet<MemoKey>);
 #[cfg(test)]
 thread_local! {
     /// Lowered by tests to exercise the cap cheaply.
@@ -207,11 +297,16 @@ fn max_tries() -> usize {
 /// (an `FF` followed by anything but `00`, `D0`–`D7`, `D9` or `FF`; a sector of one repeated byte value or an unreadable
 /// one; a sector where another file starts). Returns the candidates `(g, e)`: for each distinct `EOI` at `e`, the first
 /// [`PER_EOI`] sector starts whose first event it is, ascending. `None` if the scan was cancelled.
-fn window(r: &mut Reader, lowest: u64) -> Option<Vec<(u64, u64)>> {
+fn window(r: &mut Reader, lowest: u64) -> Option<Window> {
     let first = lowest + SECTOR;
     let end = lowest.saturating_add(JPEG_GAP_MAX).min(r.len);
+    let mut heads = Vec::new();
     if first >= end {
-        return Some(Vec::new());
+        return Some(Window {
+            candidates: Vec::new(),
+            truncated: Vec::new(),
+            heads,
+        });
     }
     let sectors = (end - first).div_ceil(SECTOR) as usize;
     let mut rec = vec![NONE; sectors];
@@ -225,7 +320,12 @@ fn window(r: &mut Reader, lowest: u64) -> Option<Vec<(u64, u64)>> {
         let next = s + SECTOR;
         // Events at the sector's start come first: another file's head, or an erased or unreadable sector (`r` reads
         // the disk itself, so the sector alignment is absolute).
-        if r.file_starts_at(formats, s) || data_end(r, s, next.min(end)) == s {
+        if r.file_starts_at(formats, s) {
+            heads.push(s);
+            *rec = BAD;
+            continue;
+        }
+        if data_end(r, s, next.min(end)) == s {
             *rec = BAD;
             continue;
         }
@@ -255,69 +355,124 @@ fn window(r: &mut Reader, lowest: u64) -> Option<Vec<(u64, u64)>> {
         }
     }
     let mut candidates = Vec::new();
-    let (mut last, mut taken) = (NONE, 0);
+    let mut truncated = Vec::new();
+    let (mut last, mut taken, mut group) = (NONE, 0, 0);
     for (i, &e) in rec.iter().enumerate() {
         if e == NONE || e == BAD {
             continue;
         }
+        let g = first + i as u64 * SECTOR;
         if e != last {
-            (last, taken) = (e, 0);
+            (last, taken, group) = (e, 0, g);
         }
         if taken < PER_EOI {
-            candidates.push((first + i as u64 * SECTOR, e));
+            candidates.push((g, e));
+            taken += 1;
+        } else if taken == PER_EOI {
+            truncated.push((group, e));
             taken += 1;
         }
     }
-    Some(candidates)
+    Some(Window {
+        candidates,
+        truncated,
+        heads,
+    })
+}
+
+/// What the window pass found.
+struct Window {
+    /// `(g, e)`: a sector start and the EOI that is its first event, in the order they are tried.
+    candidates: Vec<(u64, u64)>,
+    /// `(first sector, e)` of each EOI with more than [`PER_EOI`] sectors whose first event it is (not all tried).
+    truncated: Vec<(u64, u64)>,
+    /// Sector starts where another file starts, ascending.
+    heads: Vec<u64>,
 }
 
 /// Decodes the photo through `pieces` from the break `b`: passes when every MCU decodes, `EOI` follows right at the end
-/// of the second piece, and the DC seam test holds. Gives up after the MCU row after the seam if the seam already fails
-/// the test against the rows above it. Adds the continuation bytes decoded to `bytes`.
+/// of the second piece, and the DC seam test holds. At each MCU row it looks at the cancel flag and the read budget
+/// (`Unknown` if either stops it) and at `memo`; after the MCU row below the seam it gives up if the seam already fails
+/// the test against the rows above it.
 fn try_join(
-    source: &dyn Source,
+    source: &Overlay,
     frame: &Frame,
     dc0: &[i32],
     bpm: u64,
     b: &Break,
     pieces: [Fragment; 2],
-    bytes: &mut u64,
-) -> bool {
+    memo: &mut Memo,
+) -> Try {
     let start = pieces[0].start;
+    let first_len = pieces[0].len;
+    let (g, e) = (pieces[1].start, pieces[1].start + pieces[1].len - 2);
     let view = Fragmented::new(source, pieces.to_vec());
     let len = view.len();
-    let mut vr = Reader::new(&view);
+    let mut vr = Reader::with_window(&view, TRY_WINDOW);
     let from = b.cur.shifted_back(start);
     let seam = b.cur.mcu;
     let head = &dc0[..(seam * bpm) as usize];
     let row = u64::from(frame.mcus_x);
-    let stop = (seam / row + 2) * row;
-    let early = jpeg_entropy::decode_until(&mut vr, frame, from.clone(), len, true, stop);
-    *bytes += early.pos - from.pos;
-    let run = match early.end {
-        End::Eoi { .. } => early,
-        End::Error { .. } => return false,
-        End::OutOfData if early.mcus < stop => return false,
-        End::OutOfData => {
-            let dc = Dc {
-                head,
-                tail: &early.dc,
-            };
-            if let (Some(base), Some(at_seam)) = (b.base_above, seam_mean(frame, dc, seam))
-                && !within(at_seam, base)
-            {
+    let check_at = (seam / row + 2) * row;
+    let mut seen: Vec<MemoKey> = Vec::new();
+    let mut stopped: Option<Try> = None;
+    let mut seam_failed = false;
+    let run = jpeg_entropy::decode_rows(
+        &mut vr,
+        frame,
+        from,
+        len,
+        true,
+        false,
+        u64::MAX,
+        &mut |c, dc| {
+            if cancelled() || source.read() >= JOIN_BYTES_MAX {
+                stopped = Some(Try::Unknown);
                 return false;
             }
-            let run = jpeg_entropy::decode(&mut vr, frame, from.clone(), len, true);
-            *bytes += run.pos - from.pos;
-            run
+            if c.pos >= first_len {
+                let key = (g + (c.pos - first_len), e, c.key());
+                if memo.0.contains(&key) {
+                    #[cfg(test)]
+                    MEMO_HITS.with(|h| h.set(h.get() + 1));
+                    stopped = Some(Try::Fail);
+                    return false;
+                }
+                seen.push(key);
+            }
+            if c.mcu == check_at
+                && let (Some(base), Some(at_seam)) =
+                    (b.base_above, seam_mean(frame, Dc { head, tail: dc }, seam))
+                && !within(at_seam, base)
+            {
+                seam_failed = true;
+                return false;
+            }
+            true
+        },
+    );
+    match stopped {
+        Some(Try::Unknown) => return Try::Unknown,
+        Some(_) => {}
+        None if seam_failed => return Try::Fail,
+        None if run.end == (End::Eoi { at: len - 2 }) => {
+            let whole: Vec<i32> = head.iter().chain(&run.dc).copied().collect();
+            return if seam_ok(frame, &whole, seam) {
+                Try::Pass
+            } else {
+                Try::Fail
+            };
         }
-    };
-    if run.end != (End::Eoi { at: len - 2 }) {
-        return false;
+        None => {}
     }
-    let whole: Vec<i32> = head.iter().chain(&run.dc).copied().collect();
-    seam_ok(frame, &whole, seam)
+    // The walk itself failed (or reached a state that did): every state it passed through leads to the same failure.
+    for key in seen {
+        if memo.0.len() >= MEMO_MAX {
+            break;
+        }
+        memo.0.insert(key);
+    }
+    Try::Fail
 }
 
 /// Luma DC values in coding order, as two consecutive slices (the first piece's, then the continuation's).
@@ -465,11 +620,19 @@ pub(crate) fn seam_ok(frame: &Frame, dc: &[i32], seam_mcu: u64) -> bool {
     }
 }
 
-/// `inner`, with the bytes `[at, at + bytes.len())` served from memory (reads wholly inside them).
+/// `inner`, with the bytes `[at, at + bytes.len())` served from memory (reads wholly inside them), counting the bytes
+/// read from `inner` (the search's read budget).
 struct Overlay<'a> {
     inner: &'a dyn Source,
     at: u64,
     bytes: Vec<u8>,
+    read: AtomicU64,
+}
+
+impl Overlay<'_> {
+    fn read(&self) -> u64 {
+        self.read.load(Ordering::Relaxed)
+    }
 }
 
 impl Source for Overlay<'_> {
@@ -484,7 +647,9 @@ impl Source for Overlay<'_> {
             buf.copy_from_slice(&self.bytes[from..from + buf.len()]);
             return Ok(buf.len());
         }
-        self.inner.read_at(offset, buf)
+        let n = self.inner.read_at(offset, buf)?;
+        self.read.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
     }
 
     fn volume(&self) -> Option<VolumeId> {
@@ -592,7 +757,7 @@ mod tests {
 
     #[test]
     fn hitting_the_cap_is_not_unique() {
-        let a = testkit::jpeg_smooth(256, 192, 1);
+        let a = testkit::jpeg_smooth(1024, 768, 1);
         let c = (a.len() / 2).next_multiple_of(512);
         let scan_start = {
             let src = Mem(a.clone());
@@ -629,5 +794,104 @@ mod tests {
         MAX_TRIES.with(|m| m.set(MAX_JOIN_TRIES));
         let capped = capped.expect("joined before the cap");
         assert_eq!((capped.fragments, capped.unique), (expected, false));
+    }
+
+    /// Cancels `token` at the first read of `[at, ..)` no larger than the try reader's window (the window pass reads 1 MiB
+    /// at a time), and counts the reads there after that.
+    struct CancelOnTail {
+        inner: Mem,
+        at: u64,
+        token: CancelToken,
+        after: std::sync::atomic::AtomicU64,
+    }
+
+    impl Source for CancelOnTail {
+        fn len(&self) -> u64 {
+            self.inner.len()
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+            if offset >= self.at && buf.len() <= TRY_WINDOW {
+                if self.token.is_cancelled() {
+                    self.after
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    self.token.cancel();
+                }
+            }
+            self.inner.read_at(offset, buf)
+        }
+        fn volume(&self) -> Option<VolumeId> {
+            None
+        }
+    }
+
+    #[test]
+    fn cancel_stops_a_try_within_a_row() {
+        // A flat 8192×4096 photo (about 384 KiB of data, rows of 768 bytes) split after 32 KiB, its tail 1 MiB later:
+        // the try of the true tail reads several windows of 64 KiB. The scan is cancelled as that try first reads the
+        // tail; it must stop at the next MCU row, not read the rest of the tail.
+        let a = testkit::jpeg_flat_with_restarts(8192, 4096, 0);
+        let scan_start = {
+            let src = Mem(a.clone());
+            walk_header(&mut Reader::new(&src), 0, JPEG_MAX_LEN)
+                .unwrap()
+                .scan_start
+        };
+        let c = (scan_start as usize + 32 * 1024).next_multiple_of(512);
+        let tail_at = c + (1 << 20);
+        let mut img = vec![0u8; tail_at + a.len() - c + (4 << 20)];
+        img[..c].copy_from_slice(&a[..c]);
+        let mut x = 7u64;
+        for b in &mut img[c..tail_at] {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (x >> 56) as u8;
+        }
+        img[tail_at..tail_at + a.len() - c].copy_from_slice(&a[c..]);
+        let token = CancelToken::default();
+        let src = CancelOnTail {
+            inner: Mem(img),
+            at: tail_at as u64,
+            token: token.clone(),
+            after: Default::default(),
+        };
+        let _scope = CancelScope::enter(&token);
+        assert_eq!(join(&mut Reader::new(&src), 0, scan_start, c as u64), None);
+        assert!(token.is_cancelled(), "the try reached the tail");
+        assert_eq!(src.after.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn failed_tries_are_reused() {
+        // A flat photo (every MCU the same 6 bits, so 1536 bytes are exactly 2048 MCUs) split after 32 KiB, and 1 MiB
+        // later its rest with 4 KiB of it repeated (one MCU count too many: every try fails). The tries from 1536 bytes
+        // before the cut at the group's first sector, and from the cut 1536 bytes into it, skip the same MCUs of the same
+        // data: the second reaches a state the first failed from, and stops there.
+        let a = testkit::jpeg_flat_with_restarts(8192, 4096, 0);
+        let scan_start = {
+            let src = Mem(a.clone());
+            walk_header(&mut Reader::new(&src), 0, JPEG_MAX_LEN)
+                .unwrap()
+                .scan_start
+        };
+        let c = (scan_start as usize + 32 * 1024).next_multiple_of(512);
+        let tail_at = c + (1 << 20);
+        let tail = &a[c - 4096..];
+        let mut img = vec![0u8; tail_at + tail.len() + (1 << 20)];
+        img[..c].copy_from_slice(&a[..c]);
+        let mut x = 7u64;
+        for b in &mut img[c..tail_at] {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *b = (x >> 56) as u8;
+        }
+        img[tail_at..tail_at + tail.len()].copy_from_slice(tail);
+        let src = Mem(img);
+        let hits = || MEMO_HITS.with(std::cell::Cell::get);
+        let before = hits();
+        assert_eq!(join(&mut Reader::new(&src), 0, scan_start, c as u64), None);
+        assert!(hits() > before, "no try was stopped by a remembered state");
     }
 }

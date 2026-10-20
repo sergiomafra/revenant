@@ -110,7 +110,8 @@ crate-private). All positions are absolute 512-byte sector boundaries:
 1. The contiguous data is decoded (keeping each block's luma DC value). The break `x` is the first sign that the data
    stopped being this photo: the decode error, the cut, or the first sector of one repeated byte value (erased space,
    which would otherwise decode as valid blocks). The first piece may end at any of the 4 sector boundaries at or before
-   `x` (`c1`), each resumed from the decoder's last state at or before it.
+   `x` (`c1`) that leave it at least 16 KiB long (ruling Q8: a few sectors of a photo hold too little to recover, and every
+   header could otherwise start a search), each resumed from the decoder's last state at or before it.
 2. One forward pass over the window of `JPEG_GAP_MAX` (64 MiB) after the earliest `c1` records, for each sector start `g`,
    the first event at or after it: an `FF D9` (`EOI` at `e`), or a sign the bytes are not entropy-coded data (`FF`
    followed by anything but `00`, `D0`–`D7`, `D9`, `FF`; a sector of one repeated byte value or an unreadable one; a sector
@@ -121,22 +122,41 @@ crate-private). All positions are absolute 512-byte sector boundaries:
    piece and the DC seam test holds. The DC seam test compares the mean `|ΔDC|` between the luma blocks on both sides of the
    seam with the median of the other block-row boundaries: it passes iff the image has at least 4 block rows and the seam
    is at most 3 × that median + 4 (it is what rejects another photo's tail spliced at a restart marker, where the MCU count
-   alone would pass). A try stops after the MCU row below the seam if the seam already fails against the rows above it.
+   alone would pass). A try stops after the MCU row below the seam if the seam already fails against the rows above it,
+   and at an MCU row where its decoder state (position in the second piece, MCU, buffered bits, DC predictors) is one a
+   failed try with the same EOI passed through: from there it reads the same bytes and fails the same way (up to 16,384
+   states are remembered).
 4. The first passing pair is the result: the measurement is the two pieces, with the JPEG health rule above applied to
    them (`Intact`; `Partial` when only the lenient `zune-jpeg` decode succeeds; neither → the join is dropped and the
    contiguous result stands), an unreadable sector in either piece making it at most `Partial`.
 
-Evidence for `Intact` (ruling Q1): exactly one candidate in the whole window passed, and every candidate was tried. A
-second passing candidate (the search then stops) or hitting a bound makes the reassembled photo at most `Partial`.
+Evidence for `Intact` (rulings Q1, Q7): exactly one candidate in the whole window passed, and every candidate was tried.
+A second passing candidate (the search then stops) or hitting a bound makes the reassembled photo at most `Partial`. So
+does an EOI with more than 4 sector starts whose first event it is (not all were tried), unless it is the passing
+continuation's own EOI (the others lie inside it) or those sectors belong to a file in the gap: the last file head before
+them is a JPEG that is `Intact` on its own, contiguously up to that EOI, with a frame (geometry, tables, restart interval)
+other than this photo's. A JPEG of the same frame does not count: this photo's rest could lie inside it, as when two
+photos from one camera were written interleaved.
 
-Bounds on hostile input: one 8-byte record per sector of the window (at most 131,072), at most `MAX_JOIN_TRIES` (4096)
-tries and 256 MiB of continuation bytes decoded in total; the first piece's last bytes are read once and kept in memory
-(at most 1 MiB). The search looks at the scan's cancel flag every MiB of the window and before every try (a measurement
-reaches the flag through a per-thread scope set by the scan), so a cancelled scan does not wait for it. Each sector is
-read once by the scan and the detectors; a JPEG gap search may re-read up to its 64 MiB window (through the scan's cache).
+Bounds on hostile input (ruling Q8): a first piece of at least 16 KiB; one 8-byte record per sector of the window (at
+most 131,072); at most `MAX_JOIN_TRIES` (4096) tries; at most 64 MiB read from the source by the tries and by the checks
+of files in the gap, together (each try's reader loads 64 KiB at a time); the first piece's last bytes are read once and
+kept in memory (at most 1 MiB). The search looks at the scan's cancel flag every MiB of the window, before every try and
+at every MCU row of a try (a measurement reaches the flag through a per-thread scope set by the scan), so a cancelled
+scan does not wait for it. Memory per search: the luma DC values of the first piece, of a try and of the joined image
+(4 bytes per block, about 13 MiB each at 210 megapixels), the window's records (1 MiB), the remembered states (about
+1 MiB) and the first piece's last bytes (1 MiB), held by the measuring thread.
 
-Not covered: progressive, arithmetic-coded or 12-bit JPEGs (any frame the decoder does not cover), three or more pieces,
-a second piece that lies before the first, and a second piece that ends past the window.
+Reading: each sector is read once by the scan and the detectors, except that a JPEG gap search re-reads, through the
+scan's cache: the photo's contiguous bytes (decoded again, scanned for erased sectors, and decoded once more up to an
+erased sector if there is one: at most 3 × 64 MiB), its 64 MiB window once, at most 64 MiB for the tries and the checks
+of files in the gap, and the two pieces once more to judge the reassembled photo (at most 64 MiB).
+
+Not covered: progressive, arithmetic-coded or 12-bit JPEGs (any frame the decoder does not cover), a first piece under
+16 KiB, three or more pieces, a second piece that lies before the first, a second piece that ends past the window, and
+two photos written interleaved (each split in two with the other's pieces in between): they are at most `Partial`, and
+a photo of the same frame glued to the other's tail exactly on a restart marker may even come out `Intact` as a
+contiguous file (the MCU count and restart markers are all right, and a DC step below the seam threshold is not seen).
 
 Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`).
 
@@ -373,7 +393,8 @@ file never hides the rest of the disk; a damaged file may then overlap another f
 
 Reading once: the scan and every `measure` read through one shared cache (`CachedSource`, crate-private) of
 `ScanOptions::cache_bytes` (default 256 MiB; values below 1 MiB are raised to it). For files that fit in the cache, each
-sector is read once by the scan and the detectors; a JPEG gap search may re-read up to its 64 MiB window, and a `Partial` or
+sector is read once by the scan and the detectors; a JPEG gap search re-reads the photo, its 64 MiB window and at most
+64 MiB for its tries (see "Fragmented JPEG"), and a `Partial` or
 `Damaged` finding larger than the cache may be read again (the scan keeps examining heads inside it, so it reads its blocks
 itself). The cache reads the source in aligned 1 MiB windows (rounded down to whole sectors) and keeps the most recently used
 ones up to `cache_bytes`; a window being loaded is not counted yet, so each reading thread can hold one more window on top.
@@ -404,7 +425,8 @@ budget counts only those: the decoder's internal buffers (for example a progress
 Memory: at most `cache_bytes` of cached windows, plus for each reading thread (the scan thread and every measuring
 thread) one window being loaded (1 MiB) and its reader pool (at most 4 MiB), plus the decode budget (512 MiB, shared by
 every scan in the process, plus the decoder's internal buffers), plus what each running measurement holds (for example a
-`moov` of at most 16 MiB), plus about 200 B per recognized sector start in the read-ahead (at most
+`moov` of at most 16 MiB, or a JPEG gap search's DC values, about 3 × 13 MiB at 210 megapixels, plus 3 MiB), plus about
+200 B per recognized sector start in the read-ahead (at most
 lookahead × block / sector of them). With the defaults on a 16-thread machine: about 256 MiB + 17 × 5 MiB + 512 MiB,
 plus the measurements' own buffers.
 

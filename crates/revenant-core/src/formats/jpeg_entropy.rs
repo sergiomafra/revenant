@@ -23,7 +23,7 @@ const MAX_BLOCKS_PER_MCU: u32 = 10;
 const CHUNK: usize = 16 * 1024;
 
 /// One decoding table built from a DHT (T.81 Annex C and F.2.2.3).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Huffman {
     /// By the next [`LOOKUP_BITS`] bits: `(code length, symbol)`; length 0 when the code is longer (or there is none).
     fast: Vec<(u8, u8)>,
@@ -78,7 +78,7 @@ impl Huffman {
 }
 
 /// One component of the scan, in scan order.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Component {
     /// Blocks of this component in one MCU, horizontally and vertically.
     h: u32,
@@ -91,7 +91,7 @@ struct Component {
 }
 
 /// What [`decode`] needs from a JPEG's header: the MCU grid, the restart interval, the scan's components and tables.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Frame {
     pub mcus_x: u32,
     pub mcus_y: u32,
@@ -381,6 +381,12 @@ impl Cursor {
             *p = p.saturating_sub(by);
         }
         c
+    }
+
+    /// Everything the rest of a walk from this state depends on besides the bytes from `pos` on: `(mcu, bits, nbits,
+    /// DC predictors)`. Two states with the same key at the same position over the same bytes end the same way.
+    pub(crate) fn key(&self) -> (u64, u64, u32, [i32; 4]) {
+        (self.mcu, self.bits, self.nbits, self.pred)
     }
 
     /// Position of the byte holding the next unconsumed bit.
@@ -680,6 +686,33 @@ pub(crate) fn decode_until(
     keep_dc: bool,
     stop_at: u64,
 ) -> Run {
+    decode_rows(
+        r,
+        frame,
+        from,
+        limit,
+        keep_dc,
+        true,
+        stop_at,
+        &mut |_, _| true,
+    )
+}
+
+/// [`decode_until`], calling `on_row` at every MCU-row boundary after `from` (before decoding the row's first MCU) with
+/// the state there and the DC values kept so far; `false` stops the walk there (as [`End::OutOfData`]). Without
+/// `keep_resume`, [`Run::resume`] stays empty.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_rows(
+    r: &mut Reader,
+    frame: &Frame,
+    from: Cursor,
+    limit: u64,
+    keep_dc: bool,
+    keep_resume: bool,
+    stop_at: u64,
+    on_row: &mut dyn FnMut(&Cursor, &[i32]) -> bool,
+) -> Run {
+    let row = u64::from(frame.mcus_x).max(1);
     let total = frame.total_mcus();
     let interval = u64::from(frame.restart_interval);
     let mut src = Bytes {
@@ -691,10 +724,14 @@ pub(crate) fn decode_until(
     };
     let from_mcu = from.mcu;
     let mut c = from;
-    let points = total
-        .min(stop_at)
-        .saturating_sub(from_mcu)
-        .min(RESUME_POINTS as u64);
+    let points = if keep_resume {
+        total
+            .min(stop_at)
+            .saturating_sub(from_mcu)
+            .min(RESUME_POINTS as u64)
+    } else {
+        0
+    };
     let mut resume: VecDeque<Cursor> = VecDeque::with_capacity(points as usize);
     let mut dc = Vec::new();
     let end = loop {
@@ -709,10 +746,15 @@ pub(crate) fn decode_until(
         if c.mcu >= stop_at {
             break End::OutOfData;
         }
-        if resume.len() == RESUME_POINTS {
-            resume.pop_front();
+        if c.mcu > from_mcu && c.mcu.is_multiple_of(row) && !on_row(&c, &dc) {
+            break End::OutOfData;
         }
-        resume.push_back(c.clone());
+        if keep_resume {
+            if resume.len() == RESUME_POINTS {
+                resume.pop_front();
+            }
+            resume.push_back(c.clone());
+        }
         let dc_len = dc.len();
         match mcu(
             &mut c,
