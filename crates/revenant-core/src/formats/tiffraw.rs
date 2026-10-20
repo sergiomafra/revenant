@@ -120,10 +120,24 @@ impl Format for TiffRaw {
             .chain(&info.data)
             .map(|&(o, _)| start + o)
             .collect();
+        // Nor is a JPEG inside one of its own JPEGs (the EXIF thumbnail in a preview's APP1, as in a Panasonic
+        // JpgFromRaw). A file written over the largest preview breaks its decode, so this file is not `Intact` and that
+        // file is still reported on its own; one written over a smaller embedded JPEG is taken as part of this file, as
+        // one written exactly at a strip start is.
+        let inside = merged(
+            info.jpegs
+                .iter()
+                .map(|&(o, l)| (start + o, start + o + l))
+                .collect(),
+        );
+        let in_own_jpeg = |pos: u64| {
+            let i = inside.partition_point(|&(s, _)| s < pos);
+            i > 0 && pos < inside[i - 1].1
+        };
         let formats = all_formats();
         let mut pos = (start / SECTOR + 1) * SECTOR;
         while pos < start + len {
-            if !own.contains(&pos) && r.file_starts_at(&formats, pos) {
+            if !own.contains(&pos) && !in_own_jpeg(pos) && r.file_starts_at(&formats, pos) {
                 len = pos - start;
                 cut = true;
                 break;
@@ -142,6 +156,19 @@ impl Format for TiffRaw {
         };
         Some(Measurement { len, kind, health })
     }
+}
+
+/// `ranges` (`[start, end)`) sorted and merged into disjoint ranges.
+fn merged(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
 }
 
 fn kind_of(head: &[u8], magic: Magic, info: &TiffInfo) -> FileKind {

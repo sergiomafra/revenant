@@ -7,8 +7,10 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 ## Onde o desenvolvimento está
 
 **19/10/2026.** Módulo 1 (motor), Parte 1.1 (fundação e escultura) mergeada (PR #1, CI verde nas 4 arquiteturas). Parte 1.2
-em andamento na branch `feat/m1-p2-raw`. Roteiro até a 1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de
-desenvolvimento: `revenant-dev`.
+(RAW e dados da foto) concluída na branch `feat/m1-p2-raw`, aguardando PR/merge; decisões e pendências em
+`docs/superpowers/history/2026-10-19-m1-p2-pendencias.md`. Próxima: 1.3 (arquivos fragmentados e velocidade). Roteiro até a
+1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`. Amostras reais de câmera (CC0,
+nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.
 
 ## Diretrizes fixas
 
@@ -23,7 +25,8 @@ desenvolvimento: `revenant-dev`.
   GPL/AGPL/LGPL/MPL de terceiros e qualquer código copiado do PhotoRec/TestDisk. O Revenant é GPL-3.0-only.
 - Erros por código: todo erro do motor tem `code() -> &'static str` em `snake_case`; nenhum texto de UI no motor.
 - Rust edição 2024, `rust-version = "1.88"`. Sem `unsafe` fora de `source/windows.rs`, cada bloco com `// SAFETY:`.
-- Testes nunca tocam dados reais nem discos físicos: só imagens sintéticas em `tempfile`. Todo teste novo é visto falhando antes.
+- Testes nunca tocam dados reais nem discos físicos: só imagens sintéticas em `tempfile`. Única exceção: o teste opcional
+  `real_samples`, que só lê as amostras CC0 baixadas para `samples/cache/`. Todo teste novo é visto falhando antes.
 - Commits em Conventional Commits, com o trailer `Co-Authored-By`. Nunca `git add -A`.
 
 ## Ambiente

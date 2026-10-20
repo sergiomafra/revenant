@@ -170,7 +170,19 @@ and
   a strip that starts inside the source is kept up to its end, while one that starts beyond it is not counted (a
   corrupted offset never claims the rest of the source). The file is cut at the first 512-aligned sector inside it where
   another file starts, except at the starts of its own embedded previews and raw strips/tiles (a lossless-JPEG tile
-  legitimately begins with FF D8), and at the end of the source; either makes it `Partial`.
+  legitimately begins with FF D8) and anywhere inside its own embedded JPEGs (the EXIF thumbnail in a preview's APP1),
+  and at the end of the source; either makes it `Partial`. A file written exactly at one of those starts, or over a
+  smaller embedded JPEG, is indistinguishable from the RAW's own data and does not cut it (one written over the largest
+  preview breaks its decode, so the RAW is not `Intact` and that file is still reported).
+- Vendor layouts (checked against real files from raw.pixls.us). Panasonic RW2: StripOffsets is a placeholder
+  (`0xFFFFFFFF`, its StripByteCounts 0 or an unpacked size) and is ignored; the raw data starts at tag 0x0118 and has no
+  length tag, so its length comes from the sensor size (tags 0x0002/0x0003) and packing: 16-byte packets of 14 pixels
+  (RawFormat 4, 12-bit), 10 (RawFormat 5, 12-bit) or 9 (RawFormat 5, 14-bit), rounded up to 0x4000-byte blocks. Another
+  RawFormat leaves the length unknown: the file is measured up to its known structure and is `Partial`. The preview is
+  tag 0x002E (JpgFromRaw). Olympus/OM System ORF: the thumbnail and the preview live in the MakerNote (see the TIFF
+  reader below).
+- Sony pads some ARW files with zeros after the raw data (to a 4 KiB or 64 KiB multiple). Nothing references that
+  padding, so the finding ends at the last referenced byte; the recovered file opens like the original.
 - Health: `Damaged` when the IFD structure is malformed (a cycle, an unknown type, and so on). `Partial` when cut, when
   a sector inside is unreadable, when a size cap was hit (`truncated`, for example a huge legitimate DNG), when there is
   no embedded JPEG preview, or when the largest preview (by SOF pixel count, over all previews) decodes only leniently
@@ -184,8 +196,9 @@ and
 `tiff::walk` (and `walk_exif_ifd`, for a TIFF whose IFD0 is itself an Exif IFD, as in a CR3's `CMT2`) is the crate-private reader the TIFF-based RAW formats (CR2, NEF, ARW, DNG, ORF, RW2) share. It takes a
 `Reader`, the absolute position of the TIFF header and a limit (at most `TIFF_MAX_LEN`, 1 GiB), and returns a `TiffInfo`:
 the extent (`end`, relative to the header), Make/Model/lens/serial/ISO/DateTimeOriginal, the largest image size, whether
-`DNGVersion` is present, the embedded JPEG ranges (`JPEGInterchangeFormat`, and strips/tiles of Compression 6/7 starting
-with FF D8) and the other strip/tile ranges (raw data). Header magics `II*\0`, `MM\0*`, `IIRO`, `IIRS`, `MMOR`, `IIU\0`
+`DNGVersion` is present, the embedded JPEG ranges (`JPEGInterchangeFormat`, strips/tiles of Compression 6/7 starting
+with FF D8, Panasonic's JpgFromRaw and an Olympus MakerNote's JPEGs) and the other strip/tile ranges (raw data, including
+Panasonic's raw data). Header magics `II*\0`, `MM\0*`, `IIRO`, `IIRS`, `MMOR`, `IIU\0`
 are accepted; BigTIFF and anything else gives `None`.
 
 It follows the IFD chain, SubIFDs, Exif, GPS (extent only) and Interop IFDs; the next pointer of Exif/GPS/Interop IFDs is
@@ -202,6 +215,15 @@ file). `truncated` is a size cap hit (the walk is incomplete, not malformed). Ca
 and treat `truncated` as at best `Partial`. First value wins for Make/Model/lens/serial/ISO/date. Each IFD is classified
 once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 go to `jpegs`; lossless JPEG (SOF3) is
 `data`.
+
+Vendor data it reads: in an RW2 (`IIU\0`) IFD0, Panasonic's tags 0x0002/0x0003 (sensor size), 0x000A (bits per sample),
+0x002D (raw format), 0x002E (JpgFromRaw, a lossy JPEG goes to `jpegs`) and 0x0118 (raw data offset; the length is computed
+as described under TIFF-based RAW, an unknown packing sets `truncated`; StripOffsets/StripByteCounts are then ignored). In
+an Exif IFD, a MakerNote (0x927C) that starts with `OLYMPUS\0` (IFD at +12) or `OM SYSTEM\0\0\0` (IFD at +16), in the byte
+order its header names and with offsets relative to the MakerNote: its thumbnail (0x0100) and the preview of its
+CameraSettings IFD (0x2020 → 0x0101 start, 0x0102 length) go to `jpegs` when they lie inside the MakerNote and are lossy
+JPEGs. Each MakerNote IFD is read with one read of at most 1024 entries; a MakerNote that does not parse adds nothing and
+is not an error (vendor data, not TIFF structure).
 
 ## Inspect
 
@@ -261,7 +283,22 @@ nothing is ever overwritten; after 10,000 attempts it fails with `write_failed`)
   partial file comes out instead of none. The copy stops at the source's end, even if the finding's length runs past it.
 - A write error returns `write_failed` and removes the incomplete file.
 
+## Tested against real files
+
+`tests/real_samples.rs` runs the engine over real camera files (one each of CR2, CR3, NEF, ARW, RAF, DNG, ORF, RW2; all
+CC0 from raw.pixls.us, listed with URL and SHA-256 in `samples/samples.toml`, never committed). Each is embedded in a
+noise image at a sector start and must come out as exactly one finding of its kind, `Intact`, with the file's length
+(trailing zero padding under 64 KiB aside), make and model, and a preview that decodes strictly. It is ignored by default:
+
+```sh
+scripts/fetch-samples.sh
+REVENANT_SAMPLES=samples/cache cargo test -p revenant-core --test real_samples -- --ignored
+```
+
+CI runs it in the `samples` job. There is no HEIC sample: none with a verifiable CC0/public-domain license was found.
+
 ## Trying it
 
-The `revenant-dev` crate is a command line over this engine: `revenant-dev scan <image> [--extract <dir>]` prints each finding
-as a JSON line. See `crates/revenant-dev/README.md`.
+The `revenant-dev` crate is a command line over this engine: `revenant-dev scan <image> [--extract <dir>]
+[--previews <dir>]` prints each finding, with its photo details and preview, as a JSON line. See
+`crates/revenant-dev/README.md`.

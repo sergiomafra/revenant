@@ -427,3 +427,109 @@ fn raw_cut_by_source_end_keeps_partial_strip() {
     let m = TiffRaw.measure(&source, 4096).unwrap();
     assert_eq!((m.len, m.health), (keep as u64, Health::Partial));
 }
+
+fn rw2(raw_format: u16, bits: u16, raw_len: usize) -> testkit::TiffRaw {
+    rw2_with_strip_len(raw_format, bits, raw_len, 0)
+}
+
+fn rw2_with_strip_len(
+    raw_format: u16,
+    bits: u16,
+    raw_len: usize,
+    strip_len: u32,
+) -> testkit::TiffRaw {
+    testkit::panasonic_rw2(&testkit::Rw2Options {
+        width: 280,
+        height: 200,
+        raw_format,
+        bits,
+        raw_len,
+        strip_len,
+        seed: 3,
+        exif: TestExif::default(),
+    })
+}
+
+/// Real RW2s (DMC-LX7, DC-G100, DC-GH5S) give no strip length: StripOffsets is 0xFFFFFFFF, the raw data starts at tag
+/// 0x0118 and runs to the end of the file in 16-byte packets of 14 (format 4), 10 (format 5, 12-bit) or 9 (format 5,
+/// 14-bit) pixels, rounded up to 0x4000-byte blocks. The preview (tag 0x002E) sits on a sector start.
+#[test]
+fn panasonic_rw2_raw_length_comes_from_the_sensor_size() {
+    // 280 x 200 = 56000 pixels.
+    for (format, bits, raw_len) in [(4, 12, 65_536), (5, 12, 98_304), (5, 14, 114_688)] {
+        let f = rw2(format, bits, raw_len);
+        let mut img = DiskImage::noise(8192 + f.bytes.len() + 8192, 21);
+        img.put(8192, &f.bytes);
+        assert_eq!(
+            scan_image(&img.save()),
+            vec![(8192, f.bytes.len() as u64, FileKind::Rw2, Health::Intact)],
+            "format {format}, {bits} bits"
+        );
+    }
+}
+
+/// A DMC-FZ28 writes StripOffsets 0xFFFFFFFF with a nonzero StripByteCounts; with the raw data offset in 0x0118 the strip
+/// tags mean nothing (otherwise the range past the source makes the file partial, or damaged on a source over 1 GiB).
+#[test]
+fn panasonic_rw2_ignores_the_placeholder_strip() {
+    let f = rw2_with_strip_len(4, 12, 65_536, 15_447_152);
+    let mut img = DiskImage::noise(8192 + f.bytes.len() + 8192, 21);
+    img.put(8192, &f.bytes);
+    assert_eq!(
+        scan_image(&img.save()),
+        vec![(8192, f.bytes.len() as u64, FileKind::Rw2, Health::Intact)]
+    );
+}
+
+#[test]
+fn panasonic_rw2_with_an_unknown_raw_format_is_partial() {
+    let f = rw2(7, 14, 100_000);
+    let mut img = DiskImage::noise(8192 + f.bytes.len() + 8192, 21);
+    img.put(8192, &f.bytes);
+    let found = scan_image(&img.save());
+    assert_eq!(found[0].0, 8192, "{found:?}");
+    assert_eq!(found[0].2, FileKind::Rw2);
+    assert_eq!(found[0].3, Health::Partial);
+    // Only the part whose extent is known (IFDs and preview), not the raw data.
+    let p = f.preview.clone().unwrap();
+    assert!(
+        found[0].1 >= p.end as u64 && found[0].1 <= f.raw.start as u64,
+        "{found:?}"
+    );
+    // A partial file does not hide the files inside it: its preview is reported on its own.
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[1].0, 8192 + p.start as u64);
+    assert_eq!(found[1].2, FileKind::Jpeg);
+}
+
+/// Real ORFs (E-PL2, E-M10 Mark II, TG-7) keep a thumbnail and the preview inside the MakerNote, both on sector starts.
+#[test]
+fn olympus_makernote_jpegs_do_not_cut_the_orf() {
+    for om_system in [false, true] {
+        let f = testkit::olympus_orf(om_system, 50_000, 4, &TestExif::default());
+        let mut img = DiskImage::noise(8192 + f.bytes.len() + 8192, 22);
+        img.put(8192, &f.bytes);
+        assert_eq!(
+            scan_image(&img.save()),
+            vec![(8192, f.bytes.len() as u64, FileKind::Orf, Health::Intact)],
+            "om_system {om_system}"
+        );
+    }
+}
+
+/// A preview inside the MakerNote that does not decode cleanly makes the ORF partial: the MakerNote preview is the
+/// content check.
+#[test]
+fn olympus_makernote_preview_decides_the_health() {
+    let mut f = testkit::olympus_orf(false, 50_000, 4, &TestExif::default());
+    let p = f.preview.clone().unwrap();
+    // Lenient-only decode, as in `preview_that_does_not_decode_cleanly_is_partial`.
+    let mid = (p.start + p.end) / 2;
+    f.bytes[mid..mid + 8].copy_from_slice(&[0xFF, 0x01].repeat(4));
+    let mut img = DiskImage::noise(8192 + f.bytes.len() + 8192, 22);
+    img.put(8192, &f.bytes);
+    let found = scan_image(&img.save());
+    assert_eq!(found[0].0, 8192, "{found:?}");
+    assert_eq!(found[0].1, f.bytes.len() as u64, "{found:?}");
+    assert_eq!(found[0].3, Health::Partial, "{found:?}");
+}

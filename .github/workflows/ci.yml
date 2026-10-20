@@ -34,3 +34,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  samples:
+    name: real camera samples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: samples/cache
+          key: samples-${{ hashFiles('samples/samples.toml') }}
+      - name: Fetch samples
+        run: scripts/fetch-samples.sh
+      - name: Test
+        run: cargo test -p revenant-core --test real_samples -- --ignored --nocapture
+        env:
+          REVENANT_SAMPLES: samples/cache

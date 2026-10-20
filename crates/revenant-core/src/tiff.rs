@@ -26,6 +26,8 @@ const MAX_SUBIFDS: u64 = 16;
 const MAX_STRING: u64 = 256;
 /// Marker segments inspected looking for the SOF of a JPEG.
 const MAX_SEGMENTS: usize = 16;
+/// Panasonic raw data is stored in blocks of this many bytes.
+const PANASONIC_BLOCK: u64 = 0x4000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Endian {
@@ -62,12 +64,13 @@ pub(crate) struct TiffInfo {
     /// Largest ImageWidth/ImageLength seen.
     pub width: Option<u32>,
     pub height: Option<u32>,
-    /// `(offset, len)` relative to the header: JPEGInterchangeFormat ranges, and strips/tiles of Compression 6/7 that
-    /// start with FF D8 and whose first SOF is SOF0, SOF1 or SOF2 (baseline, extended, progressive). Lossless JPEG
-    /// (SOF3, as in CR2 raw slices and lossless DNG) lands in `data`, as does a JPEG whose SOF is not found in the first
-    /// 16 marker segments.
+    /// `(offset, len)` relative to the header: JPEGInterchangeFormat ranges, strips/tiles of Compression 6/7 that
+    /// start with FF D8 and whose first SOF is SOF0, SOF1 or SOF2 (baseline, extended, progressive), and the same kind
+    /// of JPEG in vendor places: Panasonic's JpgFromRaw (RW2 tag 0x002E) and the thumbnail and preview of an Olympus
+    /// MakerNote. Lossless JPEG (SOF3, as in CR2 raw slices and lossless DNG) lands in `data`, as does a JPEG whose SOF
+    /// is not found in the first 16 marker segments.
     pub jpegs: Vec<(u64, u64)>,
-    /// Other strip/tile ranges (raw data).
+    /// Other strip/tile ranges (raw data), and Panasonic's raw data (RW2 tag 0x0118, length from the sensor size).
     pub data: Vec<(u64, u64)>,
     /// IFD entries processed (test observation of the entry cap).
     #[cfg(test)]
@@ -109,6 +112,8 @@ struct Walker<'a, 'b> {
     base: u64,
     limit: u64,
     endian: Endian,
+    /// Panasonic RW2 ("IIU\0" header): IFD0 holds Panasonic's own tags.
+    panasonic: bool,
     info: TiffInfo,
     /// Strip/tile values still allowed in this walk.
     budget: u64,
@@ -124,6 +129,33 @@ struct ImageTags {
     tile_counts: Vec<u64>,
     jpeg_offset: Option<u64>,
     jpeg_len: Option<u64>,
+    panasonic: PanasonicTags,
+}
+
+/// Panasonic RW2 tags of IFD0: sensor size (0x0002/0x0003), bits per sample (0x000A), raw format (0x002D), the
+/// JpgFromRaw block (0x002E, `(offset, len)`) and the raw data offset (0x0118).
+#[derive(Default)]
+struct PanasonicTags {
+    width: Option<u32>,
+    height: Option<u32>,
+    bits: Option<u32>,
+    format: Option<u32>,
+    jpeg: Option<(u64, u64)>,
+    raw_offset: Option<u64>,
+}
+
+/// Length of Panasonic packed raw data: 16-byte packets of 14 pixels (raw format 4, 12-bit), 10 (format 5, 12-bit) or 9
+/// (format 5, 14-bit), the whole rounded up to [`PANASONIC_BLOCK`]. Checked against real DMC-FZ28, DMC-GF1, DMC-LX7 (two),
+/// DC-G100 (format 4) and DC-GH5S (format 5, 14-bit) files. `None` for other formats or a zero size.
+fn panasonic_raw_len(t: &PanasonicTags) -> Option<u64> {
+    let per_packet: u64 = match (t.format?, t.bits?) {
+        (4, 12) => 14,
+        (5, 12) => 10,
+        (5, 14) => 9,
+        _ => return None,
+    };
+    let pixels = u64::from(t.width?) * u64::from(t.height?);
+    (pixels > 0).then(|| (pixels.div_ceil(per_packet) * 16).next_multiple_of(PANASONIC_BLOCK))
 }
 
 /// Walks the TIFF whose header is at absolute `base` (offsets are relative to `base`). `limit` caps every offset
@@ -161,6 +193,7 @@ fn walk_from(r: &mut Reader, base: u64, limit: u64, root: Kind) -> Option<TiffIn
         base,
         limit,
         endian,
+        panasonic: endian == Endian::Little && &head[2..4] == b"U\0",
         info: TiffInfo {
             end: 8,
             ..TiffInfo::default()
@@ -347,6 +380,17 @@ impl Walker<'_, '_> {
             0x0145 if image => tags.tile_counts = self.uints(typ, value_at, count),
             0x0201 if image => tags.jpeg_offset = self.uint(typ, value_at).map(u64::from),
             0x0202 if image => tags.jpeg_len = self.uint(typ, value_at).map(u64::from),
+            0x0002 if image && self.panasonic => tags.panasonic.width = self.uint(typ, value_at),
+            0x0003 if image && self.panasonic => tags.panasonic.height = self.uint(typ, value_at),
+            0x000A if image && self.panasonic => tags.panasonic.bits = self.uint(typ, value_at),
+            0x002D if image && self.panasonic => tags.panasonic.format = self.uint(typ, value_at),
+            0x002E if image && self.panasonic && typ == 7 && total > 4 => {
+                tags.panasonic.jpeg = Some((value_at, total));
+            }
+            0x0118 if image && self.panasonic => {
+                tags.panasonic.raw_offset = self.uint(typ, value_at).map(u64::from);
+            }
+            0x927C if !image && typ == 7 && total > 4 => self.olympus_makernote(value_at, total),
             0x014A if image && matches!(typ, 4 | 13) => {
                 let n = count.min(MAX_SUBIFDS);
                 if count > MAX_SUBIFDS {
@@ -493,8 +537,132 @@ impl Walker<'_, '_> {
         false
     }
 
+    /// Olympus/OM System MakerNote at `at` (`len` bytes, already claimed): header "OLYMPUS\0" + byte order + version with
+    /// the IFD at +12, or "OM SYSTEM\0\0\0" + byte order + version with the IFD at +16; offsets are relative to the
+    /// MakerNote's start. Its thumbnail (0x0100, UNDEFINED) and the preview named by its CameraSettings IFD (0x2020 →
+    /// PreviewImageStart 0x0101, PreviewImageLength 0x0102) are recorded as JPEGs when they lie inside the MakerNote and
+    /// are lossy JPEGs. A MakerNote that does not parse adds nothing: it is vendor data, not part of the TIFF structure.
+    fn olympus_makernote(&mut self, at: u64, len: u64) {
+        let mut head = [0u8; 16];
+        if len < 16 || self.r.read(self.abs(at), &mut head) != 16 {
+            return;
+        }
+        let ifd = if head.starts_with(b"OLYMPUS\0") {
+            12
+        } else if head.starts_with(b"OM SYSTEM\0\0\0") {
+            16
+        } else {
+            return;
+        };
+        let endian = match &head[ifd - 4..ifd - 2] {
+            b"II" => Endian::Little,
+            b"MM" => Endian::Big,
+            _ => return,
+        };
+        let main = self.makernote_ifd(at, len, ifd as u64, endian);
+        let value = |entries: &[(u16, u16, u32, u32)], tag: u16| {
+            entries.iter().find(|e| e.0 == tag).copied()
+        };
+        let mut found: Vec<(u64, u64)> = Vec::new();
+        if let Some((_, 7, count, off)) = value(&main, 0x0100) {
+            found.push((u64::from(off), u64::from(count)));
+        }
+        if let Some((_, 4 | 7 | 13, _, settings)) = value(&main, 0x2020) {
+            let s = self.makernote_ifd(at, len, u64::from(settings), endian);
+            if let (Some((_, 4, 1, start)), Some((_, 4, 1, size))) =
+                (value(&s, 0x0101), value(&s, 0x0102))
+            {
+                found.push((u64::from(start), u64::from(size)));
+            }
+        }
+        for (o, l) in found {
+            let inside = l > 0 && o.checked_add(l).is_some_and(|e| e <= len);
+            if inside && self.room() && self.is_lossy_jpeg(at + o, l) {
+                self.info.jpegs.push((at + o, l));
+            }
+        }
+    }
+
+    /// Entries `(tag, type, count, raw value field)` of the MakerNote IFD at `ifd` (relative to the MakerNote at `at`,
+    /// `len` bytes), read with one read, at most [`MAX_ENTRIES`]; empty if the table does not fit in the MakerNote.
+    fn makernote_ifd(
+        &mut self,
+        at: u64,
+        len: u64,
+        ifd: u64,
+        endian: Endian,
+    ) -> Vec<(u16, u16, u32, u32)> {
+        let u16_of = |b: [u8; 2]| match endian {
+            Endian::Little => u16::from_le_bytes(b),
+            Endian::Big => u16::from_be_bytes(b),
+        };
+        let u32_of = |b: [u8; 4]| match endian {
+            Endian::Little => u32::from_le_bytes(b),
+            Endian::Big => u32::from_be_bytes(b),
+        };
+        let mut count = [0u8; 2];
+        if ifd.saturating_add(2) > len || self.r.read(self.abs(at + ifd), &mut count) != 2 {
+            return Vec::new();
+        }
+        let n = u16_of(count).min(MAX_ENTRIES);
+        let table = 12 * u64::from(n);
+        if ifd + 2 + table > len {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; table as usize];
+        if self.r.read(self.abs(at + ifd + 2), &mut buf) != buf.len() {
+            return Vec::new();
+        }
+        buf.as_chunks::<12>()
+            .0
+            .iter()
+            .map(|e| {
+                (
+                    u16_of([e[0], e[1]]),
+                    u16_of([e[2], e[3]]),
+                    u32_of([e[4], e[5], e[6], e[7]]),
+                    u32_of([e[8], e[9], e[10], e[11]]),
+                )
+            })
+            .collect()
+    }
+
+    /// Panasonic's JpgFromRaw and raw data (RW2 IFD0): the raw data has no length tag, so its length comes from the
+    /// sensor size and packing ([`panasonic_raw_len`]); an unknown packing leaves the walk `truncated`.
+    fn finish_panasonic(&mut self, t: &PanasonicTags) {
+        if let Some((o, l)) = t.jpeg
+            && self.room()
+            && self.is_lossy_jpeg(o, l)
+        {
+            self.info.jpegs.push((o, l));
+        }
+        let Some(o) = t.raw_offset else {
+            return;
+        };
+        let Some(l) = panasonic_raw_len(t) else {
+            self.info.truncated = true;
+            return;
+        };
+        if self.claim(o, l) {
+            if self.room() {
+                self.info.data.push((o, l));
+            }
+        } else if o < self.limit && self.room() {
+            self.info.data.push((o, self.limit - o)); // clamped: truncated by the limit
+        }
+    }
+
     /// Turns the strip/tile/JPEG tags of one IFD into ranges.
     fn finish_image(&mut self, t: &ImageTags) {
+        self.finish_panasonic(&t.panasonic);
+        // Panasonic gives the raw data's place in 0x0118; its StripOffsets is a placeholder (0xFFFFFFFF), sometimes with
+        // a nonzero StripByteCounts (DMC-FZ28), that points at nothing.
+        let no_strips = Vec::new();
+        let (strip_offsets, strip_counts) = if t.panasonic.raw_offset.is_some() {
+            (&no_strips, &no_strips)
+        } else {
+            (&t.strip_offsets, &t.strip_counts)
+        };
         if let (Some(o), Some(l)) = (t.jpeg_offset, t.jpeg_len)
             && l > 0
         {
@@ -509,7 +677,7 @@ impl Walker<'_, '_> {
         let jpeg_compression = matches!(t.compression, Some(6 | 7));
         let mut kind: Option<bool> = None;
         for (offsets, counts) in [
-            (&t.strip_offsets, &t.strip_counts),
+            (strip_offsets, strip_counts),
             (&t.tile_offsets, &t.tile_counts),
         ] {
             for (&o, &l) in offsets.iter().zip(counts.iter()) {

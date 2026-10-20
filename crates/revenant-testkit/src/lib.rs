@@ -569,6 +569,202 @@ pub fn tiff_raw(opts: &TiffRawOptions) -> TiffRaw {
     }
 }
 
+/// Shape of a synthetic Panasonic RW2 built by [`panasonic_rw2`].
+pub struct Rw2Options {
+    /// Sensor size (Panasonic tags 0x0002/0x0003).
+    pub width: u16,
+    pub height: u16,
+    /// Panasonic RawFormat (tag 0x002D) and BitsPerSample (tag 0x000A).
+    pub raw_format: u16,
+    pub bits: u16,
+    /// Bytes of raw data (noise) at the end of the file.
+    pub raw_len: usize,
+    /// StripByteCounts value next to StripOffsets 0xFFFFFFFF: 0 on most bodies, an unpacked size on some (DMC-FZ28).
+    pub strip_len: u32,
+    pub seed: u64,
+    pub exif: TestExif,
+}
+
+/// A Panasonic RW2 laid out like real ones (DMC-LX7, DC-G100, DC-GH5S): "IIU\0" header; IFD0 with the Panasonic sensor
+/// tags (0x0002/0x0003 size, 0x000A bits, 0x000B compression 34316, 0x002D raw format), a 160x120 preview JPEG as tag
+/// 0x002E (UNDEFINED, starting on a 512-byte boundary, with an EXIF APP1 holding a 16x16 thumbnail JPEG that also starts
+/// on a 512-byte boundary, as in a real DMC-LX7), StripOffsets 0xFFFFFFFF with StripByteCounts 0, the raw data offset in
+/// tag 0x0118 (no length anywhere), and an Exif IFD. The raw data comes last, on a 512-byte boundary.
+pub fn panasonic_rw2(opts: &Rw2Options) -> TiffRaw {
+    let enc = Enc(false);
+    let preview = jpeg_with_thumbnail_at(160, 120, opts.seed, 512);
+    let make = opts.exif.make.clone().unwrap_or_else(|| "Panasonic".into());
+    let entries = |exif_at: u32, raw_at: u32| {
+        let mut e = vec![
+            enc.short(0x0002, opts.width),
+            enc.short(0x0003, opts.height),
+            enc.short(0x000A, opts.bits),
+            enc.short(0x000B, 34316),
+            enc.short(0x002D, opts.raw_format),
+            TiffEntry {
+                tag: 0x002E,
+                typ: 7,
+                count: preview.len() as u32,
+                data: preview.clone(),
+            },
+            enc.ascii(0x010F, &make),
+            enc.long(0x0111, u32::MAX),
+            enc.long(0x0117, opts.strip_len),
+            enc.long(0x0118, raw_at),
+        ];
+        e.extend(opts.exif.model.as_deref().map(|m| enc.ascii(0x0110, m)));
+        let ex = exif_entries(enc, &opts.exif);
+        if !ex.is_empty() {
+            e.push(enc.long(0x8769, exif_at));
+        }
+        e
+    };
+    let n = entries(0, 0).len() as u32;
+    // 0x002E is the first value stored outside the table: start the IFD so that it lands on 512.
+    let ifd0_at = 512 - (2 + 12 * n + 4);
+    let ifd0_len = enc.ifd(ifd0_at, entries(0, 0)).len() as u32;
+    let exif_at = (ifd0_at + ifd0_len).next_multiple_of(2);
+    let ex = exif_entries(enc, &opts.exif);
+    let ex_bytes = if ex.is_empty() {
+        Vec::new()
+    } else {
+        enc.ifd(exif_at, ex)
+    };
+    let raw_at = (exif_at + ex_bytes.len() as u32).next_multiple_of(512);
+    let mut bytes = b"IIU\0".to_vec();
+    bytes.extend_from_slice(&enc.u32(ifd0_at));
+    bytes.resize(ifd0_at as usize, 0);
+    bytes.extend(enc.ifd(ifd0_at, entries(exif_at, raw_at)));
+    bytes.resize(exif_at as usize, 0);
+    bytes.extend(ex_bytes);
+    bytes.resize(raw_at as usize, 0);
+    bytes.extend_from_slice(&DiskImage::noise(opts.raw_len, opts.seed ^ 0x0052_5732).bytes);
+    TiffRaw {
+        preview: Some(512..512 + preview.len()),
+        raw: raw_at as usize..bytes.len(),
+        bytes,
+    }
+}
+
+/// Like [`jpeg`] without padding, with an APP1 `Exif\0\0` segment holding a 16x16 thumbnail JPEG that starts `at` bytes
+/// from the start of the JPEG (zeros fill the payload before it). `at` must be at least 12 and leave the APP1 under the
+/// segment limit.
+fn jpeg_with_thumbnail_at(width: u32, height: u32, seed: u64, at: usize) -> Vec<u8> {
+    let base = encode_noise(width, height, seed);
+    // SOI (2) + APP1 marker and length (4) come before the payload.
+    let mut payload = b"Exif\0\0".to_vec();
+    payload.resize(at - 6, 0);
+    payload.extend(encode_noise(16, 16, seed ^ 0x5DEE_CE66));
+    assert!(payload.len() <= MAX_SEGMENT_PAYLOAD);
+    let mut out = base[..2].to_vec();
+    out.extend(app1_segment(&payload));
+    out.extend_from_slice(&base[2..]);
+    debug_assert_eq!(&out[at..at + 3], &[0xFF, 0xD8, 0xFF]);
+    out
+}
+
+/// One IFD table with every value inline (`(tag, type, count, value)`), little-endian, no next IFD.
+fn inline_ifd(entries: &[(u16, u16, u32, u32)]) -> Vec<u8> {
+    let mut out = (entries.len() as u16).to_le_bytes().to_vec();
+    for &(tag, typ, count, value) in entries {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&typ.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&[0; 4]);
+    out
+}
+
+/// An Olympus/OM System ORF laid out like real ones (E-PL2, E-M10 Mark II, TG-7): "IIRO" header; IFD0 with size, Make,
+/// Model, one raw strip and an Exif pointer; an Exif IFD whose MakerNote (0x927C) starts on a 512-byte boundary and holds
+/// a little-endian Olympus IFD (header "OLYMPUS\0II\x03\0" with the IFD at +12, or with `om_system` "OM SYSTEM\0\0\0II\x04\0"
+/// with the IFD at +16; offsets relative to the MakerNote start): a 64x48 thumbnail JPEG (tag 0x0100, UNDEFINED) and a
+/// CameraSettings IFD (tag 0x2020) whose PreviewImageStart/Length (0x0101/0x0102) give a 320x240 preview. Both JPEGs
+/// start on 512-byte boundaries inside the MakerNote; the raw strip (noise) follows it and ends the file.
+///
+/// `preview` is the larger JPEG's range, `raw` the strip.
+pub fn olympus_orf(om_system: bool, raw_len: usize, seed: u64, exif: &TestExif) -> TiffRaw {
+    let enc = Enc(false);
+    let thumb = jpeg(64, 48, seed, 0);
+    let big = jpeg(320, 240, seed ^ 1, 0);
+    // MakerNote, offsets relative to its own start.
+    let (header, ifd_at): (&[u8], u32) = if om_system {
+        (b"OM SYSTEM\0\0\0II\x04\0", 16)
+    } else {
+        (b"OLYMPUS\0II\x03\0", 12)
+    };
+    let main_len = 2 + 12 * 2 + 4;
+    let settings_at = ifd_at + main_len;
+    let thumb_at = 512u32;
+    let big_at = (thumb_at + thumb.len() as u32).next_multiple_of(512);
+    let mut note = header.to_vec();
+    note.extend(inline_ifd(&[
+        (0x0100, 7, thumb.len() as u32, thumb_at),
+        (0x2020, 13, 1, settings_at),
+    ]));
+    note.extend(inline_ifd(&[
+        (0x0100, 3, 1, 1),
+        (0x0101, 4, 1, big_at),
+        (0x0102, 4, 1, big.len() as u32),
+    ]));
+    note.resize(thumb_at as usize, 0);
+    note.extend_from_slice(&thumb);
+    note.resize(big_at as usize, 0);
+    note.extend_from_slice(&big);
+
+    let make = exif
+        .make
+        .clone()
+        .unwrap_or_else(|| "OM Digital Solutions".into());
+    let ifd0 = |exif_at: u32, raw_at: u32| {
+        let mut e = vec![
+            enc.long(0x0100, 4000),
+            enc.long(0x0101, 3000),
+            enc.ascii(0x010F, &make),
+            enc.long(0x0111, raw_at),
+            enc.long(0x0117, raw_len as u32),
+            enc.long(0x8769, exif_at),
+        ];
+        e.extend(exif.model.as_deref().map(|m| enc.ascii(0x0110, m)));
+        e
+    };
+    let mut ex = exif_entries(enc, exif);
+    ex.push(TiffEntry {
+        tag: 0x927C,
+        typ: 7,
+        count: note.len() as u32,
+        data: note.clone(),
+    });
+    // Bytes of the Exif IFD before the MakerNote's value: the table and the values of lower tags stored outside it.
+    let before_note = 2
+        + 12 * ex.len() as u32
+        + 4
+        + ex.iter()
+            .filter(|e| e.tag < 0x927C && e.data.len() > 4)
+            .map(|e| e.data.len().next_multiple_of(2) as u32)
+            .sum::<u32>();
+    let ifd0_len = enc.ifd(8, ifd0(0, 0)).len() as u32;
+    let exif_at = (8 + ifd0_len + before_note).next_multiple_of(512) - before_note;
+    let note_at = exif_at + before_note;
+    let ex_bytes = enc.ifd(exif_at, ex);
+    let raw_at = (exif_at + ex_bytes.len() as u32).next_multiple_of(2);
+    let mut bytes = b"IIRO".to_vec();
+    bytes.extend_from_slice(&enc.u32(8));
+    bytes.extend(enc.ifd(8, ifd0(exif_at, raw_at)));
+    bytes.resize(exif_at as usize, 0);
+    bytes.extend(ex_bytes);
+    bytes.resize(raw_at as usize, 0);
+    debug_assert_eq!(&bytes[note_at as usize..][..header.len()], header);
+    bytes.extend_from_slice(&DiskImage::noise(raw_len, seed ^ 0x004F_5246).bytes);
+    let big_abs = (note_at + big_at) as usize;
+    TiffRaw {
+        preview: Some(big_abs..big_abs + big.len()),
+        raw: raw_at as usize..bytes.len(),
+        bytes,
+    }
+}
+
 /// The Exif-IFD entries for the `TestExif` fields that are set (ISO, date, serial, lens).
 fn exif_entries(enc: Enc, x: &TestExif) -> Vec<TiffEntry> {
     let mut ex = Vec::new();

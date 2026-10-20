@@ -443,3 +443,44 @@ fn noise_never_panics_for_any_kind() {
         }
     }
 }
+
+#[test]
+fn rw2_preview_is_the_jpg_from_raw() {
+    let f = testkit::panasonic_rw2(&testkit::Rw2Options {
+        width: 280,
+        height: 200,
+        raw_format: 4,
+        bits: 12,
+        raw_len: 65_536,
+        strip_len: 0,
+        seed: 3,
+        exif: exif(),
+    });
+    let (source, found, _keep) = find(&f.bytes, FileKind::Rw2);
+    let i = inspect(&source, &found);
+    assert_exif(&i.metadata);
+    let p = i.preview.expect("preview");
+    let range = f.preview.unwrap();
+    assert_eq!(
+        (p.start, p.len, p.width, p.height),
+        ((AT + range.start) as u64, range.len() as u64, 160, 120)
+    );
+}
+
+#[test]
+fn orf_preview_comes_from_the_olympus_makernote() {
+    for om_system in [false, true] {
+        let f = testkit::olympus_orf(om_system, 50_000, 4, &exif());
+        let (source, found, _keep) = find(&f.bytes, FileKind::Orf);
+        let i = inspect(&source, &found);
+        assert_exif(&i.metadata);
+        let p = i.preview.expect("preview");
+        let range = f.preview.unwrap();
+        // The larger of the MakerNote's two JPEGs (thumbnail 64x48, preview 320x240).
+        assert_eq!(
+            (p.start, p.len, p.width, p.height),
+            ((AT + range.start) as u64, range.len() as u64, 320, 240),
+            "om_system {om_system}"
+        );
+    }
+}

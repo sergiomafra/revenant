@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   starts.
 - TIFF-based RAW photo detection (CR2, NEF, ARW, DNG, ORF, RW2) and generic TIFF: exact length from the IFD structure, health
   from the embedded JPEG preview (the raw data itself cannot be verified, so a RAW without a decodable preview is partial).
+  Panasonic RW2 raw data, which has no length tag, is measured from the sensor size and packing; Olympus/OM System ORF
+  previews are read from the MakerNote; a thumbnail inside a RAW's own preview no longer cuts the RAW.
 - Fujifilm RAF, Canon CR3 and HEIC photo detection: exact length from the file structure (RAF header blocks; CR3 and HEIC
   boxes), health from the embedded JPEG (RAF, CR3 preview) or from whether every item extent lies inside the file (HEIC; the
   image data itself is never decoded). A JPEG a CR3 or HEIC keeps inside its own data no longer cuts it.
@@ -26,6 +28,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Extraction: copies a found file into a chosen folder without overwriting, never past the end of the source, and refuses to
   write onto the source's own volume.
 - `revenant-dev`: developer command line (`scan <image> [--extract <dir>]`) that prints findings as JSON lines.
+- `revenant-dev`: each finding's photo details (`make`, `model`, `lens`, `serial`, `iso`, `captured_at`, `width`,
+  `height`) and embedded `preview` in its JSON line, and `--previews <dir>` to save each preview as
+  `<name>.preview.jpg`.
+- Real camera samples: an opt-in test (and CI job) runs the engine over real CR2, CR3, NEF, ARW, RAF, DNG, ORF and RW2
+  files (CC0, from raw.pixls.us), downloaded on demand by `scripts/fetch-samples.sh` and checked by SHA-256.
 
 ### Changed
 
