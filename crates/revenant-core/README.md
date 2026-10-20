@@ -526,6 +526,68 @@ all (a test counts them on every hostile case):
 
 No read is larger than 128 KiB, and none is allocated before it is known to lie inside the source.
 
+## File systems: FAT
+
+`filesystem::read(source, cancel)` returns a `Listing` of the live files of every FAT12/16/32 volume `volumes` finds
+(exFAT volumes are listed in `volumes` but not walked yet; a volume of more than 2^28 clusters is not walked). It never
+fails: a broken volume yields fewer files. Cancellation is checked before each directory; a cancelled read returns what
+was listed so far. Written from fatgen103 (FAT entries, directory entries, long names).
+
+- `Listing.files`: the photo/video files, those whose extension `FileKind::from_extension` knows (jpg jpeg jpe, mp4 m4v,
+  mov, cr2, cr3, nef nrw, arw, dng, orf ori, rw2, raf, heic heif hif, tif tiff; any case). Each is an `FsFile`:
+  - `origin`: `volume` (the volume's index), `path` (components joined by `/`, from the root, no leading `/`),
+    `state` `live`, `placement` `chain`, `size` as recorded, `created` and `modified` as `FsTime` (local time
+    `YYYY-MM-DDTHH:MM:SS`, no offset on FAT; `None` when a field is out of range: month, day for that month and year,
+    hour, minute, seconds, or a creation 10 ms count above 199). The creation time adds its 10 ms count, floored to the
+    second. `name()` is the last component, `folder()` the rest (`""` for the root).
+  - `pieces`: absolute byte ranges in file order, consecutive clusters joined, holding the first `size` bytes; a piece
+    past the end of the source is cut or dropped, and a file with no piece left is not listed.
+  - `trusted` (ruling D3): the chain is complete (exactly `ceil(size / cluster)` clusters, the last one end-of-chain),
+    with no cycle and no cluster another chain holds, in at most 4096 runs.
+
+  Sorted by (first piece start, volume, path).
+- `Listing.others`: the first piece of every other live file (any other extension, or none), sorted by start.
+- `Listing.live`: the merged ranges of every live file (its pieces) and every trusted live directory (its clusters).
+  The fixed FAT12/16 root region is not in it, nor is a directory that is not trusted.
+
+The walk:
+
+- **Names.** A long name is used only when its parts come right before the short entry, ordinals counting down to 1 from
+  the part marked last (`0x40`), every part carrying the short name's checksum; its text is the UTF-16 up to the first
+  `0x0000`, decoded lossily. Otherwise the 8.3 name: base and extension trimmed, joined by `.` when the extension is not
+  empty, lower-cased as the NT bits of byte 12 say (`0x08` base, `0x10` extension), a first byte `0x05` read as `0xE5`,
+  any byte outside printable ASCII read as `_`. In every component `/` and NUL become `_`, and an empty one is `_`, so
+  `name()`/`folder()` never split one wrongly. Deleted entries (`0xE5`), the volume label, `.` and `..` are skipped;
+  `0x00` ends a directory. An entry is a long-name part when its attribute byte masked with `0x3F` is `0x0F`
+  (fatgen103's mask).
+- **Chains.** The first cluster is `hi << 16 | lo` on FAT32, `lo` otherwise. FAT12 entries are packed 12 bits, FAT16 16,
+  FAT32 the low 28 bits; end-of-chain is ≥ `0xFF8`/`0xFFF8`/`0x0FFFFFF8`, bad is `0xFF7`/`0xFFF7`/`0x0FFFFFF7`, and a
+  value outside the heap is invalid. A chain is followed until end-of-chain, a free, bad or invalid entry, a cluster
+  outside the heap or already claimed, `ceil(size / cluster)` clusters, or 4096 runs. A sector of the first FAT that
+  cannot be read is read from the next copy; one no copy gives stops the chain there.
+- **Claims.** Every live directory and file claims the clusters of its chain, in walk order (depth first, entries in
+  on-disk order). A chain that reaches a cluster another chain claimed stops there and the cluster becomes contested;
+  once the walk of the volume ends, every file and directory holding a contested cluster is untrusted. Reaching a
+  cluster of its own chain is a cycle: the chain is incomplete, nothing is contested. When more than 65,536 clusters
+  would be contested, every live file and directory of that volume is untrusted (ruling C11).
+- **Directories.** The root is the fixed region (FAT12/16) or the `RootClus` chain (FAT32). A directory entry whose first
+  cluster is outside the heap or already claimed (a loop back to an ancestor, itself, or a second link) is not entered.
+  A directory is trusted when its chain ends in end-of-chain within 2 MiB, with no cycle and no contested cluster (ruling
+  C10); one that is not trusted is still walked, as far as its chain goes. An unreadable cluster or sector of a
+  directory is skipped.
+
+Bounds (each lowerable in unit tests): per volume at most 65,536 directories, 4,000,000 directory entries (every
+32-byte slot read counts, the end marker included), depth 32 (the root is 0), 2 MiB per directory, 65,536 contested
+clusters; per listing at most 262,144 photo/video files and `MAX_PIECES` (2^20) pieces, counting a file's runs (a
+photo/video's pieces, an other file's ranges in `live`) and a directory's runs. A file that would pass either cap is not
+listed at all (not in `files`, `others` or `live`); a directory past the piece cap is still walked but its ranges are not
+in `live`. Following chains examines each cluster of a volume at most once.
+
+Reads: only metadata, through the given source: the boot sector again (to locate the FATs and the root), the FATs in
+32 KiB blocks cached up to 8 MiB (a block whose read fails is read again sector by sector, from each copy in turn; a
+block may be read again after the cache is emptied), each directory cluster once (at most 512 KiB per read), and the
+FAT12/16 root region once (at most 2 MiB).
+
 ## Inspect
 
 `inspect(source, &Finding) -> Inspection` reads what a found file says about itself: `Metadata` (make, model, lens, serial,

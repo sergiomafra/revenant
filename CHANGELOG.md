@@ -57,6 +57,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - FAT and exFAT volumes are found on MBR (including logical partitions and disks with 4096-byte sectors), GPT and
   unpartitioned media, also with a damaged boot sector (the backup boot sector is used) or a lost partition table (the
   usual partition starts are probed).
+- The live files of FAT12/16/32 volumes are listed with their original folders and names (long names included), their
+  creation and modification times and where their pieces are on the disk, even when a file is fragmented or a FAT
+  sector is unreadable (the FAT's second copy is used). A damaged or forged volume (directory loops, chains that loop
+  or cross each other) is read in bounded time, and the files it touches are marked as not trusted.
 
 ### Changed
 

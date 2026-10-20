@@ -19,7 +19,7 @@ const FAT_LABEL_ENTRIES: u64 = 16;
 
 /// Where the root directory starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Root {
+pub(super) enum Root {
     /// FAT12/16: the fixed root region, at this sector of the volume, holding this many entries.
     Fixed { sector: u64, entries: u64 },
     /// FAT32/exFAT: the root's first cluster.
@@ -35,6 +35,9 @@ struct Boot {
     total: u64,
     /// First sector of the first FAT.
     fat_start: u64,
+    /// Sectors of one FAT copy.
+    fat_len: u64,
+    nfats: u64,
     /// The media byte FAT entry 0 starts with (exFAT: always `0xF8`).
     media: u8,
     heap: u64,
@@ -142,6 +145,8 @@ fn fat_fields(s: &[u8]) -> Option<Boot> {
         spc,
         total,
         fat_start: reserved,
+        fat_len,
+        nfats,
         media: s[21],
         heap,
         count,
@@ -190,6 +195,8 @@ fn exfat_fields(s: &[u8]) -> Option<Boot> {
         spc: 1 << spc_shift,
         total: volume_len,
         fat_start: fat_offset,
+        fat_len,
+        nfats,
         media: 0xF8,
         heap,
         count,
@@ -216,6 +223,50 @@ fn exfat_checksum_ok(source: &dyn Source, at: u64, bps: u64) -> bool {
         .0
         .iter()
         .all(|c| u32::from_le_bytes(*c) == sum)
+}
+
+/// Where a volume's allocation tables and root are, in absolute bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Layout {
+    pub sector_size: u64,
+    /// The first FAT copy.
+    pub fat_offset: u64,
+    /// Bytes of one FAT copy.
+    pub fat_bytes: u64,
+    pub fat_copies: u64,
+    /// FAT12/16: `Fixed` with an absolute byte offset in `sector`; FAT32/exFAT: the root's first cluster.
+    pub root: Root,
+}
+
+/// The layout of a volume [`super::volumes`] reported, from the same boot sector it was read from (`None` when that
+/// boot sector no longer gives the same geometry).
+pub(super) fn layout(source: &dyn Source, v: &Volume) -> Option<Layout> {
+    let (b, _) = choose(source, v.offset)?;
+    if b.fs != v.fs
+        || b.count != v.cluster_count
+        || offset_of(v.offset, b.heap, b.bps)? != v.heap_offset
+    {
+        return None;
+    }
+    let root = match b.root {
+        Root::Fixed { sector, entries } => Root::Fixed {
+            sector: offset_of(v.offset, sector, b.bps)?,
+            entries,
+        },
+        r => r,
+    };
+    Some(Layout {
+        sector_size: b.bps,
+        fat_offset: offset_of(v.offset, b.fat_start, b.bps)?,
+        fat_bytes: b.fat_len.checked_mul(b.bps)?,
+        fat_copies: b.nfats,
+        root,
+    })
+}
+
+/// `base + sector × bps`, when representable.
+fn offset_of(base: u64, sector: u64, bps: u64) -> Option<u64> {
+    sector.checked_mul(bps)?.checked_add(base)
 }
 
 /// The boot sector at `at`, when valid.

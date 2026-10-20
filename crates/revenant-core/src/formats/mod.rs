@@ -68,6 +68,28 @@ impl FileKind {
         }
     }
 
+    /// The kind a file name's extension (without the dot) stands for, case-insensitively: jpg jpeg jpe → Jpeg;
+    /// mp4 m4v → Mp4; mov → Mov; cr2; cr3; nef nrw → Nef; arw; dng; orf ori → Orf; rw2; raf; heic heif hif → Heic;
+    /// tif tiff → Tiff; anything else `None`.
+    pub fn from_extension(ext: &str) -> Option<FileKind> {
+        Some(match ext.to_ascii_lowercase().as_str() {
+            "jpg" | "jpeg" | "jpe" => FileKind::Jpeg,
+            "mp4" | "m4v" => FileKind::Mp4,
+            "mov" => FileKind::Mov,
+            "cr2" => FileKind::Cr2,
+            "cr3" => FileKind::Cr3,
+            "nef" | "nrw" => FileKind::Nef,
+            "arw" => FileKind::Arw,
+            "dng" => FileKind::Dng,
+            "orf" | "ori" => FileKind::Orf,
+            "rw2" => FileKind::Rw2,
+            "raf" => FileKind::Raf,
+            "heic" | "heif" | "hif" => FileKind::Heic,
+            "tif" | "tiff" => FileKind::Tiff,
+            _ => return None,
+        })
+    }
+
     /// Conventional file extension, without the dot.
     pub fn extension(self) -> &'static str {
         match self {
@@ -385,6 +407,50 @@ pub(crate) mod tests {
     use super::*;
     use crate::error::EngineError;
     use crate::source::VolumeId;
+
+    #[test]
+    fn kinds_from_extensions() {
+        use FileKind::*;
+        let table = [
+            ("jpg", Jpeg),
+            ("JPEG", Jpeg),
+            ("Jpe", Jpeg),
+            ("mp4", Mp4),
+            ("M4V", Mp4),
+            ("mov", Mov),
+            ("CR2", Cr2),
+            ("cr3", Cr3),
+            ("nef", Nef),
+            ("NRW", Nef),
+            ("arw", Arw),
+            ("dng", Dng),
+            ("orf", Orf),
+            ("ORI", Orf),
+            ("rw2", Rw2),
+            ("raf", Raf),
+            ("heic", Heic),
+            ("HEIF", Heic),
+            ("hif", Heic),
+            ("tif", Tiff),
+            ("TIFF", Tiff),
+        ];
+        for (ext, kind) in table {
+            assert_eq!(FileKind::from_extension(ext), Some(kind), "{ext}");
+        }
+        for ext in [
+            "",
+            "txt",
+            "thm",
+            "xml",
+            "lrv",
+            "jpgx",
+            "jp",
+            "j.pg",
+            "ｊｐｇ",
+        ] {
+            assert_eq!(FileKind::from_extension(ext), None, "{ext}");
+        }
+    }
 
     pub(crate) struct Mem(pub Vec<u8>);
 

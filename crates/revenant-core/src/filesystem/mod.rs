@@ -1,14 +1,19 @@
-//! FAT12/16/32 and exFAT volumes of a source: where they are and their geometry.
+//! FAT12/16/32 and exFAT volumes of a source: where they are, their geometry, and the files they list.
 //!
 //! Formats from the public specifications only: the MBR/EBR conventions, the GPT chapter of the UEFI specification,
 //! Microsoft's "FAT32 File System Specification" 1.03 (fatgen103) and Microsoft's "exFAT file system specification".
 //! Nothing here writes, and a broken table or boot sector is never an error: it only yields fewer volumes.
 
+mod alloc;
 mod boot;
+mod fat;
+mod listing;
 mod partitions;
 
 use crate::source::Source;
 use partitions::Candidate;
+
+pub use listing::{FsFile, FsOrigin, FsState, FsTime, Listing, Placement, read};
 
 /// Most volumes reported for one source (the lowest offsets are kept).
 pub(crate) const MAX_VOLUMES: usize = 16;
@@ -16,6 +21,49 @@ pub(crate) const MAX_VOLUMES: usize = 16;
 pub(crate) const MAX_EBR_LINKS: usize = 64;
 /// Most entries a GPT may declare; a header declaring more is refused.
 pub(crate) const MAX_GPT_ENTRIES: u32 = 128;
+/// Most photo/video files one listing holds (later ones are not listed).
+pub(crate) const MAX_FILES: usize = 262_144;
+/// Most pieces one listing holds: the runs of every listed file (a photo/video's pieces, an other file's ranges in
+/// `live`) and of every directory count; a file (or a directory's ranges) that would pass it is not listed.
+pub const MAX_PIECES: usize = 1 << 20;
+/// Most directories walked per volume.
+pub(crate) const MAX_DIRS: usize = 65_536;
+/// Most directory entries (32-byte slots) parsed per volume.
+pub(crate) const MAX_ENTRIES: u64 = 4_000_000;
+/// Deepest directory walked (the root is depth 0).
+pub(crate) const MAX_DEPTH: u32 = 32;
+/// Most bytes of one FAT directory read (65,536 entries).
+pub(crate) const MAX_FAT_DIR_BYTES: u64 = 2 << 20;
+/// Most contested clusters recorded per volume; past it the volume's live files are all untrusted (ruling C11).
+pub(crate) const MAX_CONTESTED: usize = 65_536;
+/// Volumes with more clusters are reported but not walked.
+pub(crate) const MAX_WALKED_CLUSTERS: u32 = 1 << 28;
+
+/// The bounds of one listing: [`Limits::DEFAULT`] holds the constants above; unit tests pass lowered copies (the
+/// `cfg(test)` twins), which integration tests cannot reach.
+#[derive(Clone, Debug)]
+pub(crate) struct Limits {
+    pub files: usize,
+    pub pieces: usize,
+    pub dirs: usize,
+    pub entries: u64,
+    pub depth: u32,
+    pub fat_dir_bytes: u64,
+    pub contested: usize,
+}
+
+impl Limits {
+    pub(crate) const DEFAULT: Limits = Limits {
+        files: MAX_FILES,
+        pieces: MAX_PIECES,
+        dirs: MAX_DIRS,
+        entries: MAX_ENTRIES,
+        depth: MAX_DEPTH,
+        fat_dir_bytes: MAX_FAT_DIR_BYTES,
+        contested: MAX_CONTESTED,
+    };
+}
+
 /// Where a volume is looked for, in 512-byte sectors, when no table gave one.
 const PROBE_LBAS: [u64; 7] = [0, 63, 128, 2048, 8192, 32_768, 65_536];
 
