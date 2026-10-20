@@ -567,3 +567,56 @@ fn fragmented_jpeg_inspects_like_the_whole_file() {
         }]
     );
 }
+
+#[test]
+fn a_preview_inside_one_piece_has_no_pieces() {
+    // The CR3's full-size JPEG starts the `mdat` payload, at a multiple of 512: split right there, so the whole preview
+    // lies in the second piece.
+    let cr3 = testkit::cr3(4, &exif());
+    let (contiguous_source, contiguous, _keep) = find(&cr3, FileKind::Cr3);
+    let whole = inspect(&contiguous_source, &contiguous);
+    let full = whole.preview.clone().unwrap();
+    assert_eq!((full.width, full.height), (640, 480));
+    let split = full.start - AT as u64;
+    assert_eq!(split % 512, 0);
+    let len = cr3.len() as u64;
+
+    const SECOND: usize = 1 << 20;
+    let mut img = DiskImage::noise(SECOND + cr3.len() + 8192, 43);
+    img.put(AT, &cr3[..split as usize]);
+    img.put(SECOND, &cr3[split as usize..]);
+    let file = img.save();
+    let source = FileSource::open(file.path()).unwrap();
+    let f = Finding {
+        id: 1,
+        start: AT as u64,
+        len,
+        kind: FileKind::Cr3,
+        health: Health::Intact,
+        fragments: vec![
+            Fragment {
+                start: AT as u64,
+                len: split,
+            },
+            Fragment {
+                start: SECOND as u64,
+                len: len - split,
+            },
+        ],
+    };
+    let i = inspect(&source, &f);
+    assert_eq!(i.metadata, whole.metadata);
+    let p = i.preview.unwrap();
+    assert_eq!(
+        (p.start, p.len, p.width, p.height),
+        (SECOND as u64, full.len, 640, 480)
+    );
+    assert!(p.fragments.is_empty(), "{:?}", p.fragments);
+    assert_eq!(
+        p.ranges(),
+        vec![Fragment {
+            start: SECOND as u64,
+            len: full.len
+        }]
+    );
+}

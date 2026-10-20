@@ -1,6 +1,6 @@
-use revenant_core::formats::{FileKind, Format, Health, IsoBmff, Jpeg, all_formats};
+use revenant_core::formats::{FileKind, Format, Health, IsoBmff, Jpeg, Measurement, all_formats};
 use revenant_core::source::{FileSource, Source, VolumeId};
-use revenant_core::{CancelToken, EngineError, Event, ScanOptions, ScanSummary, scan};
+use revenant_core::{CancelToken, EngineError, Event, Fragment, ScanOptions, ScanSummary, scan};
 use revenant_testkit as testkit;
 use testkit::{DiskImage, Mp4Options};
 
@@ -767,4 +767,119 @@ fn stray_ftyp_does_not_cut_a_jpeg() {
         })
         .collect();
     assert_eq!(files, vec![(at as u64, jpeg.len() as u64)]);
+}
+
+/// Test-only format: a sector starting with `PIECES!!` measures as `len` bytes made of `pieces`, whatever they are.
+struct Pieces {
+    len: u64,
+    pieces: Vec<Fragment>,
+}
+
+impl Format for Pieces {
+    fn name(&self) -> &'static str {
+        "pieces"
+    }
+
+    fn recognizes(&self, head: &[u8]) -> bool {
+        head.starts_with(b"PIECES!!")
+    }
+
+    fn confirms(&self, _source: &dyn Source, _start: u64) -> bool {
+        true
+    }
+
+    fn measure(&self, _source: &dyn Source, _start: u64) -> Option<Measurement> {
+        Some(Measurement {
+            len: self.len,
+            kind: FileKind::Jpeg,
+            health: Health::Partial,
+            fragments: self.pieces.clone(),
+        })
+    }
+}
+
+/// Scans a 64 KiB zero image with `PIECES!!` at 4096 and returns the findings.
+fn scan_pieces(len: u64, pieces: &[(u64, u64)]) -> Vec<revenant_core::Finding> {
+    let mut img = DiskImage::zeros(64 * 1024);
+    img.put(4096, b"PIECES!!");
+    let file = img.save();
+    let source = FileSource::open(file.path()).unwrap();
+    let formats: Vec<Box<dyn Format>> = vec![Box::new(Pieces {
+        len,
+        pieces: pieces
+            .iter()
+            .map(|&(start, len)| Fragment { start, len })
+            .collect(),
+    })];
+    let mut out = Vec::new();
+    scan(
+        &source,
+        &formats,
+        &ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |e| {
+            if let Event::Found(f) = e {
+                out.push(f);
+            }
+        },
+    )
+    .unwrap();
+    out
+}
+
+#[test]
+fn a_finding_carries_its_measured_pieces() {
+    let found = scan_pieces(1500, &[(4096, 1000), (20_480, 500)]);
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].start, found[0].len), (4096, 1500));
+    assert_eq!(
+        found[0].fragments,
+        vec![
+            Fragment {
+                start: 4096,
+                len: 1000
+            },
+            Fragment {
+                start: 20_480,
+                len: 500
+            },
+        ]
+    );
+    // Contiguous: no pieces.
+    assert!(scan_pieces(1500, &[])[0].fragments.is_empty());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pieces contract")]
+fn a_single_piece_breaks_the_pieces_contract() {
+    scan_pieces(1000, &[(4096, 1000)]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pieces contract")]
+fn a_first_piece_elsewhere_breaks_the_pieces_contract() {
+    scan_pieces(1500, &[(4608, 1000), (20_480, 500)]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pieces contract")]
+fn pieces_not_summing_to_len_break_the_pieces_contract() {
+    scan_pieces(1600, &[(4096, 1000), (20_480, 500)]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pieces contract")]
+fn overlapping_pieces_break_the_pieces_contract() {
+    scan_pieces(1500, &[(4096, 1000), (4596, 500)]);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pieces contract")]
+fn a_piece_past_the_source_breaks_the_pieces_contract() {
+    scan_pieces(1500, &[(4096, 1000), (65_400, 500)]);
 }

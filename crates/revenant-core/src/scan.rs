@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::EngineError;
-use crate::formats::{FileKind, Format, Fragment, Health};
+use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
 use crate::source::Source;
 
 /// Bytes of a sector start shown to `Format::recognizes`.
@@ -32,6 +32,27 @@ impl Finding {
     pub fn ranges(&self) -> Vec<Fragment> {
         ranges(self.start, self.len, &self.fragments)
     }
+}
+
+/// Whether a measurement at `at` keeps the pieces contract: no pieces, or at least 2 in file order whose first starts at
+/// `at`, whose lengths sum to `len`, that do not overlap and that lie inside a source of `source_len` bytes.
+fn pieces_ok(at: u64, m: &Measurement, source_len: u64) -> bool {
+    let p = &m.fragments;
+    if p.is_empty() {
+        return true;
+    }
+    let inside = p.iter().all(|f| {
+        f.start
+            .checked_add(f.len)
+            .is_some_and(|end| end <= source_len)
+    });
+    let sum = p.iter().try_fold(0u64, |acc, f| acc.checked_add(f.len));
+    let mut sorted = p.clone();
+    sorted.sort_by_key(|f| f.start);
+    let disjoint = sorted
+        .windows(2)
+        .all(|w| w[0].start.saturating_add(w[0].len) <= w[1].start);
+    p.len() >= 2 && p[0].start == at && sum == Some(m.len) && inside && disjoint
 }
 
 /// `[Fragment { start, len }]` when `fragments` is empty, else `fragments`.
@@ -218,6 +239,10 @@ pub fn scan(
                     if m.health == Health::Intact {
                         skip_until = end;
                     }
+                    debug_assert!(
+                        pieces_ok(at, &m, total),
+                        "pieces contract broken at {at}: {m:?}"
+                    );
                     let finding = Finding {
                         id: next_id,
                         start: at,

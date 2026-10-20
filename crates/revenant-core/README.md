@@ -32,9 +32,9 @@ scans `src/source/` to ensure no write-capable open flags are ever introduced, a
 modification time are unchanged after a full scan that extracts every finding.
 
 `source::Fragmented::new(source, pieces)` is a read-only logical view of pieces (`Fragment { start, len }`, absolute ranges)
-of a source, in the given order: offset 0 is the first byte of the first piece and `len()` is the sum of the pieces' lengths.
-A read crosses pieces in order; a read error is the inner source's, so its offset is absolute in the inner source; a piece
-that runs past the inner source's end ends the view there (a short read); `volume()` is the inner source's.
+of a source, in the given order: offset 0 is the first byte of the first piece. Each piece is first clamped to the inner
+source's end (as `extract` clamps it), and `len()` is the sum of the clamped lengths. A read crosses pieces in order; a read
+error is the inner source's, so its offset is absolute in the inner source; `volume()` is the inner source's.
 `absolute(start, len)` maps a logical range back to absolute pieces of the source, merging pieces that touch.
 
 ## Formats: JPEG
@@ -264,7 +264,8 @@ it). `Fragment { start, len }` (re-exported as `revenant_core::Fragment`) is one
 and `Preview` carry `fragments: Vec<Fragment>` with one contract: empty for a contiguous file; otherwise at least 2 pieces
 in file order, the first starting at `start`, their lengths summing to `len`, no two overlapping. `start` is always the
 first piece's start and `len` the total length. `Finding::ranges()` and `Preview::ranges()` give `[Fragment { start, len }]`
-for a contiguous file, else the pieces. No detector produces pieces yet (reassembly comes later in this part); the scan
+for a contiguous file, else the pieces. In debug builds the scan asserts this contract (and that every piece lies inside the
+source) when it turns a measurement into a finding. No detector produces pieces yet (reassembly comes later in this part); the scan
 copies a measurement's `fragments` into its finding.
 
 ## Inspect

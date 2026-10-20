@@ -200,3 +200,42 @@ fn fragmented_view_maps_reads_and_errors() {
     // A read that misses the bad byte succeeds.
     assert_eq!(view.read_at(0, &mut b).unwrap(), 10);
 }
+
+#[test]
+fn fragmented_view_clamps_pieces_to_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("image.bin");
+    let src: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &src).unwrap();
+    let file = FileSource::open(&path).unwrap();
+    // The first piece runs 104 bytes past the end; the last starts past it.
+    let view = Fragmented::new(
+        &file,
+        vec![
+            Fragment {
+                start: 4000,
+                len: 200,
+            },
+            Fragment { start: 50, len: 20 },
+            Fragment {
+                start: 5000,
+                len: 10,
+            },
+        ],
+    );
+    assert_eq!(view.len(), 96 + 20);
+    let mut all = [0u8; 200];
+    assert_eq!(view.read_at(0, &mut all).unwrap(), 116);
+    assert_eq!(all[..96], src[4000..]);
+    assert_eq!(all[96..116], src[50..70]);
+    assert_eq!(
+        view.absolute(90, 100),
+        vec![
+            Fragment {
+                start: 4090,
+                len: 6
+            },
+            Fragment { start: 50, len: 20 },
+        ]
+    );
+}

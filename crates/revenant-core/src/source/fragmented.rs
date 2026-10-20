@@ -5,6 +5,7 @@ use crate::EngineError;
 use crate::formats::Fragment;
 
 /// Read-only logical view of pieces of a source, in the given order: offset 0 is the first byte of the first piece.
+/// Pieces are clamped to the inner source's end.
 pub struct Fragmented<'a> {
     source: &'a dyn Source,
     pieces: Vec<Fragment>,
@@ -14,7 +15,17 @@ pub struct Fragmented<'a> {
 }
 
 impl<'a> Fragmented<'a> {
+    /// Each piece is clamped to the inner source (a piece starting at or past its end becomes empty), so the view reads
+    /// exactly the bytes [`crate::extract()`] copies for the same pieces.
     pub fn new(source: &'a dyn Source, pieces: Vec<Fragment>) -> Self {
+        let inner_len = source.len();
+        let pieces: Vec<Fragment> = pieces
+            .into_iter()
+            .map(|p| Fragment {
+                start: p.start,
+                len: p.len.min(inner_len.saturating_sub(p.start)),
+            })
+            .collect();
         let mut starts = Vec::with_capacity(pieces.len());
         let mut len = 0u64;
         for p in &pieces {
@@ -67,8 +78,8 @@ impl Source for Fragmented<'_> {
         self.len
     }
 
-    /// Reads across pieces in order. A piece that runs past the end of the inner source ends the view there (a short
-    /// read). A read error is the inner source's, so its offset is absolute in the inner source.
+    /// Reads across pieces in order (fewer bytes only at the view's end, or if the inner source shrinks). A read error is
+    /// the inner source's, so its offset is absolute in the inner source.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
         if offset >= self.len {
             return Ok(0);
