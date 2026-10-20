@@ -36,36 +36,61 @@ reproduzem a estrutura:
   Agora o MakerNote é lido (cabeçalhos `OLYMPUS` e `OM SYSTEM`). Custo: o MakerNote antigo `OLYMP` (E-10 e afins) não é lido.
 - **P13 (estreitada na revisão):** uma cabeça de JPEG dentro de um JPEG do próprio RAW (a miniatura EXIF dentro da prévia)
   não corta o RAW só se todo JPEG próprio que a contém (até `JPEG_MAX_LEN`) ainda decodifica no modo rigoroso; uma
-  decodificação por JPEG, guardada. Se não decodifica, corta, e o arquivo de dentro aparece sozinho. Custo: nenhum além de
-  uma decodificação a mais quando há cabeça dentro de um JPEG próprio.
+  decodificação por JPEG, guardada. Se não decodifica, corta, e o arquivo de dentro aparece sozinho. Vale para RAW em
+  TIFF, RAF e CR3 (`PRVW` e JPEG de tamanho cheio), num ajudante compartilhado. Custo: uma prévia que não decodifica no
+  modo rigoroso e guarda uma miniatura aninhada agora corta o RAW ali (Parcial, e a miniatura aparece como outro achado);
+  e uma decodificação a mais quando há cabeça dentro de um JPEG próprio.
 - **P14:** só valem os empacotamentos da Panasonic conferidos em arquivo real: formato 4 com 12 bits, 14 pixels por pacote
   (DMC-FZ28, DMC-GF1, DMC-LX7 duas vezes, DC-G100) e formato 5 com 14 bits, 9 pixels (DC-GH5S). Qualquer outro, inclusive o
-  formato 5 com 12 bits, dá tamanho desconhecido: o RW2 sai Parcial e medido até a estrutura conhecida. Custo: um corpo com
-  outro empacotamento aparece Parcial até ser conferido.
+  formato 5 com 12 bits, dá tamanho desconhecido: o RW2 sai Parcial. Custo: um corpo com outro empacotamento aparece
+  Parcial até ser conferido.
+- **P16** (emenda o P14, revisão final): com empacotamento desconhecido o RW2 continua Parcial, mas os dados brutos são
+  reivindicados a partir da tag 0x0118 até um limite seguro (2 bytes por pixel, arredondado ao bloco de 0x4000, com
+  aritmética verificada e o mesmo teto de pixels); o corte por outro arquivo e o fim da origem aparam. Sem isso o RW2
+  recuperado não abria (o achado acabava antes dos dados). Custo se errada: alguns bytes do que vem depois entram no
+  arquivo (inofensivo para leitores de RAW).
 - **P15:** `tiff.rs` usa o mesmo limite de 64 segmentos de marcador (`jpeg::SOF_SEGMENTS`) para achar o SOF; a tolerância
   de zeros no fim do teste de amostras reais vale só para ARW. Custo: nenhum.
 - **Preenchimento do ARW:** a Sony completa alguns ARW com zeros depois dos dados (até múltiplo de 4 KiB ou 64 KiB). Nada
   aponta para esses zeros, então o achado termina no último byte referenciado, e o teste aceita até 64 KiB de zeros no fim.
   Custo: o arquivo recuperado fica sem esse enchimento (abre igual).
 
+**Revisão final (onda de correções).**
+- O MJPEG não anda mais o `mdat` inteiro depois de um corte: a segunda leitura só lê cabeçalhos de caixa, e numa trilha
+  MJPEG com índice Íntegro uma terceira leitura pula os inícios de chunk e para na primeira cabeça que não é um deles
+  (mesma regra do P2). Medido em 1,5 GiB com 96 MP4 de `mdat` tamanho 0: 21,8 s → 2,6 s.
+- CR3: a saúde é julgada sobre os mesmos JPEGs que a inspeção mostra (`PRVW` e o JPEG de tamanho cheio), com a regra do
+  RAW em TIFF (o maior decide; um não mensurável deixa Parcial). Sem `PRVW` continua Parcial. Custo: um `PRVW` quebrado
+  ao lado de um JPEG cheio bom não rebaixa mais o CR3.
+- RAW em TIFF: só o início de strip/tile com compressão JPEG (6, 7, 34892) é isento de corte; uma foto gravada no início
+  de um strip sem compressão agora corta o RAW e aparece.
+- Num RW2 Parcial (empacotamento desconhecido) a busca continua olhando cabeças dentro dele (regra da 1.1: um arquivo
+  quebrado não esconde outros), então o JpgFromRaw, que começa em setor, ainda aparece como achado próprio. Evitar isso
+  pede que a medida diga à busca quais inícios são do próprio arquivo: fica para a 1.3.
+
 ## Pendências (dono: parte indicada)
 
 **Parte 1.3 (arquivos fragmentados e velocidade)**
-- O `moov` é relido em `is_motion_jpeg`, e o MJPEG anda o `mdat` inteiro mesmo depois de um corte cedo (poderia parar na
-  primeira cabeça fora de chunk).
+- O `moov` é carregado mais de uma vez por medida de um vídeo cortado no `mdat` (`judge`, `own_starts`, os JPEGs do CR3).
+- A busca relata os JPEGs próprios de um achado Parcial que começam em setor (ex.: o JpgFromRaw de um RW2 com
+  empacotamento desconhecido). A medida poderia devolver os inícios próprios para a busca pular.
+- A saúde depende da posição perto do fim da origem: o mesmo offset corrompido dá Parcial quando a origem acaba antes
+  dele e Danificado quando ela continua (revisão final, item 4).
+- ISO BMFF: `confirms` aceita `ftyp` seguido de qualquer caixa válida, mas `measure` recusa um arquivo sem `mdat`; um
+  `ftyp` solto pode cortar outro arquivo sem virar achado (revisão final, item 8).
 - `all_formats()` é reconstruído a cada `measure`.
 - Um COUNT ou tamanho corrompido num offset válido ainda é cortado no limite; numa origem menor que 1 GiB o achado pode ir
   até o fim dela (Parcial). Os comentários de `claim()`/`TiffInfo.data` devem dizer que o corte vale para toda faixa.
 - O ARW da Sony DSLR-A100 (2006) sai Danificado: o ponteiro de SubIFD aponta para dados embaralhados. Pede tratamento por
   modelo.
-- RW2 com empacotamento não conferido sai Parcial (P14): o formato 5 com 12 bits (seriam 10 pixels por pacote) e os
+- RW2 com empacotamento não conferido sai Parcial (P14, P16): o formato 5 com 12 bits (seriam 10 pixels por pacote) e os
   formatos 6 e 7 dos corpos mais novos. Conferir com amostras reais quando houver.
 - O MakerNote antigo `OLYMP\0` da Olympus (E-10 e afins, offsets relativos ao TIFF) não é lido.
 - Não há HEIC real: nenhuma amostra com licença CC0/domínio público verificável foi achada.
 
 **Parte 1.4 (sistemas de arquivos)**
-- Uma foto gravada exatamente no início de um strip/prévia de RAW, de um chunk de CR3 ou de uma extensão de HEIC não se
-  distingue dos dados do próprio arquivo. Os metadados do sistema de arquivos resolvem isso.
+- Uma foto gravada exatamente no início de uma prévia ou de um strip com compressão JPEG de RAW, de um chunk de CR3 ou de
+  uma extensão de HEIC não se distingue dos dados do próprio arquivo. Os metadados do sistema de arquivos resolvem isso.
 
 **Parte 1.5 (disco de verdade)**
 - O HEIC nunca fica "completo" na leitura: um setor ilegível logo depois de um HEIC completo o deixa Parcial, e um `moov`
@@ -78,7 +103,7 @@ reproduzem a estrutura:
 - JPEG acima de 64 MiB perde as dimensões na inspeção.
 
 **Menores, sem dono**
-- Testes que faltam: tirar a condição `hdlr 'vide'` do MJPEG; o ramo do limite de iterações do `iloc`; a guarda `room()`.
+- Testes que faltam: o ramo do limite de iterações do `iloc`; a guarda `room()`.
   O teste `zero_size` do HEIC aceita qualquer coisa diferente de Íntegro (mais frouxo que Parcial).
 - `random_head_inside_mdat` depende do ruído semeado.
 - O ponteiro de próximo IFD é reivindicado antes da checagem de `MAX_ENTRIES` e pode marcar `garbled` à toa quando o limite

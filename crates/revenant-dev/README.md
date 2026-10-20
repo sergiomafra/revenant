@@ -35,9 +35,9 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
 
 ```json
 {"event":"found","id":1,"start":0,"len":12345,"kind":"jpeg","health":"intact","width":64,"height":48,"preview":{"start":0,"len":12345,"width":64,"height":48}}
+{"event":"unreadable","start":1044480,"len":4096}
 {"event":"found","id":2,"start":1049088,"len":13507425,"kind":"nef","health":"intact","make":"NIKON CORPORATION","model":"NIKON Z 6","lens":"NIKKOR Z 24-70mm f/4 S","iso":100,"captured_at":"2019-11-29T17:15:20","width":4548,"height":3030,"preview":{"start":3215360,"len":432488,"width":3024,"height":2016}}
-{"event":"unreadable","start":1048576,"len":4096}
-{"event":"summary","found":1,"unreadable_bytes":4096}
+{"event":"summary","found":2,"unreadable_bytes":4096}
 ```
 
 - `kind`: `jpeg`, `mp4`, `mov`, `cr2`, `nef`, `arw`, `dng`, `orf`, `rw2`, `raf`, `cr3`, `heic` or `tiff`.
