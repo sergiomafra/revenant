@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, builtin};
+use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, builtin, jpeg_entropy};
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
@@ -30,14 +30,15 @@ fn is_segment_marker(m: u8) -> bool {
     matches!(m, 0xC0..=0xCF | DQT | 0xDC | 0xDD | 0xE0..=0xEF | 0xFE)
 }
 
-fn is_sof(m: u8) -> bool {
+/// SOF markers (T.81 Table B.1).
+pub(super) fn is_sof(m: u8) -> bool {
     matches!(m, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF)
 }
 
 /// Result of walking the header segments.
-struct Header {
+pub(super) struct Header {
     /// Offset just past SOS's segment: where the entropy-coded data starts.
-    scan_start: u64,
+    pub(super) scan_start: u64,
     /// A DAC segment (arithmetic coding conditioning) was seen: the content is beyond our decoder.
     has_dac: bool,
 }
@@ -48,7 +49,7 @@ const CONFIRM_MAX_HEADER: u64 = 1 << 20;
 /// Walks the header segments of the JPEG at `start`, up to and including SOS. A walk that breaks on an unreadable
 /// sector is not proof that this is not a JPEG: the walk then ends where it broke (the search for EOI continues from
 /// there). `None` means "not a JPEG": a bad marker or length, no DQT/SOF, or the end of the source.
-fn walk_header(r: &mut Reader, start: u64, limit: u64) -> Option<Header> {
+pub(super) fn walk_header(r: &mut Reader, start: u64, limit: u64) -> Option<Header> {
     let (mut pos, mut has_dqt, mut has_sof, mut has_dac) = (start + 2, false, false, false);
     // Whether the 4 bytes (marker and length) at `pos` are within `limit` of the start.
     let within = |pos: u64| pos - start + 4 <= limit;
@@ -94,7 +95,7 @@ fn walk_header(r: &mut Reader, start: u64, limit: u64) -> Option<Header> {
 }
 
 /// Largest image (in pixels) the validation decode will attempt: 1 byte per pixel keeps it near 200 MB.
-const MAX_DECODE_PIXELS: u64 = 210_000_000;
+pub(super) const MAX_DECODE_PIXELS: u64 = 210_000_000;
 
 /// Decodes `data` as grayscale (1 byte per pixel). A decoder panic on hostile input counts as failure.
 ///
@@ -135,6 +136,24 @@ pub(super) fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
         Some(false) if try_decode(&data, false) == Some(true) => Health::Partial,
         None => Health::Partial, // too large to decode: structure complete, content not verifiable
         Some(_) => Health::Damaged,
+    }
+}
+
+/// Health of the JPEG at `start` whose bytes end at `end` without EOI (cut by another file, the end of the source or
+/// [`JPEG_MAX_LEN`]): `Partial` if something of the photo would show, that is our entropy decoder completes at least one
+/// full row of MCUs from `scan_start` before its first error or the cut; otherwise `Damaged`. A frame the decoder does not
+/// cover (progressive, arithmetic, 12-bit, a header broken by an unreadable sector...) stays `Partial`.
+fn cut_health(r: &mut Reader, start: u64, scan_start: u64, end: u64) -> Health {
+    let Some(frame) = jpeg_entropy::frame(r, start, scan_start) else {
+        return Health::Partial;
+    };
+    let row = u64::from(frame.mcus_x);
+    // Stops as soon as the first row is complete: the rest of the file does not change the answer.
+    let run = jpeg_entropy::decode_until(r, &frame, frame.start(scan_start), end, false, row);
+    if run.mcus >= row {
+        Health::Partial
+    } else {
+        Health::Damaged
     }
 }
 
@@ -355,26 +374,26 @@ impl Format for Jpeg {
 
         // Entropy-coded data. FF00 and RSTn are data; EOI ends the file.
         let formats = builtin();
-        let partial = |end: u64| Measurement {
+        let cut = |r: &mut Reader, end: u64| Measurement {
             len: end - start,
             kind: FileKind::Jpeg,
-            health: Health::Partial,
+            health: cut_health(r, start, header.scan_start, end),
             fragments: Vec::new(),
         };
         loop {
             if pos - start >= JPEG_MAX_LEN {
-                return Some(partial(start + JPEG_MAX_LEN));
+                return Some(cut(&mut r, start + JPEG_MAX_LEN));
             }
             let Some(b) = r.byte(pos) else {
-                return Some(partial(pos));
+                return Some(cut(&mut r, pos));
             };
             if pos.is_multiple_of(SECTOR) && r.file_starts_at(formats, pos) {
-                return Some(partial(pos));
+                return Some(cut(&mut r, pos));
             }
             if b == 0xFF && r.byte(pos + 1) == Some(EOI) {
                 let len = pos + 2 - start;
                 if len > JPEG_MAX_LEN {
-                    return Some(partial(start + JPEG_MAX_LEN));
+                    return Some(cut(&mut r, start + JPEG_MAX_LEN));
                 }
                 return Some(Measurement {
                     len,

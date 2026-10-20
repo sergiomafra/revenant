@@ -848,6 +848,114 @@ pub fn jpeg_with_app_segments(width: u32, height: u32, seed: u64, count: usize) 
     out
 }
 
+/// Code lengths (counts for lengths 1..=16) and symbols of the typical luminance DC table (ITU-T T.81, Table K.3).
+const STD_LUMA_DC_BITS: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+const STD_LUMA_DC_VALS: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+/// Code lengths and symbols of the typical luminance AC table (ITU-T T.81, Table K.5).
+const STD_LUMA_AC_BITS: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7D];
+const STD_LUMA_AC_VALS: [u8; 162] = [
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08, 0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+    0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5,
+    0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+    0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8,
+    0xF9, 0xFA,
+];
+
+/// MSB-first bit writer for entropy-coded data: an `FF` data byte is followed by a stuffed `00`.
+#[derive(Default)]
+struct BitWriter {
+    out: Vec<u8>,
+    acc: u8,
+    used: u32,
+}
+
+impl BitWriter {
+    fn bits(&mut self, value: u32, count: u32) {
+        for i in (0..count).rev() {
+            self.acc = (self.acc << 1) | ((value >> i) & 1) as u8;
+            self.used += 1;
+            if self.used == 8 {
+                self.byte_out();
+            }
+        }
+    }
+
+    fn byte_out(&mut self) {
+        self.out.push(self.acc);
+        if self.acc == 0xFF {
+            self.out.push(0x00);
+        }
+        self.acc = 0;
+        self.used = 0;
+    }
+
+    /// Pads the last byte with 1-bits.
+    fn align(&mut self) {
+        while self.used != 0 {
+            self.bits(1, 1);
+        }
+    }
+}
+
+/// Grayscale baseline JPEG of a flat gray image, standard luminance Huffman tables, DRI = `interval` MCUs, built
+/// byte by byte (every block: DC diff 0, EOB; RSTn every `interval` MCUs, byte-aligned with 1-bits). Strict-decodable.
+/// `interval == 0` means no DRI segment and no RST markers.
+pub fn jpeg_flat_with_restarts(width: u32, height: u32, interval: u16) -> Vec<u8> {
+    let (w, h) = (
+        u16::try_from(width).expect("width fits a SOF"),
+        u16::try_from(height).expect("height fits a SOF"),
+    );
+    assert!(w > 0 && h > 0);
+    let mut out = vec![0xFF, 0xD8];
+    // DQT: table 0, 8-bit, every step 1.
+    out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+    out.extend_from_slice(&[1; 64]);
+    // SOF0: 8-bit, one component (id 1, 1x1 sampling, quantization table 0).
+    out.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08]);
+    out.extend_from_slice(&h.to_be_bytes());
+    out.extend_from_slice(&w.to_be_bytes());
+    out.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+    for (class, bits, vals) in [
+        (0x00, &STD_LUMA_DC_BITS, &STD_LUMA_DC_VALS[..]),
+        (0x10, &STD_LUMA_AC_BITS, &STD_LUMA_AC_VALS[..]),
+    ] {
+        out.extend_from_slice(&[0xFF, 0xC4]);
+        out.extend_from_slice(&((2 + 1 + 16 + vals.len()) as u16).to_be_bytes());
+        out.push(class);
+        out.extend_from_slice(bits);
+        out.extend_from_slice(vals);
+    }
+    if interval > 0 {
+        out.extend_from_slice(&[0xFF, 0xDD, 0x00, 0x04]);
+        out.extend_from_slice(&interval.to_be_bytes());
+    }
+    // SOS: one component, DC table 0, AC table 0, Ss 0, Se 63, Ah/Al 0.
+    out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+
+    let mcus = u64::from(w.div_ceil(8)) * u64::from(h.div_ceil(8));
+    let mut data = BitWriter::default();
+    let mut restarts = 0u8;
+    for m in 0..mcus {
+        if interval > 0 && m > 0 && m % u64::from(interval) == 0 {
+            data.align();
+            data.out.extend_from_slice(&[0xFF, 0xD0 + restarts % 8]);
+            restarts = restarts.wrapping_add(1);
+        }
+        data.bits(0b00, 2); // DC category 0 (difference 0)
+        data.bits(0b1010, 4); // AC end of block
+    }
+    data.align();
+    out.extend(data.out);
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
 fn put_be32(buf: &mut [u8], at: usize, v: u32) {
     buf[at..at + 4].copy_from_slice(&v.to_be_bytes());
 }
@@ -1171,5 +1279,56 @@ mod bench_tests {
         write_bench_image(BenchImage::DenseJpeg, 16 << 20, &mut a).unwrap();
         write_bench_image(BenchImage::DenseJpeg, 16 << 20, &mut b).unwrap();
         assert!(a == b);
+    }
+}
+
+#[cfg(test)]
+mod flat_jpeg_tests {
+    use super::*;
+
+    /// Payload of the first DHT segment of `jpeg` whose first byte (table class and id) is `class`.
+    fn dht_payload(jpeg: &[u8], class: u8) -> Vec<u8> {
+        let mut pos = 2;
+        while jpeg[pos] == 0xFF && jpeg[pos + 1] != 0xDA {
+            let len = usize::from(u16::from_be_bytes([jpeg[pos + 2], jpeg[pos + 3]]));
+            if jpeg[pos + 1] == 0xC4 && jpeg[pos + 4] == class {
+                return jpeg[pos + 4..pos + 2 + len].to_vec();
+            }
+            pos += 2 + len;
+        }
+        panic!("no DHT of class {class:#x}");
+    }
+
+    #[test]
+    fn standard_tables_match_the_encoder() {
+        // The `image` encoder writes the typical tables of Annex K; ours must be the same bytes.
+        let reference = encode_noise(16, 16, 1);
+        let flat = jpeg_flat_with_restarts(16, 16, 0);
+        for class in [0x00, 0x10] {
+            assert_eq!(dht_payload(&flat, class), dht_payload(&reference, class));
+        }
+    }
+
+    #[test]
+    fn flat_jpeg_decodes_to_mid_gray() {
+        for (w, h, interval) in [(256, 128, 4), (33, 17, 0), (8, 8, 1), (512, 24, 7)] {
+            let bytes = jpeg_flat_with_restarts(w, h, interval);
+            let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+                .expect("decodes")
+                .to_luma8();
+            assert_eq!(img.dimensions(), (w, h));
+            assert!(img.pixels().all(|p| p.0[0] == 128), "{w}x{h}/{interval}");
+            let rst = bytes
+                .windows(2)
+                .filter(|p| p[0] == 0xFF && (0xD0..=0xD7).contains(&p[1]))
+                .count();
+            let mcus = w.div_ceil(8) * h.div_ceil(8);
+            let expected = if interval == 0 {
+                0
+            } else {
+                (mcus - 1) / u32::from(interval)
+            };
+            assert_eq!(rst as u32, expected, "{w}x{h}/{interval}");
+        }
     }
 }

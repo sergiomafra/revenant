@@ -61,6 +61,58 @@ fn jpeg_cut_by_next_file_is_partial() {
     assert_eq!(m.len, (next - start) as u64);
 }
 
+/// Offset just past the SOS segment of `j`: where its entropy-coded data starts.
+fn scan_data_start(j: &[u8]) -> usize {
+    let sos = j.windows(2).position(|w| w == [0xFF, 0xDA]).unwrap();
+    sos + 2 + usize::from(u16::from_be_bytes([j[sos + 2], j[sos + 3]]))
+}
+
+/// `jpeg(640, 480, 5, 0)` keeping its header and `scan_bytes` of scan data, then `jpeg(64, 64, 6, 0)` at the next sector.
+fn cut_by_next_file(scan_bytes: usize) -> Measurement {
+    let j1 = testkit::jpeg(640, 480, 5, 0);
+    let j2 = testkit::jpeg(64, 64, 6, 0);
+    let start = 4096usize;
+    let kept = scan_data_start(&j1) + scan_bytes;
+    let next = (start + kept).div_ceil(512) * 512;
+    let img = DiskImage::zeros(1 << 20)
+        .put(start, &j1[..kept])
+        .put(next, &j2)
+        .save();
+    let m = measure(&img, start as u64).unwrap();
+    assert_eq!(m.len, (next - start) as u64, "{scan_bytes} bytes");
+    m
+}
+
+#[test]
+fn cut_inside_the_first_mcu_row_is_damaged() {
+    // That photo has rows of 80 MCUs, about 9.5 KB each. 200 bytes of scan data decode 1 MCU, 6000 bytes about 50 (the
+    // zeros up to the next sector decode as a few more blocks): nothing of the photo would show, so it is not salvageable.
+    for scan_bytes in [200, 6000] {
+        assert_eq!(
+            cut_by_next_file(scan_bytes).health,
+            Health::Damaged,
+            "{scan_bytes}"
+        );
+    }
+}
+
+#[test]
+fn cut_after_the_first_mcu_row_is_partial() {
+    // 12000 bytes decode 100 MCUs: the first row shows.
+    assert_eq!(cut_by_next_file(12_000).health, Health::Partial);
+}
+
+#[test]
+fn header_only_jpeg_cut_by_end_of_source_is_damaged() {
+    let j = testkit::jpeg(640, 480, 7, 0);
+    let cut = scan_data_start(&j) + 100;
+    let mut image = DiskImage::zeros(4096 + cut);
+    image.put(4096, &j[..cut]);
+    let img = image.save();
+    let m = measure(&img, 4096).unwrap();
+    assert_eq!((m.len, m.health), (cut as u64, Health::Damaged));
+}
+
 #[test]
 fn jpeg_cut_by_end_of_source_is_partial() {
     let j = testkit::jpeg(640, 480, 7, 0);

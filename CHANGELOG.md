@@ -43,6 +43,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- A JPEG cut before its first row of pixels (for example right after its header, when another file was written over the
+  rest) is damaged, not partial: nothing of the photo would show. A JPEG cut later is still partial.
 - A RAW with a corrupt offset at or past 1 GiB is damaged wherever the card ends (it used to be partial on a short card).
   Below 1 GiB the end of the card still matters: an offset past the end is a cut file (partial), while the same offset on a
   longer card is counted.
