@@ -58,8 +58,9 @@ once). When a window cannot be read it is re-read sector by sector: unreadable s
 only the end of the source ends a walk for lack of data. A file whose measured range contains an unreadable sector is never
 `Intact` (details per format below).
 
-Each reader takes its window from a small per-thread pool (at most 4 kept) and gives it back when dropped, so measuring
-allocates nothing after warm-up; the detectors share one list of formats built once; the JPEG entropy walk jumps from `FF` to
+Each reader takes its window from a small per-thread pool (at most 4 kept, so at most 4 MiB per measuring thread, outside
+the scan cache; see the memory bound under Scan) and gives it back when dropped, so measuring allocates nothing after
+warm-up; the detectors share one list of formats built once; the JPEG entropy walk jumps from `FF` to
 `FF` (still checking every sector start it crosses for another file); a reader loads a `moov`/`meta` payload at most once per
 measurement, however many checks need it.
 
@@ -269,9 +270,10 @@ it). `Fragment { start, len }` (re-exported as `revenant_core::Fragment`) is one
 and `Preview` carry `fragments: Vec<Fragment>` with one contract: empty for a contiguous file; otherwise at least 2 pieces
 in file order, the first starting at `start`, their lengths summing to `len`, no two overlapping. `start` is always the
 first piece's start and `len` the total length. `Finding::ranges()` and `Preview::ranges()` give `[Fragment { start, len }]`
-for a contiguous file, else the pieces. In debug builds the scan asserts this contract (and that every piece lies inside the
-source) when it turns a measurement into a finding. No detector produces pieces yet (reassembly comes later in this part); the scan
-copies a measurement's `fragments` into its finding.
+for a contiguous file, else the pieces. The scan ignores a measurement that breaks this contract (or has a piece
+outside the source): it gives no finding. No detector produces pieces yet (reassembly comes later in this part); the scan
+copies a measurement's `fragments` into its finding. After an `Intact` finding in pieces, the scan skips heads only inside
+its pieces (each rounded out to whole sectors), so files in the gaps between them are still found.
 
 ## Inspect
 
@@ -304,8 +306,8 @@ kept only if it starts with `FF D8 FF`, its SOF parses and its whole range lies 
 `scan(source, formats, &ScanOptions, &CancelToken, &mut on_event) -> Result<ScanSummary, EngineError>` walks a source in blocks
 (`ScanOptions::block`, default 4 MiB, rounded down to whole sectors) and looks at the first 16 bytes of every sector
 (`ScanOptions::sector`, default 512, at least 16). The first format that recognizes a head and measures a file there wins. The
-scan keeps reading every block. After an `Intact` finding it examines no head until the first sector at or after the file's
-end; after a `Partial` or `Damaged` finding it keeps examining heads, so files inside a broken one are still reported (one bad
+scan keeps reading every block. After an `Intact` finding it examines no head inside the file (inside its pieces, for a
+file in pieces); after a `Partial` or `Damaged` finding it keeps examining heads, so files inside a broken one are still reported (one bad
 file never hides the rest of the disk; a damaged file may then overlap another finding). `measure` reads the whole source
 (not just the block), so files may cross block boundaries.
 
@@ -324,21 +326,42 @@ unreadable sectors are not remembered and are read again when their window is lo
 and events). A block that lies wholly inside an `Intact` finding whose bytes have all gone through the cache already (the
 detector walked the file) is not read again; its unreadable sectors come from the bad-sector map, so its `Unreadable` events
 are the same. The cache is `Send + Sync`: windows are shared across threads, and a window being loaded by one thread is
-waited for by the others, never read twice at once. Events are the same for any `cache_bytes`.
+waited for by the others, never read twice at once. The scan looks at the heads of a block straight in the cache's windows,
+without copying the block.
+
+Threads: the source is still read in order, by the scan thread, while candidate files are measured on worker threads
+(`ScanOptions::threads`: 0, the default, means one per available core, at most 16; 1 measures on the scan thread itself;
+other values are capped at 64; `ScanOptions::resolved_threads()` gives the number used). The scan thread reads up to
+`ScanOptions::lookahead_blocks()` = `min(16, max(1, cache_bytes / (2 × block)))` blocks ahead of the block it is examining,
+so the read-ahead fits in half the cache and a block is still cached when it is examined, and queues one job for each
+sector start some format recognizes. It then examines the blocks in order exactly as a sequential scan would: a head
+inside a skip range committed meanwhile is ignored (its result is thrown away), and for every other head it waits for that
+head's measurement. Because a measurement depends only on the source's bytes and unreadable sectors, the events, their
+order, the ids and `ScanSummary` are the same for any `threads` and any `cache_bytes`. A JPEG validation decode holds
+part of a process-wide budget of 512 MiB (its bytes plus one byte per pixel) while it runs, so concurrent decodes never
+hold more than that.
+
+Memory: at most `cache_bytes` of cached windows, plus for each reading thread (the scan thread and every measuring
+thread) one window being loaded (1 MiB) and its reader pool (at most 4 MiB), plus the decode budget (512 MiB, shared by
+every scan in the process), plus what each running measurement holds (for example a `moov` of at most 16 MiB). With the
+defaults on a 16-thread machine: about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
 
 Events:
 
-- `Found(Finding)`: sequential `id` from 1, in start order. It is emitted once the scan has read past the file's end, so
-  unreadable sectors inside the file are known: they are reported as `Unreadable` events before the `Found`, and an `Intact`
-  finding that contains any of them is downgraded to `Partial`. A file found inside a `Partial`/`Damaged` one is emitted right
+- `Found(Finding)`: sequential `id` from 1, in start order. It is emitted once the scan has read past the file's end (the end of its
+  farthest piece), so unreadable sectors inside the file are known: they are reported as `Unreadable` events before the
+  `Found`, and an `Intact` finding with any of them inside one of its pieces is downgraded to `Partial`. A file found inside a `Partial`/`Damaged` one is emitted right
   after it.
 - `Progress { read, total }`: once per block, plus one for an empty source; the last has `read == total`.
 - `Unreadable { start, len }`: when a block cannot be read it is re-read sector by sector; each run of consecutive failed
   sectors (also across blocks) is one event and counts in `ScanSummary::unreadable_bytes`. A run is split where a finding
   ends. The scan then continues.
 
-`CancelToken::cancel()` (from any thread or from inside the callback) makes the scan return `EngineError::Cancelled` at the
-next block boundary; findings still pending at that point are dropped.
+`CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block, after
+every event and while waiting for a measurement. Once it is seen no further event is emitted (a cancel from inside the
+callback makes that event the last one), the measuring threads drop their remaining jobs, and `scan` returns
+`EngineError::Cancelled` after every thread has stopped (a measurement already running is finished first); findings still
+pending are dropped.
 
 ## Extract
 

@@ -850,39 +850,18 @@ fn a_finding_carries_its_measured_pieces() {
     assert!(scan_pieces(1500, &[])[0].fragments.is_empty());
 }
 
-#[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "pieces contract")]
-fn a_single_piece_breaks_the_pieces_contract() {
-    scan_pieces(1000, &[(4096, 1000)]);
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "pieces contract")]
-fn a_first_piece_elsewhere_breaks_the_pieces_contract() {
-    scan_pieces(1500, &[(4608, 1000), (20_480, 500)]);
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "pieces contract")]
-fn pieces_not_summing_to_len_break_the_pieces_contract() {
-    scan_pieces(1600, &[(4096, 1000), (20_480, 500)]);
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "pieces contract")]
-fn overlapping_pieces_break_the_pieces_contract() {
-    scan_pieces(1500, &[(4096, 1000), (4596, 500)]);
-}
-
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "pieces contract")]
-fn a_piece_past_the_source_breaks_the_pieces_contract() {
-    scan_pieces(1500, &[(4096, 1000), (65_400, 500)]);
+fn measurements_breaking_the_pieces_contract_are_ignored() {
+    let broken: [(u64, &[(u64, u64)]); 5] = [
+        (1000, &[(4096, 1000)]),                // a single piece
+        (1500, &[(4608, 1000), (20_480, 500)]), // the first piece elsewhere
+        (1600, &[(4096, 1000), (20_480, 500)]), // pieces not summing to len
+        (1500, &[(4096, 1000), (4596, 500)]),   // overlapping pieces
+        (1500, &[(4096, 1000), (65_400, 500)]), // a piece past the source
+    ];
+    for (len, pieces) in broken {
+        assert!(scan_pieces(len, pieces).is_empty(), "{len} {pieces:?}");
+    }
 }
 
 /// Wraps a source, fails every read that touches any of the `bad` ranges (`[start, end)`) and counts what reaches it.
@@ -996,6 +975,7 @@ fn big_intact_video_is_read_once() {
     let source = MultiFailingSource::new(file.path(), Vec::new());
     let opts = ScanOptions {
         cache_bytes: 4 * MIB,
+        block: MIB,
         ..ScanOptions::default()
     };
     let (r, events) = run(&source, &opts);
@@ -1009,8 +989,11 @@ fn big_intact_video_is_read_once() {
             Health::Intact
         )]
     );
+    // The read-ahead (2 blocks here) fits in the cache, so at most it and the block being examined are read twice.
     let read = source.bytes();
-    assert!(read <= 50 * MIB as u64, "inner bytes read: {read}");
+    let bound = (48 + (opts.lookahead_blocks() as u64 + 1)) * MIB as u64;
+    eprintln!("inner bytes read: {read} (bound {bound})");
+    assert!(read <= bound, "inner bytes read: {read}");
 }
 
 #[test]
@@ -1156,4 +1139,388 @@ fn block_not_read_again_still_reports_its_unreadable_sectors() {
     );
     // Every sector went through the cache once: the scan did not read the measured file again.
     assert!(source.bytes() <= 4 * MIB as u64, "{}", source.bytes());
+}
+
+/// Scans with `formats` and `opts`; every event in order.
+fn run_with(
+    source: &dyn Source,
+    formats: &[Box<dyn Format>],
+    opts: &ScanOptions,
+) -> (Result<ScanSummary, EngineError>, Vec<Event>) {
+    let mut events = Vec::new();
+    let r = scan(source, formats, opts, &CancelToken::default(), &mut |e| {
+        events.push(e)
+    });
+    (r, events)
+}
+
+/// Scans with every format, cancelling from the callback when the `k`-th `Found` arrives.
+fn run_cancelling_at(
+    source: &dyn Source,
+    opts: &ScanOptions,
+    k: usize,
+) -> (Result<ScanSummary, EngineError>, Vec<Event>) {
+    let cancel = CancelToken::default();
+    let token = cancel.clone();
+    let mut events = Vec::new();
+    let mut seen = 0;
+    let r = scan(source, &all_formats(), opts, &cancel, &mut |e| {
+        if matches!(e, Event::Found(_)) {
+            seen += 1;
+            if seen == k {
+                token.cancel();
+            }
+        }
+        events.push(e);
+    });
+    (r, events)
+}
+
+fn threads(n: usize) -> ScanOptions {
+    ScanOptions {
+        threads: n,
+        ..ScanOptions::default()
+    }
+}
+
+/// 48 MiB of noise (seed 42) holding every kind of file the scan finds, and three unreadable ranges: inside a JPEG,
+/// inside an `mdat` and between files.
+fn mixed_image() -> (DiskImage, Vec<(u64, u64)>) {
+    let mut img = DiskImage::noise(48 * MIB, 42);
+    let mut in_jpeg = 0;
+    for i in 0..6 {
+        let jpeg = testkit::jpeg(640, 480, 60 + i as u64, 0);
+        assert!(jpeg.len() < 2 * MIB);
+        img.put(2 * i * MIB, &jpeg);
+        if i == 1 {
+            in_jpeg = ((2 * MIB + jpeg.len() / 2) / 512 * 512) as u64;
+        }
+    }
+    for i in 0..2 {
+        let cut = testkit::jpeg(256, 256, 70 + i as u64, 2000);
+        img.put((12 + 2 * i) * MIB, &cut[..cut.len() / 2]);
+    }
+    let video = testkit::mp4(&Mp4Options {
+        mdat_len: 3 * MIB,
+        moov_at_end: true,
+        mov: false,
+        mdat_64bit: false,
+    });
+    img.put(16 * MIB, &video);
+    // Motion-JPEG MOV whose index lists one chunk, with a photo at a sector start that is not a chunk: a Damaged video
+    // with a JPEG inside.
+    let photo = testkit::jpeg(64, 64, 72, 2000);
+    let mut payload = vec![0x11u8; 484];
+    payload.extend_from_slice(&photo);
+    payload.resize(payload.len() + 3000, 0x22);
+    img.put(
+        21 * MIB,
+        &testkit::mp4_with(&mp4_opts(true), b"mjpa", &payload, &[0]),
+    );
+    let arw = testkit::tiff_raw(&TiffRawOptions {
+        variant: TiffVariant::Arw,
+        big_endian: false,
+        raw_len: 2 * MIB,
+        seed: 73,
+        preview: Some((160, 120)),
+        preview_sector_aligned: true,
+        exif: TestExif::default(),
+    });
+    img.put(23 * MIB, &arw.bytes);
+    img.put(27 * MIB, &testkit::raf(MIB, 74, &TestExif::default()));
+    img.put(30 * MIB, &testkit::cr3(75, &TestExif::default()));
+    img.put(33 * MIB, &testkit::heic(200_000, 76, &TestExif::default()));
+    let in_mdat = 17 * MIB as u64;
+    let between = 40 * MIB as u64 + 512;
+    let bad = vec![
+        (in_jpeg, in_jpeg + 512),
+        (in_mdat, in_mdat + 4096),
+        (between, between + 1024),
+    ];
+    (img, bad)
+}
+
+#[test]
+fn parallel_scan_matches_sequential_events() {
+    let (img, bad) = mixed_image();
+    let file = img.save();
+    let events_with = |opts: &ScanOptions| {
+        let source = MultiFailingSource::new(file.path(), bad.clone());
+        let (r, events) = run(&source, opts);
+        r.unwrap();
+        events
+    };
+    let sequential = events_with(&threads(1));
+    let kinds: Vec<FileKind> = found(&sequential).iter().map(|f| f.1).collect();
+    for kind in [
+        FileKind::Mp4,
+        FileKind::Mov,
+        FileKind::Arw,
+        FileKind::Raf,
+        FileKind::Cr3,
+        FileKind::Heic,
+    ] {
+        assert!(kinds.contains(&kind), "{kind:?} missing: {kinds:?}");
+    }
+    assert!(kinds.iter().filter(|&&k| k == FileKind::Jpeg).count() >= 9);
+    assert_eq!(
+        sequential
+            .iter()
+            .filter(|e| matches!(e, Event::Unreadable { .. }))
+            .count(),
+        3
+    );
+    for n in [2, 8, 16] {
+        assert_eq!(events_with(&threads(n)), sequential, "threads {n}");
+    }
+    let small_cache = ScanOptions {
+        cache_bytes: MIB,
+        ..threads(8)
+    };
+    assert_eq!(events_with(&small_cache), sequential, "cache 1 MiB");
+    for _ in 0..3 {
+        assert_eq!(events_with(&threads(8)), sequential);
+    }
+}
+
+#[test]
+fn bench_images_give_the_same_events_for_any_thread_count() {
+    for kind in testkit::BenchImage::ALL {
+        let mut bytes = Vec::new();
+        testkit::write_bench_image(kind, 16 * MIB as u64, &mut bytes).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        let bad = vec![
+            (5 * MIB as u64 + 512, 5 * MIB as u64 + 1024),
+            (11 * MIB as u64, 11 * MIB as u64 + 4096),
+        ];
+        let events_with = |opts: &ScanOptions, cancel_at: Option<usize>| {
+            let source = MultiFailingSource::new(file.path(), bad.clone());
+            match cancel_at {
+                None => {
+                    let (r, events) = run(&source, opts);
+                    r.unwrap();
+                    events
+                }
+                Some(k) => run_cancelling_at(&source, opts, k).1,
+            }
+        };
+        let sequential = events_with(&threads(1), None);
+        let cancelled = events_with(&threads(1), Some(3));
+        for n in [2, 8] {
+            assert_eq!(
+                events_with(&threads(n), None),
+                sequential,
+                "{} threads {n}",
+                kind.name()
+            );
+            assert_eq!(
+                events_with(&threads(n), Some(3)),
+                cancelled,
+                "{} cancelled, threads {n}",
+                kind.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn lookahead_fits_the_cache() {
+    let small = ScanOptions {
+        cache_bytes: 2 * MIB,
+        block: MIB,
+        ..ScanOptions::default()
+    };
+    let big = ScanOptions {
+        block: MIB,
+        ..ScanOptions::default()
+    };
+    assert_eq!(small.lookahead_blocks(), 1);
+    assert_eq!(big.lookahead_blocks(), 16);
+    assert_eq!(ScanOptions::default().lookahead_blocks(), 16);
+    let (img, bad) = mixed_image();
+    let file = img.save();
+    let events_with = |opts: &ScanOptions| {
+        let source = MultiFailingSource::new(file.path(), bad.clone());
+        let (r, events) = run(&source, opts);
+        r.unwrap();
+        events
+    };
+    assert_eq!(events_with(&small), events_with(&big));
+}
+
+#[test]
+fn no_event_after_cancel() {
+    let (img, _) = mixed_image();
+    let file = img.save();
+    let source = FileSource::open(file.path()).unwrap();
+    let (r, events) = run_cancelling_at(&source, &threads(8), 1);
+    assert_eq!(r.unwrap_err().code(), "cancelled");
+    assert!(
+        matches!(events.last(), Some(Event::Found(f)) if f.id == 1),
+        "{events:?}"
+    );
+    assert_eq!(found(&events).len(), 1);
+}
+
+/// Wraps a source and sleeps 2 ms in every read.
+struct SlowSource(FileSource);
+
+impl Source for SlowSource {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        self.0.read_at(offset, buf)
+    }
+
+    fn volume(&self) -> Option<VolumeId> {
+        None
+    }
+}
+
+#[test]
+fn cancel_from_another_thread_stops_the_scan() {
+    use std::time::{Duration, Instant};
+    let file = DiskImage::noise(64 * MIB, 44).save();
+    let source = SlowSource(FileSource::open(file.path()).unwrap());
+    let cancel = CancelToken::default();
+    let cancelled_at = std::sync::Mutex::new(None);
+    let r = std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            *cancelled_at.lock().unwrap() = Some(Instant::now());
+            cancel.cancel();
+        });
+        scan(&source, &all_formats(), &threads(8), &cancel, &mut |_| {})
+    });
+    let returned = Instant::now();
+    assert_eq!(r.unwrap_err().code(), "cancelled");
+    let at = cancelled_at.lock().unwrap().expect("cancelled");
+    assert!(
+        returned - at < Duration::from_secs(2),
+        "{:?}",
+        returned - at
+    );
+}
+
+/// Test-only format: a sector starting with `TWOPIECES-HEAD!!` is a 2048-byte `Intact` file in two 1 KiB pieces, the
+/// second 1 MiB after the first (the second piece is `second_len` bytes).
+struct TwoPieces {
+    second_len: u64,
+}
+
+impl Format for TwoPieces {
+    fn name(&self) -> &'static str {
+        "two-pieces"
+    }
+
+    fn recognizes(&self, head: &[u8]) -> bool {
+        head.starts_with(b"TWOPIECES-HEAD!!")
+    }
+
+    fn confirms(&self, _source: &dyn Source, _start: u64) -> bool {
+        true
+    }
+
+    fn measure(&self, _source: &dyn Source, start: u64) -> Option<Measurement> {
+        Some(Measurement {
+            len: 2048,
+            kind: FileKind::Raf,
+            health: Health::Intact,
+            fragments: vec![
+                Fragment { start, len: 1024 },
+                Fragment {
+                    start: start + MIB as u64,
+                    len: self.second_len,
+                },
+            ],
+        })
+    }
+}
+
+/// A two-piece file at 4096 and three small JPEGs: inside piece 1, in the gap, inside piece 2. Scanned with `bad`.
+fn scan_two_pieces(second_len: u64, bad: Vec<(u64, u64)>) -> (Vec<Event>, Vec<u8>) {
+    let gap_jpeg = testkit::jpeg(64, 64, 81, 0);
+    let mut img = DiskImage::zeros(3 * MIB);
+    img.put(4096, b"TWOPIECES-HEAD!!")
+        .put(4096 + 512, &testkit::jpeg(64, 64, 80, 0))
+        .put(4096 + 64 * 1024, &gap_jpeg)
+        .put(4096 + MIB + 512, &testkit::jpeg(64, 64, 82, 0));
+    let file = img.save();
+    let source = MultiFailingSource::new(file.path(), bad);
+    let formats: Vec<Box<dyn Format>> = vec![Box::new(TwoPieces { second_len }), Box::new(Jpeg)];
+    let (r, events) = run_with(&source, &formats, &ScanOptions::default());
+    r.unwrap();
+    (events, gap_jpeg)
+}
+
+#[test]
+fn fragmented_measurements_skip_only_their_pieces() {
+    let two = |health| {
+        Event::Found(revenant_core::Finding {
+            id: 1,
+            start: 4096,
+            len: 2048,
+            kind: FileKind::Raf,
+            health,
+            fragments: vec![
+                Fragment {
+                    start: 4096,
+                    len: 1024,
+                },
+                Fragment {
+                    start: 4096 + MIB as u64,
+                    len: 1024,
+                },
+            ],
+        })
+    };
+    let gap = |len: usize| {
+        Event::Found(revenant_core::Finding {
+            id: 2,
+            start: 4096 + 64 * 1024,
+            len: len as u64,
+            kind: FileKind::Jpeg,
+            health: Health::Intact,
+            fragments: Vec::new(),
+        })
+    };
+    let (events, gap_jpeg) = scan_two_pieces(1024, Vec::new());
+    assert_eq!(
+        relevant(&events),
+        vec![&two(Health::Intact), &gap(gap_jpeg.len())]
+    );
+
+    let in_piece = 4096 + MIB as u64 + 512;
+    let (events, _) = scan_two_pieces(1024, vec![(in_piece, in_piece + 512)]);
+    assert_eq!(
+        relevant(&events),
+        vec![
+            &Event::Unreadable {
+                start: in_piece,
+                len: 512
+            },
+            &two(Health::Partial),
+            &gap(gap_jpeg.len())
+        ]
+    );
+
+    let in_gap = 4096 + 128 * 1024;
+    let (events, _) = scan_two_pieces(1024, vec![(in_gap, in_gap + 512)]);
+    assert_eq!(
+        found(&events),
+        vec![
+            (4096, FileKind::Raf, Health::Intact),
+            (4096 + 64 * 1024, FileKind::Jpeg, Health::Intact)
+        ]
+    );
+}
+
+#[test]
+fn inconsistent_fragments_are_ignored() {
+    let (events, _) = scan_two_pieces(1023, Vec::new());
+    assert!(found(&events).iter().all(|f| f.0 != 4096), "{events:?}");
 }

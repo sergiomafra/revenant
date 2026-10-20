@@ -18,6 +18,7 @@ struct BenchLine {
     bytes: u64,
     placed: u64,
     found: u64,
+    threads: usize,
     runs: u32,
     best_seconds: f64,
     mb_per_s: f64,
@@ -27,14 +28,19 @@ fn io_err(cause: std::io::Error) -> EngineError {
     EngineError::Write { cause }
 }
 
-/// Writes each image to a fresh temp dir under `dir` (the system temp dir if `None`), scans it `runs` times and prints
-/// one JSON line per image. The temp dir is removed at the end.
+/// Writes each image to a fresh temp dir under `dir` (the system temp dir if `None`), scans it `runs` times with
+/// `threads` measuring threads (0 = auto) and prints one JSON line per image. The temp dir is removed at the end.
 pub fn run_bench(
     size_mib: u64,
     runs: u32,
     images: &[BenchImage],
     dir: Option<&Path>,
+    threads: usize,
 ) -> Result<(), EngineError> {
+    let opts = ScanOptions {
+        threads,
+        ..ScanOptions::default()
+    };
     let tmp = match dir {
         Some(d) => tempfile::tempdir_in(d),
         None => tempfile::tempdir(),
@@ -59,7 +65,7 @@ pub fn run_bench(
             let summary = scan(
                 &source,
                 &formats,
-                &ScanOptions::default(),
+                &opts,
                 &CancelToken::default(),
                 &mut |_| {},
             )?;
@@ -76,6 +82,7 @@ pub fn run_bench(
             bytes,
             placed,
             found: best.1,
+            threads: opts.resolved_threads(),
             runs,
             best_seconds: (best.0 * 100.0).round() / 100.0,
             mb_per_s: ((bytes as f64 / 1e6 / best.0) * 10.0).round() / 10.0,

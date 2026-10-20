@@ -23,12 +23,12 @@ const MAX_COVERAGE_RUNS: usize = 1 << 16;
 
 /// Merged, non-overlapping, non-adjacent half-open runs `start -> end`.
 #[derive(Default)]
-struct Runs(BTreeMap<u64, u64>);
+pub(crate) struct Runs(BTreeMap<u64, u64>);
 
 impl Runs {
     /// Adds `[start, end)`, merging with the runs it overlaps or touches. Adds nothing and returns `false` when that would
     /// need a new run while there are already `cap` runs.
-    fn add(&mut self, start: u64, end: u64, cap: usize) -> bool {
+    pub(crate) fn add(&mut self, start: u64, end: u64, cap: usize) -> bool {
         let mut s = start;
         let mut e = end;
         if let Some((&ps, &pe)) = self.0.range(..start).next_back()
@@ -65,7 +65,7 @@ impl Runs {
     }
 
     /// Whether one run holds all of `[start, end)` (always for an empty range).
-    fn covers(&self, start: u64, end: u64) -> bool {
+    pub(crate) fn covers(&self, start: u64, end: u64) -> bool {
         start >= end
             || self
                 .0
@@ -75,7 +75,7 @@ impl Runs {
     }
 
     /// Drops the runs that end at or before `pos`.
-    fn drop_below(&mut self, pos: u64) {
+    pub(crate) fn drop_below(&mut self, pos: u64) {
         while let Some((&s, &e)) = self.0.first_key_value()
             && e <= pos
         {
@@ -83,7 +83,7 @@ impl Runs {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
 }
@@ -195,6 +195,29 @@ impl<'a> CachedSource<'a> {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Lends the bytes of `[start, end)` without copying them: calls `f(at, bytes, bad)` for each window it spans, in
+    /// order, where `bytes` starts at the absolute offset `at` and `bad` lists that window's unreadable runs (absolute
+    /// `(start, end)`, ascending; their bytes are zeros). Stops early at the end of the source. The window is held only
+    /// during the call.
+    pub(crate) fn visit(&self, start: u64, end: u64, mut f: impl FnMut(u64, &[u8], &[(u64, u64)])) {
+        let end = end.min(self.len);
+        let mut pos = start;
+        while pos < end {
+            let index = pos / self.window;
+            let w = self.window_at(index);
+            let from = (pos - index * self.window) as usize;
+            if from >= w.data.len() {
+                break; // the source shrank
+            }
+            let to = (w.data.len() as u64).min(end - index * self.window) as usize;
+            f(pos, &w.data[from..to], &w.bad);
+            pos = index * self.window + to as u64;
+            if to == w.data.len() && (w.data.len() as u64) < self.window {
+                break;
+            }
+        }
     }
 
     /// The window with index `index`, loading it if needed.
@@ -555,6 +578,54 @@ mod tests {
         // The reads made by the threads' own comparisons go to `inner` directly: subtract them.
         let window_reads = inner.calls.load(Ordering::SeqCst) - 8 * 256;
         assert_eq!(window_reads, 16);
+    }
+
+    #[test]
+    fn concurrent_readers_with_a_one_window_cache_stay_exact_and_bounded() {
+        let bad = 5 * MIB + 7 * 512;
+        let inner = Mem::new(16 * MIB, 9, vec![(bad, bad + 512)]);
+        let cache = CachedSource::new(&inner, 512, MIB as usize);
+        std::thread::scope(|s| {
+            for t in 0..8u64 {
+                let (cache, inner) = (&cache, &inner);
+                s.spawn(move || {
+                    let mut rng = Rng(100 + t);
+                    for _ in 0..400 {
+                        // Mostly around the bad sector's window, so threads keep evicting each other's windows there.
+                        let offset = if rng.next().is_multiple_of(2) {
+                            4 * MIB + rng.next() % (3 * MIB)
+                        } else {
+                            rng.next() % (16 * MIB)
+                        };
+                        let len = 1 + (rng.next() % (2 * MIB)) as usize;
+                        let end = (offset + len as u64).min(16 * MIB);
+                        match read(cache, offset, len) {
+                            Ok(bytes) => {
+                                assert!(
+                                    end <= bad || offset >= bad + 512,
+                                    "{offset} {len} read the bad sector"
+                                );
+                                assert_eq!(
+                                    bytes,
+                                    &inner.data[offset as usize..end as usize],
+                                    "{offset} {len}"
+                                );
+                            }
+                            Err(at) => {
+                                assert_eq!(at, bad, "{offset} {len}");
+                                assert!(offset < bad + 512 && end > bad, "{offset} {len}");
+                            }
+                        }
+                        assert!(cache.held() <= MIB as usize);
+                    }
+                });
+            }
+        });
+        let attempts = inner.bad_attempts.load(Ordering::SeqCst);
+        assert!(
+            (1..=2).contains(&attempts),
+            "attempts touching the bad sector: {attempts}"
+        );
     }
 
     #[test]

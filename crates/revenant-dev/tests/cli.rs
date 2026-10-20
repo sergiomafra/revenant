@@ -364,3 +364,48 @@ fn bench_rejects_an_unknown_image() {
         .stderr(predicates::str::contains("unknown image 'bogus'"));
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
+
+#[test]
+fn threads_option_gives_the_same_output() {
+    let (img, _, _) = image();
+    let stdout = |threads: &str| {
+        Command::cargo_bin("revenant-dev")
+            .unwrap()
+            .args(["scan", "--threads", threads])
+            .arg(img.path())
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+    let one = stdout("1");
+    assert_eq!(lines(&one).len(), 3);
+    assert_eq!(stdout("8"), one);
+}
+
+#[test]
+fn bench_reports_its_thread_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .args([
+            "bench",
+            "--size-mib",
+            "4",
+            "--runs",
+            "1",
+            "--images",
+            "noise",
+            "--threads",
+            "3",
+            "--dir",
+        ])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(lines(&out)[0]["threads"], 3);
+}

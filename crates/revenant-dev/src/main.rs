@@ -43,6 +43,9 @@ enum Command {
         /// extraction (and previews) onto the same volume is allowed.
         #[arg(long)]
         allow_same_volume: bool,
+        /// Threads measuring candidate files (0 = one per core, at most 16). The output is the same for any value.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        threads: usize,
     },
     /// Measure scan throughput on synthetic images written to a temp dir (page-cache speed, not a card reader's).
     Bench {
@@ -63,6 +66,9 @@ enum Command {
         /// Folder for the temporary images (default: the system temp dir).
         #[arg(long, value_name = "DIR")]
         dir: Option<PathBuf>,
+        /// Threads measuring candidate files (0 = one per core, at most 16).
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        threads: usize,
     },
 }
 
@@ -278,6 +284,7 @@ fn run_scan(
     dest: Option<&Path>,
     previews: Option<&Path>,
     allow_same_volume: bool,
+    threads: usize,
 ) -> Result<(), EngineError> {
     let file = FileSource::open(image)?;
     let wrapped = UnknownVolume(&file);
@@ -299,7 +306,10 @@ fn run_scan(
     let result = scan(
         source,
         &all_formats(),
-        &ScanOptions::default(),
+        &ScanOptions {
+            threads,
+            ..ScanOptions::default()
+        },
         &cancel,
         &mut |event| match event {
             Event::Found(f) => {
@@ -359,17 +369,20 @@ fn main() -> ExitCode {
             runs,
             images,
             dir,
-        } => bench::run_bench(size_mib, runs, &images, dir.as_deref()),
+            threads,
+        } => bench::run_bench(size_mib, runs, &images, dir.as_deref(), threads),
         Command::Scan {
             image,
             extract,
             previews,
             allow_same_volume,
+            threads,
         } => run_scan(
             &image,
             extract.as_deref(),
             previews.as_deref(),
             allow_same_volume,
+            threads,
         ),
     };
     match result {

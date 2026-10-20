@@ -56,6 +56,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The scan and the file detectors share what they read, so each sector of a card is read once (a JPEG gap search may
   re-read up to its 64 MiB window), and known unreadable sectors are never retried (retrying a bad sector on a failing card
   can take seconds each time).
+- Scanning uses every core: the card is still read in order, while the files found are checked in parallel (5x faster on
+  the photo-dense benchmark on an 8-core machine). The results are the same, in the same order, whatever the number of
+  threads; cancelling stops the scan without reporting anything more. The JPEG checks share a memory budget (512 MiB at
+  once), so many large photos checked together cannot exhaust memory.
 
 ### Fixed
 

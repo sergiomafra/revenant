@@ -12,6 +12,7 @@ use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
 
+use crate::budget::DECODE_BUDGET;
 use crate::source::Source;
 
 /// Longest JPEG the detector will follow (and decode).
@@ -120,6 +121,11 @@ fn try_decode(data: &[u8], strict: bool) -> Option<bool> {
 /// Partial (salvageable); neither -> Damaged. Oversized images are not decoded: complete structure -> Partial (not fully verifiable). With unreadable sectors
 /// (decoded as zeros) a successful decode, strict or lenient, gives at most Partial.
 pub(super) fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
+    // The bytes plus the 1-byte-per-pixel output; a size the header does not give counts as the largest decoded.
+    let pixels = sof_pixels(r, start, len)
+        .unwrap_or(MAX_DECODE_PIXELS)
+        .min(MAX_DECODE_PIXELS);
+    let _budget = DECODE_BUDGET.acquire(len.saturating_add(pixels));
     let mut data = vec![0u8; len as usize];
     r.read(start, &mut data);
     let unreadable = r.bad_in(start, start + len);

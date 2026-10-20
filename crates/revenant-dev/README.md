@@ -13,7 +13,7 @@ cargo build --release -p revenant-dev
 ## Usage
 
 ```sh
-revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-volume]
+revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-volume] [--threads N]
 ```
 
 - `<IMAGE>`: a disk image file (scanning devices directly comes in a later part).
@@ -28,6 +28,8 @@ revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-vol
 - `--allow-same-volume`: **developer only: use when scanning an image FILE, never a card.** Treats the source's volume as
   unknown, so extraction (and previews) onto the same volume is allowed. Tests use it because the image and the output folder live in the
   same temporary directory.
+- `--threads N`: threads that measure candidate files (default 0 = one per core, at most 16; 1 = measure on the scan
+  thread; capped at 64). The output is identical for any value.
 
 ### Output
 
@@ -60,12 +62,13 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
 ## Benchmark
 
 ```sh
-cargo run --release -p revenant-dev -- bench [--size-mib N=1024] [--runs N=3] [--images a,b,..=all] [--dir DIR=temp]
+cargo run --release -p revenant-dev -- bench [--size-mib N=1024] [--runs N=3] [--images a,b,..=all] [--dir DIR=temp] [--threads N=0]
 ```
 
 Writes each synthetic image into a fresh temp dir under `--dir`, scans it `--runs` times and prints one JSON line per image
-(`image`, `bytes`, `placed` = files put in the image, `found` = findings of the best run, `runs`, `best_seconds`,
-`mb_per_s` with MB = 10^6 bytes). The temp files are removed at the end. Always measure with a release build.
+(`image`, `bytes`, `placed` = files put in the image, `found` = findings of the best run, `threads` = the measuring
+threads actually used (`--threads 0` resolves to one per core, at most 16), `runs`, `best_seconds`, `mb_per_s` with
+MB = 10^6 bytes). The temp files are removed at the end. Always measure with a release build.
 
 Images (files go back to back, each at the next 512-byte boundary, the rest is seeded noise):
 
