@@ -181,7 +181,7 @@ and
 
 ## TIFF reader (internal)
 
-`tiff::walk` is the crate-private reader the TIFF-based RAW formats (CR2, NEF, ARW, DNG, ORF, RW2) share. It takes a
+`tiff::walk` (and `walk_exif_ifd`, for a TIFF whose IFD0 is itself an Exif IFD, as in a CR3's `CMT2`) is the crate-private reader the TIFF-based RAW formats (CR2, NEF, ARW, DNG, ORF, RW2) share. It takes a
 `Reader`, the absolute position of the TIFF header and a limit (at most `TIFF_MAX_LEN`, 1 GiB), and returns a `TiffInfo`:
 the extent (`end`, relative to the header), Make/Model/lens/serial/ISO/DateTimeOriginal, the largest image size, whether
 `DNGVersion` is present, the embedded JPEG ranges (`JPEGInterchangeFormat`, and strips/tiles of Compression 6/7 starting
@@ -202,6 +202,27 @@ file). `truncated` is a size cap hit (the walk is incomplete, not malformed). Ca
 and treat `truncated` as at best `Partial`. First value wins for Make/Model/lens/serial/ISO/date. Each IFD is classified
 once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 go to `jpegs`; lossless JPEG (SOF3) is
 `data`.
+
+## Inspect
+
+`inspect(source, &Finding) -> Inspection` reads what a found file says about itself: `Metadata` (make, model, lens, serial,
+ISO, `captured_at` as `YYYY-MM-DDTHH:MM:SS`, width, height) and an optional `Preview` (an absolute `start`/`len` range of an
+embedded JPEG plus its size from the SOF, ready to show on the results screen). It never fails and never panics: what cannot
+be read is `None`, nothing is read outside the finding, and the walks reuse the detectors' caps (`TIFF_MAX_LEN`,
+`MOOV_MAX_LEN`, `JPEG_MAX_LEN`).
+
+| Kind                            | Details from                                                      | Preview                                              |
+| ------------------------------- | ----------------------------------------------------------------- | ---------------------------------------------------- |
+| JPEG                            | first `Exif` APP1; size from the SOF                              | the whole file                                       |
+| CR2, NEF, ARW, DNG, ORF, RW2, TIFF | the IFD walk                                                  | the largest embedded lossy JPEG (by SOF pixel count) |
+| RAF                             | the embedded JPEG's APP1; size from its SOF                       | the embedded JPEG                                    |
+| CR3                             | `CMT1` (make, model), `CMT2` (an Exif IFD: ISO, date, lens, serial) | the larger of `PRVW` and track 1's first chunk if it is a JPEG |
+| HEIC                            | the `Exif` item listed in `iloc` (4-byte offset prefix skipped)   | none (HEVC; the app uses the OS decoder)             |
+| MP4, MOV                        | `mvhd` creation time (UTC, seconds since 1904) and the first video track's `tkhd` size | none                           |
+
+Values are validated or dropped: a date must be a real calendar date (leap years included), time of day valid and the year
+1990 or later; strings are printable ASCII, trimmed and non-empty; ISO is above zero; sizes are above zero. A preview is
+kept only if it starts with `FF D8 FF`, its SOF parses and its whole range lies inside the finding.
 
 ## Scan
 

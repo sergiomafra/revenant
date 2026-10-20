@@ -149,10 +149,6 @@ fn stsd_box(codec: &[u8; 4]) -> Vec<u8> {
     bmff_box(b"stsd", &payload)
 }
 
-fn moov_box(chunk_offsets: &[u64], sample_len: u32, wide: bool, codec: &[u8; 4]) -> Vec<u8> {
-    moov_box_with(chunk_offsets, sample_len, wide, codec, &[])
-}
-
 /// Like [`moov_box`], with `extra` (already-built boxes) placed after `mvhd` and before the `trak`.
 fn moov_box_with(
     chunk_offsets: &[u64],
@@ -161,7 +157,30 @@ fn moov_box_with(
     codec: &[u8; 4],
     extra: &[u8],
 ) -> Vec<u8> {
-    let mvhd = bmff_box(b"mvhd", &[0; 100]);
+    moov_box_full(chunk_offsets, sample_len, wide, codec, extra, None)
+}
+
+/// Creation time (seconds since 1904-01-01 UTC) and `tkhd` size of a video built by [`mp4_dated`].
+#[derive(Clone, Copy)]
+struct VideoMeta {
+    creation: u32,
+    width: u32,
+    height: u32,
+}
+
+fn moov_box_full(
+    chunk_offsets: &[u64],
+    sample_len: u32,
+    wide: bool,
+    codec: &[u8; 4],
+    extra: &[u8],
+    meta: Option<VideoMeta>,
+) -> Vec<u8> {
+    let mut mvhd = vec![0u8; 100];
+    if let Some(m) = meta {
+        mvhd[4..8].copy_from_slice(&m.creation.to_be_bytes());
+    }
+    let mvhd = bmff_box(b"mvhd", &mvhd);
     let mut stsz = vec![0; 4];
     stsz.extend_from_slice(&0u32.to_be_bytes()); // sample_size = 0: per-sample table
     stsz.extend_from_slice(&1u32.to_be_bytes());
@@ -185,10 +204,17 @@ fn moov_box_with(
         b"stbl",
         &[stsd_box(codec), bmff_box(b"stsz", &stsz), chunk_table].concat(),
     );
-    let trak = bmff_box(
-        b"trak",
-        &bmff_box(b"mdia", &[hdlr, bmff_box(b"minf", &stbl)].concat()),
-    );
+    let mdia = bmff_box(b"mdia", &[hdlr, bmff_box(b"minf", &stbl)].concat());
+    let trak = match meta {
+        Some(m) => {
+            // tkhd version 0: 84 bytes of payload; width and height are 16.16 fixed point at 76 and 80.
+            let mut tkhd = vec![0u8; 84];
+            tkhd[76..80].copy_from_slice(&(m.width << 16).to_be_bytes());
+            tkhd[80..84].copy_from_slice(&(m.height << 16).to_be_bytes());
+            bmff_box(b"trak", &[bmff_box(b"tkhd", &tkhd), mdia].concat())
+        }
+        None => bmff_box(b"trak", &mdia),
+    };
     bmff_box(b"moov", &[mvhd, extra.to_vec(), trak].concat())
 }
 
@@ -205,6 +231,29 @@ pub fn mp4(opts: &Mp4Options) -> Vec<u8> {
 /// header; 36 with `mdat_64bit`) when `moov` is at the end. `chunks` are the chunk offsets listed in the index, relative to
 /// the start of the payload.
 pub fn mp4_with(opts: &Mp4Options, codec: &[u8; 4], payload: &[u8], chunks: &[u64]) -> Vec<u8> {
+    mp4_build(opts, codec, payload, chunks, None)
+}
+
+/// Like [`mp4`], with the `mvhd` creation time set to `creation` (seconds since 1904-01-01 UTC) and a `tkhd` of
+/// `width` x `height` pixels in the video track.
+pub fn mp4_dated(opts: &Mp4Options, creation: u32, width: u32, height: u32) -> Vec<u8> {
+    let mut payload = vec![0u8; opts.mdat_len];
+    SplitMix64(opts.mdat_len as u64).fill(&mut payload);
+    let meta = VideoMeta {
+        creation,
+        width,
+        height,
+    };
+    mp4_build(opts, b"avc1", &payload, &[0], Some(meta))
+}
+
+fn mp4_build(
+    opts: &Mp4Options,
+    codec: &[u8; 4],
+    payload: &[u8],
+    chunks: &[u64],
+    meta: Option<VideoMeta>,
+) -> Vec<u8> {
     let brand: &[u8; 4] = if opts.mov { b"qt  " } else { b"isom" };
     let mut ftyp = brand.to_vec();
     ftyp.extend_from_slice(&0u32.to_be_bytes());
@@ -221,7 +270,8 @@ pub fn mp4_with(opts: &Mp4Options, codec: &[u8; 4], payload: &[u8], chunks: &[u6
         bmff_box(b"mdat", payload)
     };
     let header = if opts.mdat_64bit { 16 } else { 8 };
-    let moov_len = moov_box(&vec![0; chunks.len()], 0, opts.mdat_64bit, codec).len();
+    let moov_len =
+        moov_box_full(&vec![0; chunks.len()], 0, opts.mdat_64bit, codec, &[], meta).len();
     let mdat_at = if opts.moov_at_end {
         ftyp.len()
     } else {
@@ -231,7 +281,14 @@ pub fn mp4_with(opts: &Mp4Options, codec: &[u8; 4], payload: &[u8], chunks: &[u6
         .iter()
         .map(|c| (mdat_at + header) as u64 + c)
         .collect();
-    let moov = moov_box(&absolute, payload.len() as u32, opts.mdat_64bit, codec);
+    let moov = moov_box_full(
+        &absolute,
+        payload.len() as u32,
+        opts.mdat_64bit,
+        codec,
+        &[],
+        meta,
+    );
 
     if opts.moov_at_end {
         [ftyp, mdat, moov].concat()

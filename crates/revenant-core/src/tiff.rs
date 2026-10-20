@@ -27,14 +27,12 @@ const MAX_STRING: u64 = 256;
 /// Marker segments inspected looking for the SOF of a JPEG.
 const MAX_SEGMENTS: usize = 16;
 
-#[allow(dead_code)] // used by Task 3/5
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Endian {
     Little,
     Big,
 }
 
-#[allow(dead_code)] // used by Task 3/5
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TiffInfo {
     /// Furthest byte referenced, relative to the TIFF header.
@@ -131,6 +129,16 @@ struct ImageTags {
 /// Walks the TIFF whose header is at absolute `base` (offsets are relative to `base`). `limit` caps every offset
 /// (min([`TIFF_MAX_LEN`], what the caller allows, e.g. an APP1 payload length)). `None` if the header is not TIFF.
 pub(crate) fn walk(r: &mut Reader, base: u64, limit: u64) -> Option<TiffInfo> {
+    walk_from(r, base, limit, Kind::Image)
+}
+
+/// Like [`walk`] for a TIFF whose IFD0 is an Exif IFD (Canon CR3's `CMT2` box): ISO, capture date, lens and serial are
+/// read from IFD0 itself, and its next pointer is not followed.
+pub(crate) fn walk_exif_ifd(r: &mut Reader, base: u64, limit: u64) -> Option<TiffInfo> {
+    walk_from(r, base, limit, Kind::Exif)
+}
+
+fn walk_from(r: &mut Reader, base: u64, limit: u64, root: Kind) -> Option<TiffInfo> {
     let limit = limit.min(TIFF_MAX_LEN);
     let mut head = [0u8; 8];
     if r.read(base, &mut head) < 8 {
@@ -160,7 +168,7 @@ pub(crate) fn walk(r: &mut Reader, base: u64, limit: u64) -> Option<TiffInfo> {
         budget: STRIP_BUDGET,
     };
     let first = w.u32_of([head[4], head[5], head[6], head[7]]);
-    w.run(u64::from(first));
+    w.run(u64::from(first), root);
     Some(w.info)
 }
 
@@ -212,9 +220,9 @@ impl Walker<'_, '_> {
         }
     }
 
-    fn run(&mut self, first: u64) {
+    fn run(&mut self, first: u64, root: Kind) {
         let mut visited: HashSet<u64> = HashSet::new();
-        let mut pending: Vec<(u64, Kind)> = vec![(first, Kind::Image)];
+        let mut pending: Vec<(u64, Kind)> = vec![(first, root)];
         while let Some((off, kind)) = pending.pop() {
             if visited.contains(&off) {
                 self.info.hard_garbled(); // cycle
@@ -1100,5 +1108,22 @@ mod tests {
         let item2 = iloc + 4 + 2 + 2 + 16; // version/flags, sizes, count, first item
         let off = u32::from_be_bytes(heic[item2 + 8..item2 + 12].try_into().unwrap()) as usize;
         assert_fields(&walk_all(&heic[off + 4..]).unwrap(), true);
+    }
+
+    #[test]
+    fn exif_ifd_as_ifd0_reads_exif_tags() {
+        let cr3 = revenant_testkit::cr3(3, &exif());
+        let cmt2 = after(&cr3, b"CMT2", 0);
+        let src = Mem(cmt2.to_vec());
+        // `walk` ignores Exif tags in IFD0 ...
+        let plain = walk(&mut Reader::new(&src), 0, TIFF_MAX_LEN).unwrap();
+        assert_eq!((plain.iso, plain.date_original.as_deref()), (None, None));
+        // ... `walk_exif_ifd` reads them.
+        let info = walk_exif_ifd(&mut Reader::new(&src), 0, TIFF_MAX_LEN).unwrap();
+        assert_eq!(info.iso, Some(400));
+        assert_eq!(info.date_original.as_deref(), Some("2024:05:06 07:08:09"));
+        assert_eq!(info.serial.as_deref(), Some("SN12345"));
+        assert_eq!(info.lens.as_deref(), Some("Lens 50mm f/1.8"));
+        assert!(!info.garbled);
     }
 }

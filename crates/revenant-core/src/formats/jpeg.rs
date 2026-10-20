@@ -130,11 +130,25 @@ pub(super) fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
     }
 }
 
+/// Marker segments `sof_pixels` looks through.
+const SOF_SEGMENTS: usize = 16;
+
 /// Pixel count (width x height) from the first SOF of the JPEG of `len` bytes at `start`, looking at the first 16
 /// marker segments. `None` if no SOF is found there.
 pub(super) fn sof_pixels(r: &mut Reader, start: u64, len: u64) -> Option<u64> {
+    sof_dims(r, start, len, SOF_SEGMENTS).map(|(w, h)| u64::from(w) * u64::from(h))
+}
+
+/// `(width, height)` from the first SOF of the JPEG of `len` bytes at `start`, looking at the first `max_segments`
+/// marker segments. `None` if no SOF is found there.
+pub(crate) fn sof_dims(
+    r: &mut Reader,
+    start: u64,
+    len: u64,
+    max_segments: usize,
+) -> Option<(u32, u32)> {
     let mut pos = 2u64;
-    for _ in 0..16 {
+    for _ in 0..max_segments {
         if pos + 4 > len {
             return None;
         }
@@ -149,13 +163,46 @@ pub(super) fn sof_pixels(r: &mut Reader, start: u64, len: u64) -> Option<u64> {
                 if r.read(start + pos + 5, &mut dims) != 4 {
                     return None;
                 }
-                let h = u64::from(u16::from_be_bytes([dims[0], dims[1]]));
-                let w = u64::from(u16::from_be_bytes([dims[2], dims[3]]));
-                return Some(w * h);
+                let h = u32::from(u16::from_be_bytes([dims[0], dims[1]]));
+                let w = u32::from(u16::from_be_bytes([dims[2], dims[3]]));
+                return Some((w, h));
             }
             SOS | EOI => return None,
             0xFF => pos += 1,
             _ => pos += 2 + u64::from(u16::from_be_bytes([seg[2], seg[3]])).max(2),
+        }
+    }
+    None
+}
+
+/// Marker segments looked through for the EXIF APP1.
+const EXIF_SEGMENTS: usize = 64;
+
+/// Where the TIFF of the first `Exif\0\0` APP1 of the JPEG of `len` bytes at `start` lies: `(absolute offset of the
+/// TIFF header, bytes of TIFF in the segment)`. Stops at SOS, EOI or after 64 segments.
+pub(crate) fn exif_tiff(r: &mut Reader, start: u64, len: u64) -> Option<(u64, u64)> {
+    let mut pos = 2u64;
+    for _ in 0..EXIF_SEGMENTS {
+        if pos + 4 > len {
+            return None;
+        }
+        let mut seg = [0u8; 4];
+        if r.read(start + pos, &mut seg) != 4 || seg[0] != 0xFF {
+            return None;
+        }
+        let seg_len = u64::from(u16::from_be_bytes([seg[2], seg[3]]));
+        match seg[1] {
+            0xFF => pos += 1,
+            SOS | EOI => return None,
+            0xE1 if seg_len >= 8 && pos + 2 + seg_len <= len => {
+                let mut id = [0u8; 6];
+                if r.read(start + pos + 4, &mut id) == 6 && &id == b"Exif\0\0" {
+                    return Some((start + pos + 10, seg_len - 8));
+                }
+                pos += 2 + seg_len;
+            }
+            m if is_segment_marker(m) && seg_len >= 2 => pos += 2 + seg_len,
+            _ => return None,
         }
     }
     None

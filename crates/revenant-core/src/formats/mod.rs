@@ -5,9 +5,9 @@
 //! cannot be read is re-read sector by sector; unreadable sectors read as zeros and are remembered, so a read error never
 //! ends a walk early (only the end of the source does) and the detector can lower the file's health instead.
 
-mod isobmff;
-mod jpeg;
-mod raf;
+pub(crate) mod isobmff;
+pub(crate) mod jpeg;
+pub(crate) mod raf;
 mod tiffraw;
 
 pub use isobmff::{IsoBmff, MOOV_MAX_LEN};

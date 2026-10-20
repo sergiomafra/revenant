@@ -1,0 +1,372 @@
+use revenant_core::formats::{FileKind, Health, all_formats};
+use revenant_core::source::FileSource;
+use revenant_core::{CancelToken, Event, Finding, ScanOptions, inspect, scan};
+use revenant_testkit as testkit;
+use testkit::{DiskImage, Mp4Options, TestExif, TiffRawOptions, TiffVariant};
+
+const AT: usize = 8192;
+
+fn exif() -> TestExif {
+    TestExif {
+        make: Some("Acme".into()),
+        model: Some("Model X".into()),
+        lens: Some("Lens 50mm f/1.8".into()),
+        serial: Some("SN12345".into()),
+        iso: Some(400),
+        date: Some("2024:05:06 07:08:09".into()),
+    }
+}
+
+/// Puts `bytes` at [`AT`] in a noise image, scans it and returns the finding at [`AT`] with the source.
+fn find(bytes: &[u8], kind: FileKind) -> (FileSource, Finding, tempfile::NamedTempFile) {
+    let mut img = DiskImage::noise(AT + bytes.len() + 8192, 99);
+    img.put(AT, bytes);
+    let file = img.save();
+    let source = FileSource::open(file.path()).unwrap();
+    let mut found = Vec::new();
+    scan(
+        &source,
+        &all_formats(),
+        &ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |e| {
+            if let Event::Found(f) = e {
+                found.push(f);
+            }
+        },
+    )
+    .unwrap();
+    let f = found
+        .into_iter()
+        .find(|f| f.start == AT as u64)
+        .unwrap_or_else(|| panic!("{kind:?} not found"));
+    assert_eq!(f.kind, kind);
+    (source, f, file)
+}
+
+fn assert_exif(m: &revenant_core::Metadata) {
+    assert_eq!(m.make.as_deref(), Some("Acme"));
+    assert_eq!(m.model.as_deref(), Some("Model X"));
+    assert_eq!(m.lens.as_deref(), Some("Lens 50mm f/1.8"));
+    assert_eq!(m.serial.as_deref(), Some("SN12345"));
+    assert_eq!(m.iso, Some(400));
+    assert_eq!(m.captured_at.as_deref(), Some("2024-05-06T07:08:09"));
+}
+
+#[test]
+fn jpeg_exif_and_self_preview() {
+    let jpeg = testkit::jpeg_with_exif(64, 48, 1, &exif());
+    let (source, f, _keep) = find(&jpeg, FileKind::Jpeg);
+    let i = inspect(&source, &f);
+    assert_exif(&i.metadata);
+    assert_eq!((i.metadata.width, i.metadata.height), (Some(64), Some(48)));
+    let p = i.preview.unwrap();
+    assert_eq!((p.start, p.len), (f.start, f.len));
+    assert_eq!((p.width, p.height), (64, 48));
+}
+
+#[test]
+fn each_raw_kind_metadata_and_largest_preview() {
+    let kinds = [
+        (TiffVariant::Cr2, FileKind::Cr2),
+        (TiffVariant::Nef, FileKind::Nef),
+        (TiffVariant::Arw, FileKind::Arw),
+        (TiffVariant::Dng, FileKind::Dng),
+        (TiffVariant::Orf, FileKind::Orf),
+        (TiffVariant::Rw2, FileKind::Rw2),
+    ];
+    for big_endian in [false, true] {
+        for (variant, kind) in kinds {
+            let mut e = exif();
+            // Kind detection reads the Make of NEF and ARW.
+            e.make = Some(
+                match variant {
+                    TiffVariant::Nef => "NIKON CORPORATION",
+                    TiffVariant::Arw => "SONY",
+                    _ => "Acme",
+                }
+                .into(),
+            );
+            let raw = testkit::tiff_raw(&TiffRawOptions {
+                variant,
+                big_endian,
+                raw_len: 3000,
+                seed: 7,
+                preview: Some((96, 64)),
+                preview_sector_aligned: false,
+                exif: e.clone(),
+            });
+            let (source, f, _keep) = find(&raw.bytes, kind);
+            let i = inspect(&source, &f);
+            let label = format!("{variant:?} be={big_endian}");
+            assert_eq!(i.metadata.make, e.make, "{label}");
+            assert_eq!(i.metadata.model.as_deref(), Some("Model X"), "{label}");
+            assert_eq!(i.metadata.iso, Some(400), "{label}");
+            assert_eq!(
+                i.metadata.captured_at.as_deref(),
+                Some("2024-05-06T07:08:09"),
+                "{label}"
+            );
+            assert_eq!(
+                i.metadata.lens.as_deref(),
+                Some("Lens 50mm f/1.8"),
+                "{label}"
+            );
+            assert_eq!(i.metadata.serial.as_deref(), Some("SN12345"), "{label}");
+            let pr = raw.preview.clone().unwrap();
+            let p = i.preview.unwrap_or_else(|| panic!("{label}: no preview"));
+            assert_eq!(p.start, (AT + pr.start) as u64, "{label}");
+            assert_eq!(p.len, pr.len() as u64, "{label}");
+            assert_eq!((p.width, p.height), (96, 64), "{label}");
+        }
+    }
+
+    // RAF: EXIF and preview of the embedded JPEG.
+    let raf = testkit::raf(2000, 3, &exif());
+    let (source, f, _keep) = find(&raf, FileKind::Raf);
+    let i = inspect(&source, &f);
+    assert_exif(&i.metadata);
+    let jpeg_at = u32::from_be_bytes(raf[0x54..0x58].try_into().unwrap());
+    let jpeg_len = u32::from_be_bytes(raf[0x58..0x5C].try_into().unwrap());
+    let p = i.preview.unwrap();
+    assert_eq!(
+        (p.start, p.len, p.width, p.height),
+        (
+            AT as u64 + u64::from(jpeg_at),
+            u64::from(jpeg_len),
+            160,
+            120
+        )
+    );
+
+    // CR3: Make/Model from CMT1, the rest from CMT2; the full-size JPEG in `mdat` beats the PRVW one.
+    let cr3 = testkit::cr3(4, &exif());
+    let (source, f, _keep) = find(&cr3, FileKind::Cr3);
+    let i = inspect(&source, &f);
+    assert_exif(&i.metadata);
+    let p = i.preview.unwrap();
+    assert_eq!((p.width, p.height), (640, 480));
+    assert_eq!(p.start % 512, 0);
+    assert_eq!(&cr3[(p.start as usize - AT)..][..3], [0xFF, 0xD8, 0xFF]);
+}
+
+#[test]
+fn heic_metadata_without_preview() {
+    let heic = testkit::heic(4000, 5, &exif());
+    let (source, f, _keep) = find(&heic, FileKind::Heic);
+    let i = inspect(&source, &f);
+    assert_exif(&i.metadata);
+    assert_eq!(i.preview, None);
+}
+
+#[test]
+fn mp4_creation_time_and_size() {
+    // 2024-05-06 07:08:09 UTC as seconds since 1904-01-01.
+    let unix: u64 = 1_714_979_289;
+    let qt = (unix + 2_082_844_800) as u32;
+    for mov in [false, true] {
+        let opts = Mp4Options {
+            mdat_len: 4000,
+            moov_at_end: true,
+            mov,
+            mdat_64bit: false,
+        };
+        let bytes = testkit::mp4_dated(&opts, qt, 1920, 1080);
+        let kind = if mov { FileKind::Mov } else { FileKind::Mp4 };
+        let (source, f, _keep) = find(&bytes, kind);
+        let i = inspect(&source, &f);
+        assert_eq!(
+            i.metadata.captured_at.as_deref(),
+            Some("2024-05-06T07:08:09")
+        );
+        assert_eq!(
+            (i.metadata.width, i.metadata.height),
+            (Some(1920), Some(1080))
+        );
+        assert_eq!(i.preview, None);
+    }
+    // A zero-sized track header gives no size.
+    let flat = testkit::mp4_dated(
+        &Mp4Options {
+            mdat_len: 4000,
+            moov_at_end: true,
+            mov: false,
+            mdat_64bit: false,
+        },
+        qt,
+        0,
+        0,
+    );
+    let (source, f, _keep) = find(&flat, FileKind::Mp4);
+    let m = inspect(&source, &f).metadata;
+    assert_eq!((m.width, m.height), (None, None));
+    // A video with a zero creation time and no tkhd: nothing to report.
+    let plain = testkit::mp4(&Mp4Options {
+        mdat_len: 4000,
+        moov_at_end: false,
+        mov: false,
+        mdat_64bit: false,
+    });
+    let (source, f, _keep) = find(&plain, FileKind::Mp4);
+    assert_eq!(inspect(&source, &f).metadata, Default::default());
+}
+
+#[test]
+fn garbage_exif_fields_become_none() {
+    let bad = TestExif {
+        make: Some("Ac\u{e9}me".into()),
+        model: Some("  ".into()),
+        lens: Some("Len\u{1}s".into()),
+        serial: None,
+        iso: Some(0),
+        date: Some("0000:00:00 00:00:00".into()),
+    };
+    let jpeg = testkit::jpeg_with_exif(32, 32, 2, &bad);
+    let (source, f, _keep) = find(&jpeg, FileKind::Jpeg);
+    let m = inspect(&source, &f).metadata;
+    assert_eq!(
+        (m.make, m.model, m.lens, m.serial, m.iso, m.captured_at),
+        (None, None, None, None, None, None)
+    );
+    // Still a good JPEG: size and preview come from the SOF.
+    assert_eq!((m.width, m.height), (Some(32), Some(32)));
+
+    // A date that parses but is not a real day, and one from before 1990.
+    for date in [
+        "2023:02:29 10:00:00",
+        "1980:01:01 10:00:00",
+        "2024:01:01 25:00:00",
+    ] {
+        let e = TestExif {
+            date: Some(date.into()),
+            ..exif()
+        };
+        let jpeg = testkit::jpeg_with_exif(32, 32, 2, &e);
+        let (source, f, _keep) = find(&jpeg, FileKind::Jpeg);
+        assert_eq!(inspect(&source, &f).metadata.captured_at, None, "{date}");
+    }
+}
+
+#[test]
+fn no_exif_gives_default_metadata() {
+    let jpeg = testkit::jpeg(40, 30, 3, 0);
+    let (source, f, _keep) = find(&jpeg, FileKind::Jpeg);
+    let i = inspect(&source, &f);
+    assert_eq!(
+        i.metadata,
+        revenant_core::Metadata {
+            width: Some(40),
+            height: Some(30),
+            ..Default::default()
+        }
+    );
+    assert!(i.preview.is_some());
+
+    let raw = testkit::tiff_raw(&TiffRawOptions {
+        variant: TiffVariant::Plain,
+        big_endian: false,
+        raw_len: 3000,
+        seed: 1,
+        preview: None,
+        preview_sector_aligned: false,
+        exif: TestExif::default(),
+    });
+    let (source, f, _keep) = find(&raw.bytes, FileKind::Tiff);
+    let i = inspect(&source, &f);
+    assert_eq!(i.preview, None);
+    assert_eq!(i.metadata.model, None);
+    assert_eq!(i.metadata.iso, None);
+    assert_eq!(i.metadata.captured_at, None);
+}
+
+#[test]
+fn a_preview_outside_the_finding_is_dropped() {
+    let raw = testkit::tiff_raw(&TiffRawOptions {
+        variant: TiffVariant::Dng,
+        big_endian: false,
+        raw_len: 3000,
+        seed: 7,
+        preview: Some((96, 64)),
+        preview_sector_aligned: false,
+        exif: exif(),
+    });
+    let (source, f, _keep) = find(&raw.bytes, FileKind::Dng);
+    let pr = raw.preview.clone().unwrap();
+    assert!(inspect(&source, &f).preview.is_some());
+    // A finding that ends inside the preview keeps no preview ...
+    let cut = Finding {
+        len: (pr.start + pr.len() / 2) as u64,
+        ..f.clone()
+    };
+    assert_eq!(inspect(&source, &cut).preview, None);
+    // ... and one that ends right after it keeps it.
+    let exact = Finding {
+        len: pr.end as u64,
+        ..f
+    };
+    assert_eq!(
+        inspect(&source, &exact).preview.map(|p| p.len),
+        Some(pr.len() as u64)
+    );
+}
+
+#[test]
+fn cr3_chunk_jpeg_outside_the_finding_is_dropped() {
+    let cr3 = testkit::cr3(4, &exif());
+    let (source, f, _keep) = find(&cr3, FileKind::Cr3);
+    let full = inspect(&source, &f).preview.unwrap();
+    assert_eq!((full.width, full.height), (640, 480));
+    // Cut in the middle of the full-size JPEG: only the PRVW one lies inside.
+    let cut = Finding {
+        len: full.start - f.start + full.len / 2,
+        ..f.clone()
+    };
+    let p = inspect(&source, &cut).preview.unwrap();
+    assert_eq!((p.width, p.height), (160, 120));
+    // Ending exactly at its last byte keeps it.
+    let exact = Finding {
+        len: full.start - f.start + full.len,
+        ..f
+    };
+    assert_eq!(inspect(&source, &exact).preview, Some(full));
+}
+
+#[test]
+fn noise_never_panics_for_any_kind() {
+    let img = DiskImage::noise(200_000, 5);
+    let file = img.save();
+    let source = FileSource::open(file.path()).unwrap();
+    let kinds = [
+        FileKind::Jpeg,
+        FileKind::Mp4,
+        FileKind::Mov,
+        FileKind::Cr2,
+        FileKind::Nef,
+        FileKind::Arw,
+        FileKind::Dng,
+        FileKind::Orf,
+        FileKind::Rw2,
+        FileKind::Tiff,
+        FileKind::Raf,
+        FileKind::Cr3,
+        FileKind::Heic,
+    ];
+    for kind in kinds {
+        for (start, len) in [
+            (0, 200_000),
+            (512, 100),
+            (199_990, 5000),
+            (300_000, 10),
+            (0, 0),
+        ] {
+            let f = Finding {
+                id: 1,
+                start,
+                len,
+                kind,
+                health: Health::Partial,
+            };
+            let _ = inspect(&source, &f);
+        }
+    }
+}

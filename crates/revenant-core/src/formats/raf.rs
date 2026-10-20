@@ -43,6 +43,15 @@ fn pairs(r: &mut Reader, start: u64) -> Option<[(u64, u64); 3]> {
     Some(out)
 }
 
+/// `(offset relative to the start of the file, length)` of the embedded JPEG, if the header holds one.
+pub(crate) fn embedded_jpeg(r: &mut Reader, start: u64) -> Option<(u64, u64)> {
+    let (head, n) = r.head(start);
+    if head.get(..n)?.get(..16)? != MAGIC {
+        return None;
+    }
+    pairs(r, start).map(|p| p[0]).filter(|p| p.1 > 0)
+}
+
 impl Format for Raf {
     fn name(&self) -> &'static str {
         "raf"

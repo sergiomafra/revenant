@@ -69,11 +69,11 @@ struct BoxHeader {
     size: Option<u64>,
 }
 
-fn be32(b: &[u8]) -> u32 {
+pub(crate) fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
 
-fn be64(b: &[u8]) -> u64 {
+pub(crate) fn be64(b: &[u8]) -> u64 {
     u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
 
@@ -131,7 +131,7 @@ fn next_file_inside(
 /// Children `(type, payload)` of a box payload, bounded by the payload itself. Sets `garbled` if the walk ends on an
 /// invalid size (or leftover bytes) instead of consuming the payload exactly. Fewer than 8 trailing zero bytes (a
 /// QuickTime terminator or padding) are tolerated.
-fn children<'a>(mut data: &'a [u8], garbled: &mut bool) -> Vec<([u8; 4], &'a [u8])> {
+pub(crate) fn children<'a>(mut data: &'a [u8], garbled: &mut bool) -> Vec<([u8; 4], &'a [u8])> {
     let mut out = Vec::new();
     while !data.is_empty() {
         if data.len() < 8 && data.iter().all(|&b| b == 0) {
@@ -155,7 +155,7 @@ fn children<'a>(mut data: &'a [u8], garbled: &mut bool) -> Vec<([u8; 4], &'a [u8
     out
 }
 
-fn child<'a>(data: &'a [u8], kind: &[u8; 4], garbled: &mut bool) -> Option<&'a [u8]> {
+pub(crate) fn child<'a>(data: &'a [u8], kind: &[u8; 4], garbled: &mut bool) -> Option<&'a [u8]> {
     children(data, garbled)
         .into_iter()
         .find(|(k, _)| k == kind)
@@ -433,7 +433,7 @@ fn walk_boxes(
 }
 
 /// Loads a box payload for parsing; `None` when it is over [`MOOV_MAX_LEN`].
-fn load(r: &mut Reader, at: u64, len: u64) -> Option<Vec<u8>> {
+pub(crate) fn load(r: &mut Reader, at: u64, len: u64) -> Option<Vec<u8>> {
     (len <= MOOV_MAX_LEN).then(|| {
         let mut data = vec![0u8; len as usize];
         r.read(at, &mut data);
@@ -478,26 +478,102 @@ const CR3_PRVW_UUID: [u8; 16] = [
     0xea, 0xf4, 0x2b, 0x5e, 0x1c, 0x98, 0x4b, 0x88, 0xb9, 0xfb, 0xb7, 0xdc, 0x40, 0x6e, 0x4d, 0x16,
 ];
 
-/// Content check of a CR3 whose structure is complete: the `PRVW` JPEG must decode strictly. No preview found, or one
-/// whose size field does not fit its box, is `Partial`.
-fn cr3_preview_health(r: &mut Reader, w: &Walk) -> Health {
-    for &(payload, end) in &w.uuids {
+/// The `PRVW` JPEG of a CR3 as `(absolute offset, length)`, from the top-level `uuid` boxes `(payload start, box end)`.
+/// `None` when there is no `PRVW` or its size field does not fit its box.
+pub(crate) fn cr3_prvw(r: &mut Reader, uuids: &[(u64, u64)]) -> Option<(u64, u64)> {
+    for &(payload, end) in uuids {
         // uuid (16), 8 bytes, then the PRVW box: size (4), "PRVW", 4+2 reserved, width, height, 1, JPEG size (4).
         let mut head = [0u8; 16 + 8 + 8 + 16];
         if r.read(payload, &mut head) != head.len() || head[..16] != CR3_PRVW_UUID {
             continue;
         }
         if &head[28..32] != b"PRVW" {
-            return Health::Partial;
+            return None;
         }
         let jpeg_len = u64::from(be32(&head[44..48]));
         let jpeg_at = payload + head.len() as u64;
         if jpeg_at + jpeg_len > end {
-            return Health::Partial;
+            return None;
         }
-        return preview_health(r, &[(jpeg_at, jpeg_len)]);
+        return Some((jpeg_at, jpeg_len));
     }
-    Health::Partial
+    None
+}
+
+/// Content check of a CR3 whose structure is complete: the `PRVW` JPEG must decode strictly. No preview found, or one
+/// whose size field does not fit its box, is `Partial`.
+fn cr3_preview_health(r: &mut Reader, w: &Walk) -> Health {
+    match cr3_prvw(r, &w.uuids) {
+        Some(range) => preview_health(r, &[range]),
+        None => Health::Partial,
+    }
+}
+
+/// First chunk of the first `trak` of a CR3 `moov` payload as `(offset from the start of the file, length of its first
+/// sample)`: Canon keeps the full-size JPEG there.
+pub(crate) fn cr3_first_chunk(moov: &[u8]) -> Option<(u64, u64)> {
+    let mut garbled = false;
+    let trak = child(moov, b"trak", &mut garbled)?;
+    let stbl = child(trak, b"mdia", &mut garbled)
+        .and_then(|m| child(m, b"minf", &mut garbled))
+        .and_then(|m| child(m, b"stbl", &mut garbled))?;
+    let at = child(stbl, b"stco", &mut garbled)
+        .map(|p| chunk_offsets(p, false))
+        .or_else(|| child(stbl, b"co64", &mut garbled).map(|p| chunk_offsets(p, true)))?
+        .first()
+        .copied()?;
+    let stsz = child(stbl, b"stsz", &mut garbled)?;
+    let fixed = u64::from(be32(stsz.get(4..8)?));
+    let len = if fixed != 0 {
+        fixed
+    } else {
+        u64::from(be32(stsz.get(12..16)?))
+    };
+    Some((at, len))
+}
+
+/// Top-level boxes read by [`top_level`].
+const MAX_TOP_LEVEL_BOXES: usize = 4096;
+
+/// Where the boxes an inspection needs lie in the file at `start` of `len` bytes. Offsets are absolute.
+#[derive(Default)]
+pub(crate) struct TopLevel {
+    /// Payload offset and length of the first `moov`.
+    pub moov: Option<(u64, u64)>,
+    /// Payload offset and length of the first `meta`.
+    pub meta: Option<(u64, u64)>,
+    /// Payload start and box end of the first top-level `uuid` boxes.
+    pub uuids: Vec<(u64, u64)>,
+}
+
+/// Walks the top-level boxes of the file at `start` (`len` bytes) by their declared sizes, clamped to the file, without
+/// reading any payload: the cheap walk for `inspect`. Ends at the first header that is not valid.
+pub(crate) fn top_level(r: &mut Reader, start: u64, len: u64) -> TopLevel {
+    let mut out = TopLevel::default();
+    let end = start.saturating_add(len);
+    let mut pos = start;
+    for _ in 0..MAX_TOP_LEVEL_BOXES {
+        if pos.saturating_add(8) > end {
+            break;
+        }
+        let (head, n) = r.head(pos);
+        let Some(h) = parse_header(&head[..n]) else {
+            break;
+        };
+        let size = h.size.unwrap_or(end - pos).min(end - pos);
+        if size < h.header_len {
+            break;
+        }
+        let payload = (pos + h.header_len, size - h.header_len);
+        match &h.kind {
+            b"moov" if out.moov.is_none() => out.moov = Some(payload),
+            b"meta" if out.meta.is_none() => out.meta = Some(payload),
+            b"uuid" if out.uuids.len() < MAX_UUIDS => out.uuids.push((payload.0, pos + size)),
+            _ => {}
+        }
+        pos += size;
+    }
+    out
 }
 
 /// Extents the `iloc` of a HEIC `meta` lists, and whether some of them could not be checked.
@@ -505,6 +581,8 @@ struct Iloc {
     /// `(offset, length)` relative to the start of the file, for construction method 0 and data reference 0 with a
     /// non-zero length.
     extents: Vec<(u64, u64)>,
+    /// The same extents with their item ID: `(item ID, offset, length)`.
+    items: Vec<(u32, u64, u64)>,
     /// Some extent (or the whole table) cannot be checked against the file.
     unverifiable: bool,
 }
@@ -529,6 +607,7 @@ fn parse_iloc(payload: &[u8]) -> Option<Iloc> {
     let version = *payload.first()?;
     let mut out = Iloc {
         extents: Vec::new(),
+        items: Vec::new(),
         unverifiable: false,
     };
     if version > 2 {
@@ -559,7 +638,7 @@ fn parse_iloc(payload: &[u8]) -> Option<Iloc> {
         out.unverifiable = true;
     }
     for _ in 0..count.min(ILOC_MAX_ITEMS) {
-        c.uint(if version < 2 { 2 } else { 4 })?; // item_ID
+        let item_id = c.uint(if version < 2 { 2 } else { 4 })? as u32;
         let method = if version >= 1 { c.uint(2)? & 15 } else { 0 };
         let data_reference = c.uint(2)?;
         let base = c.uint(base_size)?;
@@ -576,7 +655,9 @@ fn parse_iloc(payload: &[u8]) -> Option<Iloc> {
             if method != 0 || data_reference != 0 || length == 0 {
                 out.unverifiable = true;
             } else if out.extents.len() < ILOC_MAX_EXTENTS {
-                out.extents.push((base.saturating_add(offset), length));
+                let offset = base.saturating_add(offset);
+                out.extents.push((offset, length));
+                out.items.push((item_id, offset, length));
             } else {
                 out.unverifiable = true;
             }
@@ -590,6 +671,34 @@ fn meta_iloc(meta: &[u8]) -> Option<Iloc> {
     let mut garbled = false;
     let iloc = child(meta.get(4..)?, b"iloc", &mut garbled)?; // meta is a full box: version and flags first
     if garbled { None } else { parse_iloc(iloc) }
+}
+
+/// ID of the first `Exif` item listed in the `iinf` of a `meta` payload.
+fn exif_item_id(meta: &[u8]) -> Option<u32> {
+    let mut garbled = false;
+    let iinf = child(meta.get(4..)?, b"iinf", &mut garbled)?;
+    // version/flags (4), entry count (2 or 4), then the `infe` boxes.
+    let skip = if *iinf.first()? == 0 { 6 } else { 8 };
+    children(iinf.get(skip..)?, &mut garbled)
+        .into_iter()
+        .filter(|(k, _)| k == b"infe")
+        .find_map(|(_, p)| match *p.first()? {
+            // version/flags (4), item_ID (2), protection (2), item_type (4)
+            2 if p.get(8..12)? == b"Exif" => Some(u32::from(u16::from_be_bytes([p[4], p[5]]))),
+            // version/flags (4), item_ID (4), protection (2), item_type (4)
+            3 if p.get(10..14)? == b"Exif" => Some(be32(p.get(4..8)?)),
+            _ => None,
+        })
+}
+
+/// The Exif item of a HEIC `meta` payload as `(offset from the start of the file, length)`.
+pub(crate) fn heic_exif_item(meta: &[u8]) -> Option<(u64, u64)> {
+    let id = exif_item_id(meta)?;
+    let iloc = meta_iloc(meta)?;
+    iloc.items
+        .iter()
+        .find(|i| i.0 == id)
+        .map(|&(_, off, len)| (off, len))
 }
 
 /// Judges a HEIC: `meta` with an `iloc` whose extents lie inside the measured file.

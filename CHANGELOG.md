@@ -17,6 +17,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Fujifilm RAF, Canon CR3 and HEIC photo detection: exact length from the file structure (RAF header blocks; CR3 and HEIC
   boxes), health from the embedded JPEG (RAF, CR3 preview) or from whether every item extent lies inside the file (HEIC; the
   image data itself is never decoded). A JPEG a CR3 or HEIC keeps inside its own data no longer cuts it.
+- Photo details and preview: for any found file, camera make and model, lens, serial number, ISO, capture time and dimensions
+  (JPEG, RAW, CR3, HEIC; capture time and size for MP4/MOV), and the embedded JPEG the results screen can show (the largest
+  one in a RAW, the `PRVW` or full-size JPEG of a CR3). Values that are not valid (an impossible date, a zero ISO) are left out.
 - Sector scan of a disk image (including formatted cards) with progress, cancellation and unreadable-region reporting; each
   file is classified as intact, partial or damaged. Unreadable sectors never hide a file (a file containing one is never
   intact), and files inside a partial or damaged file are still found.
