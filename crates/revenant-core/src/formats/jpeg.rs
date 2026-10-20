@@ -141,7 +141,8 @@ pub(super) fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
 
 /// Health of the JPEG at `start` whose bytes end at `end` without EOI (cut by another file, the end of the source or
 /// [`JPEG_MAX_LEN`]): `Partial` if something of the photo would show, that is our entropy decoder completes at least one
-/// full row of MCUs from `scan_start` before its first error or the cut; otherwise `Damaged`. A frame the decoder does not
+/// full row of MCUs from `scan_start` before its first error, the cut, or the [`data_end`] of the bytes it used (zeros of
+/// erased space decode as valid blocks, but they are not the photo); otherwise `Damaged`. A frame the decoder does not
 /// cover (progressive, arithmetic, 12-bit, a header broken by an unreadable sector...) stays `Partial`.
 fn cut_health(r: &mut Reader, start: u64, scan_start: u64, end: u64) -> Health {
     let Some(frame) = jpeg_entropy::frame(r, start, scan_start) else {
@@ -150,11 +151,45 @@ fn cut_health(r: &mut Reader, start: u64, scan_start: u64, end: u64) -> Health {
     let row = u64::from(frame.mcus_x);
     // Stops as soon as the first row is complete: the rest of the file does not change the answer.
     let run = jpeg_entropy::decode_until(r, &frame, frame.start(scan_start), end, false, row);
-    if run.mcus >= row {
-        Health::Partial
-    } else {
-        Health::Damaged
+    if run.mcus < row {
+        return Health::Damaged;
     }
+    // Only the bytes that row used are checked (the file is not read again).
+    let used = run.pos.saturating_add(2).min(end);
+    let data_end = data_end(r, scan_start, used);
+    if data_end < used {
+        let run =
+            jpeg_entropy::decode_until(r, &frame, frame.start(scan_start), data_end, false, row);
+        if run.mcus < row {
+            return Health::Damaged;
+        }
+    }
+    Health::Partial
+}
+
+/// Where entropy-coded data found in `[from, end)` stops being a photo's: the start of the first 512-byte sector
+/// starting in that range that is made of one repeated byte value (erased or TRIMmed space, zero-filled slack; real
+/// entropy-coded data never repeats one value over a whole sector), or of the first unreadable sector overlapping it
+/// (clamped to `from`); `end` if there is neither. Reads each sector of the range once (a sector starting before `end` is
+/// read whole). The cut-file health rule and the gap search share it.
+pub(super) fn data_end(r: &mut Reader, from: u64, end: u64) -> u64 {
+    let mut sector = [0u8; SECTOR as usize];
+    let mut s = from - from % SECTOR;
+    while s < end {
+        let n = r.read(s, &mut sector);
+        // Reading marks the unreadable sectors (they read as zeros).
+        if r.bad_in(s, s + SECTOR) {
+            return s.max(from);
+        }
+        if s >= from && n == sector.len() && sector.iter().all(|&b| b == sector[0]) {
+            return s;
+        }
+        if n < sector.len() {
+            break; // end of the source
+        }
+        s += SECTOR;
+    }
+    end
 }
 
 /// Marker segments looked through for a SOF (health and inspection use the same bound).
@@ -422,6 +457,44 @@ mod tests {
     use super::*;
     use crate::formats::tests::Mem;
     use std::time::Instant;
+
+    fn noise(len: usize) -> Vec<u8> {
+        let mut x = 7u64;
+        (0..len)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (x >> 56) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn data_end_stops_at_uniform_or_unreadable_sectors() {
+        let mut data = noise(8192);
+        data[2048..2560].fill(0x00);
+        data[4096..4608].fill(0x55);
+        data[6000..6600].fill(0x00); // no whole sector of one value
+        let src = Mem(data.clone());
+        let mut r = Reader::new(&src);
+        assert_eq!(data_end(&mut r, 100, 8192), 2048);
+        // A uniform sector starting before `from` is not counted; one starting before `end` is read whole.
+        assert_eq!(data_end(&mut r, 2100, 8192), 4096);
+        assert_eq!(data_end(&mut r, 100, 2048), 2048);
+        assert_eq!(data_end(&mut r, 100, 2049), 2048);
+        assert_eq!(data_end(&mut r, 4700, 8192), 8192);
+        // An unreadable sector overlapping the range ends it, clamped to `from` (it reads as zeros, but it holds data
+        // from before `from` too).
+        let src = crate::formats::tests::BadSector {
+            inner: Mem(noise(8192)),
+            bad: 1536,
+        };
+        let mut r = Reader::new(&src);
+        assert_eq!(data_end(&mut r, 1600, 8192), 1600);
+        assert_eq!(data_end(&mut r, 100, 8192), 1536);
+        assert_eq!(data_end(&mut r, 2048, 8192), 8192);
+    }
 
     #[test]
     fn vouch_for_scales_with_touching_ranges() {

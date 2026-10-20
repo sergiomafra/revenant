@@ -388,6 +388,9 @@ pub(crate) enum End {
 pub(crate) struct Run {
     /// Complete MCUs: the index of the first MCU not decoded.
     pub mcus: u64,
+    /// The final cursor's `pos`. Every byte the run read lies below `pos + 2` (it may look at a marker's two bytes
+    /// without consuming them).
+    pub pos: u64,
     pub end: End,
     /// Cursors at the last [`RESUME_POINTS`] MCU boundaries reached, oldest first; `resume[i]` is the state right before
     /// MCU `resume[i].mcu`.
@@ -552,13 +555,15 @@ fn block(
         let rs = symbol(c, src, ac)?;
         let (run, size) = (u32::from(rs >> 4), u32::from(rs & 0x0F));
         if size == 0 {
-            if run != 15 {
-                break; // EOB (other run/0 symbols are undefined; treated as EOB as common decoders do)
+            match run {
+                0 => break,                                     // EOB
+                15 => {}                                        // ZRL: sixteen zero coefficients
+                _ => return Err(Fail::Error(c.current_byte())), // no other run/0 symbol exists (T.81 F.1.2.2.1)
             }
             if k + 15 > 63 {
                 return Err(Fail::Error(c.current_byte()));
             }
-            k += 16; // ZRL: sixteen zero coefficients
+            k += 16;
             continue;
         }
         if size > 10 || k + run > 63 {
@@ -622,8 +627,13 @@ pub(crate) fn decode_until(
         start: 0,
         len: 0,
     };
+    let from_mcu = from.mcu;
     let mut c = from;
-    let mut resume: VecDeque<Cursor> = VecDeque::with_capacity(RESUME_POINTS.min(total as usize));
+    let points = total
+        .min(stop_at)
+        .saturating_sub(from_mcu)
+        .min(RESUME_POINTS as u64);
+    let mut resume: VecDeque<Cursor> = VecDeque::with_capacity(points as usize);
     let mut dc = Vec::new();
     let end = loop {
         if c.mcu >= total {
@@ -661,6 +671,7 @@ pub(crate) fn decode_until(
     };
     Run {
         mcus: c.mcu,
+        pos: c.pos,
         end,
         resume: resume.into(),
         dc,
@@ -1121,5 +1132,92 @@ mod tests {
         }
         println!("checked {checked}, not covered {uncovered}");
         assert!(checked > 0);
+    }
+
+    #[test]
+    fn subsampled_geometry_is_counted_exactly() {
+        // 33×17 with 3 interleaved components: MCUs of 8·Hmax × 8·Vmax pixels, h·v luma blocks then Cb and Cr.
+        for (luma, interval, mcus) in [
+            ((2, 2), 0, (3, 2)),
+            ((2, 1), 0, (3, 3)),
+            ((1, 2), 0, (5, 2)),
+            ((2, 2), 2, (3, 2)),
+            ((2, 1), 4, (3, 3)),
+        ] {
+            let j = testkit::jpeg_flat_ycbcr(33, 17, luma, interval);
+            let src = Mem(j.clone());
+            assert_eq!(
+                decode_health(&mut Reader::new(&src), 0, j.len() as u64),
+                Health::Intact,
+                "{luma:?}/{interval}"
+            );
+            let (f, run) = decode_from_start(&j, j.len() as u64, true);
+            let hv = (u32::from(luma.0), u32::from(luma.1));
+            assert_eq!((f.mcus_x, f.mcus_y), mcus, "{luma:?}/{interval}");
+            assert_eq!(f.luma_blocks_per_mcu(), hv, "{luma:?}/{interval}");
+            assert_eq!(
+                run.end,
+                End::Eoi {
+                    at: j.len() as u64 - 2
+                },
+                "{luma:?}/{interval}"
+            );
+            assert_eq!(run.mcus, f.total_mcus());
+            assert_eq!(run.dc.len() as u64, f.total_mcus() * u64::from(hv.0 * hv.1));
+        }
+    }
+
+    /// Baseline 8×8 grayscale JPEG with the given DC and AC tables (`(counts, symbols)`) and entropy-coded `data`.
+    fn with_tables(dc: (&[u8; 16], &[u8]), ac: (&[u8; 16], &[u8]), data: &[u8]) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00];
+        v.extend_from_slice(&[1; 64]);
+        v.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x08, 0x00, 0x08, 0x01, 0x01, 0x11, 0x00,
+        ]);
+        for (class, (counts, vals)) in [(0x00, dc), (0x10, ac)] {
+            v.extend_from_slice(&[0xFF, 0xC4]);
+            v.extend_from_slice(&((19 + vals.len()) as u16).to_be_bytes());
+            v.push(class);
+            v.extend_from_slice(counts);
+            v.extend_from_slice(vals);
+        }
+        v.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        v.extend_from_slice(data);
+        v.extend_from_slice(&[0xFF, 0xD9]);
+        v
+    }
+
+    #[test]
+    fn impossible_symbols_are_errors() {
+        // Two codes of length 1 in each table: `0` and `1`.
+        let two = {
+            let mut c = [0u8; 16];
+            c[0] = 2;
+            c
+        };
+        // Control: DC `0` (category 0), AC `0` (EOB), 1-bit padding.
+        let ok = with_tables((&two, &[0, 12]), (&two, &[0x00, 0x0B]), &[0b0011_1111]);
+        let (_, run) = decode_from_start(&ok, ok.len() as u64, false);
+        assert_eq!(
+            run.end,
+            End::Eoi {
+                at: ok.len() as u64 - 2
+            }
+        );
+        for (what, dc_vals, ac_vals, byte) in [
+            ("DC category 12", [0, 12], [0x00, 0x0B], 0b1000_0000),
+            ("AC size 11", [0, 12], [0x00, 0x0B], 0b0100_0000),
+            (
+                "run/0 other than EOB and ZRL",
+                [0, 12],
+                [0x00, 0x10],
+                0b0100_0000,
+            ),
+        ] {
+            let j = with_tables((&two, &dc_vals), (&two, &ac_vals), &[byte]);
+            let (_, run) = decode_from_start(&j, j.len() as u64, false);
+            assert_eq!(run.end, End::Error { at: scan_start(&j) }, "{what}");
+            assert_eq!(run.mcus, 0, "{what}");
+        }
     }
 }

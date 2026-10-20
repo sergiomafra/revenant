@@ -907,20 +907,37 @@ impl BitWriter {
 /// byte by byte (every block: DC diff 0, EOB; RSTn every `interval` MCUs, byte-aligned with 1-bits). Strict-decodable.
 /// `interval == 0` means no DRI segment and no RST markers.
 pub fn jpeg_flat_with_restarts(width: u32, height: u32, interval: u16) -> Vec<u8> {
+    flat_jpeg(width, height, &[(1, 1)], interval)
+}
+
+/// Like [`jpeg_flat_with_restarts`], with three interleaved components (Y, Cb, Cr): Y sampled `luma` = `(h, v)` (each 1
+/// or 2), Cb and Cr 1×1, all coded with the standard luminance tables. Each MCU holds `h × v` Y blocks then one Cb and
+/// one Cr block. Strict-decodable, flat mid gray.
+pub fn jpeg_flat_ycbcr(width: u32, height: u32, luma: (u8, u8), interval: u16) -> Vec<u8> {
+    flat_jpeg(width, height, &[luma, (1, 1), (1, 1)], interval)
+}
+
+/// Flat baseline JPEG with the components sampled `(h, v)` each (ids 1, 2, ...), every one interleaved in one scan.
+fn flat_jpeg(width: u32, height: u32, comps: &[(u8, u8)], interval: u16) -> Vec<u8> {
     let (w, h) = (
         u16::try_from(width).expect("width fits a SOF"),
         u16::try_from(height).expect("height fits a SOF"),
     );
-    assert!(w > 0 && h > 0);
+    assert!(w > 0 && h > 0 && (1..=4).contains(&comps.len()));
     let mut out = vec![0xFF, 0xD8];
     // DQT: table 0, 8-bit, every step 1.
     out.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
     out.extend_from_slice(&[1; 64]);
-    // SOF0: 8-bit, one component (id 1, 1x1 sampling, quantization table 0).
-    out.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08]);
+    // SOF0: 8-bit, each component with its sampling and quantization table 0.
+    out.extend_from_slice(&[0xFF, 0xC0]);
+    out.extend_from_slice(&(8 + 3 * comps.len() as u16).to_be_bytes());
+    out.push(0x08);
     out.extend_from_slice(&h.to_be_bytes());
     out.extend_from_slice(&w.to_be_bytes());
-    out.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+    out.push(comps.len() as u8);
+    for (i, &(ch, cv)) in comps.iter().enumerate() {
+        out.extend_from_slice(&[i as u8 + 1, (ch << 4) | cv, 0x00]);
+    }
     for (class, bits, vals) in [
         (0x00, &STD_LUMA_DC_BITS, &STD_LUMA_DC_VALS[..]),
         (0x10, &STD_LUMA_AC_BITS, &STD_LUMA_AC_VALS[..]),
@@ -935,10 +952,30 @@ pub fn jpeg_flat_with_restarts(width: u32, height: u32, interval: u16) -> Vec<u8
         out.extend_from_slice(&[0xFF, 0xDD, 0x00, 0x04]);
         out.extend_from_slice(&interval.to_be_bytes());
     }
-    // SOS: one component, DC table 0, AC table 0, Ss 0, Se 63, Ah/Al 0.
-    out.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+    // SOS: every component, DC table 0, AC table 0, Ss 0, Se 63, Ah/Al 0.
+    out.extend_from_slice(&[0xFF, 0xDA]);
+    out.extend_from_slice(&(6 + 2 * comps.len() as u16).to_be_bytes());
+    out.push(comps.len() as u8);
+    for i in 0..comps.len() {
+        out.extend_from_slice(&[i as u8 + 1, 0x00]);
+    }
+    out.extend_from_slice(&[0x00, 0x3F, 0x00]);
 
-    let mcus = u64::from(w.div_ceil(8)) * u64::from(h.div_ceil(8));
+    // One component: one block per MCU over the image. Several: MCUs of 8·Hmax × 8·Vmax pixels.
+    let (mcus, blocks) = if comps.len() == 1 {
+        (u64::from(w.div_ceil(8)) * u64::from(h.div_ceil(8)), 1)
+    } else {
+        let h_max = u16::from(comps.iter().map(|c| c.0).max().unwrap());
+        let v_max = u16::from(comps.iter().map(|c| c.1).max().unwrap());
+        let mcus = u64::from(w.div_ceil(8 * h_max)) * u64::from(h.div_ceil(8 * v_max));
+        (
+            mcus,
+            comps
+                .iter()
+                .map(|&(ch, cv)| u32::from(ch) * u32::from(cv))
+                .sum(),
+        )
+    };
     let mut data = BitWriter::default();
     let mut restarts = 0u8;
     for m in 0..mcus {
@@ -947,8 +984,10 @@ pub fn jpeg_flat_with_restarts(width: u32, height: u32, interval: u16) -> Vec<u8
             data.out.extend_from_slice(&[0xFF, 0xD0 + restarts % 8]);
             restarts = restarts.wrapping_add(1);
         }
-        data.bits(0b00, 2); // DC category 0 (difference 0)
-        data.bits(0b1010, 4); // AC end of block
+        for _ in 0..blocks {
+            data.bits(0b00, 2); // DC category 0 (difference 0)
+            data.bits(0b1010, 4); // AC end of block
+        }
     }
     data.align();
     out.extend(data.out);
@@ -1329,6 +1368,18 @@ mod flat_jpeg_tests {
                 (mcus - 1) / u32::from(interval)
             };
             assert_eq!(rst as u32, expected, "{w}x{h}/{interval}");
+        }
+    }
+
+    #[test]
+    fn subsampled_flat_jpeg_decodes_to_mid_gray() {
+        for (luma, interval) in [((2, 2), 0), ((2, 1), 0), ((2, 2), 2), ((1, 2), 3)] {
+            let bytes = jpeg_flat_ycbcr(33, 17, luma, interval);
+            let img = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+                .expect("decodes")
+                .to_rgb8();
+            assert_eq!(img.dimensions(), (33, 17));
+            assert!(img.pixels().all(|p| p.0 == [128; 3]), "{luma:?}/{interval}");
         }
     }
 }

@@ -102,6 +102,103 @@ fn cut_after_the_first_mcu_row_is_partial() {
     assert_eq!(cut_by_next_file(12_000).health, Health::Partial);
 }
 
+/// `jpeg(640, 480, 5, 0)` keeping its header and `scan_bytes` of scan data, then `gap` bytes of `fill` (rounded up to
+/// the next sector), then `jpeg(64, 64, 6, 0)`; or, with `next_file == false`, `fill` to the end of the source.
+fn cut_then_gap(scan_bytes: usize, fill: u8, gap: usize, next_file: bool) -> Measurement {
+    let j1 = testkit::jpeg(640, 480, 5, 0);
+    let j2 = testkit::jpeg(64, 64, 6, 0);
+    let start = 4096usize;
+    let kept = scan_data_start(&j1) + scan_bytes;
+    let next = (start + kept + gap).div_ceil(512) * 512;
+    let mut image = DiskImage::zeros(next + if next_file { 1 << 20 } else { 0 });
+    image.put(start, &j1[..kept]);
+    image.put(start + kept, &vec![fill; next - start - kept]);
+    if next_file {
+        image.put(next, &j2);
+    }
+    let img = image.save();
+    let m = measure(&img, start as u64).unwrap();
+    assert_eq!(m.len, (next - start) as u64);
+    m
+}
+
+#[test]
+fn header_only_jpeg_followed_by_uniform_bytes_is_damaged() {
+    // Erased or TRIMmed space reads as 00 (so do unreadable sectors): it decodes as valid blocks under the standard
+    // tables, but it is not the photo.
+    for (fill, gap, next_file) in [
+        (0x00, 4096, true),
+        (0x00, 64 << 10, true),
+        (0x55, 64 << 10, true),
+        (0xFF, 64 << 10, true),
+        (0x00, 256 << 10, false),
+    ] {
+        let m = cut_then_gap(100, fill, gap, next_file);
+        assert_eq!(
+            m.health,
+            Health::Damaged,
+            "{fill:#x} x {gap}, next file {next_file}"
+        );
+    }
+}
+
+#[test]
+fn cut_file_with_a_row_before_a_uniform_gap_stays_partial() {
+    for fill in [0x00, 0x55] {
+        assert_eq!(
+            cut_then_gap(12_000, fill, 64 << 10, true).health,
+            Health::Partial,
+            "{fill:#x}"
+        );
+    }
+}
+
+/// Fails every read that touches `[bad_start, bad_end)`.
+struct Unreadable {
+    inner: FileSource,
+    bad_start: u64,
+    bad_end: u64,
+}
+
+impl revenant_core::source::Source for Unreadable {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, revenant_core::EngineError> {
+        if offset < self.bad_end && offset + buf.len() as u64 > self.bad_start {
+            return Err(revenant_core::EngineError::Read {
+                offset,
+                cause: std::io::Error::other("injected"),
+            });
+        }
+        self.inner.read_at(offset, buf)
+    }
+    fn volume(&self) -> Option<revenant_core::source::VolumeId> {
+        None
+    }
+}
+
+#[test]
+fn header_only_jpeg_followed_by_unreadable_sectors_is_damaged() {
+    // The header and 100 bytes of scan data, then real scan data on sectors that cannot be read, then another photo.
+    let j1 = testkit::jpeg(640, 480, 5, 0);
+    let j2 = testkit::jpeg(64, 64, 6, 0);
+    let start = 4096usize;
+    let first_bad = (start + scan_data_start(&j1) + 100).div_ceil(512) * 512;
+    let next = first_bad + (64 << 10);
+    let img = DiskImage::zeros(next + (1 << 20))
+        .put(start, &j1[..next - start])
+        .put(next, &j2)
+        .save();
+    let source = Unreadable {
+        inner: FileSource::open(img.path()).unwrap(),
+        bad_start: first_bad as u64,
+        bad_end: next as u64,
+    };
+    let m = Jpeg.measure(&source, start as u64).unwrap();
+    assert_eq!((m.len, m.health), ((next - start) as u64, Health::Damaged));
+}
+
 #[test]
 fn header_only_jpeg_cut_by_end_of_source_is_damaged() {
     let j = testkit::jpeg(640, 480, 7, 0);

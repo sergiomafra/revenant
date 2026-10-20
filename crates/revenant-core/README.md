@@ -76,12 +76,15 @@ not end the file; DAC and JPG markers count as segments, and `FF` fill bytes bef
   verifiable").
   Also `Partial`: a DAC segment (arithmetic coding) with complete structure, which `zune-jpeg` cannot decode.
 - `Damaged`: EOI found but neither decode succeeds. The length is still exact. Also `Damaged`: a cut file (no EOI, as
-  above) whose entropy-coded data does not hold one full row of MCUs before its first error or the cut, such as a JPEG cut
-  right after its header: nothing of the photo would show. The length is still where the file was cut.
+  above) whose entropy-coded data does not hold one full row of MCUs before its first error, the cut, or the first
+  512-byte sector of one repeated byte value or unreadable sector, such as a JPEG cut right after its header and followed
+  by erased (zero-filled) space: nothing of the photo would show. Zeros decode as valid blocks under the standard
+  Huffman tables, so they are not counted as the photo's data. The length is still where the file was cut.
 
 A cut file is judged by Revenant's own entropy decoder (`formats/jpeg_entropy.rs`, written from ITU-T T.81): it covers
 sequential Huffman JPEGs (SOF0/SOF1, 8-bit, 1–4 components all in one scan, sampling factors ≤ 2, at most 210 megapixels,
-every referenced table defined; DRI restart markers checked in sequence) and decodes no pixels, only the Huffman-coded
+every referenced table defined; DRI restart markers checked in sequence; a run/0 symbol other than EOB and ZRL, a DC
+category over 11 or an AC size over 10 is an error) and decodes no pixels, only the Huffman-coded
 blocks, counting complete MCUs exactly; it stops at the first row. Any other cut JPEG (progressive, arithmetic, 12-bit, a
 header it cannot parse) stays `Partial` as before. On hostile data every loop is bounded by the frame's MCU count, 64
 coefficients per block, 16 bits per code and the bytes up to the cut; a DHT whose code lengths cannot form a prefix code is

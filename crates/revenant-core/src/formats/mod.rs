@@ -417,9 +417,9 @@ pub(crate) mod tests {
     }
 
     /// Fails every read that touches the sector at `bad`.
-    struct BadSector {
-        inner: Mem,
-        bad: u64,
+    pub(crate) struct BadSector {
+        pub(crate) inner: Mem,
+        pub(crate) bad: u64,
     }
 
     impl Source for BadSector {
