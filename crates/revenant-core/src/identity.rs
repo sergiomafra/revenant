@@ -15,6 +15,8 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x100_0000_01b3;
 /// The GPT's sectors after a protective MBR: header (1) and entries (2..=33).
 const GPT_SECTORS: u64 = 33;
+/// Largest logical sector believed (as the geometry parsers): bounds the identity reads.
+const MAX_SECTOR: u64 = 1 << 16;
 /// The MBR partition type of a protective MBR.
 const GPT_PROTECTIVE: u8 = 0xEE;
 
@@ -43,12 +45,12 @@ pub enum SourceIdentity {
 impl SourceIdentity {
     /// A device's identity (D7, P7, P20). `table` is always computed: the FNV-1a 64 of sector 0, of sectors 1..=33 when
     /// sector 0 is a protective MBR (a GPT), and of the boot sector of the first volume the partition table names, each
-    /// a logical sector of `info.geometry`. The bytes the system rewrites while a FAT or exFAT volume is mounted are
-    /// zeroed first (FAT12/16 byte 37, FAT32 byte 65, exFAT 106, 107 and 112; also in sector 0 when it is itself the
+    /// a logical sector of `info.geometry` (taken as 512 B to 64 KiB). The bytes the system rewrites while a FAT or
+    /// exFAT volume is mounted are zeroed first (FAT12/16 byte 37, FAT32 byte 65, exFAT 106, 107 and 112; also in sector 0 when it is itself the
     /// boot sector), so mounting the card does not change it. An unreadable sector counts as zeros; a device that is
     /// gone fails with `device_gone`.
     pub fn of_device(info: &DiskInfo, source: &dyn Source) -> Result<SourceIdentity, EngineError> {
-        let sector = u64::from(info.geometry.logical_sector).max(512);
+        let sector = u64::from(info.geometry.logical_sector).clamp(512, MAX_SECTOR);
         let mut s0 = read_lenient(source, 0, sector)?;
         let boot_at_zero = !volatile_boot_bytes(&s0).is_empty();
         zero_volatile(&mut s0);
@@ -257,6 +259,13 @@ mod tests {
         let mbr = card(Partitioning::Mbr { first_lba: 2048 });
         let bad = SimSource::new(mbr.clone()).bad(MIB, 512);
         assert!(SourceIdentity::of_device(&info(16 * MIB, None), &bad).is_ok());
+        // An implausible sector size is capped at 64 KiB: the reads stay bounded.
+        let mut huge = info(16 * MIB, None);
+        huge.geometry.logical_sector = 1 << 30;
+        let capped = SimSource::new(card(Partitioning::Gpt { first_lba: 2048 }));
+        assert!(SourceIdentity::of_device(&huge, &capped).is_ok());
+        let most = capped.reads().iter().map(|&(_, l)| l).max().unwrap();
+        assert_eq!(most, 33 << 16, "{:?}", capped.reads());
         let gone = SimSource::new(mbr).gone_at(MIB);
         let err = SourceIdentity::of_device(&info(16 * MIB, None), &gone).unwrap_err();
         assert_eq!(err.code(), "device_gone");

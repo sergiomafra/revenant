@@ -100,13 +100,15 @@ Windows; elsewhere every call is `unsupported_platform`). `destination` needs no
   disk. The system disk is the one holding `/`: the `ParentWholeDisk` of `diskutil info -plist /` and the disks of its
   `APFSPhysicalStores`. `removable` is `Removable` or `RemovableMedia`, `internal` is `Internal`, `solid_state` is
   `SolidState`, and an image attached with `hdiutil` (`VirtualOrPhysical` `Virtual`, bus `Disk Image`) is `virtual_disk`.
-  A disk whose info cannot be read (it left meanwhile) is left out; the list, the info of `/` or `ioreg` failing fails
-  the listing with `system_tool_failed`.
+  A disk whose info cannot be read (it left meanwhile) is left out; the list, the info of `/` (or one naming no disk) or
+  `ioreg` failing fails the listing with `system_tool_failed`: a listing never silently shows no system disk.
 - Windows: `\\.\PhysicalDrive0` to `63`, opened without read access (queries only): `IOCTL_STORAGE_QUERY_PROPERTY` (vendor,
   product, serial, removable media, bus type; the seek penalty for `solid_state`), the drive geometry and the access
   alignment. Every volume (`FindFirstVolumeW`/`FindNextVolumeW`) is attached to the disks of its extents
   (`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`), with its file system and label (`GetVolumeInformationW`) and first mount point.
-  The system disk holds the volume of `%SystemDrive%`; a dynamic volume spanning several disks marks them all. USB, SD,
+  The system disk holds the volume of the Windows folder (`GetSystemWindowsDirectoryW`, not an environment variable); a
+  dynamic volume spanning several disks marks them all, and a system volume that cannot be found or has no extent fails
+  the listing (`open_failed`). A destination volume with more extents than the 64 read is refused, never half-checked. USB, SD,
   MMC and 1394 buses are external, virtual buses (a VHD) are `virtual_disk`.
 
 ### Destination
@@ -121,6 +123,11 @@ and later the copy and the session, write only into a `Destination`. The folder 
   on an APFS volume whose store is a partition of the card is refused too;
 - for a device source, when those disks cannot be told (a network folder, a failed query, no disk) the folder is refused
   with `destination_unknown`: it could be the card itself, and nothing is ever written to the card being recovered.
+
+The folder is resolved first (`std::fs::canonicalize`: symbolic links, and junctions on Windows, are followed), and the
+rules and every later write use the resolved folder, so a link pointing into the card is judged as the card;
+`extract_to` also refuses (`destination_on_source`) when the folder is no longer on the volume it was checked on. Known
+limit: a folder inside a mounted disk image (DMG, VHD) whose backing file lives on the card is not detected.
 
 An image source (`disk()` is `None`) only gets the volume rule; `ops` is not called. `dir()` is the folder and `info()`
 what it lives on (`None` for an image source). On macOS `destination` runs `df -P -k <dir>` (the volume's node and the
@@ -1272,7 +1279,9 @@ nothing is ever overwritten, on case-sensitive and case-insensitive volumes alik
 
 `extract_to(source, &Finding, &Destination, name)` writes into a folder already checked with `Destination::check` (see
 [Destination](#destination)); `extract_as` is `Destination::check(&SystemDevices, ..)` followed by `extract_to`, so it checks
-on every call (cheap for an image; with a device source it asks the system each time, so check once and use `extract_to`).
+on every call (cheap for an image; with a device source it asks the system each time, so check once and use `extract_to`). The
+returned path lies in the resolved folder (links followed: on macOS a temporary folder under `/var` comes back under
+`/private/var`).
 
 - Refuses with `destination_on_source` when the destination is on the source's volume (writing to a damaged card could destroy
   what is still recoverable) or, for a device source, on any volume of that device; with a device source a destination

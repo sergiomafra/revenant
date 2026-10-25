@@ -119,7 +119,7 @@ pub(crate) fn confirm(bsd: &str, before: &Plist) -> Result<(), EngineError> {
 
 /// The connected whole disks (ruling D8): `diskutil list -plist`, `diskutil info -plist` of each whole disk and its
 /// partitions, `diskutil info -plist /`, one `ioreg`. A disk or partition whose info fails (it left meanwhile) is left
-/// out; the list, the root info and `ioreg` failing fail the listing.
+/// out; the list, the root info (or one naming no disk) and `ioreg` failing fail the listing.
 pub(crate) fn list() -> Result<Vec<DiskInfo>, EngineError> {
     let list = plist_of(DISKUTIL, &["list", "-plist"])?;
     let mut infos = BTreeMap::new();
@@ -136,7 +136,9 @@ pub(crate) fn list() -> Result<Vec<DiskInfo>, EngineError> {
     }
     let root = info("/")?;
     let ioreg = ioreg()?;
-    Ok(macos_parse::disks(&list, &infos, &root, Some(&ioreg)))
+    // A root info naming no disk fails the listing rather than show no system disk.
+    macos_parse::disks(&list, &infos, &root, Some(&ioreg))
+        .ok_or(EngineError::SystemTool { tool: DISKUTIL })
 }
 
 /// Where `dir` lives (ruling D12): `df -P -k` names the volume's node and free space, `diskutil info -plist <node>` its

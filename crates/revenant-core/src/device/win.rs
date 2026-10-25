@@ -12,14 +12,19 @@ use crate::source::windows as platform;
 const MAX_DRIVE: u32 = 63;
 
 /// The connected whole disks (ruling D9): `\\.\PhysicalDrive0..=63` queried without read access, every volume with its
-/// extents, and the volume of `%SystemDrive%` for the system disk.
+/// extents, and the volume of the Windows folder (`GetSystemWindowsDirectoryW`) for the system disk. Fails (`open_failed`)
+/// when the system volume or its disks cannot be told: a listing never silently shows no system disk.
 pub(crate) fn list() -> Result<Vec<DiskInfo>, EngineError> {
     let disks: Vec<_> = (0..=MAX_DRIVE).filter_map(platform::disk_raw).collect();
     let volumes = platform::volumes_raw();
-    let system = std::env::var("SystemDrive")
-        .ok()
-        .and_then(|drive| platform::volume_name_of(Path::new(&format!(r"{drive}\"))));
-    Ok(win_parse::disks(&disks, &volumes, system.as_deref()))
+    let windows =
+        platform::system_windows_directory().map_err(|cause| EngineError::Open { cause })?;
+    let system = platform::volume_name_of(&windows).ok_or_else(|| EngineError::Open {
+        cause: io::Error::other("the system volume cannot be told"),
+    })?;
+    win_parse::disks(&disks, &volumes, &system).ok_or_else(|| EngineError::Open {
+        cause: io::Error::other("the system volume has no disk extents"),
+    })
 }
 
 /// Where `dir` lives (ruling D12): its volume's extents, file system and free space. A folder without disk extents (a

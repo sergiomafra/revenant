@@ -398,9 +398,11 @@ impl FakeDevices {
         }
     }
 
-    /// What `destination(dir)` answers for `dir` and any folder inside it (the longest matching `dir` wins): the info, or
-    /// the error with that code. A folder never set answers `system_tool_failed`.
+    /// What `destination(dir)` answers for `dir` (resolved, when it exists) and any folder inside it (the longest matching
+    /// `dir` wins): the info, or the error with that code. A folder never set answers `system_tool_failed`.
     pub fn set_destination(&self, dir: &Path, answer: Result<DestInfo, &'static str>) {
+        // Stored resolved, as `Destination::check` asks about resolved folders (`/var` is `/private/var` on macOS).
+        let dir = &std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let mut st = self.lock();
         st.destinations.retain(|(d, _)| d != dir);
         st.destinations.push((dir.to_path_buf(), answer));
@@ -427,7 +429,13 @@ impl FakeDevices {
 impl DeviceOps for FakeDevices {
     fn list(&self) -> Result<Vec<DiskInfo>, EngineError> {
         self.note("list".into());
-        Ok(self.lock().disks.values().map(|d| d.info.clone()).collect())
+        let mut disks: Vec<DiskInfo> = self.lock().disks.values().map(|d| d.info.clone()).collect();
+        // Sorted by number, as `DeviceOps::list` promises (`disk2` before `disk10`).
+        disks.sort_by(|a, b| {
+            let (a, b) = (a.id.as_str(), b.id.as_str());
+            (a.len(), a).cmp(&(b.len(), b))
+        });
+        Ok(disks)
     }
 
     fn open(&self, disk: &DiskId) -> Result<Box<dyn RawDevice>, EngineError> {

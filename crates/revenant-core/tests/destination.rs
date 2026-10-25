@@ -52,11 +52,12 @@ fn destination_on_the_source_disk_is_refused() {
     // Another disk: accepted, with what it lives on.
     fake.set_destination(dir.path(), Ok(dest(&["disk2"])));
     let ok = Destination::check(&fake, &source, dir.path()).unwrap();
-    assert_eq!(ok.dir(), dir.path());
+    assert_eq!(ok.dir(), std::fs::canonicalize(dir.path()).unwrap());
     assert_eq!(ok.info(), Some(&dest(&["disk2"])));
+    let resolved = std::fs::canonicalize(dir.path()).unwrap();
     assert!(
         fake.log()
-            .contains(&format!("destination {}", dir.path().display()))
+            .contains(&format!("destination {}", resolved.display()))
     );
 
     // The same through a device opened from the fake system: DeviceSource names its disk.
@@ -66,6 +67,36 @@ fn destination_on_the_source_disk_is_refused() {
     assert_eq!(
         check_code(&fake, &device, dir.path()),
         "destination_on_source"
+    );
+}
+
+/// A folder that is a link into the card is judged (and written) as the card: the check resolves links first.
+#[cfg(unix)]
+#[test]
+fn a_link_into_the_source_disk_is_refused() {
+    let card = tempfile::tempdir().unwrap();
+    let card_dir = std::fs::canonicalize(card.path()).unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let home_dir = std::fs::canonicalize(home.path()).unwrap();
+    let fake = FakeDevices::new();
+    fake.set_destination(&card_dir, Ok(dest(&["disk4"])));
+    fake.set_destination(&home_dir, Ok(dest(&["disk2"])));
+    let source = SimSource::zeros(MIB).disk("disk4");
+    let link = home_dir.join("out");
+    std::os::unix::fs::symlink(&card_dir, &link).unwrap();
+    assert_eq!(check_code(&fake, &source, &link), "destination_on_source");
+    // A link to another folder of the computer's disk is fine, and the destination is the resolved folder.
+    let elsewhere = home_dir.join("photos");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let link2 = home_dir.join("to-photos");
+    std::os::unix::fs::symlink(&elsewhere, &link2).unwrap();
+    let ok = Destination::check(&fake, &source, &link2).unwrap();
+    assert_eq!(ok.dir(), elsewhere);
+    assert!(
+        fake.log()
+            .contains(&format!("destination {}", elsewhere.display())),
+        "{:?}",
+        fake.log()
     );
 }
 
@@ -126,7 +157,10 @@ fn image_sources_keep_the_volume_rule() {
     let before = extract(&source, &finding, other.path()).unwrap();
     assert_eq!(std::fs::read(&to).unwrap(), jpeg);
     assert_eq!(std::fs::read(&to).unwrap(), std::fs::read(before).unwrap());
-    assert_eq!(to, dir.path().join("photo.jpg"));
+    assert_eq!(
+        to,
+        std::fs::canonicalize(dir.path()).unwrap().join("photo.jpg")
+    );
 
     // A folder on the image file's own volume: refused, still without asking the system.
     let file = FileSource::open(img.path()).unwrap();
@@ -141,12 +175,17 @@ fn fake_devices_serve_virtual_disks() {
     let eight_gib = 8u64 << 30;
     fake.add_virtual(disk_info("disk7", eight_gib), vec![0xAB; 4096]);
     fake.add(disk_info("disk3", 0), vec![1u8; 8192]);
+    fake.add(disk_info("disk10", 0), vec![2u8; 512]);
     let listed = fake.list().unwrap();
     let sizes: Vec<(&str, u64)> = listed
         .iter()
         .map(|d| (d.id.as_str(), d.geometry.size))
         .collect();
-    assert_eq!(sizes, [("disk3", 8192), ("disk7", eight_gib)]);
+    assert_eq!(
+        sizes,
+        [("disk3", 8192), ("disk7", eight_gib), ("disk10", 512)],
+        "sorted by number"
+    );
     let device = DeviceSource::new(fake.open(&id("disk7")).unwrap(), id("disk7"));
     assert_eq!(device.len(), eight_gib);
     let mut buf = [7u8; 10];
@@ -155,7 +194,7 @@ fn fake_devices_serve_virtual_disks() {
     assert_eq!(device.read_at(eight_gib - 4, &mut buf).unwrap(), 4);
     // Removed: gone from the list, and the open device reads DeviceGone.
     fake.remove("disk7");
-    assert_eq!(fake.list().unwrap().len(), 1);
+    assert_eq!(fake.list().unwrap().len(), 2);
     assert!(matches!(
         device.read_at(0, &mut buf),
         Err(EngineError::DeviceGone { .. })

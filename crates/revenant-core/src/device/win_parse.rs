@@ -128,18 +128,22 @@ fn same_volume(a: &str, b: &str) -> bool {
 
 /// The connected whole disks (ruling D9): each queried disk with the volumes that have an extent on it (a dynamic volume
 /// spanning several disks is listed under each), in volume order. The system disks are those holding an extent of
-/// `system_volume` (the volume GUID path of `%SystemDrive%`), so a system volume spanning disks marks them all. Sorted
-/// by id.
+/// `system_volume` (the volume GUID path of the Windows folder's volume), so a system volume spanning disks marks them
+/// all. Sorted by id. `None` when the system volume is not among `volumes` or has no extent: the system disk must
+/// never silently go unmarked.
 pub(crate) fn disks(
     raw: &[WinDiskRaw],
     volumes: &[WinVolumeRaw],
-    system_volume: Option<&str>,
-) -> Vec<DiskInfo> {
+    system_volume: &str,
+) -> Option<Vec<DiskInfo>> {
     let system: Vec<u32> = volumes
         .iter()
-        .filter(|v| system_volume.is_some_and(|s| same_volume(&v.name, s)))
+        .filter(|v| same_volume(&v.name, system_volume))
         .flat_map(|v| v.extents.iter().map(|e| e.disk))
         .collect();
+    if system.is_empty() {
+        return None;
+    }
     let mut out: Vec<DiskInfo> = Vec::new();
     for d in raw {
         let Some(id) = drive(d.number) else { continue };
@@ -174,7 +178,7 @@ pub(crate) fn disks(
         });
     }
     sort_disks(&mut out);
-    out
+    Some(out)
 }
 
 /// Where a folder lives (ruling D12): the disks of its volume's extents, its file system (`FAT`/`FAT32` cap a file at
@@ -266,7 +270,7 @@ mod tests {
             ),
         ];
         let system = r"\\?\VOLUME{SYS}";
-        let listed = disks(&raw, &volumes, Some(system));
+        let listed = disks(&raw, &volumes, system).unwrap();
         let ids: Vec<&str> = listed.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -307,15 +311,18 @@ mod tests {
         assert!(!d3.system && !d4.system);
 
         // A system volume spanning two disks marks both (D9).
-        let disks2 = disks(&raw, &volumes, Some(r"\\?\Volume{span}\"));
+        let disks2 = disks(&raw, &volumes, r"\\?\Volume{span}\").unwrap();
         let system: Vec<&str> = disks2
             .iter()
             .filter(|d| d.system)
             .map(|d| d.id.as_str())
             .collect();
         assert_eq!(system, ["PhysicalDrive3", "PhysicalDrive4"]);
-        // No system volume known: nothing is the system disk.
-        assert!(disks(&raw, &volumes, None).iter().all(|d| !d.system));
+        // A system volume that is not listed, or has no extent: no listing (never a list without its system disk).
+        assert_eq!(disks(&raw, &volumes, r"\\?\Volume{gone}\"), None);
+        let mut no_extents = volumes.clone();
+        no_extents[0].extents.clear();
+        assert_eq!(disks(&raw, &no_extents, r"\\?\Volume{sys}\"), None);
     }
 
     #[test]

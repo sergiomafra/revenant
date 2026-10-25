@@ -8,7 +8,7 @@ use crate::EngineError;
 use crate::device::{DestInfo, DeviceOps, SystemDevices};
 use crate::naming::{fallback_name, file_name, is_unsafe_char, sanitize, split_name};
 use crate::scan::Finding;
-use crate::source::{Source, read_full, volume_of};
+use crate::source::{Source, VolumeId, read_full, volume_of};
 
 /// Copy granularity.
 const CHUNK: usize = 1024 * 1024;
@@ -36,20 +36,26 @@ pub fn extract(
 /// written to while it is being recovered, through any of its volumes. For a device source whose destination disks cannot
 /// be determined (a network folder, a failed query) the folder is refused too (`destination_unknown`): it could be the
 /// card. An image source (`disk()` is `None`) only gets the volume rule, and `ops` is not called.
+///
+/// The folder is resolved first (`std::fs::canonicalize`: symbolic links and, on Windows, junctions followed), and both
+/// rules and every later write use the resolved folder: a link pointing into the card is judged, and written, as the
+/// card.
 #[derive(Clone, Debug)]
 pub struct Destination {
     dir: PathBuf,
+    volume: VolumeId,
     info: Option<DestInfo>,
 }
 
 impl Destination {
-    /// Checks `dir` (an existing folder) against `source`. Errors: `open_failed` (the folder cannot be opened),
-    /// `destination_on_source`, `destination_unknown`.
+    /// Checks `dir` (an existing folder) against `source`. Errors: `open_failed` (the folder cannot be resolved or
+    /// opened), `destination_on_source`, `destination_unknown`.
     pub fn check(
         ops: &dyn DeviceOps,
         source: &dyn Source,
         dir: &Path,
     ) -> Result<Destination, EngineError> {
+        let dir = &std::fs::canonicalize(dir).map_err(|cause| EngineError::Open { cause })?;
         let dest_volume = volume_of(dir)?;
         if source.volume() == Some(dest_volume) {
             return Err(EngineError::DestinationOnSource);
@@ -71,10 +77,12 @@ impl Destination {
         };
         Ok(Destination {
             dir: dir.to_path_buf(),
+            volume: dest_volume,
             info,
         })
     }
 
+    /// The resolved folder (links followed).
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -87,7 +95,8 @@ impl Destination {
 
 /// Copies the finding's bytes into the checked destination under [`sanitize`]`(name)` (`revenant_<start as 12 hex
 /// digits>.<ext>` when nothing is left of it), then `<stem>_2.<ext>`, `<stem>_3.<ext>`… when the name is taken (10,000
-/// tries; never overwrites).
+/// tries; never overwrites). Refuses (`destination_on_source`) when the folder is no longer on the volume it was checked
+/// on.
 ///
 /// The file is created with `create_new`, so a taken name is detected by the volume itself: it is right on case-sensitive
 /// and case-insensitive volumes alike and for different Unicode forms of one name. The result is always a single
@@ -104,6 +113,10 @@ pub fn extract_to(
     dest: &Destination,
     name: &str,
 ) -> Result<PathBuf, EngineError> {
+    // The folder must still be on the volume it was checked on (it could have been replaced since).
+    if volume_of(dest.dir())? != dest.volume {
+        return Err(EngineError::DestinationOnSource);
+    }
     let (path, mut file) = create_named(dest.dir(), finding, name, None)?;
     if let Err(e) = copy(source, finding, &mut file) {
         drop(file);

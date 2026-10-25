@@ -25,6 +25,7 @@ use windows_sys::Win32::System::Ioctl::{
     STORAGE_PROPERTY_QUERY, StorageAccessAlignmentProperty, StorageDeviceProperty,
     StorageDeviceSeekPenaltyProperty,
 };
+use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 
 use super::Geometry;
 use crate::device::win_parse::{self, WinDestRaw, WinDiskRaw, WinExtent, WinVolumeRaw};
@@ -287,7 +288,9 @@ fn volume_information(root: &OsStr) -> (Option<String>, Option<String>) {
 
 /// The disk extents of the volume `\\?\Volume{…}\` (`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` on the volume opened for
 /// queries only, without the trailing backslash); empty when it has none (a CD, a network volume) or does not answer.
-fn volume_extents(name: &str) -> Vec<WinExtent> {
+/// With more extents than [`MAX_EXTENTS`] (`ERROR_MORE_DATA`), the first ones when `partial` is allowed (a listing), else
+/// none (a destination check fails closed rather than miss a disk).
+fn volume_extents(name: &str, partial: bool) -> Vec<WinExtent> {
     let Ok(file) = open_query(Path::new(name.trim_end_matches('\\'))) else {
         return Vec::new();
     };
@@ -295,7 +298,9 @@ fn volume_extents(name: &str) -> Vec<WinExtent> {
     match ioctl::<(), _>(&file, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, None, &mut buf) {
         Ok(_) => win_parse::extents(&buf),
         // More extents than the buffer holds: the first ones are there.
-        Err(e) if e.raw_os_error() == Some(ERROR_MORE_DATA as i32) => win_parse::extents(&buf),
+        Err(e) if partial && e.raw_os_error() == Some(ERROR_MORE_DATA as i32) => {
+            win_parse::extents(&buf)
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -338,7 +343,7 @@ pub(crate) fn volumes_raw() -> Vec<WinVolumeRaw> {
                 fs,
                 label,
                 mount_point: mount_point(&name),
-                extents: volume_extents(&name),
+                extents: volume_extents(&name, true),
                 name,
             });
         }
@@ -378,8 +383,20 @@ pub(crate) fn dest_raw(dir: &Path) -> io::Result<WinDestRaw> {
     Ok(WinDestRaw {
         fs,
         free_bytes: free,
-        extents: volume_extents(&name),
+        extents: volume_extents(&name, false),
     })
+}
+
+/// The Windows folder of the running system (`GetSystemWindowsDirectoryW`, `C:\Windows`): the system disk holds its
+/// volume. Does not depend on environment variables (a privileged helper may run with a sanitized environment).
+pub(crate) fn system_windows_directory() -> io::Result<PathBuf> {
+    let mut buf = [0u16; NAME_LEN];
+    // SAFETY: `buf` is a writable buffer of exactly `NAME_LEN` UTF-16 units, the length passed.
+    let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), NAME_LEN as u32) };
+    if n == 0 || n as usize >= NAME_LEN {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(PathBuf::from(until_nul(&buf)))
 }
 
 #[cfg(test)]

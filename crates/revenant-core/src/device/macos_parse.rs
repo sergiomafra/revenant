@@ -165,14 +165,18 @@ pub(crate) fn partition_ids(entry: &Plist) -> Vec<&str> {
 
 /// The connected whole disks (ruling D8) from `diskutil list -plist`, the `diskutil info -plist` of each whole disk and
 /// partition (`infos`, by id), `diskutil info -plist /` (`root`) and the `ioreg` plist. A whole disk without its info or
-/// a plausible geometry is left out; a partition without info keeps what the list says. Sorted by id.
+/// a plausible geometry is left out; a partition without info keeps what the list says. Sorted by id. `None` when `root`
+/// names no disk: the system disk must never silently go unmarked.
 pub(crate) fn disks(
     list: &Plist,
     infos: &BTreeMap<String, Plist>,
     root: &Plist,
     ioreg: Option<&Plist>,
-) -> Vec<DiskInfo> {
+) -> Option<Vec<DiskInfo>> {
     let system = disks_of(root);
+    if system.is_empty() {
+        return None;
+    }
     let mut out = Vec::new();
     for entry in whole_disks(list) {
         let Some(bsd) = entry.get("DeviceIdentifier").and_then(Plist::as_str) else {
@@ -215,7 +219,7 @@ pub(crate) fn disks(
         });
     }
     sort_disks(&mut out);
-    out
+    Some(out)
 }
 
 /// A partition of a `diskutil list` entry, completed by its `diskutil info` when there is one.
@@ -356,7 +360,7 @@ mod tests {
         let list = parse(LIST).unwrap();
         let root = parse(INFO_ROOT).unwrap();
         let ioreg = parse(IOREG).unwrap();
-        let listed = disks(&list, &infos(), &root, Some(&ioreg));
+        let listed = disks(&list, &infos(), &root, Some(&ioreg)).unwrap();
         let ids: Vec<&str> = listed.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(ids, ["disk0", "disk2"]);
         let (d0, d2) = (&listed[0], &listed[1]);
@@ -387,19 +391,26 @@ mod tests {
         );
 
         // Without ioreg: no serial, the model from MediaName; the system disk is still found.
-        let plain = disks(&list, &infos(), &root, None);
+        let plain = disks(&list, &infos(), &root, None).unwrap();
         assert_eq!(plain[0].serial, None);
         assert_eq!(plain[0].model.as_deref(), Some("APPLE SSD AP1024N"));
         assert!(plain[0].system);
         // Another root (on disk2) moves the system flag.
         let root2 = parse(INFO_EXFAT_VOLUME).unwrap();
-        let moved = disks(&list, &infos(), &root2, None);
+        let moved = disks(&list, &infos(), &root2, None).unwrap();
         assert!(!moved[0].system && moved[1].system);
         // A whole disk without info is left out; garbage lists nothing.
         let mut some = infos();
         some.remove("disk0");
-        assert_eq!(disks(&list, &some, &root, None).len(), 1);
-        assert!(disks(&Plist::Bool(true), &infos(), &root, None).is_empty());
+        assert_eq!(disks(&list, &some, &root, None).unwrap().len(), 1);
+        assert_eq!(
+            disks(&Plist::Bool(true), &infos(), &root, None),
+            Some(Vec::new())
+        );
+        // A root info naming no disk (no ParentWholeDisk, no physical store): no listing, never one without a system disk.
+        let orphan = without(&root, &["ParentWholeDisk", "APFSPhysicalStores"]);
+        assert_eq!(disks(&list, &infos(), &orphan, None), None);
+        assert_eq!(disks(&list, &infos(), &Plist::Bool(true), None), None);
     }
 
     #[test]

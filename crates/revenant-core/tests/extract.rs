@@ -307,7 +307,11 @@ fn extract_as_names_the_file_and_falls_back() {
     let p = extract_as(&f.source, &f.finding, dir.path(), "..").unwrap();
     assert_eq!(p.file_name().unwrap(), "revenant_000000001000.jpg");
     let p = extract_as(&f.source, &f.finding, dir.path(), "../../evil.jpg").unwrap();
-    assert_eq!(p.parent().unwrap(), dir.path());
+    // Written through the resolved folder (`/var` is `/private/var` on macOS).
+    assert_eq!(
+        p.parent().unwrap(),
+        std::fs::canonicalize(dir.path()).unwrap()
+    );
     assert_eq!(p.file_name().unwrap(), "_.._evil.jpg");
 }
 
@@ -404,7 +408,8 @@ fn hostile_names_stay_inside_the_destination() {
         let before = names_in(root.path());
         for f in &found {
             let p = extract(&source, f, &dest).unwrap();
-            assert_eq!(p.parent().unwrap(), dest, "{ty:?} {:?}", f.origin);
+            let resolved = std::fs::canonicalize(&dest).unwrap();
+            assert_eq!(p.parent().unwrap(), resolved, "{ty:?} {:?}", f.origin);
         }
         assert_eq!(names_in(&dest).len(), hostile.len(), "{ty:?}");
         assert_eq!(names_in(root.path()), before);
