@@ -127,7 +127,9 @@ listed is `device_not_found`.
   dropping the guard releases them, after which Windows mounts a volume on its next access. A volume that cannot be
   locked (in use) makes the call fail with `unmount_failed` naming it, and the volumes that did lock are released, so
 Windows may mount them again. While any local volume's disks cannot be told (its extents query failed), nothing is
-locked and the call fails closed with `unmount_failed` naming that volume, since it could lie on the card. Each volume is
+locked and the call fails closed with `unmount_failed` naming that volume, since it could lie on the card. A volume
+whose query answers `ERROR_NOT_READY` (no media, such as an empty slot of a multi-slot card reader) is not unknown: it
+lies on no disk, so it never blocks an unmount; CDs and network volumes (`GetDriveTypeW`) have no disks either. Each volume is
   opened read-only first; only when Windows refuses the lock or the dismount on that handle (`ERROR_ACCESS_DENIED`) is
   it opened again with write access, solely to repeat the two requests. That handle never reads or writes data (the
   engine's single exception to opening anything for writing, recorded in the project rules and checked by the

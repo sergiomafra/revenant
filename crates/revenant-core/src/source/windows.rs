@@ -28,7 +28,9 @@ use windows_sys::Win32::System::Ioctl::{
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 
 use super::Geometry;
-use crate::device::win_parse::{self, WinDestRaw, WinDiskRaw, WinExtent, WinVolumeRaw};
+use crate::device::win_parse::{
+    self, ExtentsFailure, WinDestRaw, WinDiskRaw, WinExtent, WinVolumeRaw,
+};
 
 /// Opens read-only. `FILE_FLAG_BACKUP_SEMANTICS` is required to open directories.
 pub fn open_read_only(path: &Path) -> io::Result<File> {
@@ -294,7 +296,8 @@ const DRIVE_CDROM: u32 = 5;
 
 /// The disk extents of the volume `\\?\Volume{…}\` (`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` on the volume opened for
 /// queries only, without the trailing backslash): `Some` and empty when it has none (a CD or a network volume, by
-/// `GetDriveTypeW`, or the IOCTL answering zero extents), `None` when the query failed (the disks are then unknown).
+/// `GetDriveTypeW`, the IOCTL answering zero extents, or no media in the drive: `ERROR_NOT_READY`, an empty card-reader
+/// slot, ruling P30), `None` when the query failed otherwise (the disks are then unknown).
 /// With more extents than [`MAX_EXTENTS`] (`ERROR_MORE_DATA`), the first ones when `partial` is allowed (a listing), else
 /// `None` (a destination check fails closed rather than miss a disk).
 fn volume_extents(name: &str, partial: bool) -> Option<Vec<WinExtent>> {
@@ -304,7 +307,14 @@ fn volume_extents(name: &str, partial: bool) -> Option<Vec<WinExtent>> {
     if kind == DRIVE_REMOTE || kind == DRIVE_CDROM {
         return Some(Vec::new());
     }
-    let file = open_query(Path::new(name.trim_end_matches('\\'))).ok()?;
+    let failed = |e: io::Error| match win_parse::extents_failure(e.raw_os_error()) {
+        ExtentsFailure::NoExtents => Some(Vec::new()),
+        ExtentsFailure::Failed => None,
+    };
+    let file = match open_query(Path::new(name.trim_end_matches('\\'))) {
+        Ok(file) => file,
+        Err(e) => return failed(e),
+    };
     let mut buf = [0u8; 8 + 24 * MAX_EXTENTS];
     match ioctl::<(), _>(&file, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, None, &mut buf) {
         Ok(_) => Some(win_parse::extents(&buf)),
@@ -312,7 +322,7 @@ fn volume_extents(name: &str, partial: bool) -> Option<Vec<WinExtent>> {
         Err(e) if partial && e.raw_os_error() == Some(ERROR_MORE_DATA as i32) => {
             Some(win_parse::extents(&buf))
         }
-        Err(_) => None,
+        Err(e) => failed(e),
     }
 }
 

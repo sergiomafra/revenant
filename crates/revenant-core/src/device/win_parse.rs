@@ -216,6 +216,26 @@ pub(crate) fn volumes_on(volumes: &[WinVolumeRaw], number: u32) -> Vec<String> {
         .collect()
 }
 
+/// What a failed open or extents query of a volume means for its disks (ruling P30).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtentsFailure {
+    /// No media in the drive (`ERROR_NOT_READY`, an empty slot of a card reader): it lies on no disk we can read.
+    NoExtents,
+    /// Anything else: the disks are unknown (an unmount fails closed).
+    Failed,
+}
+
+/// Classifies the Windows error code (`None` when the error had none) of a failed volume open or extents query.
+pub(crate) fn extents_failure(code: Option<i32>) -> ExtentsFailure {
+    /// `ERROR_NOT_READY`.
+    const NOT_READY: i32 = 21;
+    if code == Some(NOT_READY) {
+        ExtentsFailure::NoExtents
+    } else {
+        ExtentsFailure::Failed
+    }
+}
+
 /// The volumes whose disks are unknown (their extents query failed): one of them may lie on the disk being unmounted,
 /// so an unmount fails closed while any is there, naming them.
 pub(crate) fn unknown_volumes(volumes: &[WinVolumeRaw]) -> Vec<String> {
@@ -435,6 +455,23 @@ mod tests {
         e[0..4].copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(extents(&e).len(), 1, "never more than declared");
         assert!(extents(&e[..3]).is_empty());
+    }
+
+    #[test]
+    fn an_empty_reader_slot_has_no_extents() {
+        assert_eq!(extents_failure(Some(21)), ExtentsFailure::NoExtents);
+        for code in [
+            Some(5),
+            Some(2),
+            Some(1),
+            Some(32),
+            Some(1167),
+            Some(0),
+            Some(-1),
+            None,
+        ] {
+            assert_eq!(extents_failure(code), ExtentsFailure::Failed, "{code:?}");
+        }
     }
 
     #[test]
