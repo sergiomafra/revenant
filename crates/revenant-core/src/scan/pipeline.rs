@@ -11,7 +11,9 @@ use std::time::Duration;
 use super::fs::{FsJobResult, FsPlan, fs_job};
 use super::{CancelToken, HEAD_LEN};
 use crate::cache::{CachedSource, Runs};
-use crate::formats::{CancelScope, Format, MOOV_MAX_LEN, Measurement};
+use crate::formats::{
+    CancelScope, Format, Fragment, Health, MAX_OWN_FILES, MOOV_MAX_LEN, Measurement,
+};
 use crate::source::Source;
 
 /// How often a wait for a measurement looks at the cancel token.
@@ -21,26 +23,42 @@ pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The first measurement of the formats that recognize `head`, as the sequential scan takes it. A long measurement
-/// gives up once `cancel` is set (its result is then never used).
+/// A measurement and the file's own embedded files ([`Format::own_files`], only for a `Partial` one: ruling D12).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Measured {
+    pub m: Measurement,
+    /// Absolute, at most [`MAX_OWN_FILES`]; empty unless `m` is `Partial`.
+    pub own: Vec<Fragment>,
+}
+
+/// The first measurement of the formats that recognize `head`, as the sequential scan takes it, with the own files of
+/// the format that measured it when it is `Partial`. The one measurement function of every path (a worker, the commit
+/// loop, a file-system file's job), so the result does not depend on who ran it. A long measurement gives up once
+/// `cancel` is set (its result is then never used).
 pub(super) fn measure(
     formats: &[Box<dyn Format>],
     source: &dyn Source,
     at: u64,
     head: &[u8],
     cancel: &CancelToken,
-) -> Option<Measurement> {
+) -> Option<Measured> {
     let _scope = CancelScope::enter(cancel);
-    formats
-        .iter()
-        .filter(|f| f.recognizes(head))
-        .find_map(|f| f.measure(source, at))
+    formats.iter().filter(|f| f.recognizes(head)).find_map(|f| {
+        let m = f.measure(source, at)?;
+        let mut own = if m.health == Health::Partial {
+            f.own_files(source, at)
+        } else {
+            Vec::new()
+        };
+        own.truncate(MAX_OWN_FILES);
+        Some(Measured { m, own })
+    })
 }
 
 /// Where a job's result lands.
 enum SlotState {
     Waiting,
-    Done(Option<Measurement>),
+    Done(Option<Measured>),
     /// A kept file-system file's job done.
     DoneFs(Box<FsJobResult>),
     /// Not measured: the scan was cancelled, the head lies in a committed skip range (never for a file-system file's
@@ -55,7 +73,7 @@ pub(super) struct Slot {
 
 /// A measured job's outcome, as the commit loop sees it.
 pub(super) enum Outcome {
-    Measured(Option<Measurement>),
+    Measured(Option<Measured>),
     /// A kept file-system file's job.
     MeasuredFs(Box<FsJobResult>),
     /// The worker did not measure it: the commit loop measures it itself.

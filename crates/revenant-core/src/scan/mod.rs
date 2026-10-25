@@ -6,6 +6,7 @@ mod fs;
 mod pipeline;
 
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,7 +16,7 @@ use crate::filesystem::{FsOrigin, FsState, SourceProbe, Volume};
 use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
 use crate::source::Source;
 use fs::{FsJobResult, FsPlan, merge};
-use pipeline::{Block, CloseQueue, Head, MoovFinder, Outcome, Shared};
+use pipeline::{Block, CloseQueue, Head, Measured, MoovFinder, Outcome, Shared};
 
 /// Bytes of a sector start shown to `Format::recognizes`.
 const HEAD_LEN: usize = 16;
@@ -92,7 +93,8 @@ const MAX_THREADS: usize = 64;
 /// or a JPEG gap search's DC values, about 3 × 13 MiB at 210 megapixels, plus 3 MiB),
 /// plus about 200 B per recognized sector start in the read-ahead (at most lookahead × block / sector of them), plus the
 /// orphan `moov` candidates and `Damaged` videos kept for pairing (at most 4096 + 4096 per block read ahead, and 4096
-/// findings) and the start of every finding (8 B each), plus the file-system listing: up to 262,144 files and 2^20
+/// findings) and the start of every finding (8 B each), plus the own-file starts of `Partial` RAWs (at most 65,536,
+/// 24 B each, with each RAW's ranges), plus the file-system listing: up to 262,144 files and 2^20
 /// pieces, ≈ 355 MiB kept for the whole scan in the worst case at those caps, with a peak of ≈ 640 MiB while it is read
 /// (on exFAT, plus the allocation bitmap, ≤ 32 MiB, and the root entries waiting for it, ≤ 68 MiB; core README), and,
 /// after the scan, the pairing step's one `moov` and its sample lists (up to about 128 MiB). So with
@@ -224,6 +226,23 @@ const MAX_MOOVS: usize = 4096;
 const MAX_VIDEOS: usize = 4096;
 /// Bytes of a `moov` candidate's header: a skip range overlapping them drops the candidate.
 const MOOV_HEAD: u64 = 16;
+/// Most own-file starts of `Partial` findings kept at once (ruling D12); past it, further ones are not kept.
+const MAX_OWN_STARTS: usize = 65_536;
+
+/// Whether every range of `inner` lies inside the union of `outer` (disjoint ranges).
+fn within(inner: &[Fragment], outer: &[Fragment]) -> bool {
+    inner.iter().all(|r| {
+        let end = r.start.saturating_add(r.len);
+        let covered: u64 = outer
+            .iter()
+            .map(|o| {
+                let (lo, hi) = (o.start.max(r.start), o.start.saturating_add(o.len).min(end));
+                hi.saturating_sub(lo)
+            })
+            .sum();
+        covered == r.len
+    })
+}
 
 /// A finding not yet emitted.
 struct Pending {
@@ -257,6 +276,11 @@ struct Commit<'a, 's> {
     starts: Vec<u64>,
     /// The next kept file-system file the walk has not reached (index in `FsPlan::kept`).
     next_kept: usize,
+    /// Where an own file of a `Partial` finding starts, with that finding's ranges, ascending by start (ruling D12; at
+    /// most [`MAX_OWN_STARTS`], pruned below the scan position).
+    own: Vec<(u64, Rc<[Fragment]>)>,
+    /// `(heap offset, cluster size, heap end)` of each volume, for the pairing (ruling D13).
+    grids: Vec<(u64, u64, u64)>,
 }
 
 #[cfg(test)]
@@ -336,6 +360,7 @@ impl Commit<'_, '_> {
             &self.videos,
             &self.moovs,
             &self.starts,
+            &self.grids,
             cancel,
         );
         if cancel.is_cancelled() {
@@ -385,13 +410,14 @@ impl Commit<'_, '_> {
                     .then_some(r.carved.as_ref())
                     .flatten();
                 let m = merge(&self.shared.fs.kept[k], &r.view, carved);
+                let own = r.own_of(&m);
                 let measurement = Measurement {
                     len: m.len,
                     kind: m.kind,
                     health: m.health,
                     fragments: m.fragments,
                 };
-                self.add(at, measurement, Some(m.origin));
+                self.add(at, measurement, Some(m.origin), own);
             }
             if bad {
                 match &mut self.run {
@@ -439,22 +465,42 @@ impl Commit<'_, '_> {
                     None => None,
                 };
                 match found {
-                    // The head at the first cluster of a live file of another kind is consumed without a finding;
-                    // an `Intact` measurement there still skips its range (ruling R10).
-                    Some(m) if self.shared.fs.is_other(at) => {
+                    // The head at the first cluster of a live file of another kind is consumed without a finding, and
+                    // so is a `Partial` finding's own file (ruling D12); an `Intact` measurement there still skips its
+                    // range (ruling R10).
+                    Some(Measured { m, .. })
+                        if self.shared.fs.is_other(at) || self.is_own(at, &m) =>
+                    {
                         if m.health == Health::Intact
                             && pieces_ok(at, m.len, &m.fragments, self.shared.total)
                         {
                             self.skip(&ranges(at, m.len, &m.fragments));
                         }
                     }
-                    Some(m) => self.add(at, m, None),
+                    Some(Measured { m, own }) => self.add(at, m, None, own),
                     None => {}
                 }
             }
             at = sector_end;
         }
         Ok(())
+    }
+
+    /// Ruling D12: whether the carved measurement `m` at `at` is the own file of an earlier `Partial` finding, one of
+    /// whose own files starts at `at` and whose ranges hold all of `m`'s.
+    fn is_own(&self, at: u64, m: &Measurement) -> bool {
+        let i = self.own.partition_point(|(s, _)| *s < at);
+        let inner = ranges(at, m.len, &m.fragments);
+        self.own[i..]
+            .iter()
+            .take_while(|(s, _)| *s == at)
+            .any(|(_, owner)| within(&inner, owner))
+    }
+
+    /// Forgets the own-file starts below `pos` (the walk is past them).
+    fn drop_own_below(&mut self, pos: u64) {
+        let n = self.own.partition_point(|(s, _)| *s < pos);
+        self.own.drain(..n);
     }
 
     /// The index of the kept file-system file starting at `at`, if any (`at` only grows during a scan).
@@ -511,7 +557,7 @@ impl Commit<'_, '_> {
         }
     }
 
-    fn measure(&self, at: u64, head: &[u8]) -> Option<Measurement> {
+    fn measure(&self, at: u64, head: &[u8]) -> Option<Measured> {
         pipeline::measure(
             self.shared.formats,
             &self.shared.cache,
@@ -522,8 +568,10 @@ impl Commit<'_, '_> {
     }
 
     /// Turns the measurement at `at` into a pending finding; an `Intact` one adds a skip range per piece. A finding whose
-    /// origin is not a live file and whose ranges overlap a live file is at most `Partial` (ruling D7).
-    fn add(&mut self, at: u64, mut m: Measurement, origin: Option<FsOrigin>) {
+    /// origin is not a live file and whose ranges overlap a live file is at most `Partial` (ruling D7). A `Partial` one
+    /// keeps the starts of its `own` files after `at` (sector-aligned ones: no head is examined elsewhere) with its
+    /// ranges, so a carved file found there inside it is not reported (ruling D12).
+    fn add(&mut self, at: u64, mut m: Measurement, origin: Option<FsOrigin>, own: Vec<Fragment>) {
         if m.len == 0 {
             return;
         }
@@ -565,6 +613,19 @@ impl Commit<'_, '_> {
         if m.health == Health::Intact {
             self.skip(&ranges);
         }
+        if m.health == Health::Partial && !own.is_empty() {
+            let owner: Rc<[Fragment]> = ranges.clone().into();
+            for o in own {
+                if o.start <= at
+                    || !o.start.is_multiple_of(sector)
+                    || self.own.len() >= MAX_OWN_STARTS
+                {
+                    continue;
+                }
+                let i = self.own.partition_point(|(s, _)| *s <= o.start);
+                self.own.insert(i, (o.start, Rc::clone(&owner)));
+            }
+        }
         self.starts.push(at);
         let finding = Finding {
             id: self.next_id,
@@ -592,7 +653,9 @@ impl Commit<'_, '_> {
 /// still found (one broken file must not hide others). A finding is emitted once the scan has read past the end of its
 /// farthest piece, so that unreadable sectors inside it are known: they are reported as `Unreadable` events (before the
 /// `Found`), and an `Intact` finding with any of them inside one of its pieces is downgraded to `Partial`. Findings are
-/// emitted in the order they were found (by start), so one found inside another is emitted right after it. `measure`
+/// emitted in the order they were found (by start), so one found inside another is emitted right after it. A `Partial`
+/// finding's own files ([`Format::own_files`], measured with it) are not reported when found by their signature at
+/// their start wholly inside it; an `Intact` one of them still skips its range (rulings D12, R10). `measure`
 /// reads the whole source (not just the block), so files may cross block boundaries. A measurement whose pieces break
 /// the [`Finding::fragments`] contract is a detector bug: it panics in debug builds and is ignored (no finding) in
 /// release builds.
@@ -604,7 +667,8 @@ impl Commit<'_, '_> {
 /// After every `Found`, `Damaged` MP4/MOV findings without a `moov` (at most 4096) are paired with orphan `moov` boxes
 /// met during the scan (at most 4096, see `pairing`; the start of every finding is kept for it, ruling Q13: a pairing's
 /// first piece ends where another file starts, and a file starting inside its second piece makes it at most
-/// `Partial`): each video put back together is emitted as an
+/// `Partial`; a live file's video is no candidate, and on a volume's cluster grid the break points on the grid are
+/// tried first, ruling D13): each video put back together is emitted as an
 /// [`Event::Updated`] with the same id and 2 pieces, then `scan` returns. An orphan `moov` candidate is a box start whose
 /// first 16 bytes are a size in `[24, MOOV_MAX_LEN + 8]`, `moov`, any 4 bytes and `mvhd`, found in every block the scan
 /// reads; one whose header overlaps a committed skip range (those blocks may not be read at all) or lies inside a
@@ -648,7 +712,7 @@ pub fn scan(
     let total = shared.total;
     // The file systems first (ruling D1): metadata through the cache, the high-word heads through a probe over the raw
     // source that refuses what the cache knows to be unreadable. Nothing is skipped because of them (ruling R10).
-    let (volumes, listing_truncated) = if opts.filesystems {
+    let (volumes, listing_truncated): (Vec<Volume>, bool) = if opts.filesystems {
         let listing = crate::filesystem::read_with(
             &shared.cache,
             &SourceProbe::beside(source, &shared.cache),
@@ -666,6 +730,17 @@ pub fn scan(
         shared.drop_fs_jobs = opts.drop_fs_jobs;
     }
     let shared = shared;
+    let grids = volumes
+        .iter()
+        .map(|v| {
+            let heap_len = u64::from(v.cluster_count).saturating_mul(v.cluster_size);
+            (
+                v.heap_offset,
+                v.cluster_size,
+                v.heap_offset.saturating_add(heap_len),
+            )
+        })
+        .collect();
 
     std::thread::scope(|s| {
         let _close = CloseQueue(&shared);
@@ -685,6 +760,8 @@ pub fn scan(
             capped: false,
             starts: Vec::new(),
             next_kept: 0,
+            own: Vec::new(),
+            grids,
         };
         commit.summary.listing_truncated = listing_truncated;
         for volume in volumes {
@@ -716,6 +793,7 @@ pub fn scan(
             let (span, moovs, capped) =
                 ((b.pos, b.end), std::mem::take(&mut b.moovs), b.moovs_capped);
             commit.block(b)?;
+            commit.drop_own_below(read);
             commit.keep_moovs(span, moovs, capped);
             // A `moov` header may start up to 15 bytes before the next block: keep the ranges that could still overlap it.
             let keep_from = read.saturating_sub(MOOV_HEAD);
@@ -733,4 +811,24 @@ pub fn scan(
         commit.pair()?;
         Ok(commit.summary)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn within_needs_every_byte_inside() {
+        let f = |start, len| Fragment { start, len };
+        let outer = [f(1000, 1000), f(2000, 500), f(5000, 100)];
+        assert!(within(&[f(1000, 1000)], &outer));
+        // Across two adjacent pieces, and several ranges each inside.
+        assert!(within(&[f(1500, 900)], &outer));
+        assert!(within(&[f(1100, 10), f(5000, 100)], &outer));
+        // One byte out, before, after or in a gap.
+        assert!(!within(&[f(999, 10)], &outer));
+        assert!(!within(&[f(2400, 101)], &outer));
+        assert!(!within(&[f(1100, 10), f(4999, 2)], &outer));
+        assert!(!within(&[f(3000, 1)], &outer));
+    }
 }

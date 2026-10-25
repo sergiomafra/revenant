@@ -83,6 +83,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- A partial RAW (TIFF-based RAW, RAF, CR3) no longer lists its own preview (or full-size JPEG) as a separate photo; a
+  damaged RAW still does, and a photo written elsewhere inside a RAW is still found.
+- Videos on a FAT/exFAT card are put back together on cluster boundaries, so more come out intact; a video the file
+  system lists as a live file is no longer split, and a deleted one keeps its name when put back together.
 - A JPEG cut before its first row of pixels (for example right after its header, when another file was written over the
   rest or the rest of the card was erased) is damaged, not partial: nothing of the photo would show; so is one whose data
   breaks within its first row before an end-of-image marker. A JPEG cut or broken later is partial: the rows before the

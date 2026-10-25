@@ -56,7 +56,9 @@
 use std::rc::Rc;
 
 use super::jpeg::{OwnJpegs, every_preview_health};
-use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, builtin};
+use super::{
+    FileKind, Format, Fragment, Health, MAX_OWN_FILES, Measurement, Reader, SECTOR, builtin,
+};
 use crate::source::Source;
 
 /// Largest `moov` box the detector will load into memory.
@@ -327,6 +329,31 @@ impl Format for IsoBmff {
             return judge(&mut r, start, &walk);
         }
         Some(first)
+    }
+
+    /// A CR3's `PRVW` JPEG and full-size JPEG (from a walk of the box headers); nothing for other kinds.
+    fn own_files(&self, source: &dyn Source, start: u64) -> Vec<Fragment> {
+        let mut r = Reader::new(source);
+        let (head, n) = r.head(start);
+        if !self.recognizes(&head[..n]) {
+            return Vec::new();
+        }
+        let walk = walk_boxes(
+            &mut r,
+            builtin(),
+            start,
+            false,
+            &[],
+            &mut OwnJpegs::default(),
+        );
+        if walk.kind != FileKind::Cr3 {
+            return Vec::new();
+        }
+        cr3_jpegs(&mut r, start, &walk)
+            .into_iter()
+            .take(MAX_OWN_FILES)
+            .map(|(start, len)| Fragment { start, len })
+            .collect()
     }
 }
 

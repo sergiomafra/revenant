@@ -248,7 +248,9 @@ start `q` is a candidate when its 16 bytes are a size in `[24, MOOV_MAX_LEN + 8]
 finding that was `Intact` when added (rounded to whole sectors: those blocks may never be read, so keeping candidates
 there would depend on timing) or when it lies inside a non-`Damaged` MP4/MOV/CR3/HEIC finding (its own index). At most
 4096 candidates per block are looked at and 4096 per scan are kept (the first ones). The videos are the `Damaged`
-MP4/MOV findings (at most 4096, the first ones).
+MP4/MOV findings (at most 4096, the first ones), except those of a live file (its chain is where its bytes are, so it
+is not split elsewhere); a deleted file's video keeps its `origin`, with placement `Carved`, when it is put back
+together.
 
 Pairing a video at `s` (the `Found` start) with a candidate at `q`:
 
@@ -274,7 +276,11 @@ Pairing a video at `s` (the `Found` start) with a candidate at `q`:
 6. Break points `L1`: sector boundaries (relative to `s`) from the start of sample `k − 1` (not its end: a sample cut
    inside its last NAL unit's payload still passes `A`) to the start of sample `k + 1` (or `P`), at least `payload`,
    at most 4096 tried; samples `k − 1` and `k` must pass read across `L1` (bytes before it at `s`, after it at the second
-   piece). The pieces are `[s, s + L1)` and `[q − P + L1, … + (P − L1) + moov size)`, inside the source, not
+   piece). On a FAT/exFAT card (ruling D13), when `s` is a cluster start of a volume the scan found (cluster at least
+   4096 bytes, `s` inside its heap), the break points tried first are only those on that volume's cluster grid
+   (`(s + L1 − heap) % cluster == 0`) whose second piece `q − P + L1` starts on a cluster of it too, and uniqueness is
+   judged among them; when none passes, every sector boundary is tried as above (a card reformatted with another
+   cluster size pairs as before). The pieces are `[s, s + L1)` and `[q − P + L1, … + (P − L1) + moov size)`, inside the source, not
    overlapping. The first piece ends by the `Found` video's own end (the scan cut the video where another file starts,
    ruling Q13), unless that end is one of the video's own Motion-JPEG frames, and no other finding may start inside it:
    otherwise the video is not paired.
@@ -291,8 +297,9 @@ points, the sample budget or the step budget below): an unchecked candidate migh
 candidate cap does not count in a block wholly inside committed skip ranges (such a block may or may not be read, and
 all its candidates are dropped anyway), so the result does not depend on timing. Otherwise `Intact`. The checks validate
 lengths and header bytes, never the payload, so a break point inside one NAL unit's payload cannot be told from one a
-sector away: real H.264/HEVC with large slices (tens of KiB per NAL unit) will usually pair as `Partial` until 1.4
-(the file system's cluster size will narrow `L1`). So will most real videos with sound: audio samples interleaved
+sector away: real H.264/HEVC with large slices (tens of KiB per NAL unit) will usually pair as `Partial`, unless the
+video lies on the cluster grid of a FAT/exFAT volume (step 6), which leaves one candidate every cluster instead of every
+sector. So will most real videos with sound: audio samples interleaved
 between video samples `k − 1` and `k` are not checked, so every sector boundary inside them passes too. The kind comes
 from the `ftyp`.
 
@@ -342,6 +349,9 @@ brand is never HEIC.
   exactly at a CR3 chunk or HEIC extent start is indistinguishable from the file's own data and does not cut it. The
   checks need the index to be readable: if `moov`/`meta` is missing or unusable, a head inside `mdat` cuts the file as
   before.
+- Own files (`Format::own_files`, ruling D12): a `Partial` CR3's `PRVW` JPEG and full-size JPEG; a JPEG the scan finds
+  at one of their starts, wholly inside the CR3, is not reported (see [Scan](#scan)). MP4/MOV (Motion-JPEG frames
+  included) and HEIC have none: the frames of a `Partial` Motion-JPEG video are still reported.
 
 ## Formats: Fujifilm RAF
 
@@ -358,7 +368,8 @@ a file.
   the end of the source; either makes the file `Partial`. The file also ends at the first 512-aligned sector inside it
   where another file starts (`Partial`), except at the starts of its own blocks and inside its embedded JPEG (the EXIF
   thumbnail) while that JPEG still decodes strictly (ruling P13, as for TIFF RAWs); a file written over part of the JPEG
-  breaks its decode, so it cuts the RAF and is reported on its own.
+  breaks its decode, so it cuts the RAF and is reported on its own. A `Partial` RAF's own file (`Format::own_files`) is
+  its embedded JPEG: found at its start inside the RAF, it is not reported (ruling D12, see [Scan](#scan)).
 - Health: like a TIFF RAW, only the embedded JPEG can be verified. `Intact` needs a complete file, no unreadable sector
   and a strict decode of the JPEG; no JPEG, or one that decodes leniently or not at all, is `Partial`.
 
@@ -408,7 +419,10 @@ and
   or not at all (the raw data may still be fine). If the size of any preview cannot be measured (no SOF, zero size, over
   the decode cap) no smaller one may vouch for the file, so it is `Partial`. `Intact` only when the largest preview
   decodes strictly. There is no RAW decoder, so the raw data itself is never verified.
-- Inside an `Intact` RAW the scan suppresses heads, so its embedded previews are not reported separately.
+- Inside an `Intact` RAW the scan suppresses heads, so its embedded previews are not reported separately. A `Partial`
+  RAW hides its own JPEGs too (`Format::own_files`: its previews and JPEG-coded strips/tiles, at most 64; ruling D12):
+  a JPEG the scan finds at one of their starts, lying wholly inside the RAW, is not reported. A `Damaged` RAW hides
+  nothing. See [Scan](#scan).
 
 ## TIFF reader (internal)
 
@@ -827,6 +841,18 @@ file never hides the rest of the disk; a damaged file may then overlap another f
 (not just the block), so files may cross block boundaries. Before the first block the scan reads the source's file
 systems (below), so the files they list come out with their name, folder and dates, once each.
 
+A `Partial` RAW's own JPEGs (ruling D12): when a measurement is `Partial`, the format that measured it also lists the
+embedded files it references in its own data (`Format::own_files`: a TIFF RAW's previews and JPEG-coded strips/tiles, a
+RAF's embedded JPEG, a CR3's `PRVW` and full-size JPEG; at most 64), in the same measuring step on every path (a
+measuring thread, the scan thread, a listed file's job, whose view offsets are mapped back through its pieces), so the
+events do not depend on who measured. For a listed file the own files are those of the measurement its finding took
+(the view's, or the carving's when it replaced the view). The scan keeps their sector-aligned starts after the RAW's
+start, with the RAW's ranges (at most 65,536 at once, dropped once the walk is past them). A file found by its
+signature alone at one of those starts whose ranges lie wholly inside that RAW's is not reported (it gets no id);
+when it measures `Intact` it still skips its range (ruling R10), so a thumbnail inside a hidden preview is not
+reported either. A listed file is always reported, a `Damaged` finding hides nothing, and a foreign file elsewhere in
+the RAW (which cuts it) is found as before.
+
 ### File systems in the scan
 
 With `ScanOptions::filesystems` (default `true`; `false` is the scan by signature alone: no `Volume` event, every
@@ -920,7 +946,8 @@ every scan in the process, plus the decoder's internal buffers), plus what each 
 `moov` of at most 16 MiB, or a JPEG gap search's DC values, about 3 × 13 MiB at 210 megapixels, plus 3 MiB), plus about
 200 B per recognized sector start in the read-ahead (at most
 lookahead × block / sector of them), plus the `moov` candidates (16 B each: at most 4096 per block read ahead, and
-4096 kept), the `Damaged` videos kept for pairing (at most 4096 findings) and the start of every finding (8 B each),
+4096 kept), the `Damaged` videos kept for pairing (at most 4096 findings), the start of every finding (8 B each) and
+the own-file starts of `Partial` RAWs (at most 65,536 at once, 24 B each, with each RAW's ranges),
 plus the file-system listing, kept for the whole scan: at most 262,144 photo/video files and 2^20 pieces, ≈ 355 MiB
 in the worst case at those caps (mostly names; see the Memory paragraph of [File systems: FAT](#file-systems-fat)),
 and while it is read before the first block, a peak of ≈ 640 MiB in the worst case (on exFAT, plus the allocation

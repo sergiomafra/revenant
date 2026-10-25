@@ -156,7 +156,19 @@ pub trait Format: Send + Sync {
     /// Measures the file starting at `start`. `None` means "not a file of this format", never "could not read": an
     /// unreadable sector inside a file lowers its health instead (see [`Health`]).
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement>;
+
+    /// Embedded files the file at `start` holds in its own data (JPEG previews, thumbnails, JPEG-compressed strips or
+    /// tiles, a CR3's PRVW and full-size JPEG), absolute, at most [`MAX_OWN_FILES`]. Called only for a measurement that
+    /// is not `Intact` (the scan asks only for a `Partial` one, ruling D12): a file found there is the file's own, not
+    /// another photo. The default holds none.
+    fn own_files(&self, source: &dyn Source, start: u64) -> Vec<Fragment> {
+        let _ = (source, start);
+        Vec::new()
+    }
 }
+
+/// Most embedded files [`Format::own_files`] returns.
+pub const MAX_OWN_FILES: usize = 64;
 
 /// Every supported format.
 pub fn all_formats() -> Vec<Box<dyn Format>> {

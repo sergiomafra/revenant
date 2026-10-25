@@ -4,7 +4,7 @@
 
 use std::cmp::Ordering;
 
-use super::pipeline;
+use super::pipeline::{self, Measured};
 use crate::filesystem::{FsFile, FsOrigin, FsState, Listing, Placement};
 use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
 use crate::scan::{CancelToken, HEAD_LEN};
@@ -109,6 +109,8 @@ pub(crate) struct ViewMeasure {
     pub m: Option<Measurement>,
     /// Ruling D6: what lies between the structure's end and the recorded size is padding or whole files.
     pub tail_ok: bool,
+    /// The measured file's own files (ruling D12), absolute (mapped through the pieces).
+    pub own: Vec<Fragment>,
 }
 
 /// What a kept file's job computes: its view measurement and, for a deleted file, the carving at its start.
@@ -116,6 +118,36 @@ pub(crate) struct ViewMeasure {
 pub(crate) struct FsJobResult {
     pub view: ViewMeasure,
     pub carved: Option<Measurement>,
+    /// The carving's own files (ruling D12).
+    pub carved_own: Vec<Fragment>,
+}
+
+impl FsJobResult {
+    /// The own files of the measurement `merged` took: the carving's when it replaced the view (placement `Carved`,
+    /// which only [`merge`] sets), else the view's.
+    pub(crate) fn own_of(self, merged: &Merged) -> Vec<Fragment> {
+        if merged.origin.placement == Placement::Carved {
+            self.carved_own
+        } else {
+            self.view.own
+        }
+    }
+}
+
+/// `own`, offsets in the view of `pieces`, as absolute ranges: each start is mapped through the pieces (its length is
+/// kept: the scan looks only at where an own file starts); one starting past the pieces is dropped.
+fn absolute(pieces: &[Fragment], own: Vec<Fragment>) -> Vec<Fragment> {
+    own.into_iter()
+        .filter_map(|o| {
+            let mut off = 0u64;
+            pieces.iter().find_map(|p| {
+                let inside = (off..off.saturating_add(p.len)).contains(&o.start);
+                let at = inside.then(|| p.start + (o.start - off));
+                off = off.saturating_add(p.len);
+                at.map(|start| Fragment { start, len: o.len })
+            })
+        })
+        .collect()
 }
 
 /// The first measurement of the formats that recognize the head at `at` of `source`.
@@ -124,7 +156,7 @@ fn measure_at(
     source: &dyn Source,
     at: u64,
     cancel: &CancelToken,
-) -> Option<Measurement> {
+) -> Option<Measured> {
     let want = (HEAD_LEN as u64).min(source.len().checked_sub(at)?) as usize;
     let mut head = [0u8; HEAD_LEN];
     let n = source.read_at(at, &mut head[..want]).ok()?;
@@ -171,7 +203,7 @@ fn tail_ok(
         if i == MAX_TAIL_FILES {
             break;
         }
-        match measure_at(formats, view, l, cancel) {
+        match measure_at(formats, view, l, cancel).map(|x| x.m) {
             Some(m2)
                 if m2.health != Health::Damaged
                     && m2.fragments.is_empty()
@@ -194,11 +226,16 @@ pub(crate) fn measure_view(
     cancel: &CancelToken,
 ) -> ViewMeasure {
     let view = Fragmented::new(source, f.pieces.clone());
-    let m = measure_at(formats, &view, 0, cancel);
+    let (m, own) =
+        measure_at(formats, &view, 0, cancel).map_or((None, Vec::new()), |x| (Some(x.m), x.own));
     let tail_ok = m
         .as_ref()
         .is_some_and(|m| tail_ok(formats, &view, m.len, cancel));
-    ViewMeasure { m, tail_ok }
+    ViewMeasure {
+        m,
+        tail_ok,
+        own: absolute(&f.pieces, own),
+    }
 }
 
 /// The one job of the kept file `f` starting at `at` (the worker's and every commit path's): the view measurement and,
@@ -217,9 +254,11 @@ pub(crate) fn fs_job(
         return FsJobResult {
             view: measure_view(formats, source, f, cancel),
             carved: None,
+            carved_own: Vec::new(),
         };
     }
-    let carved = measure_at(formats, source, at, cancel);
+    let (carved, carved_own) =
+        measure_at(formats, source, at, cancel).map_or((None, Vec::new()), |x| (Some(x.m), x.own));
     if reuse
         && let [piece] = f.pieces.as_slice()
         && let Some(c) = &carved
@@ -232,13 +271,16 @@ pub(crate) fn fs_job(
             view: ViewMeasure {
                 m: Some(c.clone()),
                 tail_ok,
+                own: carved_own.clone(),
             },
             carved,
+            carved_own,
         };
     }
     FsJobResult {
         view: measure_view(formats, source, f, cancel),
         carved,
+        carved_own,
     }
 }
 
@@ -351,7 +393,11 @@ mod tests {
     }
 
     fn view(m: Option<Measurement>, tail_ok: bool) -> ViewMeasure {
-        ViewMeasure { m, tail_ok }
+        ViewMeasure {
+            m,
+            tail_ok,
+            own: Vec::new(),
+        }
     }
 
     #[test]
@@ -785,5 +831,100 @@ mod tests {
         // Workers handing every job back, or no workers: the commit loop runs both, with the same events.
         assert_eq!(run(8, true), (base.clone(), (2, 1)));
         assert_eq!(run(1, false), (base, (2, 1)));
+    }
+
+    #[test]
+    fn own_files_are_the_same_on_every_path() {
+        use crate::scan::{COMMIT_FS_JOBS, Event, ScanOptions, scan};
+        use revenant_testkit as tk;
+        use revenant_testkit::fs::{DeleteStyle, FsBuilder, FsType, Partitioning, disk};
+        use std::io::Write;
+
+        // A Panasonic RW2 of an unchecked packing: Partial; its JpgFromRaw starts at 512, a thumbnail inside it at 1024.
+        let rw2 = |seed| {
+            tk::panasonic_rw2(&tk::Rw2Options {
+                width: 280,
+                height: 200,
+                raw_format: 5,
+                bits: 12,
+                raw_len: 98_304,
+                strip_len: 0,
+                seed,
+                exif: tk::TestExif::default(),
+            })
+        };
+        // FAT16, 1 KiB clusters, at LBA 2048: a deleted RW2 at cluster 3000.
+        let lba = 2048u64;
+        let mut b = FsBuilder::new(FsType::Fat16, 8 << 20, 1024);
+        let r = rw2(3);
+        let dc: Vec<u32> = (3000..3000 + r.bytes.len().div_ceil(1024) as u32).collect();
+        b.add_at("DCIM/100_PANA/P1000001.RW2", &r.bytes, &dc);
+        b.delete("DCIM/100_PANA/P1000001.RW2", DeleteStyle::Camera);
+        let v = b.build();
+        let mut img = disk(
+            Partitioning::Mbr {
+                first_lba: lba as u32,
+            },
+            &v,
+            v.len() + (2 << 20),
+        );
+        let rw2_at = (lba * 512 + b.cluster_offset(3000)) as usize;
+        // An MP4 with no entry ending in a `free` box whose last 512 bytes are the RW2's first sector: an `Intact`
+        // carving whose skip range defers the deleted RW2's first 512-byte block, so the commit loop runs its job.
+        let x = tk::mp4(&tk::Mp4Options {
+            mdat_len: 100_000,
+            moov_at_end: true,
+            mov: false,
+            mdat_64bit: false,
+        });
+        let xo = (rw2_at - 8 - x.len()) / 512 * 512;
+        img[xo..xo + x.len()].copy_from_slice(&x);
+        let free = (rw2_at + 512 - (xo + x.len())) as u32;
+        img[xo + x.len()..xo + x.len() + 4].copy_from_slice(&free.to_be_bytes());
+        img[xo + x.len() + 4..xo + x.len() + 8].copy_from_slice(b"free");
+        // Another RW2 with no entry, far after the first: carved, measured by the workers.
+        let r2 = rw2(4);
+        let carved_at = rw2_at + (1 << 20);
+        img[carved_at..carved_at + r2.bytes.len()].copy_from_slice(&r2.bytes);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&img).unwrap();
+        file.flush().unwrap();
+        let src = crate::source::FileSource::open(file.path()).unwrap();
+        let formats = all_formats();
+        let run = |threads, drop_fs_jobs| {
+            COMMIT_FS_JOBS.with(|c| c.set((0, 0)));
+            let mut events = Vec::new();
+            let opts = ScanOptions {
+                threads,
+                block: 512,
+                drop_fs_jobs,
+                ..ScanOptions::default()
+            };
+            scan(&src, &formats, &opts, &CancelToken::default(), &mut |e| {
+                events.push(e)
+            })
+            .unwrap();
+            (events, COMMIT_FS_JOBS.with(|c| c.get()))
+        };
+        let (base, jobs) = run(1, false);
+        // The deleted RW2's job ran in a deferred block.
+        assert_eq!(jobs, (1, 1));
+        let found: Vec<(u64, FileKind, Health, bool)> = base
+            .iter()
+            .filter_map(|e| match e {
+                Event::Found(f) => Some((f.start, f.kind, f.health, f.origin.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (xo as u64, FileKind::Mp4, Health::Intact, false),
+                (rw2_at as u64, FileKind::Rw2, Health::Partial, true),
+                (carved_at as u64, FileKind::Rw2, Health::Partial, false),
+            ]
+        );
+        assert_eq!(run(8, false).0, base);
+        assert_eq!(run(8, true).0, base);
     }
 }
