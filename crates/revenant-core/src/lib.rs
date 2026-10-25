@@ -2,6 +2,7 @@
 
 pub(crate) mod budget;
 pub(crate) mod cache;
+pub(crate) mod device;
 pub mod error;
 pub mod extract;
 pub mod filesystem;

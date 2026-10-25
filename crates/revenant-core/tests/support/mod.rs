@@ -1,14 +1,15 @@
 //! Failure-simulating sources shared by the integration tests (`mod support;`).
 //!
 //! [`SimSource`] serves bytes from memory (or virtual zeros) and can make chosen ranges unreadable, flaky or slow, make
-//! the whole device vanish or shrink after some reads, and logs every read it receives.
+//! the whole device vanish or shrink after some reads, and logs every read it receives. [`MemDevice`] is an in-memory
+//! [`RawDevice`] that insists on aligned reads.
 #![allow(dead_code)]
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use revenant_core::EngineError;
-use revenant_core::source::{Source, VolumeId};
+use revenant_core::source::{DiskId, Geometry, RawDevice, Source, VolumeId};
 
 enum Data {
     Bytes(Vec<u8>),
@@ -48,6 +49,7 @@ pub struct SimSource {
     gone_after: Option<u64>,
     /// After this many reads, reads return short past the new length (`len()` unchanged).
     shrink: Option<(u64, u64)>,
+    disk: Option<DiskId>,
     state: Mutex<State>,
 }
 
@@ -69,6 +71,7 @@ impl SimSource {
             gone_at: None,
             gone_after: None,
             shrink: None,
+            disk: None,
             state: Mutex::new(State::default()),
         }
     }
@@ -110,6 +113,12 @@ impl SimSource {
     /// After `reads` read calls, reads return short past `new_len` (0 bytes at or past it); `len()` is unchanged.
     pub fn shrink_after(mut self, reads: u64, new_len: u64) -> Self {
         self.shrink = Some((reads, new_len));
+        self
+    }
+
+    /// The source reads the whole disk `id` (what [`Source::disk`] answers).
+    pub fn disk(mut self, id: &str) -> Self {
+        self.disk = Some(DiskId::parse(id).expect("a whole-disk id"));
         self
     }
 
@@ -214,5 +223,102 @@ impl Source for SimSource {
 
     fn volume(&self) -> Option<VolumeId> {
         None
+    }
+
+    fn disk(&self) -> Option<DiskId> {
+        self.disk.clone()
+    }
+}
+
+/// An in-memory [`RawDevice`] with sectors of `logical` bytes. It panics on any read whose offset or length is not a whole
+/// number of logical sectors (what a real device refuses), can make ranges unreadable and vanish after some reads, and logs
+/// every read as `(offset, len)`.
+pub struct MemDevice {
+    data: Vec<u8>,
+    geometry: Geometry,
+    /// Ranges `[start, end)` a read touching fails with `Read { offset: the read's offset }`.
+    bad: Vec<(u64, u64)>,
+    gone_after: Option<u64>,
+    reads: Mutex<Vec<(u64, usize)>>,
+}
+
+impl MemDevice {
+    /// `data.len()` must be a multiple of `logical`; the physical sector equals the logical one.
+    pub fn new(data: Vec<u8>, logical: u32) -> MemDevice {
+        assert!(data.len().is_multiple_of(logical as usize));
+        MemDevice {
+            geometry: Geometry {
+                size: data.len() as u64,
+                logical_sector: logical,
+                physical_sector: logical,
+            },
+            data,
+            bad: Vec::new(),
+            gone_after: None,
+            reads: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Reports physical sectors of `physical` bytes (a 512e disk: logical 512, physical 4096).
+    pub fn physical(mut self, physical: u32) -> Self {
+        self.geometry.physical_sector = physical;
+        self
+    }
+
+    /// A read touching `[start, start + len)` fails.
+    pub fn bad(mut self, start: u64, len: u64) -> Self {
+        self.bad.push((start, start + len));
+        self
+    }
+
+    /// Read number `reads + 1` and every later one fail with `DeviceGone`.
+    pub fn gone_after(mut self, reads: u64) -> Self {
+        self.gone_after = Some(reads);
+        self
+    }
+
+    /// Every read so far, in order, as `(offset, len)`.
+    pub fn reads(&self) -> Vec<(u64, usize)> {
+        self.reads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl RawDevice for MemDevice {
+    fn geometry(&self) -> Geometry {
+        self.geometry
+    }
+
+    fn read_aligned(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        let sector = u64::from(self.geometry.logical_sector);
+        assert!(
+            offset.is_multiple_of(sector) && (buf.len() as u64).is_multiple_of(sector),
+            "misaligned device read: offset {offset}, len {}",
+            buf.len()
+        );
+        let calls = {
+            let mut reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
+            reads.push((offset, buf.len()));
+            reads.len() as u64
+        };
+        if self.gone_after.is_some_and(|n| calls > n) {
+            return Err(EngineError::DeviceGone { offset });
+        }
+        let end = offset + buf.len() as u64;
+        if self.bad.iter().any(|&r| touches(offset, end, r)) {
+            return Err(EngineError::Read {
+                offset,
+                cause: std::io::Error::other("simulated bad sector"),
+            });
+        }
+        let size = self.data.len() as u64;
+        if offset >= size {
+            return Ok(0);
+        }
+        let n = (size - offset).min(buf.len() as u64) as usize;
+        buf[..n].copy_from_slice(&self.data[offset as usize..offset as usize + n]);
+        Ok(n)
     }
 }

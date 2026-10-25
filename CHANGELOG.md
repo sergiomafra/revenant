@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The engine reads a whole card or disk directly, read-only (macOS `/dev/rdiskN`, Windows `\\.\PhysicalDriveN`, with
+  root or Administrator), including disks with 4096-byte sectors; a bad sector is read once, and a disk that disconnects
+  is reported as gone, never as bad sectors.
 - Recovered files can be grouped by shooting session (a pause of more than 2 hours starts a new one), by day, by
   camera and by folder, for the results screen; "by folder" is offered only when the folder structure survived.
   `revenant-dev scan --group` prints the groups.

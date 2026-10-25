@@ -24,10 +24,11 @@ assert_eq!(EngineError::Cancelled.code(), "cancelled");
 ## Source
 
 `source::Source` is the engine's read-only disk-access layer: `len()`, `read_at(offset, buf)` (positional, no shared cursor; fills
-the buffer except at the end of the source, returns 0 past the end) and `volume()`. There is no write method.
+the buffer except at the end of the source, returns 0 past the end), `volume()` and `disk()` (the whole disk the source reads
+when it is a device, else `None`; `Fragmented` and the scan's cache answer their inner source's). There is no write method.
 
 `source::FileSource` implements it for regular files (disk image files), opened read-only (`pread` on Unix, `seek_read` on
-Windows); reading devices directly comes in a later part. `source::volume_of(path)` returns the `VolumeId` of any existing
+Windows). `source::volume_of(path)` returns the `VolumeId` of any existing
 path (device id on Unix, volume serial number on Windows), so extraction onto the source's own volume can be refused. A test
 scans `src/source/` to ensure no write-capable open flags are ever introduced, and another checks that the image's bytes and
 modification time are unchanged after a full scan that extracts every finding.
@@ -38,6 +39,29 @@ when it can tell, and a read that comes back short before the length the source 
 counts as vanished too. The scan stops with it (below), extraction stops with it and removes the incomplete file, and the
 scan's cache never remembers those sectors as unreadable: it keeps the first offset and loads nothing from the source
 again (what it already holds is still served).
+
+### Devices
+
+`source::DeviceSource` reads a whole card or disk directly, read-only. Only whole disks: `source::DiskId::parse` accepts
+`disk4`, `/dev/disk4`, `/dev/rdisk4`, `PhysicalDrive2` and `\\.\PhysicalDrive2` on every platform (canonical names `disk4`,
+`PhysicalDrive2`); a partition (`disk4s1`) or anything else is `not_whole_disk`. `DeviceSource::open(&disk)` opens the raw
+node on macOS (`/dev/rdisk4`, plain `File::open`) and `\\.\PhysicalDrive2` on Windows (`GENERIC_READ` only, sharing read
+and write); it needs root or Administrator (`permission_denied` otherwise), a missing disk is `device_not_found`, and other
+systems answer `unsupported_platform`. Its geometry (`Geometry { size, logical_sector, physical_sector }`) comes on macOS
+from `diskutil info -plist` (`TotalSize` or `Size`, `DeviceBlockSize`) and `ioreg -a -r -c IOBlockStorageDevice -l` (the
+device's `Physical Block Size`, else the logical size), tools run by absolute path with their output bounded to 16 MiB
+(any failure is `system_tool_failed`); on Windows from `IOCTL_DISK_GET_LENGTH_INFO` and the storage access alignment
+property (else the drive geometry's bytes per sector).
+
+A device reads only whole logical sectors; `DeviceSource` accepts any offset and length and aligns inside: an aligned
+request goes straight to the caller's buffer, a partial sector at either end through a sector buffer aligned to 4096 bytes.
+4Kn disks (4096-byte logical sectors) and 512e disks (512 logical, 4096 physical) are transparent. Scans and copies on a
+device use `DeviceSource::scan_sector()` (`max(physical, logical)`) as `ScanOptions::sector`, so a bad physical sector is
+read once and reported as one unreadable run of its size. A read error is `device_gone` when the error says the device
+left (macOS `ENOENT`/`ENXIO`/`ENODEV`; Windows `ERROR_DEVICE_NOT_CONNECTED`, `ERROR_NO_SUCH_DEVICE`, `ERROR_DEV_NOT_EXIST`,
+`ERROR_NOT_READY`, `ERROR_FILE_NOT_FOUND`) or when the device is no longer present (macOS: `/dev/diskN` is gone; Windows:
+`IOCTL_STORAGE_CHECK_VERIFY2` fails); otherwise it is a bad sector (`read_failed`). `source::RawDevice` (aligned reads
+and the geometry) is what `DeviceSource::new(raw, disk)` wraps, for a privileged helper or a test double.
 
 `source::Fragmented::new(source, pieces)` is a read-only logical view of pieces (`Fragment { start, len }`, absolute ranges)
 of a source, in the given order: offset 0 is the first byte of the first piece. Each piece is first clamped to the inner

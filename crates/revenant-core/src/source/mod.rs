@@ -1,5 +1,6 @@
 //! Read-only positional access to the data being recovered.
 
+mod device;
 mod file;
 mod fragmented;
 #[cfg(unix)]
@@ -14,6 +15,7 @@ use windows as platform;
 
 use crate::EngineError;
 
+pub use device::{DeviceSource, DiskId, Geometry, RawDevice};
 pub use file::FileSource;
 pub use fragmented::Fragmented;
 
@@ -34,6 +36,11 @@ pub trait Source: Send + Sync {
 
     /// Volume the source lives on (to refuse extracting onto it). `None` if unknown.
     fn volume(&self) -> Option<VolumeId>;
+
+    /// The whole disk the source reads, when it is a device (extraction and copies refuse every volume of it).
+    fn disk(&self) -> Option<DiskId> {
+        None
+    }
 }
 
 /// Fills `buf` from `offset` of a source whose `len()` covers it. A short read means the source vanished there: it is

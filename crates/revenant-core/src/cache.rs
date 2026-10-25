@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::EngineError;
 use crate::scan::CancelToken;
-use crate::source::{Source, VolumeId, read_full};
+use crate::source::{DiskId, Source, VolumeId, read_full};
 
 /// Bytes per cache window (rounded down to a whole number of sectors, at least one).
 pub(crate) const CACHE_WINDOW: usize = 1 << 20;
@@ -498,6 +498,10 @@ impl Source for CachedSource<'_> {
     fn volume(&self) -> Option<VolumeId> {
         self.inner.volume()
     }
+
+    fn disk(&self) -> Option<DiskId> {
+        self.inner.disk()
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +568,35 @@ mod tests {
         fn volume(&self) -> Option<VolumeId> {
             None
         }
+    }
+
+    /// A source that reads the whole disk `disk4`.
+    struct OnDisk(Mem);
+
+    impl Source for OnDisk {
+        fn len(&self) -> u64 {
+            self.0.len()
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+            self.0.read_at(offset, buf)
+        }
+        fn volume(&self) -> Option<VolumeId> {
+            None
+        }
+        fn disk(&self) -> Option<DiskId> {
+            DiskId::parse("disk4").ok()
+        }
+    }
+
+    #[test]
+    fn the_cache_forwards_the_disk() {
+        let plain = Mem::new(4096, 1, Vec::new());
+        assert_eq!(CachedSource::new(&plain, 512, MIB as usize).disk(), None);
+        let device = OnDisk(Mem::new(4096, 1, Vec::new()));
+        assert_eq!(
+            CachedSource::new(&device, 512, MIB as usize).disk(),
+            DiskId::parse("disk4").ok()
+        );
     }
 
     /// splitmix64.

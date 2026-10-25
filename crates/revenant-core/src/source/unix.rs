@@ -14,3 +14,45 @@ pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
 pub fn volume_of_file(file: &File) -> io::Result<u64> {
     Ok(file.metadata()?.dev())
 }
+
+/// Opens a device node read-only (`/dev/rdiskN`): plain `File::open`, never a write mode.
+#[cfg(target_os = "macos")]
+pub(crate) fn open_device(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// Whether a read error number means the device vanished (ruling D2): `ENOENT` (2), `ENXIO` (6), `ENODEV` (19), the same
+/// numbers on macOS and Linux.
+#[cfg(target_os = "macos")]
+pub(crate) fn is_gone_errno(raw: i32) -> bool {
+    const ENOENT: i32 = 2;
+    const ENXIO: i32 = 6;
+    const ENODEV: i32 = 19;
+    matches!(raw, ENOENT | ENXIO | ENODEV)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gone_errnos_match_the_system() {
+        for (kind, raw) in [
+            (io::ErrorKind::NotFound, 2),
+            (io::ErrorKind::PermissionDenied, 13),
+        ] {
+            assert_eq!(io::Error::from_raw_os_error(raw).kind(), kind);
+        }
+        // ENXIO and ENODEV have no stable kind: their messages identify them.
+        let msg = |raw| io::Error::from_raw_os_error(raw).to_string();
+        assert!(msg(6).contains("Device not configured"), "{}", msg(6));
+        assert!(
+            msg(19).contains("Operation not supported by device"),
+            "{}",
+            msg(19)
+        );
+        assert!(is_gone_errno(2) && is_gone_errno(6) && is_gone_errno(19));
+        assert!(!is_gone_errno(5)); // EIO: a bad sector unless the device is no longer present
+        assert!(!is_gone_errno(13));
+    }
+}
