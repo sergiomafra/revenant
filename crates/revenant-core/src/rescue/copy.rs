@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::map::{MAX_MAP_REGIONS, MapTotals, Pass, RegionState, RescueMap, map_path};
+use crate::device::DestInfo;
 use crate::naming::sanitize;
 use crate::rate::RateMeter;
 use crate::scan::CancelToken;
@@ -224,12 +225,7 @@ fn open(
             if map.size() != size || meta.len() != size || map.sector() != opts.sector {
                 return Err(EngineError::MapMismatch);
             }
-            let t = map.totals();
-            let mut missing = t.untried + t.to_trim + t.to_scrape;
-            if opts.retries > 0 {
-                missing += t.bad;
-            }
-            check_room(dest, size, missing)?;
+            check_room(dest, size, still_to_copy(&map.totals(), opts.retries > 0))?;
             map.set_cap(map_cap);
             #[cfg(test)]
             tests::before_resume_open(image);
@@ -293,17 +289,46 @@ fn same_file(_checked: &std::fs::Metadata, _opened: &std::fs::Metadata) -> bool 
     true
 }
 
+/// The bytes a resumed copy still has to write: those `Untried`, `ToTrim` or `ToScrape`, plus the `Bad` ones when they
+/// are read again (`with_bad`, retries asked).
+pub(crate) fn still_to_copy(totals: &MapTotals, with_bad: bool) -> u64 {
+    let missing = totals.untried + totals.to_trim + totals.to_scrape;
+    if with_bad {
+        missing + totals.bad
+    } else {
+        missing
+    }
+}
+
+/// What keeps a destination from holding a copy (P12), shared by the copy and the pre-flight check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RoomProblems {
+    /// `(need, free)` when the free space is below what is still to copy.
+    pub(crate) short: Option<(u64, u64)>,
+    /// The largest file the destination holds, when it is below the image's size.
+    pub(crate) file_limit: Option<u64>,
+}
+
+/// Whether `info` holds an image of `size` bytes of which `missing` are still to write.
+pub(crate) fn room_problems(info: &DestInfo, size: u64, missing: u64) -> RoomProblems {
+    RoomProblems {
+        short: (info.free_bytes < missing).then_some((missing, info.free_bytes)),
+        file_limit: info.max_file_bytes.filter(|&max| max < size),
+    }
+}
+
 /// P12: the destination's file-size limit must hold the whole image and its free space what is still to copy.
 fn check_room(dest: &Destination, size: u64, missing: u64) -> Result<(), EngineError> {
     let Some(info) = dest.info() else {
         return Ok(());
     };
-    if info.max_file_bytes.is_some_and(|max| max < size) {
+    let problems = room_problems(info, size, missing);
+    if problems.file_limit.is_some() {
         return Err(EngineError::Write {
             cause: std::io::Error::from(ErrorKind::FileTooLarge),
         });
     }
-    if info.free_bytes < missing {
+    if problems.short.is_some() {
         return Err(EngineError::Write {
             cause: std::io::Error::from(ErrorKind::StorageFull),
         });

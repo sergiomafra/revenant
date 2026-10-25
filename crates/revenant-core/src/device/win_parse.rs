@@ -55,6 +55,9 @@ pub(crate) struct WinVolumeRaw {
     pub(crate) extents: Vec<WinExtent>,
     /// The extents query of a local volume failed: the disks it lies on are unknown.
     pub(crate) extents_failed: bool,
+    /// The one query made said "no media" (an empty card-reader slot, or a card not ready yet): `extents` is empty and
+    /// not trusted by an unmount until [`confirm_no_media`] asked again. The first attempt's error.
+    pub(crate) no_media: Option<ExtentsError>,
 }
 
 /// A destination folder's volume as queried.
@@ -270,12 +273,51 @@ pub(crate) fn extents_failure(
     }
 }
 
-/// The volumes whose disks are unknown (their extents query failed): one of them may lie on the disk being unmounted,
-/// so an unmount fails closed while any is there, naming them.
+/// What a single extents query of a volume tells (a listing, a destination, a reconnect poll: no second look, no wait):
+/// `(extents, failed, no_media)`. A "no media" answer gives no extents and is kept as `no_media` for an unmount to
+/// confirm ([`confirm_no_media`]); any other failure is `failed` (the disks are unknown).
+pub(crate) fn single_shot(
+    attempt: Result<Vec<WinExtent>, ExtentsError>,
+) -> (Vec<WinExtent>, bool, Option<ExtentsError>) {
+    match attempt {
+        Ok(extents) => (extents, false, None),
+        Err(e) if no_media(&e) => (Vec::new(), false, Some(e)),
+        Err(_) => (Vec::new(), true, None),
+    }
+}
+
+/// The indexes of the volumes whose single query said "no media": an unmount waits once (about 300 ms) and asks only
+/// these again ([`confirm_no_media`]), so a reader with four empty slots costs one wait, not four.
+pub(crate) fn unconfirmed(volumes: &[WinVolumeRaw]) -> Vec<usize> {
+    (0..volumes.len())
+        .filter(|&i| volumes[i].no_media.is_some())
+        .collect()
+}
+
+/// Settles a volume that said "no media" with the answer of the second query (rulings P30, P31): extents → it has them
+/// (the card was there after all); "no media" again → it has none, confirmed; anything else → its disks are unknown.
+pub(crate) fn confirm_no_media(
+    volume: &mut WinVolumeRaw,
+    retry: Result<Vec<WinExtent>, ExtentsError>,
+) {
+    let Some(first) = volume.no_media.take() else {
+        return;
+    };
+    match retry {
+        Ok(extents) => volume.extents = extents,
+        Err(e) => {
+            volume.extents.clear();
+            volume.extents_failed = extents_failure(&first, Some(&e)) == ExtentsFailure::Failed;
+        }
+    }
+}
+
+/// The volumes whose disks are unknown (their extents query failed, or said "no media" without being confirmed): one of
+/// them may lie on the disk being unmounted, so an unmount fails closed while any is there, naming them.
 pub(crate) fn unknown_volumes(volumes: &[WinVolumeRaw]) -> Vec<String> {
     volumes
         .iter()
-        .filter(|v| v.extents_failed)
+        .filter(|v| v.extents_failed || v.no_media.is_some())
         .map(|v| v.name.clone())
         .collect()
 }
@@ -334,6 +376,7 @@ mod tests {
             mount_point: mount.map(PathBuf::from),
             extents,
             extents_failed: false,
+            no_media: None,
         }
     }
 
@@ -536,6 +579,59 @@ mod tests {
                 assert_eq!(extents_failure(other, Some(first)), ExtentsFailure::Failed);
             }
         }
+    }
+
+    #[test]
+    fn no_media_is_confirmed_only_by_an_unmount() {
+        let not_ready = ExtentsError::Open(Some(ERROR_NOT_READY));
+        let denied = ExtentsError::Open(Some(5));
+        // A single query: extents, "no media" kept for later, or unknown.
+        assert_eq!(
+            single_shot(Ok(vec![extent(1, 10)])),
+            (vec![extent(1, 10)], false, None)
+        );
+        assert_eq!(
+            single_shot(Err(not_ready)),
+            (Vec::new(), false, Some(not_ready))
+        );
+        assert_eq!(single_shot(Err(denied)), (Vec::new(), true, None));
+
+        let slot = |name: &str| WinVolumeRaw {
+            no_media: Some(not_ready),
+            ..volume(name, "FAT32", None, Vec::new())
+        };
+        let volumes = [
+            volume("sys", "NTFS", Some(r"C:\"), vec![extent(0, 100)]),
+            slot("a"),
+            slot("b"),
+            slot("c"),
+            slot("d"),
+        ];
+        // Unconfirmed slots block an unmount (fail closed) until asked again.
+        assert_eq!(unknown_volumes(&volumes).len(), 4);
+        assert_eq!(unconfirmed(&volumes), [1, 2, 3, 4]);
+        let mut settled = volumes.to_vec();
+        confirm_no_media(&mut settled[1], Err(not_ready));
+        confirm_no_media(&mut settled[2], Ok(vec![extent(1, 10)]));
+        confirm_no_media(&mut settled[3], Err(denied));
+        confirm_no_media(
+            &mut settled[4],
+            Err(ExtentsError::Query {
+                code: Some(ERROR_NOT_READY),
+                verify: None,
+            }),
+        );
+        assert!(unconfirmed(&settled).is_empty());
+        assert_eq!(
+            unknown_volumes(&settled),
+            [r"\\?\Volume{c}\", r"\\?\Volume{d}\"]
+        );
+        assert_eq!(volumes_on(&settled, 1), [r"\\?\Volume{b}\"]);
+        // A volume never said "no media": nothing to confirm.
+        let mut plain = volume("sys", "NTFS", Some(r"C:\"), vec![extent(0, 100)]);
+        confirm_no_media(&mut plain, Err(denied));
+        assert_eq!(plain.extents, [extent(0, 100)]);
+        assert!(!plain.extents_failed);
     }
 
     #[test]

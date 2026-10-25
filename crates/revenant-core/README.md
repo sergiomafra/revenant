@@ -138,7 +138,10 @@ whose drive holds no media (an empty slot of a multi-slot card reader) is not un
 blocks an unmount; CDs and network volumes (`GetDriveTypeW`) have no disks either. "No media" needs the volume's open
 to fail with `ERROR_NOT_READY`, or its extents query to fail with it and the media check on the same handle
 (`IOCTL_STORAGE_CHECK_VERIFY2`) to answer `ERROR_NO_MEDIA_IN_DRIVE` or `ERROR_NOT_READY`, and a second try 300 ms later
-to say the same; anything else fails closed. The residual risk: a card that stays not ready through both tries and whose
+to say the same; anything else fails closed. Only the unmount makes that second try: the listing, `destination` and the
+reconnect polls ask each volume once and never wait (a "no media" volume simply has no disks there), and the unmount
+waits 300 ms once for all the volumes that said "no media", then asks only those again (a four-slot reader costs 300 ms,
+not 1.2 s). The residual risk: a card that stays not ready through both tries and whose
 media check says no media would be skipped and left mounted (it is then unreadable for the scan as well). Each volume is
   opened read-only first; only when Windows refuses the lock or the dismount on that handle (`ERROR_ACCESS_DENIED`) is
   it opened again with write access, solely to repeat the two requests. That handle never reads or writes data (the
@@ -148,6 +151,21 @@ media check says no media would be skipped and left mounted (it is then unreadab
 
 Locking a volume on Windows needs Administrator. When the unmount fails, a scan can still go ahead with the card mounted: the engine
 still never writes to it, but the system may (warning the user is the app's job).
+
+**Reconnecting.** `device::reconnect(&ops, &identity, &cancel, poll)` waits for a card that was disconnected (a loose
+cable, the computer sleeping) to come back, and returns `Reconnected { source, unmount }`. Every `poll` (the app uses
+500 ms) it lists the disks with the same size and model as the identity (and the same serial when both have one; the
+system disk never), opens each candidate read-only only to read its identity sectors (on a thread, waited for at most
+`preflight::SAMPLE_TIMEOUT`) and compares with `same_source`. A candidate that does not match is closed and nothing is
+unmounted; the one that matches is closed, unmounted, and only then opened again as `source` (`unmount` holds the
+guard, or the error when the unmount failed: the card is then read mounted). Nothing but the identity sectors is read
+before the unmount. Errors: `cancelled` (seen while waiting), `device_not_found` for an identity that is not a device's,
+`unsupported_platform`, or the error of opening the card again. The remount window: the system mounts the card by itself
+when it comes back and may write to it (`.fseventsd`, a dirty flag) before `reconnect` unmounts it; closing that window
+(refusing the mount while a session lasts) is for the privileged helper of Module 2.1.
+
+Both the pre-flight check (below) and `reconnect` open the disk before unmounting it (`reconnect` only to read the
+identity sectors): opening is read-only and never writes.
 
 ### Destination
 
@@ -198,6 +216,50 @@ of a source, in the given order: offset 0 is the first byte of the first piece. 
 source's end (as `extract` clamps it), and `len()` is the sum of the clamped lengths. A read crosses pieces in order; a read
 error is the inner source's, so its offset is absolute in the inner source; `volume()` is the inner source's.
 `absolute(start, len)` maps a logical range back to absolute pieces of the source, merging pieces that touch.
+
+## Pre-flight check
+
+`preflight::preflight(&ops, &PreflightRequest { disk, unmount, copy_to, sample_timeout })` is called before any long read
+(a scan or a copy of a disk) and returns `Preflight { disk, issues, guard }`: the disk as listed, **every** problem
+already known (empty when none), and the unmount's guard when one was asked and succeeded (keep it while the disk is
+read). Nothing is written anywhere. In this order:
+
+1. **Find** the disk in the listing; not there, or the listing fails: `device_not_found`, and the check ends.
+2. **Open** it read-only: `permission_denied` (root or Administrator needed) ends the check; any other failure is
+   `device_not_found`, and ends it too.
+3. **Unmount** (when `unmount`): a failure is `unmount_failed` with the volumes still mounted (the check goes on: the
+   disk can still be read mounted); a disk gone meanwhile is `device_not_found` and ends the check.
+4. **Samples**: the first, the middle (`sectors / 2`) and the last logical sector, one after another, each read on its
+   own thread and waited for at most `sample_timeout` (callers pass `preflight::SAMPLE_TIMEOUT`, 10 s). A read that does
+   not return in time is `device_not_responding { offset }` and ends the sampling; its thread is left behind, blocked
+   until the system gives up on the read (a dying disk can hold it for minutes), and the call returns anyway. A failed
+   read is `sample_unreadable { offset }`; a device that vanishes is `device_not_found`.
+5. **Copy destination** (when `copy_to`, the image file a copy would write): its parent folder goes through
+   `Destination::check` (`destination_on_source`; `destination_unknown` for anything else, including a folder that
+   does not exist). Then the same room checks as `rescue::copy` (shared code): the free space against what is still to
+   copy, `destination_too_small { need, free }`, and the file system's largest file against the disk's size,
+   `destination_file_too_large { limit }` (FAT32: 4 GiB − 1; the image is never split). What is still to copy is the
+   whole disk, or, when `map_path(copy_to)` holds a map of this same disk (`same_source` against the identity read now,
+   under the same timeout), the bytes the map does not call rescued (its bad bytes count too: whether retries will be
+   asked is not known yet). A map of another disk, of another size or that cannot be read counts as a fresh copy (the
+   copy itself refuses it).
+
+| Issue                     | Code                         |
+| ------------------------- | ---------------------------- |
+| `PermissionDenied`        | `permission_denied`          |
+| `DeviceNotFound`          | `device_not_found`           |
+| `NotResponding`           | `device_not_responding`      |
+| `SampleUnreadable`        | `sample_unreadable`          |
+| `UnmountFailed`           | `unmount_failed`             |
+| `DestinationTooSmall`     | `destination_too_small`      |
+| `DestinationOnSource`     | `destination_on_source`      |
+| `DestinationUnknown`      | `destination_unknown`        |
+| `DestinationFileTooLarge` | `destination_file_too_large` |
+| `SessionOtherSource`      | `session_other_source`       |
+| `SessionCorrupt`          | `session_corrupt`            |
+
+The last two are for resuming a session and are not produced yet. The issues come in the order of the steps (an
+unmount failure, then the samples', then the destination's: room before the file-size limit).
 
 ## Rescue copy
 

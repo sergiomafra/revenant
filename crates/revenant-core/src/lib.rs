@@ -20,11 +20,13 @@ pub(crate) mod identity;
 pub mod inspect;
 pub mod naming;
 pub(crate) mod pairing;
+pub mod preflight;
 pub mod rate;
 pub mod rescue;
 pub mod scan;
 pub mod source;
 pub(crate) mod tiff;
+pub(crate) mod timed;
 
 pub use error::EngineError;
 pub use extract::{Destination, extract, extract_as, extract_to};

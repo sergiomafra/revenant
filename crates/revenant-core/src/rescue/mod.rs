@@ -8,5 +8,6 @@ mod mapped;
 mod text;
 
 pub use copy::{CopyEvent, CopyOptions, CopySummary, copy};
+pub(crate) use copy::{room_problems, still_to_copy};
 pub use map::{MAX_MAP_REGIONS, MapTotals, Pass, RegionState, RescueMap, map_path};
 pub use mapped::MappedSource;

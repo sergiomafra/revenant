@@ -29,7 +29,7 @@ use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 
 use super::Geometry;
 use crate::device::win_parse::{
-    self, ExtentsError, ExtentsFailure, WinDestRaw, WinDiskRaw, WinExtent, WinVolumeRaw,
+    self, ExtentsError, WinDestRaw, WinDiskRaw, WinExtent, WinVolumeRaw,
 };
 
 /// Opens read-only. `FILE_FLAG_BACKUP_SEMANTICS` is required to open directories.
@@ -288,46 +288,24 @@ fn volume_information(root: &OsStr) -> (Option<String>, Option<String>) {
     (non_empty(until_nul(&label)), non_empty(until_nul(&fs)))
 }
 
-/// How long to wait before asking a volume that said "no media" again (ruling P31).
-const NO_MEDIA_RECHECK: std::time::Duration = std::time::Duration::from_millis(300);
-
 /// `GetDriveTypeW` answers for a network volume (`DRIVE_REMOTE`; the constant lives in a `windows-sys` feature not
 /// enabled).
 const DRIVE_REMOTE: u32 = 4;
 /// `GetDriveTypeW` answers for a CD or DVD (`DRIVE_CDROM`).
 const DRIVE_CDROM: u32 = 5;
 
-/// The disk extents of the volume `\\?\Volume{…}\` (`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` on the volume opened for
-/// queries only, without the trailing backslash): `Some` and empty when it has none (a CD or a network volume, by
-/// `GetDriveTypeW`, the IOCTL answering zero extents, or no media in the drive: an empty card-reader slot, rulings P30
-/// and P31, see [`win_parse::extents_failure`]), `None` when the query failed otherwise (the disks are then unknown). A
-/// volume saying "no media" is asked again after [`NO_MEDIA_RECHECK`].
-/// With more extents than [`MAX_EXTENTS`] (`ERROR_MORE_DATA`), the first ones when `partial` is allowed (a listing), else
-/// `None` (a destination check fails closed rather than miss a disk).
-fn volume_extents(name: &str, partial: bool) -> Option<Vec<WinExtent>> {
+/// The disk extents of the volume `\\?\Volume{…}\`, asked once (no second look, no wait: a listing, a destination and
+/// a reconnect poll take this answer as it is; only an unmount confirms "no media", see
+/// [`win_parse::confirm_no_media`]): empty when it has none (a CD or a network volume, by `GetDriveTypeW`, or the IOCTL
+/// answering zero extents), else what [`extents_attempt`] answers.
+pub(crate) fn volume_extents(name: &str, partial: bool) -> Result<Vec<WinExtent>, ExtentsError> {
     let root = wide(OsStr::new(name));
     // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call.
     let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
     if kind == DRIVE_REMOTE || kind == DRIVE_CDROM {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
-    let first = match extents_attempt(name, partial) {
-        Ok(extents) => return Some(extents),
-        Err(e) => e,
-    };
-    if !win_parse::no_media(&first) {
-        return None;
-    }
-    // A card that is there but not ready yet must not pass for an empty slot: ask once more a little later.
-    std::thread::sleep(NO_MEDIA_RECHECK);
-    let retry = match extents_attempt(name, partial) {
-        Ok(extents) => return Some(extents),
-        Err(e) => e,
-    };
-    match win_parse::extents_failure(&first, Some(&retry)) {
-        ExtentsFailure::NoExtents => Some(Vec::new()),
-        ExtentsFailure::Failed => None,
-    }
+    extents_attempt(name, partial)
 }
 
 /// One attempt at the extents of the volume `name`: the volume opened for queries only (without the trailing
@@ -391,13 +369,15 @@ pub(crate) fn volumes_raw() -> Vec<WinVolumeRaw> {
         let name = until_nul(&buf);
         if !name.is_empty() {
             let (label, fs) = volume_information(OsStr::new(&name));
-            let extents = volume_extents(&name, true);
+            let (extents, extents_failed, no_media) =
+                win_parse::single_shot(volume_extents(&name, true));
             out.push(WinVolumeRaw {
                 fs,
                 label,
                 mount_point: mount_point(&name),
-                extents_failed: extents.is_none(),
-                extents: extents.unwrap_or_default(),
+                extents_failed,
+                extents,
+                no_media,
                 name,
             });
         }
@@ -437,7 +417,7 @@ pub(crate) fn dest_raw(dir: &Path) -> io::Result<WinDestRaw> {
     Ok(WinDestRaw {
         fs,
         free_bytes: free,
-        // No extents (a network volume) or a failed query: the destination check fails closed on an empty list.
+        // No extents (a network volume), no media or a failed query: the destination check fails closed on an empty list.
         extents: volume_extents(&name, false).unwrap_or_default(),
     })
 }

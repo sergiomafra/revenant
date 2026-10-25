@@ -13,6 +13,8 @@ use crate::source::windows as platform;
 
 /// The highest `\\.\PhysicalDriveN` looked at.
 const MAX_DRIVE: u32 = 63;
+/// How long an unmount waits before asking the volumes that said "no media" again (ruling P31), once for all of them.
+const NO_MEDIA_RECHECK: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// The connected whole disks (ruling D9): `\\.\PhysicalDrive0..=63` queried without read access, every volume with its
 /// extents, and the volume of the Windows folder (`GetSystemWindowsDirectoryW`) for the system disk. Fails (`open_failed`)
@@ -54,14 +56,16 @@ fn number_of(disk: &DiskId) -> Result<u32, EngineError> {
 }
 
 /// Locks and dismounts every volume on `disk` (ruling D10) and returns the locks, to be held for the session. The system
-/// disk is refused (`system_disk`, P29) and a disk not listed is `device_not_found`, before anything is locked. While a
+/// disk is refused (`system_disk`, P29) and a disk not listed is `device_not_found`, before anything is locked. Volumes
+/// whose single query said "no media" are asked once more first ([`confirm_no_media`]). While a
 /// local volume's disks are unknown (its extents query failed) nothing is locked and the call fails closed with
 /// `unmount_failed` naming it: it could lie on `disk`. When a lock fails, the others are released (dropped) and the
 /// error names those that stayed mounted.
 pub(crate) fn unmount(disk: &DiskId) -> Result<Vec<OwnedHandle>, EngineError> {
-    let (listed, volumes) = snapshot()?;
+    let (listed, mut volumes) = snapshot()?;
     super::unmountable(&listed, disk)?;
     let number = number_of(disk)?;
+    confirm_no_media(&mut volumes);
     let unknown = win_parse::unknown_volumes(&volumes);
     if !unknown.is_empty() {
         return Err(EngineError::UnmountFailed { volumes: unknown });
@@ -81,6 +85,20 @@ pub(crate) fn unmount(disk: &DiskId) -> Result<Vec<OwnedHandle>, EngineError> {
     win_parse::unmount_outcome(&results)
         .map(|()| locks)
         .map_err(|volumes| EngineError::UnmountFailed { volumes })
+}
+
+/// Asks again, after one wait of [`NO_MEDIA_RECHECK`] for all of them, only the volumes whose single query said "no
+/// media" (a 4-slot reader costs one wait, not four); `win_parse` settles each.
+fn confirm_no_media(volumes: &mut [WinVolumeRaw]) {
+    let pending = win_parse::unconfirmed(volumes);
+    if pending.is_empty() {
+        return;
+    }
+    std::thread::sleep(NO_MEDIA_RECHECK);
+    for i in pending {
+        let retry = platform::volume_extents(&volumes[i].name, true);
+        win_parse::confirm_no_media(&mut volumes[i], retry);
+    }
 }
 
 /// After the locks are released: queries each volume on `disk`, which makes Windows mount it. A volume that does not

@@ -1,6 +1,7 @@
 //! The operating system's disks: listing the connected ones ([`DeviceOps::list`]), opening one read-only
 //! ([`DeviceOps::open`]), finding which disks a destination folder lives on ([`DeviceOps::destination`]) and unmounting a
-//! disk's volumes without ejecting it ([`DeviceOps::unmount`], [`DeviceOps::remount`]).
+//! disk's volumes without ejecting it ([`DeviceOps::unmount`], [`DeviceOps::remount`]); finding a card again after it was
+//! disconnected ([`reconnect`]).
 //!
 //! macOS asks its tools (`diskutil`, `ioreg`, `df`; parsed in `macos_parse`), Windows asks its devices directly (FFI in
 //! `source/windows.rs`, assembled in `win_parse`); other systems answer `unsupported_platform`. The parsers are pure and
@@ -11,12 +12,15 @@ use std::path::{Path, PathBuf};
 use crate::EngineError;
 use crate::source::{DiskId, Geometry, RawDevice};
 
+pub use reconnect::{Reconnected, reconnect};
+
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod macos_parse;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) mod plist;
+mod reconnect;
 #[cfg(windows)]
 pub(crate) mod win;
 #[cfg(any(windows, test))]

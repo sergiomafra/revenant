@@ -348,15 +348,27 @@ pub fn error_of(code: &str) -> EngineError {
     }
 }
 
+/// Read faults of a fake disk, shared with its open devices (set after they are opened, they still apply).
+#[derive(Default)]
+struct Faults {
+    /// Ranges `[start, end)` a read touching fails with `Read { offset: the read's offset }`.
+    bad: Vec<(u64, u64)>,
+    /// Offsets a read touching blocks until the [`FakeDevices`] is dropped (then fails with `Read`).
+    hang: Vec<u64>,
+}
+
 /// One connected fake disk: its info, the bytes it holds (zeros past them up to `info.geometry.size`), whether it is
 /// still connected (an open device reads `DeviceGone` once removed), whether its volumes are mounted (they are when it
-/// is connected) and the volumes an unmount leaves mounted, if it is set to fail.
+/// is connected), the volumes an unmount leaves mounted, if it is set to fail, whether opening it is refused, and its
+/// read faults.
 struct FakeDisk {
     info: DiskInfo,
     data: Arc<Vec<u8>>,
     present: Arc<AtomicBool>,
     mounted: bool,
     fail_unmount: Option<Vec<String>>,
+    deny_open: bool,
+    faults: Arc<Mutex<Faults>>,
 }
 
 #[derive(Default)]
@@ -364,6 +376,8 @@ struct FakeState {
     disks: BTreeMap<DiskId, FakeDisk>,
     destinations: Vec<(PathBuf, Result<DestInfo, &'static str>)>,
     log: Arc<Mutex<Vec<String>>>,
+    /// Set when the `FakeDevices` is dropped: hanging reads give up.
+    released: Arc<AtomicBool>,
 }
 
 /// A [`DeviceOps`] over in-memory disks. Every method takes `&self` (state behind a mutex), so a test can connect and
@@ -394,6 +408,8 @@ impl FakeDevices {
             present: Arc::new(AtomicBool::new(true)),
             mounted: true,
             fail_unmount: None,
+            deny_open: false,
+            faults: Arc::default(),
         };
         if let Some(old) = self.lock().disks.insert(info.id, disk) {
             old.present.store(false, Ordering::SeqCst);
@@ -414,6 +430,31 @@ impl FakeDevices {
         if let Some(d) = self.lock().disks.get_mut(&id) {
             d.fail_unmount = Some(volumes.iter().map(|v| v.to_string()).collect());
         }
+    }
+
+    /// From now on, opening disk `id` fails with `permission_denied`.
+    pub fn deny_open(&self, id: &str) {
+        self.with_disk(id, |d| d.deny_open = true);
+    }
+
+    /// From now on, a read of disk `id` touching byte `offset` never returns while this `FakeDevices` lives (a device
+    /// that stopped answering); it fails with `read_failed` once the `FakeDevices` is dropped. Also on devices already
+    /// open.
+    pub fn hang_reads(&self, id: &str, offset: u64) {
+        self.with_disk(id, |d| d.faults.lock().unwrap().hang.push(offset));
+    }
+
+    /// From now on, a read of disk `id` touching `[offset, offset + len)` fails with `read_failed` (also on devices
+    /// already open).
+    pub fn bad(&self, id: &str, offset: u64, len: u64) {
+        self.with_disk(id, |d| {
+            d.faults.lock().unwrap().bad.push((offset, offset + len))
+        });
+    }
+
+    fn with_disk(&self, id: &str, f: impl FnOnce(&mut FakeDisk)) {
+        let id = DiskId::parse(id).expect("a whole-disk id");
+        f(self.lock().disks.get_mut(&id).expect("a connected disk"));
     }
 
     /// Whether disk `id` is connected with its volumes mounted (true from `add` until a successful `unmount`, and again
@@ -467,11 +508,16 @@ impl DeviceOps for FakeDevices {
         self.note(format!("open {}", disk.as_str()));
         let st = self.lock();
         let d = st.disks.get(disk).ok_or(EngineError::DeviceNotFound)?;
+        if d.deny_open {
+            return Err(EngineError::PermissionDenied);
+        }
         Ok(Box::new(FakeDevice {
             id: disk.clone(),
             geometry: d.info.geometry,
             data: d.data.clone(),
             present: d.present.clone(),
+            faults: d.faults.clone(),
+            released: st.released.clone(),
             log: st.log.clone(),
         }))
     }
@@ -518,13 +564,21 @@ impl DeviceOps for FakeDevices {
     }
 }
 
+impl Drop for FakeDevices {
+    fn drop(&mut self) {
+        self.lock().released.store(true, Ordering::SeqCst);
+    }
+}
+
 /// An open fake disk: aligned reads only (it panics on others, as [`MemDevice`]), zeros past its data, `DeviceGone`
-/// once removed.
+/// once removed, and the disk's read faults.
 struct FakeDevice {
     id: DiskId,
     geometry: Geometry,
     data: Arc<Vec<u8>>,
     present: Arc<AtomicBool>,
+    faults: Arc<Mutex<Faults>>,
+    released: Arc<AtomicBool>,
     log: Arc<Mutex<Vec<String>>>,
 }
 
@@ -546,6 +600,25 @@ impl RawDevice for FakeDevice {
             .push(format!("read {} {offset}", self.id.as_str()));
         if !self.present.load(Ordering::SeqCst) {
             return Err(EngineError::DeviceGone { offset });
+        }
+        let end = offset + buf.len() as u64;
+        let (hangs, bad) = {
+            let f = self.faults.lock().unwrap_or_else(PoisonError::into_inner);
+            (
+                f.hang.iter().any(|&at| offset <= at && at < end),
+                f.bad.iter().any(|&r| touches(offset, end, r)),
+            )
+        };
+        if hangs {
+            while !self.released.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if hangs || bad {
+            return Err(EngineError::Read {
+                offset,
+                cause: std::io::Error::other("simulated bad sector"),
+            });
         }
         let size = self.geometry.size;
         if offset >= size {
