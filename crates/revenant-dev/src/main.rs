@@ -76,6 +76,9 @@ enum Command {
         /// Threads measuring candidate files (0 = one per core, at most 16).
         #[arg(long, value_name = "N", default_value_t = 0)]
         threads: usize,
+        /// Also scan each image through a saved session (one more line per image, `"session":true`).
+        #[arg(long)]
+        session: bool,
     },
 }
 
@@ -641,7 +644,8 @@ fn main() -> ExitCode {
             images,
             dir,
             threads,
-        } => bench::run_bench(size_mib, runs, &images, dir.as_deref(), threads),
+            session,
+        } => bench::run_bench(size_mib, runs, &images, dir.as_deref(), threads, session),
         Command::Scan {
             image,
             extract,

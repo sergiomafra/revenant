@@ -66,6 +66,15 @@ pub enum EngineError {
     /// A saved scan state or session record is damaged: cut short, a length past its end, or a value out of range.
     #[error("session_corrupt")]
     SessionCorrupt,
+    /// A saved session was written by a version of the engine this one cannot read.
+    #[error("session_version")]
+    SessionVersion,
+    /// A saved session was made from another source than the one given to resume it.
+    #[error("session_other_source")]
+    SessionOtherSource,
+    /// A new session needs an empty folder, and the one given holds something.
+    #[error("session_not_empty")]
+    SessionNotEmpty,
 }
 
 impl EngineError {
@@ -91,6 +100,9 @@ impl EngineError {
             Self::MapMismatch => "map_mismatch",
             Self::MapOtherSource => "map_other_source",
             Self::SessionCorrupt => "session_corrupt",
+            Self::SessionVersion => "session_version",
+            Self::SessionOtherSource => "session_other_source",
+            Self::SessionNotEmpty => "session_not_empty",
         }
     }
 }
@@ -135,6 +147,12 @@ mod tests {
         assert_eq!(EngineError::MapMismatch.code(), "map_mismatch");
         assert_eq!(EngineError::MapOtherSource.code(), "map_other_source");
         assert_eq!(EngineError::SessionCorrupt.code(), "session_corrupt");
+        assert_eq!(EngineError::SessionVersion.code(), "session_version");
+        assert_eq!(
+            EngineError::SessionOtherSource.code(),
+            "session_other_source"
+        );
+        assert_eq!(EngineError::SessionNotEmpty.code(), "session_not_empty");
         let io = || std::io::Error::other("x");
         assert_eq!(
             EngineError::Read {

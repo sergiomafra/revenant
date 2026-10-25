@@ -75,6 +75,11 @@ impl ScanState {
         self.events
     }
 
+    /// The length of the source the state's scan reads.
+    pub(crate) fn total(&self) -> u64 {
+        self.shape.total
+    }
+
     /// The cache's bad map stored, as `(start, end)` runs.
     #[cfg(test)]
     pub(crate) fn bad(&self) -> &[(u64, u64)] {
@@ -89,10 +94,14 @@ pub(crate) enum Checkpoint<'a> {
     Listing(&'a Listing),
     /// At every block boundary, after its `Progress` and `DiskFailing` (fixed order `Progress`, `DiskFailing`, `Rate`;
     /// `Rate` is never counted). `state()` builds the state on demand.
+    ///
+    /// `stopping`: the scan was cancelled or the source vanished after this boundary's events were emitted. The state is
+    /// still good (everything in it was committed before), and the scan returns that error right after the hook.
     Boundary {
         read: u64,
         events: u64,
         state: &'a dyn Fn() -> ScanState,
+        stopping: bool,
     },
     /// After the pairing step, before the `Updated` events (a resume from it runs the pairing again; ruling D24).
     Paired {

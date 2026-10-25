@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use revenant_core::device::{DestInfo, DeviceOps, DiskInfo, FAT_MAX_FILE, VolumeInfo, reconnect};
 use revenant_core::preflight::{Issue, PreflightRequest, SAMPLE_TIMEOUT, preflight};
 use revenant_core::rescue::{RegionState, RescueMap, map_path};
+use revenant_core::session::Session;
 use revenant_core::source::{DeviceSource, DiskId};
-use revenant_core::{CancelToken, SourceIdentity};
+use revenant_core::{CancelToken, Destination, ScanOptions, SourceIdentity};
 use revenant_testkit::fs::{FsBuilder, FsType, Partitioning, disk};
 use support::{FakeDevices, disk_info};
 
@@ -76,6 +77,7 @@ fn request<'a>(disk: &'a DiskId, copy_to: Option<&'a Path>) -> PreflightRequest<
         disk,
         unmount: true,
         copy_to,
+        session: None,
         sample_timeout: SAMPLE_TIMEOUT,
     }
 }
@@ -264,6 +266,71 @@ fn each_problem_has_its_code() {
             need: 64 * MIB,
             free: 20 * MIB
         }]
+    );
+}
+
+/// A new session folder `dir` for disk4 of `ops`, recording `identity` as its source.
+fn session_of(ops: &FakeDevices, dir: &Path, identity: SourceIdentity) {
+    std::fs::create_dir(dir).unwrap();
+    let source = DeviceSource::new(ops.open(&id("disk4")).unwrap(), id("disk4"));
+    let dest = Destination::check(ops, &source, dir).unwrap();
+    Session::create(&dest, identity, &ScanOptions::default()).unwrap();
+}
+
+#[test]
+fn session_issues_are_reported() {
+    let s = setup();
+    let ask = |dir: &Path| {
+        preflight(
+            &s.fake,
+            &PreflightRequest {
+                session: Some(dir),
+                ..request(&id("disk4"), None)
+            },
+        )
+        .issues
+    };
+    // No session there (an empty folder, no folder): nothing to report.
+    assert_eq!(ask(s.dir.path()), []);
+    assert_eq!(ask(&s.dir.path().join("missing")), []);
+    // A session of this card; of another card (same model and size, other identity sectors).
+    let mine = s.dir.path().join("mine");
+    session_of(&s.fake, &mine, identity_of(&s.fake, "disk4"));
+    assert_eq!(ask(&mine), []);
+    let other = FakeDevices::new();
+    other.add(info("disk4", Some("S1")), card(4096));
+    let theirs = s.dir.path().join("theirs");
+    session_of(&s.fake, &theirs, identity_of(&other, "disk4"));
+    assert_eq!(ask(&theirs), [Issue::SessionOtherSource]);
+    // A manifest damaged, or of a newer version: session_corrupt (C11).
+    let manifest = mine.join("session.rvs");
+    let good = std::fs::read(&manifest).unwrap();
+    let mut b = good.clone();
+    *b.last_mut().unwrap() ^= 1;
+    std::fs::write(&manifest, &b).unwrap();
+    assert_eq!(ask(&mine), [Issue::SessionCorrupt]);
+    let mut b = good.clone();
+    b[9] = 2;
+    std::fs::write(&manifest, &b).unwrap();
+    assert_eq!(ask(&mine), [Issue::SessionCorrupt]);
+    // After the other checks, in order.
+    std::fs::write(&manifest, &good).unwrap();
+    s.fake.fail_unmount("disk4", &["disk4s1"]);
+    assert_eq!(
+        preflight(
+            &s.fake,
+            &PreflightRequest {
+                session: Some(&theirs),
+                ..request(&id("disk4"), Some(&s.copy_to))
+            },
+        )
+        .issues,
+        [
+            Issue::UnmountFailed {
+                volumes: vec!["disk4s1".into()]
+            },
+            Issue::SessionOtherSource
+        ]
     );
 }
 

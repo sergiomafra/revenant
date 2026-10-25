@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A scan can be saved into a folder of its own and resumed after the card is disconnected, the program crashes or is
+  closed, or the power goes, with the same results as an uninterrupted scan; a finished scan's results can be opened
+  again without the card. A session refuses to resume on another card (or on a rescue copy whose image changed
+  meanwhile), never lives on the card itself, and the pre-flight check says up front when a session belongs to another
+  card or cannot be read. `revenant-dev bench --session` measures a scan through a session.
 - An early "disk failing, make a copy" signal: once the scan meets 16 unreadable areas or 4 MiB of unreadable data, it
   says so right away (once), so a dying card can be copied before it gets worse. A scan can also report its reading
   speed, the time left and how often the device stalled.

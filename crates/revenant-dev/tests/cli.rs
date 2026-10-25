@@ -354,6 +354,38 @@ fn bench_reports_each_image() {
 }
 
 #[test]
+fn bench_with_session_adds_a_session_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .args([
+            "bench",
+            "--size-mib",
+            "8",
+            "--runs",
+            "1",
+            "--images",
+            "dense-jpeg",
+            "--session",
+            "--dir",
+        ])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events = lines(&out);
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["session"], false);
+    assert_eq!(events[1]["session"], true);
+    assert_eq!(events[1]["image"], "dense-jpeg");
+    assert_eq!(events[1]["found"], events[0]["found"]);
+    assert!(events[1]["mb_per_s"].as_f64().unwrap() > 0.0);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn bench_rejects_an_unknown_image() {
     let dir = tempfile::tempdir().unwrap();
     Command::cargo_bin("revenant-dev")

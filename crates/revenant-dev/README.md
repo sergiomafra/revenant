@@ -122,13 +122,16 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
 ## Benchmark
 
 ```sh
-cargo run --release -p revenant-dev -- bench [--size-mib N=1024] [--runs N=3] [--images a,b,..=all] [--dir DIR=temp] [--threads N=0]
+cargo run --release -p revenant-dev -- bench [--size-mib N=1024] [--runs N=3] [--images a,b,..=all] [--dir DIR=temp] [--threads N=0] [--session]
 ```
 
 Writes each synthetic image into a fresh temp dir under `--dir`, scans it `--runs` times and prints one JSON line per image
 (`image`, `bytes`, `placed` = files put in the image, `found` = findings of the best run, `threads` = the measuring
-threads actually used (`--threads 0` resolves to one per core, at most 16), `runs`, `best_seconds`, `mb_per_s` with
-MB = 10^6 bytes). The temp files are removed at the end. Always measure with a release build.
+threads actually used (`--threads 0` resolves to one per core, at most 16), `runs`, `session`, `best_seconds`,
+`mb_per_s` with MB = 10^6 bytes). With `--session`, each image is then scanned `--runs` times more through a saved
+session (a new one each time, in a fresh folder of the temp dir, default checkpoint cadence: every 256 MiB or 30 s) and
+a second line with `"session":true` follows the plain one (`"session":false`); its time includes creating the session.
+The temp files are removed at the end. Always measure with a release build.
 
 Images (files go back to back, each at the next 512-byte boundary, the rest is seeded noise):
 

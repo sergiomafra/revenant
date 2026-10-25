@@ -52,6 +52,7 @@ fn record(source: &dyn Source, opts: &ScanOptions) -> Recorded {
                 read,
                 events,
                 state,
+                ..
             } => {
                 let s = state();
                 assert_eq!((s.position(), s.events()), (read, events));
@@ -118,6 +119,7 @@ fn resume_points(
                 read,
                 events,
                 state,
+                ..
             } => points.push(Point {
                 events,
                 read: Some(read),
@@ -445,6 +447,7 @@ fn resume_across_disk_failing_keeps_the_event() {
                     read,
                     events,
                     state,
+                    ..
                 } => {
                     assert_eq!(state().events(), events);
                     counted.push(events);

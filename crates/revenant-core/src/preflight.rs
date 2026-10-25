@@ -3,15 +3,17 @@
 //!
 //! In this order: the disk is found in the listing, opened read-only, unmounted (when asked), three sectors are read (the
 //! first, the middle and the last logical sector, each on its own thread and waited for at most `sample_timeout`), and
-//! the copy destination is checked (on the source? known disks? room and file-size limit for what is still to copy).
-//! Nothing is written anywhere.
+//! the copy destination is checked (on the source? known disks? room and file-size limit for what is still to copy), and
+//! the session to resume is checked (made from this disk?). Nothing is written anywhere.
 
+use std::cell::OnceCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::device::{DeviceOps, DiskInfo, UnmountGuard};
 use crate::rescue::{RescueMap, map_path, room_problems, still_to_copy};
+use crate::session::saved_identity;
 use crate::source::{DeviceSource, DiskId, Source};
 use crate::timed::{Timed, timed};
 use crate::{Destination, EngineError, SourceIdentity};
@@ -29,6 +31,10 @@ pub struct PreflightRequest<'a> {
     /// The image FILE a copy would write (ruling P10): its map is [`map_path`]`(copy_to)` and the destination checked is
     /// its parent folder. `None`: no copy planned, no destination checked.
     pub copy_to: Option<&'a Path>,
+    /// The folder of a saved session to resume (see [`crate::session`]): `SessionOtherSource` when it was made from
+    /// another disk, `SessionCorrupt` when its manifest cannot be read (ruling C11). `None`, or a folder holding no
+    /// session: nothing checked.
+    pub session: Option<&'a Path>,
     /// How long each sample read is waited for: [`SAMPLE_TIMEOUT`] (ruling P1).
     pub sample_timeout: Duration,
 }
@@ -59,9 +65,9 @@ pub enum Issue {
     DestinationUnknown,
     /// The destination's file system holds files of at most `limit` bytes, less than the image (FAT32).
     DestinationFileTooLarge { limit: u64 },
-    /// The session to resume was made from another disk (reported from Task 10 on).
+    /// The session to resume was made from another disk.
     SessionOtherSource,
-    /// The session to resume cannot be read, or its version is not supported (reported from Task 10 on).
+    /// The session to resume cannot be read, or its version is not supported.
     SessionCorrupt,
 }
 
@@ -97,7 +103,8 @@ pub struct Preflight {
     pub guard: Option<UnmountGuard>,
 }
 
-/// Checks `req.disk` (ruling D14), in this order: find → open → unmount → samples → copy destination. Every issue found
+/// Checks `req.disk` (ruling D14), in this order: find → open → unmount → samples → copy destination → session. Every
+/// issue found
 /// is reported, in that order; `DeviceNotFound`, `SystemDisk`, `OpenFailed` and `PermissionDenied` end the check early
 /// (nothing after them can be checked; nothing is unmounted when the disk cannot be opened).
 ///
@@ -111,7 +118,7 @@ pub struct Preflight {
 /// - Samples: the first, middle (`sectors / 2`) and last logical sector, one after another, each read on its own thread
 ///   and waited for at most `req.sample_timeout`. A read that does not return in time is `NotResponding` and ends the
 ///   sampling (its thread stays blocked, with the device open, until the system gives up on the read); the whole check
-///   waits at most about 4 × `sample_timeout` (three samples and the identity read of a resumed copy's map). A failed
+///   waits at most about 4 × `sample_timeout` (three samples and the one identity read, for a resumed copy's map or a session). A failed
 ///   or short read is `SampleUnreadable`; a vanished device (`device_gone`) is `DeviceNotFound`.
 /// - Copy destination (`req.copy_to`): [`Destination::check`] on its parent folder (`DestinationOnSource`, and
 ///   `DestinationUnknown` for any other failure); then the room the copy would check (P12): free space for what is still
@@ -120,6 +127,11 @@ pub struct Preflight {
 ///   file-size limit against the disk's size, `DestinationFileTooLarge`. A map of another disk, of another size, or that
 ///   cannot be read counts as a fresh copy (the copy itself refuses it). The bad bytes of a map count as still to copy:
 ///   the check does not know whether retries will be asked.
+/// - Session (`req.session`): a folder holding no session is fine. Otherwise its manifest is read: one that cannot be
+///   read, or of an unsupported version, is `SessionCorrupt` (ruling C11); a session not made from this disk
+///   (`same_source` against the identity read now, on a thread under the same timeout, at most once per check) is
+///   `SessionOtherSource`. When the samples did not all answer, or the identity cannot be read in time, the disk cannot
+///   be told and nothing is reported (the resume itself refuses another disk).
 pub fn preflight(ops: &dyn DeviceOps, req: &PreflightRequest) -> Preflight {
     let mut out = Preflight {
         disk: None,
@@ -180,18 +192,63 @@ pub fn preflight(ops: &dyn DeviceOps, req: &PreflightRequest) -> Preflight {
             return out;
         }
     };
+    let identity = Identity {
+        source: &source,
+        info: &info,
+        timeout: req.sample_timeout,
+        responding,
+        read: OnceCell::new(),
+    };
     if let Some(image) = req.copy_to {
         let room = CopyCheck {
             ops,
             source: &source,
-            info: &info,
             image,
-            timeout: req.sample_timeout,
-            responding,
+            identity: &identity,
         };
         room.run(&mut out.issues);
     }
+    if let Some(dir) = req.session {
+        match saved_identity(dir) {
+            Ok(None) => {}
+            Ok(Some(saved)) => {
+                if identity.get().is_some_and(|now| !saved.same_source(now)) {
+                    out.issues.push(Issue::SessionOtherSource);
+                }
+            }
+            Err(_) => out.issues.push(Issue::SessionCorrupt),
+        }
+    }
     out
+}
+
+/// The disk's identity, read at most once per check, on a thread under the sample timeout, and only when every
+/// sample answered.
+struct Identity<'a> {
+    source: &'a Arc<DeviceSource>,
+    info: &'a DiskInfo,
+    timeout: Duration,
+    responding: bool,
+    read: OnceCell<Option<SourceIdentity>>,
+}
+
+impl Identity<'_> {
+    fn get(&self) -> Option<&SourceIdentity> {
+        self.read
+            .get_or_init(|| {
+                if !self.responding {
+                    return None;
+                }
+                let (info, source) = (self.info.clone(), self.source.clone());
+                match timed(self.timeout, None, move || {
+                    SourceIdentity::of_device(&info, &*source)
+                }) {
+                    Timed::Done(Ok(identity)) => Some(identity),
+                    _ => None,
+                }
+            })
+            .as_ref()
+    }
 }
 
 /// The listed volumes of `info` that have a mount point.
@@ -247,11 +304,8 @@ fn sample(source: &Arc<DeviceSource>, timeout: Duration, issues: &mut Vec<Issue>
 struct CopyCheck<'a> {
     ops: &'a dyn DeviceOps,
     source: &'a Arc<DeviceSource>,
-    info: &'a DiskInfo,
     image: &'a Path,
-    timeout: Duration,
-    /// Every sample answered: the identity sectors may be read.
-    responding: bool,
+    identity: &'a Identity<'a>,
 }
 
 impl CopyCheck<'_> {
@@ -287,7 +341,7 @@ impl CopyCheck<'_> {
 
     /// The bytes the copy still has to write: the whole disk, or what a map of this disk does not call rescued.
     fn still_to_copy(&self, size: u64) -> u64 {
-        if !self.responding {
+        if !self.identity.responding {
             return size;
         }
         let Ok(map) = RescueMap::load(&map_path(self.image)) else {
@@ -296,11 +350,8 @@ impl CopyCheck<'_> {
         if map.size() != size {
             return size;
         }
-        let (info, source) = (self.info.clone(), self.source.clone());
-        match timed(self.timeout, None, move || {
-            SourceIdentity::of_device(&info, &*source)
-        }) {
-            Timed::Done(Ok(identity)) if map.identity().same_source(&identity) => {
+        match self.identity.get() {
+            Some(identity) if map.identity().same_source(identity) => {
                 still_to_copy(&map.totals(), true)
             }
             _ => size,

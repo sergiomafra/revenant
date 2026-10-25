@@ -27,7 +27,10 @@ Every engine error is an `EngineError`; each variant has a stable `snake_case` c
 | `MapCorrupt`          | `map_corrupt`           |
 | `MapMismatch`         | `map_mismatch`          |
 | `MapOtherSource`      | `map_other_source`      |
-| `SessionCorrupt`     | `session_corrupt`       |
+| `SessionCorrupt`      | `session_corrupt`       |
+| `SessionVersion`      | `session_version`       |
+| `SessionOtherSource`  | `session_other_source`  |
+| `SessionNotEmpty`     | `session_not_empty`     |
 
 ```rust
 use revenant_core::EngineError;
@@ -223,7 +226,7 @@ error is the inner source's, so its offset is absolute in the inner source; `vol
 
 ## Pre-flight check
 
-`preflight::preflight(&ops, &PreflightRequest { disk, unmount, copy_to, sample_timeout })` is called before any long read
+`preflight::preflight(&ops, &PreflightRequest { disk, unmount, copy_to, session, sample_timeout })` is called before any long read
 (a scan or a copy of a disk) and returns `Preflight { disk, issues, guard }`: the disk as listed, **every** problem
 already known (empty when none), and the unmount's guard when one was asked and succeeded (keep it while the disk is
 read). Nothing is written anywhere. In this order:
@@ -239,9 +242,8 @@ read). Nothing is written anywhere. In this order:
    not return in time is `device_not_responding { offset }` and ends the sampling; its thread is left behind, blocked
    until the system gives up on the read (a dying disk can hold it for minutes), and the call returns anyway. That
    thread keeps the device open meanwhile, so ejecting the disk may fail as busy until the system gives up. In the
-   worst case the whole check waits about 4 × `sample_timeout` (three slow samples, then the identity read of a
-   resumed copy's map). A failed
-   read is `sample_unreadable { offset }`; a device that vanishes is `device_not_found`.
+   worst case the whole check waits about 4 × `sample_timeout` (three slow samples, then the one identity read, for a
+   resumed copy's map or a session). A failed read is `sample_unreadable { offset }`; a device that vanishes is `device_not_found`.
 5. **Copy destination** (when `copy_to`, the image file a copy would write): its parent folder goes through
    `Destination::check` (`destination_on_source`; `destination_unknown` for anything else, including a folder that
    does not exist). Then the same room checks as `rescue::copy` (shared code): the free space against what is still to
@@ -251,6 +253,11 @@ read). Nothing is written anywhere. In this order:
    under the same timeout), the bytes the map does not call rescued (its bad bytes count too: whether retries will be
    asked is not known yet). A map of another disk, of another size or that cannot be read counts as a fresh copy (the
    copy itself refuses it).
+6. **Session** (when `session`, the folder of a saved session to resume): a folder holding no session is fine; a
+   manifest that cannot be read, or of an unsupported version, is `session_corrupt`; a session not made from this disk
+   (`same_source` against the identity read now, under the same timeout) is `session_other_source`. The identity is read
+   at most once per check (shared with step 5); when the samples did not all answer or it cannot be read in time, the
+   disk cannot be told apart and nothing is reported (the resume itself still refuses another disk).
 
 | Issue                     | Code                         |
 | ------------------------- | ---------------------------- |
@@ -268,8 +275,8 @@ read). Nothing is written anywhere. In this order:
 | `SessionOtherSource`      | `session_other_source`       |
 | `SessionCorrupt`          | `session_corrupt`            |
 
-The last two are for resuming a session and are not produced yet. The issues come in the order of the steps (an
-unmount failure, then the samples', then the destination's: room before the file-size limit).
+The issues come in the order of the steps (an unmount failure, then the samples', then the destination's: room before the
+file-size limit, then the session's).
 
 ## Rescue copy
 
@@ -1416,8 +1423,11 @@ Events:
   [File systems: after a quick format](#file-systems-after-a-quick-format)); one event per id, both merged.
 
 `CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block
-examined and each block read ahead, before and after every event and while waiting for a measurement. Once it is seen no
-further event is emitted (a cancel from inside the callback makes that event the last one), the measuring threads drop
+examined and each block read ahead, before and after every event and while waiting for a measurement. A block
+boundary's `Progress`, `DiskFailing` and `Rate` count as one event here: checked before and after the group, so a cancel
+from inside their callback stops the scan right after the whole boundary (where a saved session can still checkpoint).
+Once it is seen no further event is emitted (a cancel from inside the callback makes that event, or that boundary, the
+last one), the measuring threads drop
 their remaining jobs, and `scan` returns `EngineError::Cancelled` after every thread has stopped (a measurement already
 running is finished first, except a JPEG gap search, which gives up as soon as it sees the cancel, and a `zune-jpeg`
 validation decode, which is skipped when the cancel is seen before waiting for the decode budget or once the budget is
@@ -1436,15 +1446,17 @@ the cache) is never used: the scan returns that error before emitting any `Volum
 ## Resumable scans
 
 A scan can be stopped and taken up again where it was, with exactly the events it would have emitted had it not stopped.
-The saved session that stores this on disk is not there yet (it comes next); inside the engine, `scan_with` (crate
-private; `scan` is `scan_with` with neither a resume nor a hook) hands a hook three kinds of checkpoint:
+The saved session ([Sessions](#sessions)) stores this on disk; inside the engine, `scan_with` (crate private; `scan` is
+`scan_with` with neither a resume nor a hook) hands a hook three kinds of checkpoint:
 
 - `Listing`, once, after the file-system listing (an empty one with `filesystems: false`) and before any event. A
   listing read while the scan was cancelled or after the source vanished is never handed over (nor any `Volume`
   emitted): the scan returns `cancelled` or `device_gone` instead (ruling P3).
 - `Boundary`, at every block boundary, right after its `Progress` and its `DiskFailing` (the fixed order is `Progress`,
   `DiskFailing`, `Rate`), with the bytes read and the events emitted so far. Every event counts except `Rate`, which is
-  timing and never part of a saved scan (ruling P4). The state is built only when the hook asks for it.
+  timing and never part of a saved scan (ruling P4). The state is built only when the hook asks for it. `stopping` says
+  the scan was cancelled or the source vanished once the boundary's events were out: the state is still good
+  (everything in it was committed before), and the scan returns that error right after the hook.
 - `Paired`, after the pairing step, before the `Updated` events.
 
 **What the state holds** (ruling D22): the shape of the scan it belongs to (the sector and block sizes as the scan
@@ -1481,6 +1493,86 @@ Starting from the position, a scan without file systems or pairing reads nothing
 65,536 own-file starts, 65,536 old-folder candidates, 262,144 grid findings and one start per finding), plus the bad map
 (at most 2^20 runs, 16 bytes each in the saved form: about 16 MiB) and at most 65,536 coverage runs. The listing is
 saved once, up to a few hundred MiB in the worst case of the listing's caps.
+
+## Sessions
+
+A session saves a scan into a folder of its own, so it can be taken up again after a cancel, a card pulled out, a crash
+of the program or a power loss, with exactly the events of an uninterrupted scan, and so a finished scan's results can be
+read back later without the card.
+
+```rust
+use revenant_core::session::{Session, SessionOptions, scan_session};
+let dest = Destination::check(&ops, &source, folder)?;             // never on the source
+let mut session = Session::create(&dest, identity.clone(), &opts)?; // the folder must be empty
+let summary = scan_session(&source, &identity, &formats, &opts, &mut session, &SessionOptions::default(), &cancel,
+    &mut |event| { /* … */ })?;
+// Later, after a crash or a disconnect:
+let mut session = Session::open(folder)?;      // state(): Fresh, Interrupted { read, total } or Finished(summary)
+scan_session(&source, &identity, &formats, &opts, &mut session, &sopts, &cancel, &mut on_event)?;
+```
+
+- **One folder per session, never on the source.** `Session::create(&dest, identity, &opts)` takes a folder checked
+  with `Destination::check` (not on the card, through any of its volumes) that must be empty (`session_not_empty`). It
+  records the source's identity (see [Source identity](#source-identity)) and the scan's `sector`, `block` and
+  `filesystems`: a resume always scans with these, whatever the caller's `opts` say (threads, cache size and rates do
+  come from the caller). `Session::open(folder)` reopens one (`open_failed` when there is none there). Running a
+  reopened session checks its folder again against the source (`Destination::check` with the running system; for an
+  image only the volume rule applies, and the system is not asked).
+- **One session per source.** `scan_session` refuses (`session_other_source`, before anything is read or written) an
+  `identity` that is not `same_source` as the session's: for a card, size, model and the digest of its identity sectors
+  (the serial number counts only when both sides have one), so the same card in another reader resumes and a reformatted
+  or different card does not; for a rescue copy's image read through its map (`SourceIdentity::of_mapped`), the map's
+  state, so rescuing more of the image meanwhile makes it another source (ruling P7). `check_session(folder, &identity)`
+  answers the same from the manifest alone (`Ok` when the folder holds no session), and the pre-flight check reports it.
+- **Replay.** `scan_session` first hands out the stored events (`replay_len()` of them), then scans on from the last
+  checkpoint: the whole sequence is the uninterrupted scan's, ids and summary included, for any `threads` and
+  `cache_bytes` (the guarantee and its condition are those of [Resumable scans](#resumable-scans)). `Rate` events are
+  never stored nor counted. A **finished** session only replays: the source is not read and nothing is written, so its
+  results come back with the card gone (`events()` reads them without any source).
+- **Cadence.** A checkpoint is saved at the next block boundary once `SessionOptions::checkpoint_bytes` (default 256 MiB)
+  were scanned or `checkpoint_every` (default 30 s) passed since the last one, after the pairing step, and when the scan
+  finishes (with its summary). A cancel or a vanished card seen at a block boundary saves one there; seen anywhere else,
+  the last checkpoint stands and the resume redoes (identically) what came after it: at most about 256 MiB or 30 s of
+  scanning, plus the read-ahead. A listing read while cancelled or after the card vanished is never saved (ruling P3):
+  the resume reads the file systems again.
+- **Errors.** `session_other_source`, `session_not_empty`, `session_version` (written by a version this engine cannot
+  read), `session_corrupt` (damaged beyond the fallbacks below), `write_failed`, `destination_on_source` (the folder is
+  no longer on the volume it was checked on), and the scan's own. On any error the session stays at its last checkpoint,
+  ready to run again.
+
+**The folder** (ruling D25): every file starts with `RVNTSESS`, a kind byte and the format version (`u16`, 1).
+
+| File                                      | Holds                                                                                          |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `session.rvs`                             | CRC-32, then the identity, `sector`, `block`, `filesystems`                                    |
+| `listing.rvs`                             | CRC-32, then the file-system listing, saved once (an empty one with file systems off)         |
+| `events.rvs`                              | records `[len u32][crc32 u32][event]`, appended as the events go out (every one but `Rate`)    |
+| `checkpoint-a.rvs`, `checkpoint-b.rvs`    | CRC-32, then a generation, the log's length and event count, and the scan state or the summary |
+
+Values use the engine's binary encoding (see [Resumable scans](#resumable-scans)): every length checked, every file read
+up to a cap (manifest 1 MiB, listing and checkpoints 1 GiB, an event 32 MiB), so a damaged or hostile folder is
+`session_corrupt`, never a panic or a huge allocation.
+
+**Crash safety.** The log is only appended to. A checkpoint is written after the log is flushed and `sync_data`'d, into
+a new temporary file (`sync_all`) renamed over the older of the two checkpoints, then the folder is synced (best effort:
+some file systems refuse it, ruling P33); the listing is written the same way. Opening takes the valid checkpoint with
+the highest generation (a damaged or torn one, checksum wrong, falls back to the other) and drops whatever the log holds
+past the length it names (a record half written when the power went). Both checkpoints damaged is `session_corrupt`.
+Nothing follows a link planted in the folder: new files are created exclusively (a planted temporary is removed first,
+never its target), a rename replaces a link rather than its target, and the log is reopened only after checking that the
+file opened is the regular file looked at, with a single link (Unix; on Windows a reparse point is opened itself and
+refused).
+
+**Cost.** A session adds a fixed cost per scan and no measurable cost per byte (ruling P46). The fixed cost is the
+syncs that make it crash-safe: two files and the folder synced at create, and at each checkpoint the log's `sync_data`,
+the checkpoint's `sync_all` and the folder sync (on macOS `sync_all` is a full flush of the drive's cache, tens of
+milliseconds each). Checkpoints come every 256 MiB or 30 s, after the pairing step and at the end. Measured with
+`revenant-dev bench --session` (release, best of 3, default cadence, on the machine of [Performance](#performance)):
+at 1 GiB the session took 0.3 to 0.4 s more than a plain scan (`noise` 0.73 to 1.11 s, `dense-jpeg` 3.56 to 3.77 s); at
+4 GiB 0.08 to 0.2 s more on `noise` (1.88 to 1.99 s plain, 2.07 to 2.10 s through a session), and nothing on
+`dense-jpeg` (15.3 s through a session against 16.2 to 16.7 s for a plain scan run in the same place of the bench, after
+the plain runs; with the cadence checkpoints off it is the same 15.3 s). The difference does not grow with the size: on
+a card read at device speed (100 to 300 MB/s) it is well under 1%.
 
 ## Deduplication
 

@@ -125,7 +125,6 @@ pub enum Health {
 
 impl Health {
     /// Stable lowercase identifier (`"intact"`, `"partial"`, `"damaged"`), as saved in a scan state.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Health::Intact => "intact",

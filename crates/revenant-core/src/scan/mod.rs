@@ -4,8 +4,6 @@
 
 mod fs;
 mod pipeline;
-// Used by the saved session (Task 10); until then only the tests call it.
-#[cfg_attr(not(test), allow(dead_code))]
 mod state;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -25,8 +23,6 @@ use crate::rate::RateMeter;
 use crate::source::Source;
 use fs::{FsJobResult, FsPlan, merge, tail_fits};
 use pipeline::{Block, CloseQueue, Finders, Head, Measured, Outcome, Shared};
-// `ScanState` is named by the saved session (Task 10).
-#[allow(unused_imports)]
 pub(crate) use state::{Checkpoint, Resume, ScanState};
 
 /// Bytes of a sector start shown to `Format::recognizes`.
@@ -400,20 +396,30 @@ impl Commit<'_, '_> {
         Ok(())
     }
 
+    /// Emits `event` without looking at the cancel flag or the source: only for the events of a boundary, which go out
+    /// together.
+    fn emit_now(&mut self, event: Event) {
+        self.events += u64::from(!matches!(event, Event::Rate { .. }));
+        (self.on_event)(event);
+    }
+
     /// A block boundary: `Progress`, then `DiskFailing` the first time the `Unreadable` events emitted so far reach a
-    /// threshold (ruling D20), then `Rate` with `ScanOptions::rates` (ruling D21): always in that order.
+    /// threshold (ruling D20), then `Rate` with `ScanOptions::rates` (ruling D21): always in that order, and together:
+    /// a cancel or a vanished source is looked at before them only, so one seen while they are handed out stops the
+    /// scan right after the whole boundary (where a saved session can still checkpoint it).
     fn progress(&mut self, read: u64, total: u64) -> Result<(), EngineError> {
-        self.emit(Event::Progress { read, total })?;
+        self.shared.check()?;
+        self.emit_now(Event::Progress { read, total });
         if !self.failing_sent
             && (self.unreadable_runs >= FAILING_RUNS
                 || self.summary.unreadable_bytes >= FAILING_BYTES)
         {
             self.failing_sent = true;
-            self.emit(Event::DiskFailing {
+            self.emit_now(Event::DiskFailing {
                 unreadable_runs: self.unreadable_runs,
                 unreadable_bytes: self.summary.unreadable_bytes,
                 read,
-            })?;
+            });
         }
         if let Some(rate) = &mut self.rate {
             rate.sample(read, Instant::now());
@@ -422,7 +428,7 @@ impl Commit<'_, '_> {
                 eta_secs: rate.eta_secs(total.saturating_sub(read)),
                 stalls: self.shared.cache.stalls(),
             };
-            self.emit(event)?;
+            self.emit_now(event);
         }
         Ok(())
     }
@@ -952,8 +958,8 @@ impl Commit<'_, '_> {
 ///
 /// `opts.sector` is raised to at least 16 (the head length) and `opts.block` rounded down to whole sectors, so a head
 /// never straddles two blocks. Cancellation is checked before each block examined or read ahead, before and after
-/// every event, while waiting for a measurement and during the pairing step: once it is seen no further event is
-/// emitted, the measuring threads drop their remaining jobs, and the scan returns `Err(Cancelled)` after they have all
+/// every event (a boundary's `Progress`, `DiskFailing` and `Rate` count as one: checked before and after the group),
+/// while waiting for a measurement and during the pairing step: once it is seen no further event is emitted, the measuring threads drop their remaining jobs, and the scan returns `Err(Cancelled)` after they have all
 /// stopped; findings still pending and `Updated` events not yet emitted are dropped. The cache also checks it before each
 /// window load and each sector of a sector-by-sector resolution (ruling D3), so a running measurement ends quickly.
 ///
@@ -1141,10 +1147,14 @@ pub(crate) fn scan_with(
             commit.progress(read, total)?;
             if let Some(h) = hook.as_mut() {
                 let state = || state::capture(&commit, &shared, &ahead, &finders, shape, read);
+                // Everything up to this boundary was committed before a cancel or a vanished source was seen: the
+                // state is still good, and the scan stops right after the hook.
+                let stopping = shared.check().is_err();
                 h(Checkpoint::Boundary {
                     read,
                     events: commit.events,
                     state: &state,
+                    stopping,
                 })?;
             }
         }
@@ -1160,6 +1170,7 @@ pub(crate) fn scan_with(
                     read: 0,
                     events: commit.events,
                     state: &state,
+                    stopping: shared.check().is_err(),
                 })?;
             }
         }
