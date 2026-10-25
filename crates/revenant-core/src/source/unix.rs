@@ -7,6 +7,30 @@ pub fn open_read_only(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
+/// `O_NONBLOCK` where its value is known (it differs between systems; no libc dependency).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+const O_NONBLOCK: i32 = 0x0004;
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+)))]
+const O_NONBLOCK: i32 = 0;
+
+/// Opens what should be a regular file read-only, without blocking: a FIFO put in its place opens at once (and is then
+/// refused by the caller's check on the handle) instead of waiting for a writer. Reads of a regular file ignore the flag.
+pub fn open_file_read_only(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+}
+
 pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
     file.read_at(buf, offset)
 }

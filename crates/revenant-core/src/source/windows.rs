@@ -40,6 +40,12 @@ pub fn open_read_only(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// Opens what should be a regular file read-only (the caller checks the handle: a directory opened through
+/// `FILE_FLAG_BACKUP_SEMANTICS` is refused there).
+pub fn open_file_read_only(path: &Path) -> io::Result<File> {
+    open_read_only(path)
+}
+
 pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
     file.seek_read(buf, offset)
 }

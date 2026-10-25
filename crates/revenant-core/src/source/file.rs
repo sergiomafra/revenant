@@ -3,8 +3,8 @@ use crate::EngineError;
 use std::fs::File;
 use std::path::Path;
 
-/// A [`Source`] backed by a regular file (a disk image file), opened read-only. Reading devices directly comes in a
-/// later part.
+/// A [`Source`] backed by a regular file (a disk image file), opened read-only. Whole disks are read with
+/// [`super::DeviceSource`].
 pub struct FileSource {
     file: File,
     len: u64,
@@ -12,10 +12,17 @@ pub struct FileSource {
 }
 
 impl FileSource {
+    /// Opens `path` read-only. Only a regular file (links followed) is accepted, checked on the opened handle so a node
+    /// swapped in after any earlier check is still refused: a device node, a FIFO (opened without waiting for a writer
+    /// on Unix), a socket or a folder is `open_failed`, as is a file that cannot be opened.
     pub fn open(path: &Path) -> Result<Self, EngineError> {
         let open = |cause| EngineError::Open { cause };
-        let file = platform::open_read_only(path).map_err(open)?;
-        let len = file.metadata().map_err(open)?.len();
+        let file = platform::open_file_read_only(path).map_err(open)?;
+        let meta = file.metadata().map_err(open)?;
+        if !meta.is_file() {
+            return Err(open(std::io::Error::other("not a regular file")));
+        }
+        let len = meta.len();
         let volume = platform::volume_of_file(&file).ok().map(VolumeId);
         Ok(Self { file, len, volume })
     }

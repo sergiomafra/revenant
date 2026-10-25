@@ -44,7 +44,8 @@ the buffer except at the end of the source, returns 0 past the end), `volume()` 
 when it is a device, else `None`; `Fragmented` and the scan's cache answer their inner source's). There is no write method.
 
 `source::FileSource` implements it for regular files (disk image files), opened read-only (`pread` on Unix, `seek_read` on
-Windows). `source::volume_of(path)` returns the `VolumeId` of any existing
+Windows). Anything else is refused (`open_failed`), checked on the opened handle (so a node swapped in after an earlier
+check is caught): a device node, a FIFO (opened without waiting for a writer on Unix), a socket, a folder. `source::volume_of(path)` returns the `VolumeId` of any existing
 path (device id on Unix, volume serial number on Windows), so extraction onto the source's own volume can be refused. A test
 scans `src/source/` to ensure no write-capable open flags are ever introduced, and another checks that the image's bytes and
 modification time are unchanged after a full scan that extracts every finding.

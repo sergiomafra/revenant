@@ -345,3 +345,38 @@ fn fragmented_view_clamps_pieces_to_the_source() {
         ]
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn only_a_regular_file_opens() {
+    // Checked on the opened handle, so a node swapped in after any caller's check is still refused; a FIFO is opened
+    // without waiting for a writer.
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    let fifo_path = fifo.clone();
+    std::thread::spawn(move || {
+        let r = FileSource::open(&fifo_path)
+            .map(|_| ())
+            .map_err(|e| e.code());
+        let _ = tx.send(r);
+    });
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("opening a FIFO never waits for a writer");
+    assert_eq!(r, Err("open_failed"));
+    for node in [Path::new("/dev/null"), dir.path()] {
+        assert_eq!(
+            FileSource::open(node).err().map(|e| e.code()),
+            Some("open_failed"),
+            "{node:?}"
+        );
+    }
+}
