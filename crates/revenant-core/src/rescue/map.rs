@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -345,8 +345,8 @@ impl RescueMap {
         text::decode(&bytes).ok_or(EngineError::MapCorrupt)
     }
 
-    /// Writes the map to `path` so that a crash at any moment leaves either the previous file or this one: into
-    /// `<path>.tmp`, `sync_all`, renamed over `path`, then (on Unix) the folder synced. Failures are `write_failed`,
+    /// Writes the map to `path` so that a crash at any moment leaves either the previous file or this one: into a new
+    /// `<path>.tmp` (whatever was there is removed first, a link included, never what it points to), `sync_all`, renamed over `path`, then (on Unix) the folder synced. Failures are `write_failed`,
     /// except the folder sync, which is best effort (ruling P33): the new file is complete and synced by then, and some
     /// file systems refuse to sync a folder; at worst a crash right after brings the previous map back.
     ///
@@ -360,7 +360,17 @@ impl RescueMap {
             )));
         }
         let tmp = tmp_path(path);
-        let mut file = File::create(&tmp).map_err(write)?;
+        // Never through something planted at `<path>.tmp`: a link there is removed (not its target), and the file is
+        // created exclusively, which never follows a link (a link planted meanwhile makes the save fail instead).
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(write(e)),
+            _ => {}
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(write)?;
         file.write_all(&text::encode(self)).map_err(write)?;
         file.sync_all().map_err(write)?;
         drop(file);

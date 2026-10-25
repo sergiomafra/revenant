@@ -213,14 +213,19 @@ let summary = rescue::copy(&device, &identity, &dest, "card.img", &opts, &cancel
 ```
 
 `copy(source, identity, dest, image, opts, cancel, on_event)` writes `dest.dir()/image` and its map
-`<image>.rvmap`. The image is created sparse at the source's length (nothing is allocated until written) and never
-split into pieces. `image` must be a plain, safe file name, and an existing `image` that is not a regular file (a link)
-is refused (`write_failed`); the folder must still be on the volume it was checked on (`destination_on_source`).
+`<image>.rvmap`. The image is created at the source's length and never split into pieces; it is sparse (nothing
+allocated until written) only where the file system allows it (APFS, ext4; not HFS+, FAT or NTFS), so the room check
+counts the whole length. `image` must be a plain, safe file name, and an existing `image` that is not a regular file (a
+link), or that is no longer the file checked by the time it is opened (swapped meanwhile; same device and inode on
+Unix, a reparse point opened as itself on Windows), is refused (`write_failed`) before anything is written; the folder
+must still be on the volume it was checked on (`destination_on_source`). The map's temporary file is always created
+new (`create_new`, after removing whatever was there, a link included, never its target), so nothing planted in the
+folder is written through.
 
 Before creating or touching anything, when the destination knows what it lives on (`dest.info()`, a device source):
 its largest file (`max_file_bytes`, 4 GiB − 1 on FAT32) must hold the whole image, and its free space what is still to
-copy (the whole length on a fresh copy, the bytes not yet rescued on a resume); otherwise `write_failed` and no file is
-created. A copy from an image file (no `info()`) skips these two checks.
+copy (the whole length on a fresh copy; on a resume the bytes still untried, to trim or to scrape, plus the bad ones
+when `retries > 0`, so a finished copy needs no room); otherwise `write_failed` and no file is created. A copy from an image file (no `info()`) skips these two checks.
 
 The source is read directly (not through the scan's cache), in passes (`CopyOptions` defaults in brackets):
 
@@ -247,7 +252,9 @@ Resume by calling `copy` again with the same `image`: the map's identity must be
 map's (`map_mismatch`). The copy goes on from the pass and position the map records and never reads again what is
 rescued. The map is saved (after the image's `sync_data`, so it never claims bytes the image does not hold) every
 `save_every` [30 s] or `save_bytes` rescued [256 MiB], at each pass change and when the copy stops; a crash or power
-loss resumes from the last save.
+loss resumes from the last save. The map is saved right after the image is created (and the image removed if that
+fails); an image left without a map anyway (a crash in between) makes every later copy fail (`open_failed`) until it is
+deleted.
 
 `on_event` gets `CopyEvent::Progress { pass, pos, totals, bytes_per_sec, eta_secs }` after every read (bytes in each
 state, the reading speed smoothed by `rate::RateMeter` with a 10 s half-life, and the seconds left at that speed), `Bad
@@ -284,7 +291,8 @@ end <crc32 of every byte before this line, 8 lowercase hex digits>
 ```
 
 Hex values are lowercase (model and serial as the hex of their UTF-8 bytes; digests as 16 digits). `save(path)` writes
-`<path>.tmp`, `sync_all`s it, renames it over `path` and (on Unix) syncs the folder, so a crash at any moment leaves
+a new `<path>.tmp` (whatever was there removed first, a link but never its target; created with `create_new`, which
+never follows a link), `sync_all`s it, renames it over `path` and (on Unix) syncs the folder, so a crash at any moment leaves
 the previous map or the new one, never a mix; failures are `write_failed`, except the folder sync, which is best effort
 (the file is complete and synced by then; some file systems refuse it, and at worst a crash right after brings back the
 previous map). A map whose identity nests `mapped` more than 4 deep is not saved (`write_failed`), so a map that saves

@@ -518,6 +518,105 @@ fn resume_against_another_source_is_refused() {
     let longer = SimSource::new(data(9 * MIB, 8));
     let run = run_with(&longer, &a, &dest, &opts, |_, _, _| {});
     assert_eq!(code(&run.result), Some("map_mismatch"));
+    assert_eq!(longer.reads(), []);
+
+    // Another sector than the map's.
+    let sector_4k = CopyOptions {
+        sector: 4096,
+        ..CopyOptions::default()
+    };
+    source.clear_reads();
+    let run = run_with(&source, &a, &dest, &sector_4k, |_, _, _| {});
+    assert_eq!(code(&run.result), Some("map_mismatch"));
+    assert_eq!(source.reads(), []);
+
+    // An image cut short.
+    let image = image_path(dir.path());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&image)
+        .unwrap();
+    file.set_len(8 * MIB - 512).unwrap();
+    drop(file);
+    let run = run_with(&source, &a, &dest, &opts, |_, _, _| {});
+    assert_eq!(code(&run.result), Some("map_mismatch"));
+    assert_eq!(source.reads(), []);
+    assert_eq!(std::fs::metadata(&image).unwrap().len(), 8 * MIB - 512);
+    assert_eq!(std::fs::read(map_path(&image)).unwrap(), map_bytes);
+}
+
+/// A link planted where the map's temporary file goes is never written through: the map is saved as a regular file and
+/// the link's target is untouched.
+#[cfg(unix)]
+#[test]
+fn map_save_never_follows_a_planted_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let victim = elsewhere.path().join("victim");
+    std::fs::write(&victim, b"precious").unwrap();
+    let image = image_path(dir.path());
+    let map = map_path(&image);
+    let mut tmp = map.clone().into_os_string();
+    tmp.push(".tmp");
+    std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+    let source = SimSource::new(data(2 * MIB, 11));
+    let dest = dest_for(&source, dir.path());
+    let summary = run_copy(&source, &dest, &CopyOptions::default())
+        .result
+        .unwrap();
+    assert!(summary.complete);
+    assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+    assert!(std::fs::symlink_metadata(&map).unwrap().is_file());
+    assert!(std::fs::symlink_metadata(&tmp).is_err());
+    assert!(RescueMap::load(&map).is_ok());
+}
+
+#[test]
+fn an_image_whose_first_map_save_fails_is_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = image_path(dir.path());
+    let mut tmp = map_path(&image).into_os_string();
+    tmp.push(".tmp");
+    // A folder where the map's temporary file goes: the first save fails.
+    std::fs::create_dir(&tmp).unwrap();
+    let source = SimSource::new(data(MIB, 12));
+    let dest = dest_for(&source, dir.path());
+    let run = run_copy(&source, &dest, &CopyOptions::default());
+    assert_eq!(code(&run.result), Some("write_failed"));
+    assert_eq!(entries(dir.path()), ["card.img.rvmap.tmp"]);
+    assert_eq!(source.reads(), []);
+}
+
+#[test]
+fn a_finished_copy_needs_no_room() {
+    let fake = FakeDevices::new();
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = data(8 * MIB, 13);
+    let source = bad_source(&bytes[..]).disk("disk4");
+    let roomy = device_dest(&fake, &source, dir.path(), 1 << 40, None);
+    assert!(
+        run_copy(&source, &roomy, &CopyOptions::default())
+            .result
+            .unwrap()
+            .complete
+    );
+    // Nothing left to copy: no room needed. Retries need room for the bad sectors.
+    let full = device_dest(&fake, &source, dir.path(), 0, None);
+    assert!(
+        run_copy(&source, &full, &CopyOptions::default())
+            .result
+            .unwrap()
+            .complete
+    );
+    let retries = CopyOptions {
+        retries: 1,
+        ..CopyOptions::default()
+    };
+    let run = run_copy(&source, &full, &retries);
+    assert_eq!(code(&run.result), Some("write_failed"));
+    let bad: u64 = BAD_RUNS.iter().filter(|r| r.0 < 8 * MIB).map(|r| r.1).sum();
+    let just = device_dest(&fake, &source, dir.path(), bad, None);
+    assert!(run_copy(&source, &just, &retries).result.unwrap().complete);
 }
 
 #[test]

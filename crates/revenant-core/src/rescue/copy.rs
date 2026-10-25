@@ -94,16 +94,20 @@ pub struct CopySummary {
     pub complete: bool,
 }
 
-/// Copies `source` into `dest.dir()/image` (D15–D17): created sparse at `source.len()` when absent; else resumed from
+/// Copies `source` into `dest.dir()/image` (D15–D17): created at `source.len()` (sparse where the file system allows)
+/// when absent; else resumed from
 /// its map (`<image>.rvmap`), whose identity must be `same_source` as `identity` (`map_other_source`), and whose size and
 /// sector must be the source's and `opts.sector` (`map_mismatch`, also when the image's length differs).
 ///
 /// Before creating or touching anything (P12): when `dest.info()` is present, the destination's largest file must hold
-/// `source.len()` and its free space what is still to copy (the whole length on a fresh copy, the bytes not yet
-/// `Rescued` on a resume), else `write_failed` and no file is created. A `Destination` without info (an image source)
-/// skips these two checks (P19). The image is never split. `image` must be a plain, safe file name (`write_failed`
-/// otherwise); an existing `image` that is not a regular file is refused (`write_failed`), and the folder must still be
-/// on the volume it was checked on (`destination_on_source`).
+/// `source.len()` and its free space what is still to copy (the whole length on a fresh copy, since the image is not
+/// sparse on every file system; on a resume the bytes still `Untried`, `ToTrim` or `ToScrape`, plus the `Bad` ones when
+/// `retries > 0`), else `write_failed` and no file is created. A `Destination` without info (an image source) skips
+/// these two checks (P19). The image is never split. `image` must be a plain, safe file name (`write_failed`
+/// otherwise); an existing `image` that is not a regular file, or that is not the file checked by the time it is
+/// opened (a link or another file swapped in), is refused (`write_failed`) before anything is written; the folder must
+/// still be on the volume it was checked on (`destination_on_source`). An image left without its map (a crash before
+/// the first save) makes every later copy fail (`open_failed`) until it is deleted.
 ///
 /// The source is read directly (no cache): a read coming back short before `source.len()` is `DeviceGone`. On
 /// `DeviceGone`, a cancel (`cancelled`) or a write error the map is saved and the error returned; nothing is marked for
@@ -220,13 +224,25 @@ fn open(
             if map.size() != size || meta.len() != size || map.sector() != opts.sector {
                 return Err(EngineError::MapMismatch);
             }
-            check_room(dest, size, size - map.totals().rescued)?;
+            let t = map.totals();
+            let mut missing = t.untried + t.to_trim + t.to_scrape;
+            if opts.retries > 0 {
+                missing += t.bad;
+            }
+            check_room(dest, size, missing)?;
             map.set_cap(map_cap);
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(image)
-                .map_err(write)?;
+            #[cfg(test)]
+            tests::before_resume_open(image);
+            let file = open_existing(image).map_err(write)?;
+            // The file opened must be the one checked: a regular file of the map's size (and on Unix the same file,
+            // so a link or another file swapped in meanwhile is refused before anything is written).
+            let opened = file.metadata().map_err(write)?;
+            if !opened.is_file() || !same_file(&meta, &opened) {
+                return Err(invalid());
+            }
+            if opened.len() != size {
+                return Err(EngineError::MapMismatch);
+            }
             Ok((file, map, false))
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -237,7 +253,8 @@ fn open(
                 .create_new(true)
                 .open(image)
                 .map_err(write)?;
-            // Sparse: nothing is allocated until written (D17).
+            // Sparse where the file system allows it (APFS, ext4; not HFS+, FAT or NTFS without the sparse flag), so the
+            // room check counts the whole length (D17).
             if let Err(cause) = file.set_len(size) {
                 drop(file);
                 let _ = std::fs::remove_file(image);
@@ -248,6 +265,32 @@ fn open(
         }
         Err(cause) => Err(EngineError::Open { cause }),
     }
+}
+
+/// Opens an existing image for reading and writing, never truncating it. On Windows a reparse point (a link) is opened
+/// itself, not followed, so the regular-file check after opening refuses it.
+fn open_existing(image: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(image)
+}
+
+/// Whether `checked` (before opening) and `opened` describe the same file: same device and inode on Unix; elsewhere the
+/// opened handle's own checks (regular file, reparse point not followed) stand alone.
+#[cfg(unix)]
+fn same_file(checked: &std::fs::Metadata, opened: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    (checked.dev(), checked.ino()) == (opened.dev(), opened.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file(_checked: &std::fs::Metadata, _opened: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// P12: the destination's file-size limit must hold the whole image and its free space what is still to copy.
@@ -711,6 +754,90 @@ mod tests {
     use crate::test_support::{FakeDevices, SimSource};
 
     const MIB: u64 = 1 << 20;
+
+    type Hook = Box<dyn Fn(&Path)>;
+
+    thread_local! {
+        /// Runs between the resume's checks of the image and its opening (a test swapping the file there).
+        static BEFORE_RESUME_OPEN: std::cell::RefCell<Option<Hook>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_resume_open(image: &Path) {
+        BEFORE_RESUME_OPEN.with(|h| {
+            if let Some(hook) = h.borrow().as_ref() {
+                hook(image);
+            }
+        });
+    }
+
+    /// The image swapped for a link to another file of the same length, or for another regular file, between the
+    /// resume's checks and its opening: refused, nothing written, the other file untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_swapped_image_is_refused_before_writing() {
+        let size = 2 * MIB;
+        let source = SimSource::new(vec![5u8; size as usize]);
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("victim");
+        let dest = Destination::check(&FakeDevices::new(), &source, dir.path()).unwrap();
+        let identity = SourceIdentity::Image { size, digest: 1 };
+        let cancel = CancelToken::default();
+        let run = || {
+            copy(
+                &source,
+                &identity,
+                &dest,
+                "card.img",
+                &CopyOptions::default(),
+                &cancel,
+                &mut |_| {},
+            )
+        };
+        // A copy stopped at once leaves an image and its map, nothing rescued.
+        cancel.cancel();
+        assert_eq!(run().unwrap_err().code(), "cancelled");
+        let cancel = CancelToken::default();
+        let run = || {
+            copy(
+                &source,
+                &identity,
+                &dest,
+                "card.img",
+                &CopyOptions::default(),
+                &cancel,
+                &mut |_| {},
+            )
+        };
+        let image = dest.dir().join("card.img");
+        for link in [true, false] {
+            std::fs::write(&victim, vec![7u8; size as usize]).unwrap();
+            let target = victim.clone();
+            BEFORE_RESUME_OPEN.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |img: &Path| {
+                    let saved = img.with_extension("keep");
+                    std::fs::rename(img, &saved).unwrap();
+                    if link {
+                        std::os::unix::fs::symlink(&target, img).unwrap();
+                    } else {
+                        std::fs::copy(&saved, img).unwrap();
+                    }
+                }))
+            });
+            let r = run();
+            BEFORE_RESUME_OPEN.with(|h| *h.borrow_mut() = None);
+            assert_eq!(r.unwrap_err().code(), "write_failed", "link {link}");
+            assert_eq!(std::fs::read(&victim).unwrap(), vec![7u8; size as usize]);
+            if !link {
+                assert_eq!(std::fs::read(&image).unwrap(), vec![0u8; size as usize]);
+            }
+            std::fs::remove_file(&image).unwrap();
+            std::fs::rename(image.with_extension("keep"), &image).unwrap();
+        }
+        // Untouched, the same resume goes through.
+        assert!(run().unwrap().complete);
+    }
 
     #[test]
     fn map_cap_degrades_without_failing() {
