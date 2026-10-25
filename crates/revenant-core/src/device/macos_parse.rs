@@ -151,7 +151,9 @@ pub(crate) fn whole_disks(list: &Plist) -> Vec<&Plist> {
         .collect()
 }
 
-/// The partitions' ids of a `diskutil list` entry.
+/// The partitions' ids of a `diskutil list` entry. Used by the macOS lister only; compiled everywhere so its tests run
+/// everywhere.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn partition_ids(entry: &Plist) -> Vec<&str> {
     entry
         .get("Partitions")
@@ -377,6 +379,15 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect()
+    }
+
+    #[test]
+    fn partition_ids_keeps_only_bsd_named_partitions() {
+        let list = parse(LIST).unwrap();
+        let whole = whole_disks(&list);
+        let ids: Vec<Vec<&str>> = whole.iter().map(|e| partition_ids(e)).collect();
+        assert_eq!(ids[0], ["disk0s1"]);
+        assert!(ids.iter().flatten().all(|i| is_bsd_name(i)));
     }
 
     #[test]
