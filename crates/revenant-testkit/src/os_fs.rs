@@ -1,11 +1,16 @@
-//! Opt-in checks of the synthetic file-system builders against the real macOS drivers (`hdiutil`, `fsck_msdos`,
-//! `fsck_exfat`). Nothing here runs unless the machine is macOS, `/usr/bin/hdiutil` exists and `REVENANT_OS_FS=1`.
+//! Opt-in checks against the real macOS drivers and devices (`hdiutil`, `fsck_msdos`, `fsck_exfat`). Nothing here runs
+//! unless the machine is macOS, `/usr/bin/hdiutil` exists and `REVENANT_OS_FS=1` (the file-system checks, [`available`])
+//! or `REVENANT_OS_DEV=1` (the device checks, [`dev_available`]).
 //!
-//! Safety rules (this module is the only place that talks to `hdiutil`):
-//! - only image FILES inside a temp directory are ever attached, always with `-nobrowse -noverify -noautofsck`;
-//! - the only device ever passed to `hdiutil detach` is one that `hdiutil attach` just printed for such an image;
-//! - no `diskutil`, no `sudo`, no other disk, nothing is installed;
-//! - every attach is undone by a drop guard, also on panic.
+//! Safety rules (this module is the only place in the tests that talks to `hdiutil`):
+//! - only image FILES inside a temp directory this module created ([`temp_dir`], an allow-list) are ever attached,
+//!   always with `-nobrowse -noverify -noautofsck`;
+//! - the only device ever passed to `hdiutil detach` is the whole disk that `hdiutil attach` printed for such an image,
+//!   confirmed again by `hdiutil info` right before the detach; when `hdiutil info` cannot be read the detach panics
+//!   loudly instead of silently skipping;
+//! - the testkit never calls `diskutil` and never `sudo`; in the device checks the engine calls `diskutil` (`list`,
+//!   `info`, `unmountDisk`, `mountDisk`), only on the disk [`with_attached`] attached ([`AttachedDisk::disk`]);
+//! - nothing is installed; every attach is undone by a drop guard, also on panic.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,12 +57,18 @@ impl OsLayout {
 
 /// True only on macOS with `REVENANT_OS_FS=1` and `/usr/bin/hdiutil` present. Prints why when false.
 pub fn available() -> bool {
+    tools_present() && env_on("REVENANT_OS_FS", "check against the macOS drivers")
+}
+
+/// True only on macOS with `REVENANT_OS_DEV=1` and `/usr/bin/hdiutil` present (prints "skipped: <reason>" otherwise):
+/// the checks that read attached images as devices.
+pub fn dev_available() -> bool {
+    tools_present() && env_on("REVENANT_OS_DEV", "check against attached disk images")
+}
+
+fn tools_present() -> bool {
     if !cfg!(target_os = "macos") {
         eprintln!("skipped: not macOS");
-        return false;
-    }
-    if std::env::var("REVENANT_OS_FS").as_deref() != Ok("1") {
-        eprintln!("skipped: set REVENANT_OS_FS=1 to check against the macOS drivers");
         return false;
     }
     if !Path::new(HDIUTIL).exists() {
@@ -67,24 +78,73 @@ pub fn available() -> bool {
     true
 }
 
-/// A disk image created by `hdiutil` inside a temp directory (deleted on drop).
+fn env_on(var: &str, what: &str) -> bool {
+    let on = std::env::var(var).as_deref() == Ok("1");
+    if !on {
+        eprintln!("skipped: set {var}=1 to {what}");
+    }
+    on
+}
+
+/// The temp directories [`temp_dir`] made (canonical paths): the only folders whose images are ever attached.
+static MADE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// A new temp directory (deleted on drop) whose image files this module may attach (the allow-list).
+pub fn temp_dir() -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix("revenant-os-")
+        .tempdir()
+        .expect("cannot create a temp dir");
+    let canonical = dir
+        .path()
+        .canonicalize()
+        .expect("the new temp dir must resolve");
+    MADE.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(canonical);
+    dir
+}
+
+/// A disk image created by `hdiutil` inside a temp directory of this module (deleted on drop).
 pub struct OsImage {
     pub path: PathBuf,
+    label: String,
     _dir: tempfile::TempDir,
 }
 
 impl OsImage {
-    /// `hdiutil create` of a `size_mib` image formatted by the OS, volume name `RVT`. `None` when `available()` is
-    /// false or the command fails.
+    /// `hdiutil create` of a `size_mib` image formatted by the OS, volume name `RVT`. `None` when neither
+    /// [`available`] nor [`dev_available`] holds, or the command fails.
     pub fn create(fs: OsFs, layout: OsLayout, size_mib: u32) -> Option<OsImage> {
-        if !available() {
+        OsImage::create_labeled(fs, layout, size_mib, "RVT")
+    }
+
+    /// [`OsImage::create`] with the volume name `label` (letters and digits, at most 11), so two images can be
+    /// mounted at once (`/Volumes/<label>`).
+    pub fn create_labeled(
+        fs: OsFs,
+        layout: OsLayout,
+        size_mib: u32,
+        label: &str,
+    ) -> Option<OsImage> {
+        assert!(
+            !label.is_empty()
+                && label.len() <= 11
+                && label.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "bad volume name {label:?}"
+        );
+        let on = |var: &str| std::env::var(var).as_deref() == Ok("1");
+        if !(on("REVENANT_OS_FS") || on("REVENANT_OS_DEV")) || !tools_present() {
+            eprintln!(
+                "skipped: set REVENANT_OS_FS=1 or REVENANT_OS_DEV=1 on macOS to create OS images"
+            );
             return None;
         }
-        let dir = tempfile::tempdir().ok()?;
+        let dir = temp_dir();
         let path = dir.path().join("card.dmg");
         let out = Command::new(HDIUTIL)
             .args(["create", "-size", &format!("{size_mib}m"), "-fs", fs.name()])
-            .args(["-volname", "RVT", "-layout", layout.name()])
+            .args(["-volname", label, "-layout", layout.name()])
             .arg(&path)
             .output()
             .ok()?;
@@ -95,21 +155,94 @@ impl OsImage {
             );
             return None;
         }
-        Some(OsImage { path, _dir: dir })
+        Some(OsImage {
+            path,
+            label: label.to_string(),
+            _dir: dir,
+        })
     }
 
     /// Attaches read-write, runs `f` with the mount point, always detaches. Panics unless the mount point starts
-    /// with `/Volumes/RVT`.
+    /// with `/Volumes/<label>`.
     pub fn with_mounted<R>(&self, f: impl FnOnce(&Path) -> R) -> R {
         let att = Attached::new(&self.path, false, true, &[]);
         let mount = att.mount.clone().expect("no mount point printed");
         assert!(
-            mount.starts_with("/Volumes/RVT"),
+            mount.starts_with(Path::new("/Volumes").join(&self.label)),
             "unexpected mount point {}",
             mount.display()
         );
         f(&mount)
     }
+}
+
+/// An image attached by [`with_attached`].
+#[derive(Debug)]
+pub struct AttachedDisk {
+    /// The whole disk `hdiutil attach` printed for the image, without `/dev/` ("disk7"): the only disk the device
+    /// checks hand to the engine.
+    pub disk: String,
+    /// Every device printed ("/dev/disk7", "/dev/disk7s1"), in the order printed.
+    pub devices: Vec<String>,
+    /// The first mount point printed (attached with `mount`).
+    pub mount: Option<PathBuf>,
+    image: PathBuf,
+}
+
+impl AttachedDisk {
+    /// Panics unless `hdiutil info` still lists [`AttachedDisk::disk`] under this image: called right before the
+    /// engine unmounts, opens or remounts it.
+    pub fn confirm(&self) {
+        let dev = format!("/dev/{}", self.disk);
+        match info() {
+            Some(all) => assert!(
+                all.iter()
+                    .any(|(p, devs)| same_file(p, &self.image) && devs.contains(&dev)),
+                "hdiutil info no longer shows {dev} as {}",
+                self.image.display()
+            ),
+            None => panic!("hdiutil info cannot be read: {dev} is not confirmed"),
+        }
+    }
+}
+
+/// Attaches the image READ-WRITE (so any write to the device would show in it), mounted or not, runs `f`, always
+/// detaches (drop guard, also on panic). Only image files inside a [`temp_dir`] are accepted (allow-list); only the
+/// whole disk `hdiutil attach` printed is ever detached, after `hdiutil info` confirmed it again; a failing
+/// `hdiutil info` makes the detach panic loudly instead of silently skipping.
+pub fn with_attached<R>(image: &Path, mount: bool, f: impl FnOnce(&AttachedDisk) -> R) -> R {
+    let att = Attached::new(image, false, mount, &[]);
+    let disk = whole_disk_name(&att.disk).expect("Attached holds a whole disk");
+    let attached = AttachedDisk {
+        disk,
+        devices: att.devices.clone(),
+        mount: att.mount.clone(),
+        image: att.image.clone(),
+    };
+    attached.confirm();
+    f(&attached)
+}
+
+/// The one whole disk ("/dev/disk7") among the devices `hdiutil` printed, in any order (a mounted image may print its
+/// slice first); `None` when there is none, more than one, or a device that is not one of its slices.
+fn whole_disk(devices: &[String]) -> Option<String> {
+    let mut whole = devices.iter().filter(|d| whole_disk_name(d).is_some());
+    let disk = match (whole.next(), whole.next()) {
+        (Some(d), None) => d,
+        _ => return None,
+    };
+    let slice = format!("{disk}s");
+    devices
+        .iter()
+        .all(|d| d == disk || d.starts_with(&slice))
+        .then(|| disk.clone())
+}
+
+/// "disk7" from "/dev/disk7"; `None` for a slice, a raw node or anything else.
+fn whole_disk_name(dev: &str) -> Option<String> {
+    let name = dev.strip_prefix("/dev/")?;
+    let n = name.strip_prefix("disk")?;
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then(|| name.to_string())
 }
 
 /// Attaches an existing raw image file read-only, runs `f` with the mount point, detaches.
@@ -159,16 +292,22 @@ pub fn fsck(image: &Path, fs: OsFs) -> Option<bool> {
     Some(out.status.success())
 }
 
-/// The last device `hdiutil info` lists for the attached image (its partition; the whole disk of a table-less image).
+/// The slice `hdiutil info` lists for the attached image (its partition; the whole disk of a table-less image).
 /// The plist printed by a `-nomount` attach can list the whole disk only, so the slices are looked up again, briefly
 /// retrying while they are probed.
 fn partition_device(att: &Attached) -> Option<String> {
-    let mut best = att.devices.last().cloned();
+    let slice = |devs: &[String]| {
+        devs.iter()
+            .find(|d| whole_disk_name(d).is_none())
+            .or(devs.last())
+            .cloned()
+    };
+    let mut best = slice(&att.devices);
     for _ in 0..10 {
         let found = info().and_then(|all| {
             all.into_iter()
                 .find(|(_, devs)| devs.contains(&att.disk))
-                .and_then(|(_, devs)| devs.last().cloned())
+                .and_then(|(_, devs)| slice(&devs))
         });
         if found.is_some() {
             best = found;
@@ -183,12 +322,14 @@ fn partition_device(att: &Attached) -> Option<String> {
 
 /// One attached image; detaches in `Drop`.
 struct Attached {
-    /// The whole-disk device `hdiutil attach` printed first, confirmed by `hdiutil info` to belong to our image (the
-    /// only thing ever detached).
+    /// The whole-disk device `hdiutil attach` printed ([`whole_disk`]), confirmed by `hdiutil info` to belong to our
+    /// image (the only thing ever detached).
     disk: String,
     /// Every device printed, in order.
     devices: Vec<String>,
     mount: Option<PathBuf>,
+    /// The canonical image file.
+    image: PathBuf,
 }
 
 impl Attached {
@@ -219,7 +360,13 @@ impl Attached {
                 image.display()
             );
         };
-        let disk = devices[0].clone();
+        let Some(disk) = whole_disk(&devices) else {
+            detach_by_path(&image);
+            panic!(
+                "hdiutil attach printed no single whole disk in {devices:?} (detached {})",
+                image.display()
+            );
+        };
         if !info_confirms(&image, &disk) {
             detach_by_path(&image);
             panic!(
@@ -231,11 +378,13 @@ impl Attached {
             disk,
             devices,
             mount: mount_point,
+            image,
         }
     }
 }
 
-/// The canonical path of `image`, which must be a file under the (canonical, non-system) temp directory.
+/// The canonical path of `image`, which must be a file directly inside a folder [`temp_dir`] made (the allow-list),
+/// itself under the (canonical, non-system) temp directory.
 fn checked_image(image: &Path) -> PathBuf {
     let tmp = std::env::temp_dir()
         .canonicalize()
@@ -252,6 +401,14 @@ fn checked_image(image: &Path) -> PathBuf {
     assert!(
         image.starts_with(&tmp),
         "the image must live in the temp dir: {}",
+        image.display()
+    );
+    let made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        image
+            .parent()
+            .is_some_and(|dir| made.iter().any(|m| m == dir)),
+        "the image must live directly in a temp dir this module made: {}",
         image.display()
     );
     image
@@ -286,7 +443,7 @@ fn assert_tmp_ok(tmp: &Path) {
     );
 }
 
-/// Devices (in order, whole disk first) and the first mount point of an `hdiutil attach -plist` reply.
+/// Devices (in the order printed) and the first mount point of an `hdiutil attach -plist` reply.
 fn parse_attach(text: &str) -> Option<(Vec<String>, Option<PathBuf>)> {
     let root = plist::parse(text)?;
     let entities = root.get("system-entities")?.as_array()?;
@@ -349,21 +506,20 @@ fn same_file(reported: &str, image: &Path) -> bool {
     Path::new(reported).canonicalize().is_ok_and(|p| p == image)
 }
 
-/// Best effort: detaches every attached image whose `image-path` is `image` (its whole-disk device is the first
-/// device `hdiutil info` lists for it).
+/// Detaches every attached image whose `image-path` is `image` (the one whole disk `hdiutil info` lists for it). Panics loudly when `hdiutil info` cannot be read (the image may still be attached).
 fn detach_by_path(image: &Path) {
     let Some(all) = info() else {
-        eprintln!(
-            "WARNING: could not read hdiutil info; {} may still be attached",
+        loud(&format!(
+            "could not read hdiutil info; {} may still be attached: detach it by hand",
             image.display()
-        );
+        ));
         return;
     };
     for (p, devs) in all {
         if same_file(&p, image)
-            && let Some(dev) = devs.first().filter(|d| is_disk_device(d))
+            && let Some(dev) = whole_disk(&devs)
         {
-            detach(dev);
+            detach(&dev);
         }
     }
 }
@@ -381,7 +537,16 @@ fn detach(dev: &str) {
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    eprintln!("WARNING: could not detach {dev}");
+    loud(&format!("could not detach {dev}: detach it by hand"));
+}
+
+/// Panics with `msg`, or only prints it when the thread is already panicking (a second panic would abort the tests).
+fn loud(msg: &str) {
+    if std::thread::panicking() {
+        eprintln!("ERROR: {msg}");
+    } else {
+        panic!("{msg}");
+    }
 }
 
 /// A minimal reader for the XML property lists `hdiutil` prints: dict, array, string; the rest reads as `Other`.
@@ -493,8 +658,30 @@ mod plist {
 }
 
 impl Drop for Attached {
+    /// Detaches the whole disk only once `hdiutil info` confirms it still belongs to the image; a disk gone already
+    /// (detached by someone else) is left alone with a warning, an unreadable `hdiutil info` panics loudly.
     fn drop(&mut self) {
-        detach(&self.disk);
+        match info() {
+            None => loud(&format!(
+                "could not read hdiutil info; {} ({}) may still be attached: detach it by hand",
+                self.disk,
+                self.image.display()
+            )),
+            Some(all) => {
+                let ours = all
+                    .iter()
+                    .any(|(p, devs)| same_file(p, &self.image) && devs.contains(&self.disk));
+                if ours {
+                    detach(&self.disk);
+                } else {
+                    eprintln!(
+                        "WARNING: {} is no longer attached from {}; nothing detached",
+                        self.disk,
+                        self.image.display()
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -534,6 +721,69 @@ mod tests {
             "</array>".repeat(100)
         );
         assert!(plist::parse(&deep).is_none());
+    }
+
+    #[test]
+    fn only_images_in_our_temp_dirs_are_attached() {
+        let ours = temp_dir();
+        let image = ours.path().join("card.dmg");
+        std::fs::write(&image, b"x").unwrap();
+        assert_eq!(checked_image(&image), image.canonicalize().unwrap());
+        // A folder of ours nested deeper, a temp dir made elsewhere, a missing file and a folder are all refused.
+        let nested = ours.path().join("inner");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("card.dmg"), b"x").unwrap();
+        let theirs = tempfile::tempdir().unwrap();
+        std::fs::write(theirs.path().join("card.dmg"), b"x").unwrap();
+        for bad in [
+            nested.join("card.dmg"),
+            theirs.path().join("card.dmg"),
+            ours.path().join("missing.dmg"),
+            nested.clone(),
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| checked_image(&bad)).is_err(),
+                "{}",
+                bad.display()
+            );
+        }
+    }
+
+    #[test]
+    fn the_whole_disk_is_found_in_any_order() {
+        let devs = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A mounted MBR image prints its slice first.
+        assert_eq!(
+            whole_disk(&devs(&["/dev/disk3s1", "/dev/disk3"])).as_deref(),
+            Some("/dev/disk3")
+        );
+        assert_eq!(
+            whole_disk(&devs(&["/dev/disk3"])).as_deref(),
+            Some("/dev/disk3")
+        );
+        for bad in [
+            &["/dev/disk3s1"][..],
+            &["/dev/disk3", "/dev/disk4"],
+            &["/dev/disk3", "/dev/disk4s1"],
+            &[],
+        ] {
+            assert_eq!(whole_disk(&devs(bad)), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn whole_disk_names_are_read() {
+        assert_eq!(whole_disk_name("/dev/disk7").as_deref(), Some("disk7"));
+        assert_eq!(whole_disk_name("/dev/disk12").as_deref(), Some("disk12"));
+        for bad in [
+            "/dev/disk7s1",
+            "/dev/rdisk7",
+            "disk7",
+            "/dev/disk",
+            "/dev/diskx",
+        ] {
+            assert_eq!(whole_disk_name(bad), None, "{bad}");
+        }
     }
 
     #[test]

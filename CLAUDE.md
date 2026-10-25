@@ -32,7 +32,11 @@ Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.s
 - Testes nunca tocam dados reais nem discos físicos: só imagens sintéticas em `tempfile`. Duas exceções opcionais: `real_samples`, que só lê as
   amostras CC0 baixadas para `samples/cache/`; e `os_filesystems`/`os_builders` (`REVENANT_OS_FS=1`, só macOS, rodar com
   `--test-threads=1`), que usam o `hdiutil` para criar imagens FAT/exFAT numa pasta temporária e montá-las só leitura:
-  nunca tocam disco físico nem dados reais, só as imagens que o próprio teste criou. Todo teste novo é visto falhando antes.
+  nunca tocam disco físico nem dados reais, só as imagens que o próprio teste criou. `os_devices` (macOS) e
+  `os_devices_windows` (Windows, VHD criado pelo `diskpart`) são a terceira exceção opcional: rodam só com
+  `REVENANT_OS_DEV=1`, operam apenas imagens/VHD criados pelo próprio teste numa pasta temporária, e anexam em **leitura e
+  escrita** de propósito, para que qualquer escrita do motor apareça; nunca tocam disco físico. Todo teste novo é visto
+  falhando antes.
 - Commits em Conventional Commits, com o trailer `Co-Authored-By`. Nunca `git add -A`.
 
 ## Ambiente

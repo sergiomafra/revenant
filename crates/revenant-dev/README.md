@@ -345,6 +345,45 @@ It checks that every live file is found once with its path, `Intact` and extract
 deleted photo whose clusters were not reused is found `Deleted` and `Intact`. Run it with `--test-threads=1`: every image's
 volume is named `RVT`, so two mounted at once would clash.
 
+## Checking against real devices (opt-in)
+
+Two opt-in tests in the engine read real device nodes that are backed by synthetic images, never a physical disk:
+
+```sh
+# macOS: images that hdiutil creates and attaches, read as /dev/rdiskN
+REVENANT_OS_DEV=1 cargo test -p revenant-core --test os_devices -- --ignored --test-threads=1 --nocapture
+# Windows, as Administrator: a VHD that diskpart creates and attaches, read as \\.\PhysicalDriveN
+REVENANT_OS_DEV=1 cargo test -p revenant-core --test os_devices_windows -- --ignored --test-threads=1 --nocapture
+```
+
+- `os_devices` (macOS) has macOS format an exFAT card and a FAT32 card (64 MiB, MBR) with `hdiutil create`, writes
+  photos, a RAW and a video into `DCIM/100TEST` and deletes one photo, then attaches the card **read-write** (so any write
+  by the engine would show in the image) next to a second image of the other file system that holds the copy and the
+  session. Through `SystemDevices` it lists the disk (virtual, 64 MiB, mounted), refuses a destination on the card's
+  volume, unmounts it without ejecting, hashes the whole device, runs the pre-flight check (no issues), scans the device
+  and compares every event with a scan of the image's own bytes, copies it (cancelled after the first progress, then
+  resumed from its saved map) to exactly those bytes, runs a session cancelled at its middle event and resumes it to the
+  same events, hashes the device again (unchanged), and remounts it. It prints the device's and the file's read speed.
+- `os_devices_windows` (Windows) has `diskpart` create a fixed 64 MiB VHD in the test's temp dir, attach it, make an MBR
+  FAT32 volume labelled `RVT` and give it a drive letter, and writes four photos through that letter (one deleted). It
+  finds the disk number from the VHD's own path (`detail vdisk`), never by guessing, then runs the same steps: a
+  directory symlink and a junction into the VHD's volume are refused as destinations while a plain folder on another
+  volume is accepted, the unmount holds a volume lock (the volume cannot be opened meanwhile), and the copy, the scan,
+  the session and the hashes are checked as on macOS before the remount. A drop guard detaches the VHD, also on panic.
+
+Both only ever operate on what the test itself created in its own temp dir: on macOS only image files in a temp folder
+the testkit made are attached, the engine's `diskutil` calls go only to the disk `hdiutil attach` printed for them
+(confirmed with `hdiutil info` right before each unmount, open and remount), and only that disk is detached. Nothing
+runs `sudo`: when the attached image's `/dev/rdiskN` cannot be read without root the macOS test prints `skipped: needs
+read access to /dev/rdiskN` and passes (the images `hdiutil` attaches for a user are normally readable by that user).
+Run them with `--test-threads=1`. Without `REVENANT_OS_DEV=1` (or off their system) they print `skipped: <reason>` and
+pass.
+
+CI runs the Windows test in the `windows-devices` job (`windows-latest`, where the runner is Administrator), which also
+detaches, in a final step that always runs, any VHD a crash left in a `revenant-vhd-*` temp folder. If a runner cannot
+create or attach a VHD the job fails with diskpart's output (on CI the test never skips silently); the fallback is the
+compile and unit tests on every platform plus the manual checklist.
+
 ## Real camera samples
 
 `samples/samples.toml` lists real camera files (one each of CR2, CR3, NEF, ARW, RAF, DNG, ORF, RW2; about 84 MB, all CC0
