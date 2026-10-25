@@ -36,7 +36,9 @@ revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-vol
   group of the results (see "Grouping" in the core README), using each file's latest finding and details:
   `{"event":"group","by":"session","label":{"kind":"session","camera":{"make":"Sony","model":"ILCE-7M4","serial":"111"},"first":"2025-12-14T08:00:00","last":"2025-12-14T08:30:00"},"ids":[1,2]}`.
   `label.kind` is the variant name in snake_case (`session`, `undated_session`, `day`, `undated`, `camera`,
-  `unknown_camera`, `folder`, `no_folder`) with its fields (`camera` is left out when unknown). `--group folder` on a
+  `unknown_camera`, `folder`, `no_folder`) with its fields: `session` has `camera`, `first`, `last`; `undated_session`
+  has `camera`; `day` has `day` (`YYYY-MM-DD`); `camera` has `camera`; `folder` has `folder`. A `camera` object has `make`,
+  `model`, `serial` (each left out when unknown), and the `camera` key itself is left out when the camera is unknown. `--group folder` on a
   scan where no file has a folder prints one line, `{"event":"group","by":"folder","available":false}`.
 
 ### Output

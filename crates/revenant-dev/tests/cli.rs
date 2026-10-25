@@ -747,3 +747,30 @@ fn group_lines_come_before_the_summary() {
     );
     assert_eq!(folders[3]["event"], "summary");
 }
+
+#[test]
+fn an_unknown_camera_label_has_no_camera_key() {
+    let (img, _, _) = image();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .args(["scan", "--group", "session"])
+        .arg(img.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let groups: Vec<_> = lines(&out)
+        .into_iter()
+        .filter(|e| e["event"] == "group")
+        .collect();
+    assert!(!groups.is_empty());
+    for g in &groups {
+        assert!(g["label"].get("camera").is_none(), "{g}");
+    }
+    assert!(
+        groups
+            .iter()
+            .any(|g| g["label"]["kind"] == "undated_session")
+    );
+}

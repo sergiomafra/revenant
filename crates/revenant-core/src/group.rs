@@ -454,6 +454,56 @@ mod tests {
     }
 
     #[test]
+    fn a_camera_label_shows_the_strings_of_the_smallest_ids() {
+        // One body spelled three ways; id 1 has no serial and takes the model's only serial. Make and model are
+        // shown as id 1 wrote them, the serial as id 2 (the smallest id that has one) wrote it.
+        let spelled = |id, make: &str, model: &str, serial: Option<&str>| {
+            it(
+                id,
+                "08:00:00",
+                Camera {
+                    make: Some(make.into()),
+                    model: Some(model.into()),
+                    serial: serial.map(Into::into),
+                },
+            )
+        };
+        let one = spelled(1, "Sony ", "ILCE-7M4", None);
+        let two = spelled(2, "SONY", "ilce-7m4", Some("abc1"));
+        let three = spelled(3, "sony", "Ilce-7M4", Some(" ABC1"));
+        let label = Camera {
+            make: Some("Sony ".into()),
+            model: Some("ILCE-7M4".into()),
+            serial: Some("abc1".into()),
+        };
+        let orders = [
+            [&one, &two, &three],
+            [&one, &three, &two],
+            [&two, &one, &three],
+            [&two, &three, &one],
+            [&three, &one, &two],
+            [&three, &two, &one],
+        ];
+        for order in orders {
+            let items: Vec<GroupInput> = order.iter().map(|i| (*i).clone()).collect();
+            assert_eq!(
+                by_camera(&items),
+                vec![g(GroupLabel::Camera(label.clone()), &[1, 2, 3])]
+            );
+            let sessions = by_session(&items);
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(
+                sessions[0].label,
+                GroupLabel::Session {
+                    camera: Some(label.clone()),
+                    first: format!("{D}08:00:00"),
+                    last: format!("{D}08:00:00"),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn items_without_a_camera_group_together_and_last_when_undated() {
         let items = vec![
             item(1, at("08:00:00").as_deref(), None, None),
