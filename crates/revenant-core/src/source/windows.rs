@@ -29,7 +29,7 @@ use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 
 use super::Geometry;
 use crate::device::win_parse::{
-    self, ExtentsFailure, WinDestRaw, WinDiskRaw, WinExtent, WinVolumeRaw,
+    self, ExtentsError, ExtentsFailure, WinDestRaw, WinDiskRaw, WinExtent, WinVolumeRaw,
 };
 
 /// Opens read-only. `FILE_FLAG_BACKUP_SEMANTICS` is required to open directories.
@@ -288,6 +288,9 @@ fn volume_information(root: &OsStr) -> (Option<String>, Option<String>) {
     (non_empty(until_nul(&label)), non_empty(until_nul(&fs)))
 }
 
+/// How long to wait before asking a volume that said "no media" again (ruling P31).
+const NO_MEDIA_RECHECK: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// `GetDriveTypeW` answers for a network volume (`DRIVE_REMOTE`; the constant lives in a `windows-sys` feature not
 /// enabled).
 const DRIVE_REMOTE: u32 = 4;
@@ -296,8 +299,9 @@ const DRIVE_CDROM: u32 = 5;
 
 /// The disk extents of the volume `\\?\Volume{…}\` (`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` on the volume opened for
 /// queries only, without the trailing backslash): `Some` and empty when it has none (a CD or a network volume, by
-/// `GetDriveTypeW`, the IOCTL answering zero extents, or no media in the drive: `ERROR_NOT_READY`, an empty card-reader
-/// slot, ruling P30), `None` when the query failed otherwise (the disks are then unknown).
+/// `GetDriveTypeW`, the IOCTL answering zero extents, or no media in the drive: an empty card-reader slot, rulings P30
+/// and P31, see [`win_parse::extents_failure`]), `None` when the query failed otherwise (the disks are then unknown). A
+/// volume saying "no media" is asked again after [`NO_MEDIA_RECHECK`].
 /// With more extents than [`MAX_EXTENTS`] (`ERROR_MORE_DATA`), the first ones when `partial` is allowed (a listing), else
 /// `None` (a destination check fails closed rather than miss a disk).
 fn volume_extents(name: &str, partial: bool) -> Option<Vec<WinExtent>> {
@@ -307,22 +311,49 @@ fn volume_extents(name: &str, partial: bool) -> Option<Vec<WinExtent>> {
     if kind == DRIVE_REMOTE || kind == DRIVE_CDROM {
         return Some(Vec::new());
     }
-    let failed = |e: io::Error| match win_parse::extents_failure(e.raw_os_error()) {
+    let first = match extents_attempt(name, partial) {
+        Ok(extents) => return Some(extents),
+        Err(e) => e,
+    };
+    if !win_parse::no_media(&first) {
+        return None;
+    }
+    // A card that is there but not ready yet must not pass for an empty slot: ask once more a little later.
+    std::thread::sleep(NO_MEDIA_RECHECK);
+    let retry = match extents_attempt(name, partial) {
+        Ok(extents) => return Some(extents),
+        Err(e) => e,
+    };
+    match win_parse::extents_failure(&first, Some(&retry)) {
         ExtentsFailure::NoExtents => Some(Vec::new()),
         ExtentsFailure::Failed => None,
-    };
-    let file = match open_query(Path::new(name.trim_end_matches('\\'))) {
-        Ok(file) => file,
-        Err(e) => return failed(e),
-    };
+    }
+}
+
+/// One attempt at the extents of the volume `name`: the volume opened for queries only (without the trailing
+/// backslash) and `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`; on `ERROR_NOT_READY`, `IOCTL_STORAGE_CHECK_VERIFY2` on the same
+/// handle tells an empty drive from media not ready yet. Only the error codes are gathered; `win_parse` decides.
+fn extents_attempt(name: &str, partial: bool) -> Result<Vec<WinExtent>, ExtentsError> {
+    let file = open_query(Path::new(name.trim_end_matches('\\')))
+        .map_err(|e| ExtentsError::Open(e.raw_os_error()))?;
     let mut buf = [0u8; 8 + 24 * MAX_EXTENTS];
     match ioctl::<(), _>(&file, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, None, &mut buf) {
-        Ok(_) => Some(win_parse::extents(&buf)),
+        Ok(_) => Ok(win_parse::extents(&buf)),
         // More extents than the buffer holds: the first ones are there.
         Err(e) if partial && e.raw_os_error() == Some(ERROR_MORE_DATA as i32) => {
-            Some(win_parse::extents(&buf))
+            Ok(win_parse::extents(&buf))
         }
-        Err(e) => failed(e),
+        Err(e) => {
+            let code = e.raw_os_error();
+            let verify = if code == Some(win_parse::ERROR_NOT_READY) {
+                ioctl::<(), ()>(&file, IOCTL_STORAGE_CHECK_VERIFY2, None, &mut ())
+                    .err()
+                    .and_then(|e| e.raw_os_error())
+            } else {
+                None
+            };
+            Err(ExtentsError::Query { code, verify })
+        }
     }
 }
 

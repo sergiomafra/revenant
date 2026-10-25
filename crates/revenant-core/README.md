@@ -128,8 +128,12 @@ listed is `device_not_found`.
   locked (in use) makes the call fail with `unmount_failed` naming it, and the volumes that did lock are released, so
 Windows may mount them again. While any local volume's disks cannot be told (its extents query failed), nothing is
 locked and the call fails closed with `unmount_failed` naming that volume, since it could lie on the card. A volume
-whose query answers `ERROR_NOT_READY` (no media, such as an empty slot of a multi-slot card reader) is not unknown: it
-lies on no disk, so it never blocks an unmount; CDs and network volumes (`GetDriveTypeW`) have no disks either. Each volume is
+whose drive holds no media (an empty slot of a multi-slot card reader) is not unknown: it lies on no disk, so it never
+blocks an unmount; CDs and network volumes (`GetDriveTypeW`) have no disks either. "No media" needs the volume's open
+to fail with `ERROR_NOT_READY`, or its extents query to fail with it and the media check on the same handle
+(`IOCTL_STORAGE_CHECK_VERIFY2`) to answer `ERROR_NO_MEDIA_IN_DRIVE` or `ERROR_NOT_READY`, and a second try 300 ms later
+to say the same; anything else fails closed. The residual risk: a card that stays not ready through both tries and whose
+media check says no media would be skipped and left mounted (it is then unreadable for the scan as well). Each volume is
   opened read-only first; only when Windows refuses the lock or the dismount on that handle (`ERROR_ACCESS_DENIED`) is
   it opened again with write access, solely to repeat the two requests. That handle never reads or writes data (the
   engine's single exception to opening anything for writing, recorded in the project rules and checked by the

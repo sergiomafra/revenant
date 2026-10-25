@@ -216,20 +216,54 @@ pub(crate) fn volumes_on(volumes: &[WinVolumeRaw], number: u32) -> Vec<String> {
         .collect()
 }
 
-/// What a failed open or extents query of a volume means for its disks (ruling P30).
+/// What a failed open or extents query of a volume means for its disks (rulings P30, P31).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExtentsFailure {
-    /// No media in the drive (`ERROR_NOT_READY`, an empty slot of a card reader): it lies on no disk we can read.
+    /// No media in the drive, confirmed twice (an empty slot of a card reader): it lies on no disk we can read.
     NoExtents,
     /// Anything else: the disks are unknown (an unmount fails closed).
     Failed,
 }
 
-/// Classifies the Windows error code (`None` when the error had none) of a failed volume open or extents query.
-pub(crate) fn extents_failure(code: Option<i32>) -> ExtentsFailure {
-    /// `ERROR_NOT_READY`.
-    const NOT_READY: i32 = 21;
-    if code == Some(NOT_READY) {
+/// One failed attempt at a volume's extents, as the Windows error codes say (`None` when an error had no code).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExtentsError {
+    /// Opening the volume failed.
+    Open(Option<i32>),
+    /// The volume opened and `IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` failed with `code`; `verify` is the error of
+    /// `IOCTL_STORAGE_CHECK_VERIFY2` on the same handle, asked only when `code` is `ERROR_NOT_READY` (`None` when not
+    /// asked or when it succeeded: the media is there).
+    Query {
+        code: Option<i32>,
+        verify: Option<i32>,
+    },
+}
+
+/// `ERROR_NOT_READY`.
+pub(crate) const ERROR_NOT_READY: i32 = 21;
+/// `ERROR_NO_MEDIA_IN_DRIVE`.
+const ERROR_NO_MEDIA_IN_DRIVE: i32 = 1112;
+
+/// Whether one attempt says the drive holds no media: the open failed with `ERROR_NOT_READY`, or the extents query did
+/// and the media check on the same handle confirmed it (`ERROR_NO_MEDIA_IN_DRIVE` or `ERROR_NOT_READY`). A card that is
+/// there but not ready yet (spinning up, mid-mount) answers the media check, so it is not taken for an empty slot.
+pub(crate) fn no_media(attempt: &ExtentsError) -> bool {
+    match *attempt {
+        ExtentsError::Open(code) => code == Some(ERROR_NOT_READY),
+        ExtentsError::Query { code, verify } => {
+            code == Some(ERROR_NOT_READY)
+                && matches!(verify, Some(ERROR_NO_MEDIA_IN_DRIVE | ERROR_NOT_READY))
+        }
+    }
+}
+
+/// The verdict on a volume whose extents query failed: `NoExtents` only when the first attempt and a retry (made about 300 ms
+/// later) both say there is no media; `Failed` otherwise, also when no retry was made.
+pub(crate) fn extents_failure(
+    first: &ExtentsError,
+    retry: Option<&ExtentsError>,
+) -> ExtentsFailure {
+    if no_media(first) && retry.is_some_and(no_media) {
         ExtentsFailure::NoExtents
     } else {
         ExtentsFailure::Failed
@@ -459,18 +493,48 @@ mod tests {
 
     #[test]
     fn an_empty_reader_slot_has_no_extents() {
-        assert_eq!(extents_failure(Some(21)), ExtentsFailure::NoExtents);
-        for code in [
-            Some(5),
-            Some(2),
-            Some(1),
-            Some(32),
-            Some(1167),
-            Some(0),
-            Some(-1),
-            None,
-        ] {
-            assert_eq!(extents_failure(code), ExtentsFailure::Failed, "{code:?}");
+        use ExtentsError::{Open, Query};
+        let query = |code: i32, verify: Option<i32>| Query {
+            code: Some(code),
+            verify,
+        };
+        // What says "no media": the open refused as not ready, or the query not ready and the media check agreeing.
+        let empty = [Open(Some(21)), query(21, Some(1112)), query(21, Some(21))];
+        for e in &empty {
+            assert!(no_media(e), "{e:?}");
+        }
+        // A loaded card not ready yet answers the media check (or it fails otherwise); other codes are never no media.
+        let not_empty = [
+            query(21, None),
+            query(21, Some(5)),
+            query(21, Some(1167)),
+            query(5, Some(1112)),
+            query(1, None),
+            Open(Some(5)),
+            Open(Some(2)),
+            Open(None),
+            Query {
+                code: None,
+                verify: Some(1112),
+            },
+        ];
+        for e in &not_empty {
+            assert!(!no_media(e), "{e:?}");
+        }
+        // The verdict needs both the first attempt and the retry to say no media.
+        for first in &empty {
+            for retry in &empty {
+                assert_eq!(
+                    extents_failure(first, Some(retry)),
+                    ExtentsFailure::NoExtents,
+                    "{first:?} {retry:?}"
+                );
+            }
+            assert_eq!(extents_failure(first, None), ExtentsFailure::Failed);
+            for other in &not_empty {
+                assert_eq!(extents_failure(first, Some(other)), ExtentsFailure::Failed);
+                assert_eq!(extents_failure(other, Some(first)), ExtentsFailure::Failed);
+            }
         }
     }
 
