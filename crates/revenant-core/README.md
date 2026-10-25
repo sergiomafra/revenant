@@ -952,7 +952,11 @@ a probe over the raw source that refuses, without reading it, any range the cach
   (see [Deduplication](#deduplication)). The finding has `origin: Some(FsOrigin)` (volume, folder, name, state,
   placement, recorded size, times); `len` is the sum of its pieces and `fragments` its pieces (empty for one piece),
   unless the carving replaced them. Then the usual rules apply: `Intact` skips its pieces, an unreadable sector inside
-  makes it `Partial`, and it is emitted once the scan has read past its farthest piece.
+  makes it `Partial`, and it is emitted once the scan has read past its farthest piece. A piece that lies before the
+  file's start (a FAT allocator that wrapped around on a reused card) was passed before the finding existed, so when the
+  finding is added an `Intact` one is lowered to `Partial` if the cache's bad-sector map knows an unreadable sector in
+  any of its pieces below that start (everything below it has been read, so this is the same for any `threads` and
+  `cache_bytes`), even when the detector never read those bytes.
 - **A live file of another kind** (`Listing.others`: `.THM`, `.XML`, ...): the head at its first cluster is consumed
   without a finding; when the measurement there is `Intact`, its range is skipped. Heads inside the file are examined
   as usual (ruling D18: they count as being inside a live file, below).
@@ -1041,7 +1045,8 @@ Events:
   order (see [File systems in the scan](#file-systems-in-the-scan)); none with `ScanOptions::filesystems` off.
 - `Found(Finding)`: sequential `id` from 1, in start order; `origin` is `Some` when the file system lists the file. It is emitted once the scan has read past the file's end (the end of its
   farthest piece), so unreadable sectors inside the file are known: they are reported as `Unreadable` events before the
-  `Found`, and an `Intact` finding with any of them inside one of its pieces is downgraded to `Partial`. A file found inside a `Partial`/`Damaged` one is emitted right
+  `Found`, and an `Intact` finding with any of them inside one of its pieces is downgraded to `Partial` (also one in a
+  piece below the file's start, met before the finding existed: from the bad-sector map). A file found inside a `Partial`/`Damaged` one is emitted right
   after it.
 - `Progress { read, total }`: once per block, plus one for an empty source; the last has `read == total`.
 - `Unreadable { start, len }`: when a block cannot be read it is re-read sector by sector; each run of consecutive failed

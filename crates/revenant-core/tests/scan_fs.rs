@@ -4,7 +4,7 @@
 use std::io::Write;
 
 use revenant_core::filesystem::FsKind;
-use revenant_core::formats::{FileKind, Health, all_formats};
+use revenant_core::formats::{FileKind, Format, Health, Measurement, all_formats};
 use revenant_core::source::{FileSource, Source, VolumeId};
 use revenant_core::{
     CancelToken, EngineError, Event, Finding, Fragment, FsState, Placement, ScanOptions,
@@ -1057,4 +1057,89 @@ fn orphan_name_and_pairing_merge_into_one_update() {
     // The JPEG's update and the video's: one `Updated` each.
     assert_eq!(sum.updated, 2);
     assert_eq!(updates(&ev).len(), 2);
+}
+
+/// Test-only format: a sector starting with `BLINDVID` is an `Intact` MP4 running to the end of its source, measured
+/// without reading past the head, like a detector that never reads most of a file's data.
+struct Blind;
+
+impl Format for Blind {
+    fn name(&self) -> &'static str {
+        "blind"
+    }
+
+    fn recognizes(&self, head: &[u8]) -> bool {
+        head.starts_with(b"BLINDVID")
+    }
+
+    fn confirms(&self, _source: &dyn Source, _start: u64) -> bool {
+        true
+    }
+
+    fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement> {
+        Some(Measurement {
+            len: source.len() - start,
+            kind: FileKind::Mp4,
+            health: Health::Intact,
+            fragments: Vec::new(),
+        })
+    }
+}
+
+/// A live video whose second piece lies before its first (the FAT allocator wrapped around on a reused card), with an
+/// unreadable sector in that second piece: the scan passes the sector before it reaches the file's start and the
+/// detector never reads those bytes, yet the file is `Partial`, the same for any `threads` and `cache_bytes`.
+#[test]
+fn bad_sector_in_an_earlier_piece_lowers_a_listed_file() {
+    let mut b = card();
+    let mut video = vec![0x5Au8; 64 * 512];
+    video[..8].copy_from_slice(b"BLINDVID");
+    let late = (24 * MIB as u64 / 512) as u32 + 2;
+    let early = (8 * MIB as u64 / 512) as u32 + 2;
+    let runs: Vec<u32> = (late..late + 32).chain(early..early + 32).collect();
+    let path = format!("{DIR}/C0002.MP4");
+    b.add_at(&path, &video, &runs);
+    let img = placed(&b);
+    let sector = (at(&b, early) + 8 * 512) as u64;
+    let bad = [(sector, sector + 512)];
+    let run = |bad: &[(u64, u64)], threads, cache_bytes| {
+        let (_file, src) = source(&img, bad);
+        let mut events = Vec::new();
+        let formats: Vec<Box<dyn Format>> = vec![Box::new(Blind)];
+        let opts = ScanOptions {
+            threads,
+            cache_bytes,
+            ..ScanOptions::default()
+        };
+        scan(&src, &formats, &opts, &CancelToken::default(), &mut |e| {
+            events.push(e)
+        })
+        .unwrap();
+        events
+    };
+    let clean = run(&[], 1, 256 * MIB);
+    assert_eq!(named(&clean, &path).health, Health::Intact);
+    let base = run(&bad, 1, 256 * MIB);
+    assert!(
+        base.iter()
+            .any(|e| matches!(e, Event::Unreadable { start, .. } if *start == sector))
+    );
+    let f = named(&base, &path);
+    assert_eq!(f.health, Health::Partial, "{f:?}");
+    assert_eq!(f.len, video.len() as u64);
+    assert_eq!(f.fragments.len(), 2);
+    assert!(f.fragments[1].start < f.start);
+    for (threads, cache) in [
+        (2, 256 * MIB),
+        (8, 256 * MIB),
+        (16, 256 * MIB),
+        (8, MIB),
+        (1, MIB),
+    ] {
+        assert_eq!(
+            run(&bad, threads, cache),
+            base,
+            "threads {threads}, cache {cache}"
+        );
+    }
 }

@@ -87,7 +87,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   their second piece earlier on the card) come back whole and intact. The file system only tells where a file is,
   never that it is intact: a file whose recorded size does not match what it holds (other than padding or attached
   files such as a motion photo's video), whose placement is only a guess, or (for a file the file system does not list
-  as live) that overlaps a live file, is at most partial. A photo written over part of a deleted RAW is found. Each
+  as live) that overlaps a live file, is at most partial; so is a file with an unreadable sector in a piece that lies
+  earlier on the card than its start, even when the check of its contents never reads that sector. A photo written over part of a deleted RAW is found. Each
   volume found is reported at the start of the scan, with a flag when the listing hit one of its limits (some files may
   then lack their names); the file-system step can be turned off.
 

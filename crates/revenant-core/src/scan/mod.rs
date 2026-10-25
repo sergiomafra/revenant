@@ -733,7 +733,8 @@ impl Commit<'_, '_> {
     }
 
     /// Turns the measurement at `at` into a pending finding; an `Intact` one adds a skip range per piece. A finding whose
-    /// origin is not a live file and whose ranges overlap a live file is at most `Partial` (ruling D7). A `Partial` one
+    /// origin is not a live file and whose ranges overlap a live file is at most `Partial` (ruling D7), and so is one
+    /// with a known unreadable sector in a piece below `at`. A `Partial` one
     /// keeps the starts of its `own` files after `at` (sector-aligned ones: no head is examined elsewhere) with its
     /// ranges, so a carved file found there inside it is not reported (ruling D12).
     fn add(&mut self, at: u64, mut m: Measurement, origin: Option<FsOrigin>, own: Vec<Fragment>) {
@@ -755,6 +756,17 @@ impl Commit<'_, '_> {
                 self.shared
                     .fs
                     .overlaps_live(r.start, r.start.saturating_add(r.len))
+            })
+        {
+            m.health = Health::Partial;
+        }
+        // Unreadable sectors only lower pending findings, so a piece below `at` (a file system's later piece placed
+        // before its start) was passed before this finding existed. Everything below `at` is examined, so the cache's
+        // bad map there is complete and the result does not depend on threads or cache size.
+        if m.health == Health::Intact
+            && ranges.iter().any(|r| {
+                let end = r.start.saturating_add(r.len).min(at);
+                r.start < end && !self.shared.cache.bad_runs(r.start, end).is_empty()
             })
         {
             m.health = Health::Partial;
