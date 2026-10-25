@@ -1661,7 +1661,7 @@ const CARD_FIRST_LBA: u32 = 8192;
 /// Cluster size of the `ExfatCard` volume.
 const CARD_CLUSTER: u32 = 4096;
 
-/// The `ExfatCard` image: the volume is built in memory (peak memory = `len`), then written after its MBR head.
+/// The `ExfatCard` image: the volume is built in memory (peak memory about twice `len`: the builder keeps a copy of every file and `build()` allocates the image), then written after its MBR head.
 fn write_exfat_card(len: u64, out: &mut dyn Write) -> std::io::Result<u64> {
     use fs::{DeleteStyle, FsBuilder, FsType, mbr_head};
     let head_len = u64::from(CARD_FIRST_LBA) * 512;

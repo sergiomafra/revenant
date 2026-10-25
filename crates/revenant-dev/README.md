@@ -119,8 +119,9 @@ Images (files go back to back, each at the next 512-byte boundary, the rest is s
 - `video`: MP4 files with `moov` at the end (256 MiB `mdat` from 512 MiB up, else 8 MiB).
 - `exfat-card`: an exFAT volume (4 KiB clusters) on an MBR disk (first sector 8192) that fills the image, holding the
   `dense-jpeg` photos as files in `DCIM/100TEST`, every 4th one deleted; `placed` counts them all and `found` should
-  equal it. It measures the scan with the file-system listing. It is built in memory, so its peak memory is the image
-  size (1 GiB at the default `--size-mib`).
+  equal it. It measures the scan with the file-system listing. It is built in memory, so its peak memory is about
+  twice the image size (about 2 GiB at the default `--size-mib`): the builder keeps a copy of every file and `build()`
+  allocates the image.
 - `cut-jpeg`: like `dense-jpeg` but the second half of every file is noise. It has no speed target (each cut JPEG starts
   a gap search that may re-read its 64 MiB window); it is only measured and reported.
 

@@ -533,6 +533,7 @@ fn volume_and_origin_keys() {
     assert_eq!(a["placement"], "chain");
     assert_eq!(a["volume"], 0);
     assert_eq!(a["fs_size"], named.len());
+    assert_eq!(a["created"], "2025-12-14T07:12:06");
     assert_eq!(a["modified"], "2025-12-14T07:12:06");
     let other = found.iter().find(|f| f.get("name").is_none()).unwrap();
     for k in [
