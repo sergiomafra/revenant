@@ -367,7 +367,8 @@ struct FakeDisk {
     present: Arc<AtomicBool>,
     mounted: bool,
     fail_unmount: Option<Vec<String>>,
-    deny_open: bool,
+    /// Opening it fails with this code.
+    fail_open: Option<&'static str>,
     faults: Arc<Mutex<Faults>>,
 }
 
@@ -376,6 +377,8 @@ struct FakeState {
     disks: BTreeMap<DiskId, FakeDisk>,
     destinations: Vec<(PathBuf, Result<DestInfo, &'static str>)>,
     log: Arc<Mutex<Vec<String>>>,
+    /// Listing fails with this code.
+    fail_list: Option<&'static str>,
     /// Set when the `FakeDevices` is dropped: hanging reads give up.
     released: Arc<AtomicBool>,
 }
@@ -408,7 +411,7 @@ impl FakeDevices {
             present: Arc::new(AtomicBool::new(true)),
             mounted: true,
             fail_unmount: None,
-            deny_open: false,
+            fail_open: None,
             faults: Arc::default(),
         };
         if let Some(old) = self.lock().disks.insert(info.id, disk) {
@@ -434,7 +437,17 @@ impl FakeDevices {
 
     /// From now on, opening disk `id` fails with `permission_denied`.
     pub fn deny_open(&self, id: &str) {
-        self.with_disk(id, |d| d.deny_open = true);
+        self.fail_open(id, "permission_denied");
+    }
+
+    /// From now on, opening disk `id` fails with the error of code `code` (see [`error_of`]).
+    pub fn fail_open(&self, id: &str, code: &'static str) {
+        self.with_disk(id, |d| d.fail_open = Some(code));
+    }
+
+    /// From now on, listing fails with the error of code `code` (`None`: it works again).
+    pub fn fail_list(&self, code: Option<&'static str>) {
+        self.lock().fail_list = code;
     }
 
     /// From now on, a read of disk `id` touching byte `offset` never returns while this `FakeDevices` lives (a device
@@ -495,6 +508,9 @@ impl FakeDevices {
 impl DeviceOps for FakeDevices {
     fn list(&self) -> Result<Vec<DiskInfo>, EngineError> {
         self.note("list".into());
+        if let Some(code) = self.lock().fail_list {
+            return Err(error_of(code));
+        }
         let mut disks: Vec<DiskInfo> = self.lock().disks.values().map(|d| d.info.clone()).collect();
         // Sorted by number, as `DeviceOps::list` promises (`disk2` before `disk10`).
         disks.sort_by(|a, b| {
@@ -508,8 +524,8 @@ impl DeviceOps for FakeDevices {
         self.note(format!("open {}", disk.as_str()));
         let st = self.lock();
         let d = st.disks.get(disk).ok_or(EngineError::DeviceNotFound)?;
-        if d.deny_open {
-            return Err(EngineError::PermissionDenied);
+        if let Some(code) = d.fail_open {
+            return Err(error_of(code));
         }
         Ok(Box::new(FakeDevice {
             id: disk.clone(),

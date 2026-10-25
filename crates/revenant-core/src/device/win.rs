@@ -105,6 +105,8 @@ fn confirm_no_media(volumes: &mut [WinVolumeRaw]) {
 /// answer is `remount_failed`.
 pub(crate) fn remount(disk: &DiskId) -> Result<(), EngineError> {
     let number = number_of(disk).map_err(|_| EngineError::RemountFailed)?;
+    // A single query per volume (no "no media" confirmation): a volume briefly not ready right now has no extents here
+    // and is skipped; Windows mounts it on its next access anyway, since nothing holds a lock on it any more.
     let volumes = win_parse::volumes_on(&platform::volumes_raw(), number);
     if volumes.iter().all(|v| platform::volume_answers(v)) {
         Ok(())

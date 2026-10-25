@@ -155,12 +155,15 @@ still never writes to it, but the system may (warning the user is the app's job)
 **Reconnecting.** `device::reconnect(&ops, &identity, &cancel, poll)` waits for a card that was disconnected (a loose
 cable, the computer sleeping) to come back, and returns `Reconnected { source, unmount }`. Every `poll` (the app uses
 500 ms) it lists the disks with the same size and model as the identity (and the same serial when both have one; the
-system disk never), opens each candidate read-only only to read its identity sectors (on a thread, waited for at most
-`preflight::SAMPLE_TIMEOUT`) and compares with `same_source`. A candidate that does not match is closed and nothing is
-unmounted; the one that matches is closed, unmounted, and only then opened again as `source` (`unmount` holds the
-guard, or the error when the unmount failed: the card is then read mounted). Nothing but the identity sectors is read
-before the unmount. Errors: `cancelled` (seen while waiting), `device_not_found` for an identity that is not a device's,
-`unsupported_platform`, or the error of opening the card again. The remount window: the system mounts the card by itself
+system disk never), opens each candidate read-only only to read its identity sectors, on a thread of its own (a probe),
+and compares with `same_source` when the probe answers. A probe is never waited for: a candidate whose reads hang does
+not hold up the others, and is not opened again until its probe returns (so a hung disk costs one blocked thread, not
+one per poll; at most 16 probes run at once). A candidate that does not match is closed and nothing is unmounted; the
+one that matches is closed, unmounted, and only then opened again and its identity read once more (after the unmount):
+still the card → returned as `source` (`unmount` holds the guard, or the error when the unmount failed: the card is
+then read mounted); not (another card took its name meanwhile) → closed, and waiting goes on. Nothing but the identity
+sectors is read before the unmount. Errors: `cancelled` (seen while waiting), `device_not_found` for an identity that is
+not a device's, `unsupported_platform`, or the error of opening the card again. The remount window: the system mounts the card by itself
 when it comes back and may write to it (`.fseventsd`, a dirty flag) before `reconnect` unmounts it; closing that window
 (refusing the mount while a session lasts) is for the privileged helper of Module 2.1.
 
@@ -224,15 +227,19 @@ error is the inner source's, so its offset is absolute in the inner source; `vol
 already known (empty when none), and the unmount's guard when one was asked and succeeded (keep it while the disk is
 read). Nothing is written anywhere. In this order:
 
-1. **Find** the disk in the listing; not there, or the listing fails: `device_not_found`, and the check ends.
-2. **Open** it read-only: `permission_denied` (root or Administrator needed) ends the check; any other failure is
-   `device_not_found`, and ends it too.
+1. **Find** the disk in the listing: not there is `device_not_found`, a listing that fails is `open_failed`, and the
+   system disk is `system_disk` (never opened, unmounted or read); each ends the check.
+2. **Open** it read-only: `permission_denied` (root or Administrator needed), `device_not_found` (gone meanwhile) or
+   `open_failed` (any other failure); each ends the check.
 3. **Unmount** (when `unmount`): a failure is `unmount_failed` with the volumes still mounted (the check goes on: the
    disk can still be read mounted); a disk gone meanwhile is `device_not_found` and ends the check.
 4. **Samples**: the first, the middle (`sectors / 2`) and the last logical sector, one after another, each read on its
    own thread and waited for at most `sample_timeout` (callers pass `preflight::SAMPLE_TIMEOUT`, 10 s). A read that does
    not return in time is `device_not_responding { offset }` and ends the sampling; its thread is left behind, blocked
-   until the system gives up on the read (a dying disk can hold it for minutes), and the call returns anyway. A failed
+   until the system gives up on the read (a dying disk can hold it for minutes), and the call returns anyway. That
+   thread keeps the device open meanwhile, so ejecting the disk may fail as busy until the system gives up. In the
+   worst case the whole check waits about 4 × `sample_timeout` (three slow samples, then the identity read of a
+   resumed copy's map). A failed
    read is `sample_unreadable { offset }`; a device that vanishes is `device_not_found`.
 5. **Copy destination** (when `copy_to`, the image file a copy would write): its parent folder goes through
    `Destination::check` (`destination_on_source`; `destination_unknown` for anything else, including a folder that
@@ -248,6 +255,8 @@ read). Nothing is written anywhere. In this order:
 | ------------------------- | ---------------------------- |
 | `PermissionDenied`        | `permission_denied`          |
 | `DeviceNotFound`          | `device_not_found`           |
+| `SystemDisk`              | `system_disk`                |
+| `OpenFailed`              | `open_failed`                |
 | `NotResponding`           | `device_not_responding`      |
 | `SampleUnreadable`        | `sample_unreadable`          |
 | `UnmountFailed`           | `unmount_failed`             |

@@ -268,6 +268,74 @@ fn each_problem_has_its_code() {
 }
 
 #[test]
+fn the_system_disk_is_never_touched() {
+    let s = setup();
+    let mut system = info("disk0", None);
+    system.system = true;
+    s.fake.add(system, card(2048));
+    let report = preflight(&s.fake, &request(&id("disk0"), Some(&s.copy_to)));
+    assert_eq!(report.issues, [Issue::SystemDisk]);
+    assert!(report.guard.is_none());
+    assert!(report.disk.is_some_and(|d| d.system));
+    // Listed, then nothing: no open, no unmount, no read, no destination.
+    assert_eq!(s.fake.log(), ["list"]);
+    assert!(s.fake.mounted("disk0"));
+}
+
+#[test]
+fn a_disk_that_cannot_be_listed_or_opened_is_open_failed() {
+    let s = setup();
+    s.fake.fail_list(Some("system_tool_failed"));
+    assert_eq!(
+        issues(&s.fake, "disk4", Some(&s.copy_to)),
+        [Issue::OpenFailed]
+    );
+    s.fake.fail_list(None);
+    s.fake.fail_open("disk4", "open_failed");
+    assert_eq!(
+        issues(&s.fake, "disk4", Some(&s.copy_to)),
+        [Issue::OpenFailed]
+    );
+    s.fake.fail_open("disk4", "system_tool_failed");
+    assert_eq!(
+        issues(&s.fake, "disk4", Some(&s.copy_to)),
+        [Issue::OpenFailed]
+    );
+    // Gone between the listing and the open: not found.
+    s.fake.fail_open("disk4", "device_not_found");
+    assert_eq!(
+        issues(&s.fake, "disk4", Some(&s.copy_to)),
+        [Issue::DeviceNotFound]
+    );
+    assert!(
+        s.fake.mounted("disk4"),
+        "nothing unmounted when it cannot be read"
+    );
+}
+
+#[test]
+fn bad_bytes_of_a_map_count_as_still_to_copy() {
+    // 40 MiB rescued, 8 MiB bad, 16 MiB untried: retries are not known yet, so 24 MiB are needed.
+    let s = setup();
+    let mut map = RescueMap::new(SIZE, 512, identity_of(&s.fake, "disk4"));
+    assert!(map.set(0, 40 * MIB, RegionState::Rescued));
+    assert!(map.set(40 * MIB, 8 * MIB, RegionState::Bad));
+    map.save(&map_path(&s.copy_to)).unwrap();
+    s.fake
+        .set_destination(s.dir.path(), Ok(dest(&["disk2"], 20 * MIB, None)));
+    assert_eq!(
+        issues(&s.fake, "disk4", Some(&s.copy_to)),
+        [Issue::DestinationTooSmall {
+            need: 24 * MIB,
+            free: 20 * MIB
+        }]
+    );
+    s.fake
+        .set_destination(s.dir.path(), Ok(dest(&["disk2"], 24 * MIB, None)));
+    assert_eq!(issues(&s.fake, "disk4", Some(&s.copy_to)), []);
+}
+
+#[test]
 fn everything_is_reported_at_once() {
     let s = setup();
     s.fake.add_virtual(
@@ -327,6 +395,8 @@ fn issue_codes_are_stable() {
     let codes: Vec<&str> = [
         Issue::PermissionDenied,
         Issue::DeviceNotFound,
+        Issue::SystemDisk,
+        Issue::OpenFailed,
         Issue::NotResponding { offset: 0 },
         Issue::SampleUnreadable { offset: 0 },
         Issue::UnmountFailed { volumes: vec![] },
@@ -345,6 +415,8 @@ fn issue_codes_are_stable() {
         [
             "permission_denied",
             "device_not_found",
+            "system_disk",
+            "open_failed",
             "device_not_responding",
             "sample_unreadable",
             "unmount_failed",
@@ -471,4 +543,33 @@ fn reconnect_matches_a_card_without_serial() {
     assert!(!log.contains(&"unmount disk5".to_string()), "{log:?}");
     assert!(fake.mounted("disk5"));
     assert!(!fake.mounted("disk6"));
+}
+
+#[test]
+fn a_hanging_look_alike_neither_blocks_nor_piles_up() {
+    let fake = Arc::new(FakeDevices::new());
+    fake.add(info("disk4", Some("S1")), card(2048));
+    let identity = identity_of(&fake, "disk4");
+    fake.remove("disk4");
+    // A serial-less look-alike whose reads never return: a candidate, probed once, never waited for.
+    fake.add(info("disk3", None), card(4096));
+    fake.hang_reads("disk3", 0);
+    let cancel = CancelToken::default();
+    let waiting = reconnect_in_background(&fake, identity, &cancel);
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(!waiting.is_finished());
+    fake.add(info("disk5", Some("S1")), card(2048));
+    let start = Instant::now();
+    let (disk, unmount) = waiting.join().unwrap().unwrap();
+    assert_eq!(disk, "disk5");
+    assert_eq!(unmount, Ok(0));
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        start.elapsed()
+    );
+    let log = fake.log();
+    let opened = log.iter().filter(|e| *e == "open disk3").count();
+    assert_eq!(opened, 1, "{log:?}");
+    assert!(fake.mounted("disk3"));
 }

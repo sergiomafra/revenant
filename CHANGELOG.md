@@ -10,9 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - A pre-flight check reports, before a long read, everything already known to be wrong, all at once: a missing
   permission to read the disk, a disk that does not answer or cannot read its first, middle or last sector (it never
   waits more than 10 s for one), a failed unmount, and a copy destination that cannot hold the card (not enough room,
-  FAT32 for a card over 4 GiB, a folder on the card itself or on a disk that cannot be told).
+  FAT32 for a card over 4 GiB, a folder on the card itself or on a disk that cannot be told). The disk holding the
+  running system is refused outright, never unmounted or read.
 - A card that is disconnected and plugged back in is found again (even under another disk name), told apart from
-  look-alike cards, and unmounted again before anything but its identity is read.
+  look-alike cards (one that stops answering never holds up the search), and unmounted again before anything but its
+  identity is read.
 - A bad-sector-tolerant, resumable copy of a card or disk into an image file: the readable parts are copied first, the
   damaged areas are skipped and come back later sector by sector, each bad sector is read once (no retries unless
   asked), and the copy reports bytes rescued, bad and left, speed and time left. It resumes where it stopped after a

@@ -38,8 +38,13 @@ pub struct PreflightRequest<'a> {
 pub enum Issue {
     /// The disk cannot be opened for reading: root (macOS) or Administrator (Windows) is needed.
     PermissionDenied,
-    /// The disk is not connected (or vanished during the check, or the system could not list or open it).
+    /// The disk is not connected (or vanished during the check).
     DeviceNotFound,
+    /// The disk holds the running system: it is never unmounted nor checked (ruling P38).
+    SystemDisk,
+    /// The system could not list the disks, or could not open the listed disk for another reason than permission
+    /// (ruling P39).
+    OpenFailed,
     /// The sample read at `offset` did not return within the timeout.
     NotResponding { offset: u64 },
     /// The sample read at `offset` failed.
@@ -66,6 +71,8 @@ impl Issue {
         match self {
             Self::PermissionDenied => "permission_denied",
             Self::DeviceNotFound => "device_not_found",
+            Self::SystemDisk => "system_disk",
+            Self::OpenFailed => "open_failed",
             Self::NotResponding { .. } => "device_not_responding",
             Self::SampleUnreadable { .. } => "sample_unreadable",
             Self::UnmountFailed { .. } => "unmount_failed",
@@ -91,18 +98,21 @@ pub struct Preflight {
 }
 
 /// Checks `req.disk` (ruling D14), in this order: find → open → unmount → samples → copy destination. Every issue found
-/// is reported, in that order; `DeviceNotFound` and `PermissionDenied` end the check early (nothing after them can be
-/// checked; nothing is unmounted when the disk cannot be opened).
+/// is reported, in that order; `DeviceNotFound`, `SystemDisk`, `OpenFailed` and `PermissionDenied` end the check early
+/// (nothing after them can be checked; nothing is unmounted when the disk cannot be opened).
 ///
-/// - Find: a listing that fails, or a disk not in it, is `DeviceNotFound`.
-/// - Open (read-only): `permission_denied` → `PermissionDenied`; any other failure → `DeviceNotFound`.
+/// - Find: a listing that fails is `OpenFailed` (P39); a disk not in it is `DeviceNotFound`; the system disk is
+///   `SystemDisk` (P38), before anything is opened, unmounted or read.
+/// - Open (read-only): `permission_denied` → `PermissionDenied`; `device_not_found` (gone meanwhile) →
+///   `DeviceNotFound`; any other failure → `OpenFailed` (P39).
 /// - Unmount: `unmount_failed` → `UnmountFailed` with the volumes still mounted (the check goes on: the disk can still be
-///   read mounted); `device_not_found` → `DeviceNotFound`; any other failure (`system_disk`, a failed system tool) →
-///   `UnmountFailed` naming the listed volumes that have a mount point.
+///   read mounted); `device_not_found` → `DeviceNotFound`; any other failure (a failed system tool) → `UnmountFailed`
+///   naming the listed volumes that have a mount point.
 /// - Samples: the first, middle (`sectors / 2`) and last logical sector, one after another, each read on its own thread
 ///   and waited for at most `req.sample_timeout`. A read that does not return in time is `NotResponding` and ends the
-///   sampling (its thread stays blocked until the system gives up on the read); a failed or short read is
-///   `SampleUnreadable`; a vanished device (`device_gone`) is `DeviceNotFound`.
+///   sampling (its thread stays blocked, with the device open, until the system gives up on the read); the whole check
+///   waits at most about 4 × `sample_timeout` (three samples and the identity read of a resumed copy's map). A failed
+///   or short read is `SampleUnreadable`; a vanished device (`device_gone`) is `DeviceNotFound`.
 /// - Copy destination (`req.copy_to`): [`Destination::check`] on its parent folder (`DestinationOnSource`, and
 ///   `DestinationUnknown` for any other failure); then the room the copy would check (P12): free space for what is still
 ///   to copy — the whole disk, or, when `map_path(copy_to)` holds a map of this same disk (`same_source`, read on a
@@ -118,21 +128,32 @@ pub fn preflight(ops: &dyn DeviceOps, req: &PreflightRequest) -> Preflight {
     };
     let info = match ops.list() {
         Ok(listed) => listed.into_iter().find(|d| d.id == *req.disk),
-        Err(_) => None,
+        Err(_) => {
+            out.issues.push(Issue::OpenFailed);
+            return out;
+        }
     };
     let Some(info) = info else {
         out.issues.push(Issue::DeviceNotFound);
         return out;
     };
     out.disk = Some(info.clone());
+    if info.system {
+        out.issues.push(Issue::SystemDisk);
+        return out;
+    }
     let source = match ops.open(req.disk) {
         Ok(raw) => Arc::new(DeviceSource::new(raw, req.disk.clone())),
         Err(EngineError::PermissionDenied) => {
             out.issues.push(Issue::PermissionDenied);
             return out;
         }
-        Err(_) => {
+        Err(EngineError::DeviceNotFound) => {
             out.issues.push(Issue::DeviceNotFound);
+            return out;
+        }
+        Err(_) => {
+            out.issues.push(Issue::OpenFailed);
             return out;
         }
     };
