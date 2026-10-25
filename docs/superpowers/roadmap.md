@@ -34,7 +34,7 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
     arquivo fragmentado (cadeia viva) e a FAT com setor ruim.
   - Cartão formatado rápido: os nomes e as pastas voltam pelas pastas antigas que sobraram.
   - Deduplicação: a mesma foto achada pelo sistema de arquivos e pela escultura sai uma vez; JPEGs próprios de um RAW
-    `Partial` são relatados; o vídeo pareia na grade de clusters.
+    `Partial` não são mais relatados à parte; o vídeo pareia na grade de clusters.
   - Agrupamento por sessão, dia, câmera e pasta.
   - Arquivo recuperado sem nome ganha um nome por data e câmera; a extração sanea os nomes.
   - Não cobre: arquivo apagado e fragmentado (sai `Partial`, vai para a 1.6); NTFS, APFS e HFS+ (a escultura segue

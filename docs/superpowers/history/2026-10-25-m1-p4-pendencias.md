@@ -147,6 +147,33 @@ A execução foi pausada depois da Tarefa 5 (cota) e retomada em 24/10/2026 na T
 - **R32:** o rótulo de grupo no JSON do CLI é `{"kind": <variante em snake_case>, ...campos}`, com `camera` omitida quando
   desconhecida. Custo: a interface pode querer outro formato depois.
 - **R33:** o número de série de uma sessão vem do menor id que tem um; marca/modelo do menor id.
+- **R35:** portão do R16 — a média do `dense-jpeg` contra `main` (−4,8%) fica dentro do limite de 5%, então o PR não foi
+  barrado. Dito com todas as letras: a rodada 1 (−6,1%) passou do limite; as rodadas 2 e 3 (−4,0% e −4,2%), não. O
+  revisor final ficou encarregado de procurar um custo por cabeçalho em imagens sem volume. Custo: se fosse real, ~5% de
+  vazão em cartão de JPEG denso.
+- **R36:** o R35 está fechado: a revisão final mostrou que a diferença é do código gerado naquele build, não trabalho do
+  sistema de arquivos. Na imagem `dense-jpeg` (sem volume) a leitura da listagem custa ≈ 1,1 ms e o buscador de pastas
+  antigas nem é criado; um build de controle da cabeça (mudança de uma linha) mediu 2,11 s com sistemas de arquivos
+  ligados e 2,14 s desligados, contra 2,13 s do `main`, enquanto a cabeça como foi construída da primeira vez dava 2,26 s.
+  Daqui em diante, um A/B neste Mac precisa de um build de controle para enxergar ~6%. Custo: nenhum.
+- **R37:** a triagem final do apêndice foi adotada como o revisor a deu: o que pode esperar fica com dono (1.5, 1.6,
+  Módulo 2 ou Sérgio) no apêndice abaixo; o que já estava corrigido ou testado foi fechado. Custo: os donos podem mudar
+  depois.
+
+## Onda final de correção
+
+- **Arquivo `Intact` com setor ilegível num pedaço anterior ao início** (achado Importante da revisão final, o item T7
+  do apêndice). Setores ilegíveis só rebaixavam achados já pendentes, então um arquivo vivo cujo pedaço posterior fica
+  antes do início (o alocador da FAT deu a volta num cartão reusado) passava pelo setor ruim antes de existir, e saía
+  `Intact` quando o detector não lia aqueles bytes. Agora, ao entrar, um achado `Intact` cai para `Partial` se o mapa de
+  setores ruins do cache conhece um setor ilegível em algum pedaço abaixo do início (tudo abaixo já foi lido, então o
+  resultado é o mesmo para qualquer `threads` e `cache_bytes`). Teste `bad_sector_in_an_earlier_piece_lowers_a_listed_file`
+  (formato de teste que mede sem ler, igual em 1/2/8/16 threads e cache de 1 MiB). Os detectores atuais leem todo setor
+  de um arquivo (procuram cabeçalhos em cada início de setor), então a falha não aparecia com eles; a regra fecha a porta
+  para qualquer detector futuro e para o que não é lido pelo detector.
+- Correções de documentação: custo das buscas de palavra alta (≈ 10 s com o orçamento todo, não "bem abaixo de um
+  segundo"), entrada da origem própria (70 a 90 B, até ≈ 6 MiB), números de desempenho (R36), roteiro da 1.4 (JPEGs
+  próprios de um RAW `Partial` não são mais relatados à parte) e quebra de linha do `CLAUDE.md`.
 
 ## Medida final (antes × depois)
 
@@ -178,9 +205,9 @@ com pausa de 60 s; MB/s, `main` → cabeça):
 | 3 | 591,6 → 566,6 (−4,2%) | 2523,6 → 2807,7 (+11,3%) |
 
 `dense-jpeg`: a cabeça fica 4 a 6% atrás em todas as rodadas (média 557,8 contra 585,9, −4,8%), na beira do limite de 5%
-do R16 e sem passar dele em duas das três rodadas; a causa não foi isolada. `noise` oscila para os dois lados (sem
-diferença). Custo: se a diferença do `dense-jpeg` for real, são ~5% de vazão em JPEG denso (ainda ≈ 550 MB/s, bem acima de
-um leitor UHS-II). Fica para o Sérgio decidir se quer uma otimização antes do PR.
+do R16 e sem passar dele em duas das três rodadas (a rodada 1, −6,1%, passou; R35). `noise` oscila para os dois lados
+(sem diferença). A revisão final achou a causa (R36): é o código gerado daquele build, não custo do sistema de arquivos;
+um build de controle da cabeça empata com o `main` (2,11 s contra 2,13 s no `dense-jpeg`).
 
 
 ## Pendências herdadas com dono 1.4, fechadas nesta parte
@@ -228,34 +255,44 @@ um leitor UHS-II). Fica para o Sérgio decidir se quer uma otimização antes do
 
 NTFS, APFS e HFS+ ficam fora (a escultura segue cobrindo).
 
-## Apêndice: pendências menores para a revisão final
+## Apêndice: pendências menores, triadas na revisão final (R37)
 
-Itens adiados pelas tarefas, para a onda de revisão final triar (esta seção pode ser editada por ela; nada aqui foi
-corrigido na Tarefa 13).
+Itens adiados pelas tarefas, triados pela revisão final.
 
-- T1: HiddSec absoluto do EBR (Windows/mkfs.fat), variante relativa legada sem documentação; detecção de exFAT por nome OEM
-  no builder.
-- T2: `detach_by_path` best-effort quando `hdiutil info` é ilegível (avisa); a checagem da pasta temporária é uma lista de
-  negação.
+**Fechadas**
+- T7: setor ruim antes do início não rebaixava um arquivo vivo com pedaço anterior ao início (Q8): corrigido na onda final.
+- T8: a chave `created` passou a ser conferida na rodada de correção.
+- T9: guarda `within` testada; entrada da origem própria ≈ 50 B corrigida (70 a 90 B) na onda final.
+- T10: teto de entradas exFAT por pasta corrigido na rodada de correção; memória do `note_walked` documentada (16 MiB).
+- T11: controles C1 e U+2028/2029, `split_name`/`fallback_name` públicos, "200 bytes antes do `_N`" no README e teste de
+  caixa do `camera_tag`: todos já corrigidos ou testados.
+- T12: os rótulos Camera/Day já nomeiam os campos no README.
+- T13: R35, frase "as outras linhas não mudaram" e "2^26 passos bem abaixo de um segundo": fechados na onda final;
+  quebra de linha do `CLAUDE.md` corrigida.
+
+**Parte 1.5**
+- T1: HiddSec do EBR na variante relativa legada (sem documentação); detecção de exFAT por nome OEM no builder.
+- T2: `detach_by_path` best-effort quando `hdiutil info` é ilegível; a checagem da pasta temporária é uma lista de negação.
 - T3: volume duplicado fantasma quando um candidato MBR de 4096 cai no setor de boot de backup de outro volume 4K
   (L = 8S−48/96); limitação da sonda (primário + primeiro setor da FAT sumidos) sem documentação; ordem do `backup()` em
   exFAT 4K; asserção de leitura do caso típico.
+- T5: o teto de fotos é compartilhado entre volumes (apagados do volume 1 podem tomar vagas vivas do 2).
+- T6: bits `InUse` misturados entre entradas de um conjunto (nota no README).
+- T7 (pode esperar, só nota): "carved-only-if-not-skipped" sem teste (o comentário o diz defensivo); `filesystems_off`
+  nunca visto falhar.
+
+**Parte 1.6**
 - T5: limitar a fase de palavra alta a metade do orçamento (2^25) ou colocar antes os arquivos de início conhecido; teste
-  ou `debug_assert` do corte da fila de espera; README "2^26 passos bem abaixo de um segundo" está errado para buscas de
-  palavra alta (~10 s); o teto de fotos é compartilhado entre volumes (apagados do volume 1 podem tomar vagas vivas do 2).
-- T6: confiança de diretório `NoFatChain` vivo sem teste; chunk ilegível não gasta orçamento de entradas; bits `InUse`
-  misturados entre entradas de um conjunto (nota no README); arquivos que não são foto na raiz antes da entrada do bitmap
-  reivindicam antes de fotos/diretórios (só volume malformado).
-- T7: setor ruim antes de `at` nunca rebaixa um arquivo vivo cujo pedaço posterior fica antes do início (layout Q8)
-  (checar `cache.bad_runs` em `add` ou documentar); "carved-only-if-not-skipped" sem teste (comentar como defensivo);
-  `filesystems_off` nunca visto falhar.
-- T8: a chave `created` não é conferida em `volume_and_origin_keys`.
-- T9: guarda `within` sem teste; fragmento de prévia de RAW que cruza o limite de um pedaço é relatado (nota no README);
-  entrada da origem própria ≈ 50 B na documentação, provavelmente 70–90 B (README Memory + doc de `ScanOptions`).
-- T10: continuação de pasta antiga exFAT com vários clusters vira candidata própria (`?/NOME`); teto de entradas exFAT por
-  pasta não é cumulativo (`orphans.rs:329`); nó cortado por profundidade não é memorizado (`orphans.rs:379`); `note_walked`
-  pode rodar até 256 MiB teóricos, sem documentação.
-- T11: controles C1 e U+2028/2029 mantidos no nome; `split_name`/`fallback_name` públicos sem documentação; README diz
-  "200 bytes antes do sufixo `_N`"; `camera_tag` sem teste de caixa.
-- T12: tipos CLI `undated_session`/`unknown_camera`/`no_folder`/`folder` e `camera` omitida sem teste pelo CLI; rótulos
-  Camera/Day documentam só "seus campos" no README; `--group` clona todo achado (CLI de desenvolvimento).
+  ou `debug_assert` do corte da fila de espera.
+- T6: confiança de diretório `NoFatChain` vivo sem teste; chunk ilegível não gasta orçamento de entradas; arquivos que não
+  são foto na raiz antes da entrada do bitmap reivindicam antes de fotos/diretórios (só volume malformado).
+- T9: fragmento de prévia de RAW que cruza o limite de um pedaço é relatado (nota no README).
+- T10: continuação de pasta antiga exFAT com vários clusters vira candidata própria (`?/NOME`, documentado); nó cortado
+  por profundidade não é memorizado (`orphans.rs:379`).
+
+**Módulo 2**
+- T12: tipos CLI `undated_session`/`unknown_camera`/`no_folder`/`folder` e `camera` omitida sem teste pelo CLI;
+  `--group` clona todo achado (CLI de desenvolvimento).
+
+**Sérgio**
+- T9: o D13 pode dar `Intact` num vídeo velho que cai numa grade nova por coincidência (já listado em Módulo 2, acima).

@@ -661,7 +661,9 @@ the deleted photos/videos wait, never more than the photo slots left (a later li
 - **Step budget (ruling C7, R10).** Every cluster examined by the guesses of a volume (deleted folders, then the
   high-word candidates, then the files) costs one step of 2^26; once spent, the volume's remaining deleted files are
   not listed and no further deleted folder is read (in that order, each in walk order). The allocation is read a FAT
-  block at a time, so 2^26 steps take well under a second.
+  block at a time, so 2^26 steps of guessing take well under a second; FAT32 high-word lookups are dearer per step,
+  and a hostile volume that spends the whole budget on them takes about 10 s on the development Mac (a real card asks
+  a few of them per deleted file).
 
 Bounds (each lowerable in unit tests): per volume at most 65,536 directories, 4,000,000 directory entries (every
 32-byte slot read counts, the end marker included), depth 32 (the root is 0), 2 MiB per directory, 65,536 contested
@@ -1027,8 +1029,8 @@ every scan in the process, plus the decoder's internal buffers), plus what each 
 200 B per recognized sector start in the read-ahead (at most
 lookahead × block / sector of them), plus the `moov` candidates (16 B each: at most 4096 per block read ahead, and
 4096 kept), the `Damaged` videos kept for pairing (at most 4096 findings), the start of every finding (8 B each) and
-the own-file starts of `Partial` RAWs (at most 65,536 at once, about 50 B each in the ordered map, plus each RAW's
-ranges), the old-directory candidates and the findings they may name (see
+the own-file starts of `Partial` RAWs (at most 65,536 at once, about 70 to 90 B each: an ordered-map entry, its `Vec`
+and a shared pointer to the RAW's ranges, so at most about 6 MiB, plus each RAW's ranges), the old-directory candidates and the findings they may name (see
 [File systems: after a quick format](#file-systems-after-a-quick-format)),
 plus the file-system listing, kept for the whole scan: at most 262,144 photo/video files and 2^20 pieces, ≈ 355 MiB
 in the worst case at those caps (mostly names; see the Memory paragraph of [File systems: FAT](#file-systems-fat)),
@@ -1115,11 +1117,16 @@ MB = 10^6 bytes.
 The "end of 1.4" column is the head of part 1.4 (default threads, one run of `revenant-dev bench`, best of 3 scans);
 `exfat-card` (an exFAT volume holding the `dense-jpeg` photos, every 4th deleted, so the scan also reads the file system)
 is new in 1.4, so it has no earlier figure: at 459.1 MB/s it is 0.85 of `dense-jpeg` (539.8), above the 0.8 gate, and it
-finds all 93 placed files. The other lines did not move beyond the variation between runs of this machine, which throttles
-(`dense-raw` 1576.9 to 1420.3, `video` 2296.6 to 2525.4 in the same session). Against part 1.3's head (`main`,
-`b5ec340`) built side by side and interleaved, best of 3 scans, three rounds with a 60 s pause: `dense-jpeg` 581.4 /
-584.7 / 591.6 MB/s on `main` against 545.8 / 561.1 / 566.6 on the 1.4 head (4 to 6% slower; the cause was not isolated); `noise` swings the other way as often as not (2794.1 /
-2653.3 / 2523.6 on `main`, 2468.3 / 2397.0 / 2807.7 on the head), so it shows no difference.
+finds all 93 placed files. The other lines were not compared side by side with part 1.3 (only `dense-jpeg` and `noise`
+were, below); between runs on this machine, which throttles, they move by up to about 10% (`dense-raw` 1576.9 to
+1420.3, `video` 2296.6 to 2525.4). Against part 1.3's head (`main`, `b5ec340`) built side by side and interleaved, best
+of 3 scans, three rounds with a 60 s pause: `dense-jpeg` 581.4 / 584.7 / 591.6 MB/s on `main` against 545.8 / 561.1 /
+566.6 on the 1.4 head (4 to 6% slower); `noise` swings the other way as often as not (2794.1 / 2653.3 / 2523.6 on
+`main`, 2468.3 / 2397.0 / 2807.7 on the head), so it shows no difference. The `dense-jpeg` gap is not file-system work:
+on that image (no volume) the listing step costs about 1.1 ms and the old-folder finder is never created, and a control
+rebuild of the head (a one-line change) scanned `dense-jpeg` in 2.11 s with file systems on and 2.14 s off, against
+2.13 s on `main`, while the head as first built took 2.26 s. The gap is the code layout of that one build. On this Mac
+an A/B needs such a control rebuild to resolve a difference of about 6%.
 
 Every placed file is found in every run. What it means for a card: an SD card reader delivers at most about 100 MB/s
 (UHS-I) to about 300 MB/s (UHS-II), so with the default threads the scan keeps up with the reader on every image here,

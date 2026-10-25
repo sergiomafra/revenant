@@ -97,7 +97,7 @@ const MAX_THREADS: usize = 64;
 /// plus about 200 B per recognized sector start in the read-ahead (at most lookahead × block / sector of them), plus the
 /// orphan `moov` candidates and `Damaged` videos kept for pairing (at most 4096 + 4096 per block read ahead, and 4096
 /// findings) and the start of every finding (8 B each), plus the own-file starts of `Partial` RAWs (at most 65,536,
-/// about 50 B each, plus each RAW's ranges), plus the old-directory candidates (16 B each, at most 65,536 kept) and the
+/// about 70 to 90 B each, at most about 6 MiB, plus each RAW's ranges), plus the old-directory candidates (16 B each, at most 65,536 kept) and the
 /// findings without origin on a cluster grid they may name (≈ 64 B each, at most 262,144), plus the file-system listing: up to 262,144 files and 2^20
 /// pieces, ≈ 355 MiB kept for the whole scan in the worst case at those caps, with a peak of ≈ 640 MiB while it is read
 /// (on exFAT, plus the allocation bitmap, ≤ 32 MiB, and the root entries waiting for it, ≤ 68 MiB; core README), and,
