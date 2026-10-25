@@ -981,10 +981,19 @@ fn orphan_finder_ignores_live_and_noise() {
     let ev = events(&placed(&b));
     assert!(updates(&ev).is_empty(), "{:#?}", updates(&ev));
     // A deleted folder (walked by the file-system phase, not live) whose photo's clusters a live file took over: the
-    // photo found inside that file has no origin, and the folder's old entry does not name it.
+    // photo found inside that file has no origin, and the folder's intact entry KEEP.JPG pointing at it (left intact
+    // by a raw entry, as a crashed delete would) does not name it: a walked directory is no old folder.
     let mut b = card();
+    b.mkdir("MISC");
     let jpg = jpeg(64, 64, 21, 0);
     let clusters = b.add(&format!("{DIR}/OLD/DSC09999.JPG"), &jpg);
+    let mut keep = [0u8; 32];
+    keep[..11].copy_from_slice(b"KEEP    JPG");
+    keep[11] = 0x20;
+    keep[20..22].copy_from_slice(&((clusters[0] >> 16) as u16).to_le_bytes());
+    keep[26..28].copy_from_slice(&(clusters[0] as u16).to_le_bytes());
+    keep[28..32].copy_from_slice(&(jpg.len() as u32).to_le_bytes());
+    b.raw_entry(&format!("{DIR}/OLD"), keep);
     b.delete(&format!("{DIR}/OLD"), DeleteStyle::Camera);
     let mut data = vec![0x5Au8; 512];
     data.extend_from_slice(&jpg);
