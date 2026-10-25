@@ -468,6 +468,52 @@ mod tests {
     }
 
     #[test]
+    fn source_names_are_classified_on_every_platform() {
+        use crate::devices::{Named, classify};
+        let code = |s: &str| classify(s).err().map(|e| e.code());
+        // Whole disks.
+        for (s, id) in [
+            ("disk4", "disk4"),
+            ("/dev/rdisk4", "disk4"),
+            (r"\\.\PhysicalDrive2", "PhysicalDrive2"),
+            ("PhysicalDrive2", "PhysicalDrive2"),
+        ] {
+            assert!(
+                matches!(classify(s), Ok(Named::Disk(d)) if d.as_str() == id),
+                "{s}"
+            );
+        }
+        // Files, including a Windows long path to a file (what canonicalize gives there) and a UNC long path.
+        for s in [
+            "card.img",
+            "./disk4",
+            "/Volumes/Backup/card.img",
+            r"C:\x\card.img",
+            r"\\?\C:\x\card.img",
+            r"\\?\c:\x\card.img",
+            r"\\?\UNC\server\share\card.img",
+            r"\\server\share\card.img",
+        ] {
+            assert!(matches!(classify(s), Ok(Named::File)), "{s}");
+        }
+        // Any other device path: refused whether or not it exists.
+        for s in [
+            "/dev/disk4s1",
+            "/dev/null",
+            "/DEV/disk4s1",
+            r"\\.\E:",
+            r"\\.\HarddiskVolume3",
+            "//./E:",
+            r"\\?\Volume{0b1c2d3e-0000-0000-0000-000000000000}\",
+            r"\\?\GLOBALROOT\Device\Harddisk1\Partition1",
+            r"\\?\PhysicalDrive2",
+            r"\??\E:",
+        ] {
+            assert_eq!(code(s), Some("not_whole_disk"), "{s}");
+        }
+    }
+
+    #[test]
     fn unknown_volume_forwards_the_disk() {
         let wrapped = UnknownVolume(&StubCard);
         assert_eq!(wrapped.disk(), Some(disk4()));

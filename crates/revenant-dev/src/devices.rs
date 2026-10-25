@@ -12,24 +12,62 @@ use serde::Serialize;
 use crate::Exit;
 use crate::output::emit_json;
 
-/// What a SOURCE argument names: `Some(disk)` for a whole disk ("disk4", "/dev/rdisk4", "PhysicalDrive2",
-/// r"\\.\PhysicalDrive2"), `None` for a file. Any other device path (under `/dev/`, or starting with `\\.\` or `\\?\`:
-/// a partition such as "/dev/disk4s1" or `\\.\E:`) is `not_whole_disk` whether it exists or not: read as a file it
-/// would carry no disk, and nothing would keep the scan, the copy or the session off the card it belongs to. A bare
-/// name that looks like a disk ("disk4s1") and is not an existing file is `not_whole_disk` too.
+/// What a SOURCE string names, from the string alone (pure: the same answer on every platform).
+#[derive(Debug)]
+pub(crate) enum Named {
+    /// A whole disk: "disk4", "/dev/rdisk4", "PhysicalDrive2", r"\\.\PhysicalDrive2".
+    Disk(DiskId),
+    /// A path to a file, including a Windows long path to one (`\\?\C:\…`, `\\?\UNC\…`).
+    File,
+}
+
+/// Classifies a SOURCE string: a whole disk, a file path, or (`not_whole_disk`) any other device path, which read as a
+/// file would carry no disk, so nothing would keep the scan, the copy or the session off the card it belongs to:
+/// `/dev/…` (a partition such as `/dev/disk4s1`, `/dev/null`), `\\.\…` (`\\.\E:`, `\\.\HarddiskVolume3`), `\\?\…` other
+/// than a drive-letter or UNC long path (`\\?\Volume{…}\`, `\\?\GLOBALROOT\…`, `\\?\PhysicalDrive2`) and `\??\…`, with
+/// `/` taken as `\` and in any case.
+pub(crate) fn classify(s: &str) -> Result<Named, EngineError> {
+    match DiskId::parse(s) {
+        Ok(disk) => Ok(Named::Disk(disk)),
+        Err(e) if is_device_path(s) => Err(e),
+        Err(_) => Ok(Named::File),
+    }
+}
+
+/// Whether `s` is in a device namespace (see [`classify`]).
+fn is_device_path(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("/dev/") {
+        return true;
+    }
+    let win = lower.replace('/', "\\");
+    if win.starts_with(r"\\.\") || win.starts_with(r"\??\") {
+        return true;
+    }
+    match win.strip_prefix(r"\\?\") {
+        None => false,
+        Some(rest) => {
+            let b = rest.as_bytes();
+            let drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+            !(drive || rest.starts_with(r"unc\"))
+        }
+    }
+}
+
+/// What a SOURCE argument names: `Some(disk)` for a whole disk, `None` for a file; `not_whole_disk` for any other device
+/// path ([`classify`]), whether it exists or not, and for a bare name that looks like a disk ("disk4s1") and is not an
+/// existing file.
 pub(crate) fn device_name(source: &Path) -> Result<Option<DiskId>, EngineError> {
     let Some(s) = source.to_str() else {
         return Ok(None);
     };
-    match DiskId::parse(s) {
-        Ok(disk) => Ok(Some(disk)),
-        Err(e) => {
+    match classify(s)? {
+        Named::Disk(disk) => Ok(Some(disk)),
+        Named::File => {
             let lower = s.to_ascii_lowercase();
-            if is_device_path(&lower)
-                || ((lower.starts_with("disk") || lower.starts_with("physicaldrive"))
-                    && !source.exists())
+            if (lower.starts_with("disk") || lower.starts_with("physicaldrive")) && !source.exists()
             {
-                Err(e)
+                Err(EngineError::NotWholeDisk)
             } else {
                 Ok(None)
             }
@@ -37,17 +75,14 @@ pub(crate) fn device_name(source: &Path) -> Result<Option<DiskId>, EngineError> 
     }
 }
 
-/// A device namespace path: `/dev/…`, `\\.\…` or `\\?\…` (any case).
-fn is_device_path(lower: &str) -> bool {
-    lower.starts_with("/dev/") || lower.starts_with(r"\\.\") || lower.starts_with(r"\\?\")
-}
-
-/// A file SOURCE must be a regular file (links followed), checked before it is opened (a FIFO would block the open):
-/// a link resolving into a device namespace is `not_whole_disk`, any other non-regular file (a FIFO, a socket, a
-/// folder, a device elsewhere) `open_failed`.
+/// A file SOURCE must be a regular file (links followed), checked before it is opened for a clear error (the engine
+/// checks the opened handle again). On Unix a link resolving into `/dev` is `not_whole_disk`; on Windows the resolved
+/// path is always a `\\?\C:\…` long path, so only the path typed is classified ([`device_name`]). Any other non-regular
+/// file (a FIFO, a socket, a folder) is `open_failed`.
 pub(crate) fn check_regular_file(path: &Path) -> Result<(), EngineError> {
+    #[cfg(unix)]
     if let Ok(resolved) = std::fs::canonicalize(path)
-        && is_device_path(&resolved.to_string_lossy().to_ascii_lowercase())
+        && is_device_path(&resolved.to_string_lossy())
     {
         return Err(EngineError::NotWholeDisk);
     }

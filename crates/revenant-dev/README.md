@@ -31,8 +31,11 @@ and exits with 1; `preflight` and `copy` exit with 2 when the pre-flight check f
   always means the disk (write `./disk4` for a file of that name). A partition or any other device node
   (`disk4s1`, `/dev/disk4s1`, `/dev/null`, `\\.\E:`, `\\?\Volume{…}`) is refused with `not_whole_disk`, even when it
   exists: read as a file it would not be known as part of the card, so nothing would keep the extraction, the copy or
-  the session off the card. Name the whole disk instead. A file SOURCE must be a regular file (links followed): a link
-  into `/dev` is `not_whole_disk`, a FIFO, socket or folder `open_failed`. The same rules hold for `copy` and
+  the session off the card. Name the whole disk instead. A Windows long path to a file (`\\?\C:\…`,
+  `\\?\UNC\server\share\…`) is a file path and is accepted; `/` counts as `\` in these prefixes. A file SOURCE must be
+  a regular file (links followed): on macOS and Linux a link into `/dev` is `not_whole_disk`; a FIFO, socket, folder or
+  any other node is `open_failed` (the engine checks the opened file again, so a node swapped in meanwhile is refused
+  too). The same rules hold for `copy` and
   `digest`. An image file with its rescue map beside it (`<SOURCE>.rvmap`, written by `copy`) is read through
   the map (see [Copying a card](#copying-a-card)).
 - `--extract <DIR>`: copies each finding into `<DIR>` as soon as it is found, under its original name when the file
