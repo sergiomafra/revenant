@@ -1144,11 +1144,11 @@ nothing is ever overwritten, on case-sensitive and case-insensitive volumes alik
 3. Else `revenant_<start as 12 hex digits>.<ext>` (what 1.3 wrote).
 
 `naming::sanitize(name) -> Option<String>` makes one safe component, so extraction never leaves the destination folder:
-`/ \ : * ? " < > |`, control characters (below 0x20 and 0x7F), format controls (U+200B–200F, U+202A–202E, U+2066–2069,
+`/ \ : * ? " < > |`, control characters (below 0x20, 0x7F and the C1 range U+0080–U+009F), U+2028/U+2029, format controls (U+200B–200F, U+202A–202E, U+2066–2069,
 U+FEFF, which can disguise an extension) and U+FFFD become `_`; leading and trailing `.` and spaces are trimmed (`..`
 gives `None`); a Windows reserved stem (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`, their superscript
 forms, `CONIN$`, `CONOUT$`; any case; the stem is what precedes the first `.`, so `CON.tar.gz` counts) gets a `_` in
-front; at most 200 bytes, cut on a char boundary, keeping an extension of up to 16 bytes. A total path over 260
+front; at most 200 bytes (before a `_N` suffix), cut on a char boundary, keeping an extension of up to 16 bytes. `extract::create_named(dir, &Finding, name, suffix)` is the one public way to create a file under a derived name (the CLI writes previews with it): it sanitizes `name`, replaces the extension by `suffix` when given (which must be empty or start with `.` and hold no unsafe char, else `write_failed`) and applies the `_N` rule. A total path over 260
 characters on Windows is a write error (`write_failed`) there, never an escape.
 
 ## Tested against real files

@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::EngineError;
-use crate::naming::{fallback_name, file_name, sanitize, split_name};
+use crate::naming::{fallback_name, file_name, is_unsafe_char, sanitize, split_name};
 use crate::scan::Finding;
 use crate::source::{Source, volume_of};
 
@@ -49,9 +49,7 @@ pub fn extract_as(
         return Err(EngineError::DestinationOnSource);
     }
 
-    let name = sanitize(name).unwrap_or_else(|| fallback_name(finding));
-    let (stem, suffix) = split_name(&name);
-    let (path, mut file) = create_unique(dest_dir, stem, suffix)?;
+    let (path, mut file) = create_named(dest_dir, finding, name, None)?;
     if let Err(cause) = copy(source, finding, &mut file) {
         drop(file);
         let _ = std::fs::remove_file(&path);
@@ -60,9 +58,44 @@ pub fn extract_as(
     Ok(path)
 }
 
-/// Creates `<stem><suffix>` in `dir`, else `<stem>_2<suffix>`, `<stem>_3<suffix>`… (never overwriting; at most 10,000
-/// names tried). `stem` and `suffix` must already be safe name parts.
-pub fn create_unique(dir: &Path, stem: &str, suffix: &str) -> Result<(PathBuf, File), EngineError> {
+/// Creates a new file in `dir` named after `name` and returns its path and handle: `sanitize(name)` (the finding's
+/// `revenant_<start>.<ext>` when nothing is left), then `<stem>_2<ext>`, `<stem>_3<ext>`… when the name is taken (10,000
+/// tries; never overwrites). `suffix` replaces the name's extension when given (`Some(".preview.jpg")`); it must be empty
+/// or start with '.' and hold no separator, control or other unsafe char, else `write_failed` and nothing is created.
+/// This is the only way out of the crate to create a file under a derived name, and the result always lies directly
+/// inside `dir`.
+pub fn create_named(
+    dir: &Path,
+    finding: &Finding,
+    name: &str,
+    suffix: Option<&str>,
+) -> Result<(PathBuf, File), EngineError> {
+    let name = sanitize(name).unwrap_or_else(|| fallback_name(finding));
+    let (stem, ext) = split_name(&name);
+    create_unique(dir, stem, suffix.unwrap_or(ext))
+}
+
+/// Whether `stem` and `suffix` join into one safe component.
+fn safe_parts(stem: &str, suffix: &str) -> bool {
+    let joined_ok = !stem.is_empty()
+        && !stem.chars().any(is_unsafe_char)
+        && !suffix.chars().any(is_unsafe_char)
+        && (suffix.is_empty() || suffix.starts_with('.'));
+    joined_ok && !matches!(format!("{stem}{suffix}").as_str(), "." | "..")
+}
+
+/// Creates `<stem><suffix>` in `dir`, else `<stem>_2<suffix>`… (never overwriting; at most 10,000 names tried). Refuses
+/// (`write_failed`, nothing created) parts that are not a safe name, so nothing can leave `dir`.
+pub(crate) fn create_unique(
+    dir: &Path,
+    stem: &str,
+    suffix: &str,
+) -> Result<(PathBuf, File), EngineError> {
+    if !safe_parts(stem, suffix) {
+        return Err(EngineError::Write {
+            cause: std::io::Error::from(std::io::ErrorKind::InvalidInput),
+        });
+    }
     for n in 1..=MAX_NAME_ATTEMPTS {
         let name = if n == 1 {
             format!("{stem}{suffix}")

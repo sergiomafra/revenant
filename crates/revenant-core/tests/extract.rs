@@ -415,3 +415,28 @@ fn hostile_names_stay_inside_the_destination() {
         );
     }
 }
+
+#[test]
+fn create_named_stays_inside_the_directory() {
+    use revenant_core::extract::create_named;
+    let f = fixture(other(), None, 0);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("d");
+    std::fs::create_dir(&dir).unwrap();
+    let abs = root.path().join("abs").display().to_string();
+    for name in ["../x.jpg", abs.as_str(), "a/../../b.jpg", "..", "CON.jpg"] {
+        let (p, _file) = create_named(&dir, &f.finding, name, None).unwrap();
+        assert_eq!(p.parent().unwrap(), dir, "{name}");
+    }
+    assert_eq!(names_in(root.path()), vec!["d".to_string()]);
+    // A hostile suffix is refused and nothing is created.
+    let before = names_in(&dir);
+    for suffix in ["/../evil", ".a/b", "x", ".a\\b", ".a\u{0}", ".\u{202E}jpg"] {
+        let res = create_named(&dir, &f.finding, "ok.jpg", Some(suffix));
+        assert!(matches!(res, Err(EngineError::Write { .. })), "{suffix:?}");
+    }
+    assert_eq!(names_in(&dir), before);
+    assert_eq!(names_in(root.path()), vec!["d".to_string()]);
+    let (p, _f) = create_named(&dir, &f.finding, "DSC1.ARW", Some(".preview.jpg")).unwrap();
+    assert_eq!(p.file_name().unwrap(), "DSC1.preview.jpg");
+}

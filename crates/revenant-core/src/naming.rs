@@ -45,7 +45,7 @@ pub fn file_name(f: &Finding, m: Option<&Metadata>) -> String {
 }
 
 /// `revenant_<start as 12 hex digits>.<ext>`.
-pub fn fallback_name(f: &Finding) -> String {
+pub(crate) fn fallback_name(f: &Finding) -> String {
     format!("revenant_{:012x}.{}", f.start, f.kind.extension())
 }
 
@@ -97,6 +97,17 @@ fn is_format_control(c: char) -> bool {
     matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
 }
 
+/// Whether `c` never appears in a written name: separators, Windows-forbidden characters, controls (C0, DEL, C1), line
+/// and paragraph separators, format controls and U+FFFD.
+pub(crate) fn is_unsafe_char(c: char) -> bool {
+    matches!(
+        c,
+        '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\u{FFFD}' | '\u{2028}' | '\u{2029}'
+    ) || c < ' '
+        || ('\u{7F}'..='\u{9F}').contains(&c)
+        || is_format_control(c)
+}
+
 /// Whether `stem` (what precedes the first '.', trailing spaces trimmed) is a Windows device name.
 fn is_reserved(stem: &str) -> bool {
     let upper = stem.to_uppercase();
@@ -123,23 +134,12 @@ fn is_reserved(stem: &str) -> bool {
 ///
 /// Each of `/ \ : * ? " < > |`, the control chars (below 0x20 and 0x7F), the format controls (U+200B–200F,
 /// U+202A–202E, U+2066–2069, U+FEFF) and U+FFFD become '_'; leading and trailing '.' and ' ' are trimmed; a Windows
-/// reserved stem (`CON`, `NUL`, `COM1`… in any case, with or without extension) gets a '_' in front; at most 200 bytes,
-/// cut on a char boundary, keeping an extension of up to 16 bytes.
+/// reserved stem (`CON`, `NUL`, `COM1`… in any case, with or without extension) gets a '_' in front; at most 200 bytes
+/// (before any `_N` suffix of extraction), cut on a char boundary, keeping an extension of up to 16 bytes.
 pub fn sanitize(name: &str) -> Option<String> {
     let replaced: String = name
         .chars()
-        .map(|c| {
-            if matches!(
-                c,
-                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\u{FFFD}' | '\u{7F}'
-            ) || c < ' '
-                || is_format_control(c)
-            {
-                '_'
-            } else {
-                c
-            }
-        })
+        .map(|c| if is_unsafe_char(c) { '_' } else { c })
         .collect();
     let trimmed = replaced.trim_matches(['.', ' ']);
     if trimmed.is_empty() {
@@ -176,7 +176,7 @@ fn cut(name: &str) -> String {
 }
 
 /// Splits a file name into its stem and its extension with the dot (`("a", ".jpg")`; `("a", "")` without one).
-pub fn split_name(name: &str) -> (&str, &str) {
+pub(crate) fn split_name(name: &str) -> (&str, &str) {
     match name.rfind('.') {
         Some(i) if i > 0 => (&name[..i], &name[i..]),
         _ => (name, ""),
@@ -314,6 +314,11 @@ mod tests {
         assert_eq!(s("CONSOLE.jpg").as_deref(), Some("CONSOLE.jpg"));
         assert_eq!(s("COM10").as_deref(), Some("COM10"));
         assert_eq!(s("a\u{7F}b").as_deref(), Some("a_b"));
+        assert_eq!(
+            s("a\u{85}b\u{9F}c\u{2028}d\u{2029}e").as_deref(),
+            Some("a_b_c_d_e")
+        );
+        assert_eq!(s("a\u{A0}b").as_deref(), Some("a\u{A0}b"));
         assert_eq!(s("a*?\"<>|b").as_deref(), Some("a______b"));
         // Cut on a char boundary: 'é' is two bytes.
         let multi = s(&format!("{}.jpg", "é".repeat(150))).unwrap();
@@ -327,6 +332,7 @@ mod tests {
         assert_eq!(camera_tag(None, None), "");
         assert_eq!(camera_tag(Some("SONY"), Some("ILCE-7M4")), "ILCE-7M4");
         assert_eq!(camera_tag(Some("Canon"), Some("Canon EOS R5")), "EOSR5");
+        assert_eq!(camera_tag(Some("cAnOn"), Some("CANON eos r5")), "eosr5");
         // The make is only dropped as a whole first word.
         assert_eq!(camera_tag(Some("Can"), Some("Canon R5")), "CanonR5");
         assert_eq!(camera_tag(None, Some(&"x".repeat(40))).len(), 24);

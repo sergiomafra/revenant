@@ -7,9 +7,9 @@ use std::process::ExitCode;
 mod bench;
 
 use clap::{Parser, Subcommand};
-use revenant_core::extract::create_unique;
+use revenant_core::extract::create_named;
 use revenant_core::formats::all_formats;
-use revenant_core::naming::{fallback_name, file_name, sanitize, split_name};
+use revenant_core::naming::file_name;
 use revenant_core::source::{FileSource, Source, VolumeId, volume_of};
 use revenant_core::{
     CancelToken, EngineError, Event, Finding, Fragment, Inspection, Preview, ScanOptions, Volume,
@@ -323,9 +323,7 @@ fn write_preview(
         }
         data.extend_from_slice(&piece);
     }
-    let name = sanitize(file_name).unwrap_or_else(|| fallback_name(f));
-    let (stem, _) = split_name(&name);
-    let (path, mut file) = create_unique(dir, stem, ".preview.jpg")?;
+    let (path, mut file) = create_named(dir, f, file_name, Some(".preview.jpg"))?;
     match file.write_all(&data).and_then(|()| file.flush()) {
         Ok(()) => Ok(path),
         Err(cause) => {
