@@ -402,7 +402,9 @@ fn forged_live_file_does_not_hide_a_deleted_photo() {
 #[test]
 fn live_non_photo_file_consumes_only_its_head() {
     let mut b = card();
-    let thumb = jpeg(16, 16, 3, 0);
+    // The THM is itself a JPEG holding a thumbnail JPEG at a sector of its APP1: that measures `Intact` at the THM's
+    // first cluster, so its range is skipped and the embedded thumbnail is no finding (ruling R10).
+    let thumb = revenant_testkit::jpeg_with_thumbnail_at(32, 32, 3, 1024);
     let inner = jpeg(64, 64, 4, 0);
     let mut data = thumb.clone();
     data.resize(thumb.len().div_ceil(512) * 512, 0);
@@ -416,6 +418,7 @@ fn live_non_photo_file_consumes_only_its_head() {
     assert_eq!(all[0].len, inner.len() as u64);
     assert!(all[0].origin.is_none());
     assert_eq!(all[0].health, Health::Partial);
+    assert!(founds(&ev).iter().all(|f| f.start != at(&b, cl[2]) as u64));
 }
 
 #[test]

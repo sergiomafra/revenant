@@ -379,7 +379,8 @@ impl Commit<'_, '_> {
             if let Some(k) = kept {
                 let head = heads.next_if(|h| h.at == at);
                 let r = self.fs_result(k, at, head, block.deferred)?;
-                // The carving counts only where the sequential carving would have examined the head.
+                // The carving counts only where the sequential carving would have examined the head (defensive: no
+                // known card makes a skipped or unreadable start's carving win the merge).
                 let carved = (!bad && !self.shared.skipped(at))
                     .then_some(r.carved.as_ref())
                     .flatten();

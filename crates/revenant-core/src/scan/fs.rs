@@ -544,6 +544,43 @@ mod tests {
         }
     }
 
+    /// Recognizes `TAILFILE` and measures 128 bytes there, in two pieces when `.0`.
+    struct Fake(bool);
+
+    impl Format for Fake {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn recognizes(&self, head: &[u8]) -> bool {
+            head.starts_with(b"TAILFILE")
+        }
+
+        fn confirms(&self, _: &dyn Source, _: u64) -> bool {
+            false
+        }
+
+        fn measure(&self, _: &dyn Source, start: u64) -> Option<Measurement> {
+            let fragments = if self.0 {
+                vec![
+                    Fragment { start, len: 64 },
+                    Fragment {
+                        start: start + 64,
+                        len: 64,
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            Some(Measurement {
+                len: 128,
+                kind: FileKind::Jpeg,
+                health: Health::Intact,
+                fragments,
+            })
+        }
+    }
+
     #[test]
     fn tail_rules() {
         use revenant_testkit as tk;
@@ -569,6 +606,19 @@ mod tests {
         let mut then = j.clone();
         then.extend_from_slice(&[1, 2, 3]);
         assert!(!check(&then).tail_ok);
+        // A file in the tail that is itself in pieces (a join) is not one of the files D6 allows.
+        assert!(!tail_ok(
+            &[Box::new(Fake(true))],
+            &Mem(b"TAILFILE".repeat(16)),
+            0,
+            &CancelToken::default()
+        ));
+        assert!(tail_ok(
+            &[Box::new(Fake(false))],
+            &Mem(b"TAILFILE".repeat(16)),
+            0,
+            &CancelToken::default()
+        ));
         // A view the detectors do not recognize.
         let src = Mem(vec![7; 4096]);
         let f = file(FsState::Live, true, &[(0, 4096)]);
