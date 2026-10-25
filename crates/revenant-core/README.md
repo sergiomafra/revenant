@@ -1393,6 +1393,21 @@ Events:
 - `Unreadable { start, len }`: when a block cannot be read it is re-read sector by sector; each run of consecutive failed
   sectors (also across blocks) is one event and counts in `ScanSummary::unreadable_bytes`. A run is split where a finding
   ends. The scan then continues.
+- `DiskFailing { unreadable_runs, unreadable_bytes, read }`: the disk is failing, make a copy first (ruling D20). Once per
+  scan, right after the `Progress { read, .. }` of the first block boundary where the `Unreadable` events emitted so far
+  reach `scan::FAILING_RUNS` (16) runs or `scan::FAILING_BYTES` (4 MiB); the fields are those counts at that point. Why
+  these numbers: a healthy card has no unreadable sector at all, so 16 separate failures (or 4 MiB in one place) already
+  say the medium is degrading, and every further pass over a dying card can cost more of it; the earlier the person is
+  told to copy it, the more the copy saves. The cost: a card with 16 scattered bad sectors that reads fine elsewhere gets
+  the warning too. A run still open at a boundary counts once it is emitted (a run that ends only with the source, after
+  the last `Progress`, never flags). Deterministic: it depends only on the `Unreadable` events, so it is the same for any
+  `threads` and `cache_bytes`.
+- `Rate { bytes_per_sec, eta_secs, stalls }`: only with `ScanOptions::rates` (default `false`, ruling D21), right after
+  each `Progress` (after its `DiskFailing` when both fall on the same boundary: the order is always `Progress`,
+  `DiskFailing`, `Rate`). `bytes_per_sec` is the reading speed smoothed by `rate::RateMeter` (10 s half-life; 0 until
+  known), `eta_secs` the seconds left at that speed (`None` while unknown), `stalls` the cache window loads so far that
+  took more than `scan::STALL` (2 s): a device that struggles. It is the only event that depends on timing: it is
+  outside the determinism contract (compare event lists with it filtered out) and is never stored in a session.
 - `Updated(Finding)`: a better version of a finding already reported, which replaces the earlier `Found` with the same
   `id`. Emitted after every `Found` (and the last `Progress`), before `scan` returns, in id order; counted in
   `ScanSummary::updated`. Today: a video put back together with its separated `moov` (see "Video with a separated

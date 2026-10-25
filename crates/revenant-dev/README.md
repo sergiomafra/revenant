@@ -75,6 +75,13 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   ```
 
   Files found by the byte scan alone carry none of these keys, and lines without them are exactly as before.
+- A card with many unreadable sectors early on gets one `disk_failing` line, right after the scan reaches the first block
+  where the `unreadable` lines so far add up to 16 runs or 4 MiB (`read`: bytes scanned at that point). It means: stop
+  and make an image of the card first (see "Making a card image" below), then scan the image.
+
+  ```json
+  {"event":"disk_failing","unreadable_runs":16,"unreadable_bytes":8192,"read":5242880}
+  ```
 - `kind`: `jpeg`, `mp4`, `mov`, `cr2`, `nef`, `arw`, `dng`, `orf`, `rw2`, `raf`, `cr3`, `heic` or `tiff`.
   `health`: `intact`, `partial` or `damaged`.
 - `health` follows the engine: a file containing unreadable sectors is never `intact`. Files inside a `partial` or

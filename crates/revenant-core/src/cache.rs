@@ -14,10 +14,12 @@
 //! it starts and at each sector of a sector-by-sector resolution, keeping nothing either.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use crate::EngineError;
-use crate::scan::CancelToken;
+use crate::scan::{CancelToken, STALL};
 use crate::source::{DiskId, Source, VolumeId, read_full};
 
 /// Bytes per cache window (rounded down to a whole number of sectors, at least one).
@@ -157,6 +159,8 @@ pub(crate) struct CachedSource<'a> {
     cancel: Option<CancelToken>,
     state: Mutex<State>,
     loaded: Condvar,
+    /// Window loads that took more than [`STALL`].
+    stalls: AtomicU64,
 }
 
 /// Removes a `Loading` slot left behind if the loading thread panics, so the waiters do not wait forever.
@@ -191,6 +195,7 @@ impl<'a> CachedSource<'a> {
             cancel: None,
             state: Mutex::new(State::default()),
             loaded: Condvar::new(),
+            stalls: AtomicU64::new(0),
         }
     }
 
@@ -227,6 +232,11 @@ impl<'a> CachedSource<'a> {
     /// Every byte of [start, end) has been read, or found unreadable, through this cache.
     pub(crate) fn covered(&self, start: u64, end: u64) -> bool {
         self.lock().coverage.covers(start, end)
+    }
+
+    /// Window loads so far that took more than [`STALL`] (a slow or struggling device; timing-based).
+    pub(crate) fn stalls(&self) -> u64 {
+        self.stalls.load(Ordering::Relaxed)
     }
 
     /// Unreadable runs `(start, len)` inside [start, end), merged, ascending.
@@ -320,7 +330,12 @@ impl<'a> CachedSource<'a> {
             index,
             armed: true,
         };
-        let (window, new_bad) = match self.load(buf, start, want, &known) {
+        let began = Instant::now();
+        let loaded = self.load(buf, start, want, &known);
+        if began.elapsed() > STALL {
+            self.stalls.fetch_add(1, Ordering::Relaxed);
+        }
+        let (window, new_bad) = match loaded {
             Ok(loaded) => loaded,
             Err(e) => {
                 if let EngineError::DeviceGone { offset } = e {

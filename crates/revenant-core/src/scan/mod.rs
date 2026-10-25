@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::EngineError;
 use crate::cache::{CACHE_WINDOW, CachedSource, Runs};
@@ -17,6 +18,7 @@ use crate::filesystem::{
     SourceProbe, Volume, head_len, kind_class, orphan_entries,
 };
 use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
+use crate::rate::RateMeter;
 use crate::source::Source;
 use fs::{FsJobResult, FsPlan, merge, tail_fits};
 use pipeline::{Block, CloseQueue, Finders, Head, Measured, Outcome, Shared};
@@ -122,6 +124,9 @@ pub struct ScanOptions {
     /// Read the FAT/exFAT file systems first (the default): files they list come out with their [`Finding::origin`].
     /// `false` scans by signature alone: no `Volume` events and every origin `None`.
     pub filesystems: bool,
+    /// Emit an [`Event::Rate`] right after each `Progress` (default `false`, ruling D21). Timing-based: the only event
+    /// outside the determinism contract.
+    pub rates: bool,
     /// Tests: no `fs_job` reuse of the carving.
     #[cfg(test)]
     pub(crate) no_reuse: bool,
@@ -167,6 +172,7 @@ impl Default for ScanOptions {
             cache_bytes: 256 * 1024 * 1024,
             threads: 0,
             filesystems: true,
+            rates: false,
             #[cfg(test)]
             no_reuse: false,
             #[cfg(test)]
@@ -213,7 +219,32 @@ pub enum Event {
     /// every `Found`, before `scan` returns, one per id in id order (today: a video put back together with its separated
     /// `moov`, and a finding an old folder of a quick-formatted card names, ruling D11; both merged into one).
     Updated(Finding),
+    /// Once per scan (ruling D20), right after the `Progress` of the first block boundary where the `Unreadable` events
+    /// emitted so far reach [`FAILING_RUNS`] runs or [`FAILING_BYTES`] bytes: the disk is failing, make a copy first.
+    /// Deterministic: it depends only on the `Unreadable` events emitted.
+    DiskFailing {
+        unreadable_runs: u64,
+        unreadable_bytes: u64,
+        read: u64,
+    },
+    /// Only with [`ScanOptions::rates`] (ruling D21), right after each `Progress` (after its `DiskFailing` when both fall
+    /// on the same boundary: the fixed order is `Progress`, `DiskFailing`, `Rate`). Timing-based: outside the determinism
+    /// contract and never stored in a session. `bytes_per_sec`: the reading speed, an exponential moving average with a
+    /// 10 s half-life (0 until known); `eta_secs`: seconds left at that speed; `stalls`: window loads that took more than
+    /// [`STALL`] so far.
+    Rate {
+        bytes_per_sec: u64,
+        eta_secs: Option<u64>,
+        stalls: u64,
+    },
 }
+
+/// Unreadable runs that make a scan report [`Event::DiskFailing`].
+pub const FAILING_RUNS: u64 = 16;
+/// Unreadable bytes that make a scan report [`Event::DiskFailing`].
+pub const FAILING_BYTES: u64 = 4 << 20;
+/// A window load slower than this counts as a stall in [`Event::Rate`].
+pub const STALL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ScanSummary {
@@ -292,6 +323,12 @@ struct Commit<'a, 's> {
     summary: ScanSummary,
     /// The open unreadable run `(start, len)`.
     run: Option<(u64, u64)>,
+    /// `Unreadable` events emitted (their bytes are `summary.unreadable_bytes`).
+    unreadable_runs: u64,
+    /// `DiskFailing` has been emitted (once per scan, ruling D20).
+    failing_sent: bool,
+    /// The reading speed, with `ScanOptions::rates` (ruling D21).
+    rate: Option<RateMeter>,
     /// Found but not yet emitted, in start order.
     pending: VecDeque<Pending>,
     next_id: u64,
@@ -346,7 +383,35 @@ impl Commit<'_, '_> {
     fn flush_run(&mut self) -> Result<(), EngineError> {
         if let Some((start, len)) = self.run.take() {
             self.summary.unreadable_bytes += len;
+            self.unreadable_runs += 1;
             self.emit(Event::Unreadable { start, len })?;
+        }
+        Ok(())
+    }
+
+    /// A block boundary: `Progress`, then `DiskFailing` the first time the `Unreadable` events emitted so far reach a
+    /// threshold (ruling D20), then `Rate` with `ScanOptions::rates` (ruling D21): always in that order.
+    fn progress(&mut self, read: u64, total: u64) -> Result<(), EngineError> {
+        self.emit(Event::Progress { read, total })?;
+        if !self.failing_sent
+            && (self.unreadable_runs >= FAILING_RUNS
+                || self.summary.unreadable_bytes >= FAILING_BYTES)
+        {
+            self.failing_sent = true;
+            self.emit(Event::DiskFailing {
+                unreadable_runs: self.unreadable_runs,
+                unreadable_bytes: self.summary.unreadable_bytes,
+                read,
+            })?;
+        }
+        if let Some(rate) = &mut self.rate {
+            rate.sample(read, Instant::now());
+            let event = Event::Rate {
+                bytes_per_sec: rate.bytes_per_sec(),
+                eta_secs: rate.eta_secs(total.saturating_sub(read)),
+                stalls: self.shared.cache.stalls(),
+            };
+            self.emit(event)?;
         }
         Ok(())
     }
@@ -945,6 +1010,13 @@ pub fn scan(
             on_event,
             summary: ScanSummary::default(),
             run: None,
+            unreadable_runs: 0,
+            failing_sent: false,
+            rate: opts.rates.then(|| {
+                let mut meter = RateMeter::new();
+                meter.sample(0, Instant::now());
+                meter
+            }),
             pending: VecDeque::new(),
             next_id: 1,
             moovs: Vec::new(),
@@ -1000,14 +1072,14 @@ pub fn scan(
             let keep_from = read.saturating_sub(MOOV_HEAD);
             shared.prune_skips(read.saturating_sub(MOOV_HEAD.max(MAX_HEAD)));
             commit.own_moovs.drop_below(keep_from);
-            commit.emit(Event::Progress { read, total })?;
+            commit.progress(read, total)?;
         }
         commit.flush_run()?;
         while let Some(p) = commit.pending.pop_front() {
             commit.emit_found(p)?;
         }
         if total == 0 {
-            commit.emit(Event::Progress { read: 0, total })?;
+            commit.progress(0, total)?;
         }
         let paired = commit.pair()?;
         commit.update(paired)?;

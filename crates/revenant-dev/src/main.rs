@@ -101,6 +101,13 @@ enum Line {
         start: u64,
         len: u64,
     },
+    /// Many unreadable sectors early in the scan: the disk is failing, make a copy first (once, after a progress step).
+    #[serde(rename = "disk_failing")]
+    DiskFailing {
+        unreadable_runs: u64,
+        unreadable_bytes: u64,
+        read: u64,
+    },
     /// A better version of an earlier `found` line with the same `id` (same fields).
     Updated(Box<FoundLine>),
     /// One group of the results (`scan --group`), or `available: false` for a grouping the scan cannot offer.
@@ -581,6 +588,21 @@ fn run_scan(
                     cancel.cancel();
                 }
             }
+            Event::DiskFailing {
+                unreadable_runs,
+                unreadable_bytes,
+                read,
+            } => {
+                if !emit(&Line::DiskFailing {
+                    unreadable_runs,
+                    unreadable_bytes,
+                    read,
+                }) {
+                    cancel.cancel();
+                }
+            }
+            // Timing-based and opt-in: the dev CLI does not ask for it.
+            Event::Rate { .. } => {}
             Event::Progress { read, total } => {
                 let pct = (read * 100).checked_div(total).unwrap_or(100);
                 if pct != last_pct {

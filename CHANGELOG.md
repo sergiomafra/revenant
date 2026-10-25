@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- An early "disk failing, make a copy" signal: once the scan meets 16 unreadable areas or 4 MiB of unreadable data, it
+  says so right away (once), so a dying card can be copied before it gets worse. A scan can also report its reading
+  speed, the time left and how often the device stalled.
 - A pre-flight check reports, before a long read, everything already known to be wrong, all at once: a missing
   permission to read the disk, a disk that does not answer or cannot read its first, middle or last sector (it never
   waits more than 10 s for one), a failed unmount, and a copy destination that cannot hold the card (not enough room,
