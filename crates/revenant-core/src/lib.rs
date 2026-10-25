@@ -10,6 +10,9 @@ pub(crate) mod test_support;
 
 pub(crate) mod budget;
 pub(crate) mod cache;
+// Used by the saved session (Task 10); until then only the tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod codec;
 pub mod device;
 pub mod error;
 pub mod extract;

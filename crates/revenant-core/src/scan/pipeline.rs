@@ -161,6 +161,8 @@ pub(super) struct Block {
     pub(super) orphans: Vec<OrphanDir>,
     /// More than [`MAX_BLOCK_ORPHANS`] were met in this block: the rest were not kept.
     pub(super) orphans_capped: bool,
+    /// The finders' tails before this block was fed to them: a scan resumed at `pos` starts from them (ruling D22).
+    pub(super) tails: FinderTails,
 }
 
 /// Most `moov` candidates kept per block.
@@ -173,6 +175,37 @@ pub(super) const MAX_BLOCK_ORPHANS: usize = 8192;
 pub(super) struct Finders {
     pub(super) moov: MoovFinder,
     pub(super) orphan: Option<OrphanFinder>,
+}
+
+/// What the finders keep between blocks: the last bytes each one saw and where they end (`orphan`: only with volumes).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FinderTails {
+    pub(crate) moov: (Vec<u8>, u64),
+    pub(crate) orphan: Option<(Vec<u8>, u64)>,
+}
+
+impl Finders {
+    pub(super) fn tails(&self) -> FinderTails {
+        FinderTails {
+            moov: (self.moov.tail.clone(), self.moov.tail_end),
+            orphan: self.orphan.as_ref().map(OrphanFinder::tail),
+        }
+    }
+
+    /// Restores tails [`Finders::tails`] gave; `false` when one is longer than it can be or an old-directory tail
+    /// comes without volumes (or the reverse).
+    pub(super) fn restore(&mut self, tails: FinderTails) -> bool {
+        let FinderTails { moov, orphan } = tails;
+        if moov.0.len() >= MOOV_HEAD {
+            return false;
+        }
+        (self.moov.tail, self.moov.tail_end) = moov;
+        match (&mut self.orphan, orphan) {
+            (Some(o), Some((tail, end))) => o.set_tail(tail, end),
+            (None, None) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Bytes of a candidate `moov` box header looked at: size, `moov`, the first child's size and `mvhd`.
@@ -403,6 +436,7 @@ impl<'s> Shared<'s> {
     ) -> Result<Block, EngineError> {
         let sector = self.sector;
         let sectors = (end - pos).div_ceil(sector) as usize;
+        let tails = finders.tails();
         if lock(&self.skips).covers(pos, end) && self.cache.covered(pos, end) {
             let mut bad = None;
             for (s, l) in self.cache.bad_runs(pos, end) {
@@ -425,6 +459,7 @@ impl<'s> Shared<'s> {
                 moovs_capped: false,
                 orphans: Vec::new(),
                 orphans_capped: false,
+                tails,
             });
         }
         let mut bad: Option<Vec<bool>> = None;
@@ -505,6 +540,7 @@ impl<'s> Shared<'s> {
             moovs_capped,
             orphans,
             orphans_capped,
+            tails,
         })
     }
 

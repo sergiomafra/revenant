@@ -6,7 +6,11 @@ use std::sync::Arc;
 
 use super::alloc::{Chain, Claims};
 use super::fat_deleted::Probes;
-use super::{FsKind, Limits, MAX_WALKED_CLUSTERS, Probe, SourceProbe, Volume, exfat, fat, volumes};
+use super::{
+    FsKind, Limits, MAX_WALKED_CLUSTERS, Probe, Scheme, SourceProbe, Volume, exfat, fat, volumes,
+};
+use crate::EngineError;
+use crate::codec::{Codec, Dec, Enc};
 use crate::formats::{FileKind, Fragment};
 use crate::scan::CancelToken;
 use crate::source::Source;
@@ -488,9 +492,302 @@ fn merged(mut ranges: Vec<Fragment>) -> Vec<Fragment> {
     out
 }
 
+// ---- Saved form (ruling D26): a scan's listing is stored once in its session and never read again (D23) ----
+
+const FS_STATES: [FsState; 3] = [FsState::Live, FsState::Deleted, FsState::Orphaned];
+const PLACEMENTS: [Placement; 4] = [
+    Placement::Chain,
+    Placement::Recorded,
+    Placement::Guessed,
+    Placement::Carved,
+];
+const FS_KINDS: [FsKind; 4] = [FsKind::Fat12, FsKind::Fat16, FsKind::Fat32, FsKind::Exfat];
+const SCHEMES: [Scheme; 3] = [Scheme::None, Scheme::Mbr, Scheme::Gpt];
+
+impl Codec for FsState {
+    fn enc(&self, e: &mut Enc) {
+        e.str(self.as_str());
+    }
+    fn dec(d: &mut Dec) -> Result<Self, EngineError> {
+        d.named(&FS_STATES, FsState::as_str)
+    }
+}
+
+impl Codec for Placement {
+    fn enc(&self, e: &mut Enc) {
+        e.str(self.as_str());
+    }
+    fn dec(d: &mut Dec) -> Result<Self, EngineError> {
+        d.named(&PLACEMENTS, Placement::as_str)
+    }
+}
+
+impl Codec for FsKind {
+    fn enc(&self, e: &mut Enc) {
+        e.str(self.as_str());
+    }
+    fn dec(d: &mut Dec) -> Result<Self, EngineError> {
+        d.named(&FS_KINDS, FsKind::as_str)
+    }
+}
+
+impl Codec for Scheme {
+    fn enc(&self, e: &mut Enc) {
+        e.str(self.as_str());
+    }
+    fn dec(d: &mut Dec) -> Result<Self, EngineError> {
+        d.named(&SCHEMES, Scheme::as_str)
+    }
+}
+
+impl Codec for FsTime {
+    fn enc(&self, e: &mut Enc) {
+        e.str(&self.local);
+        e.opt(
+            self.utc_offset_minutes
+                .map(|m| u32::from(m as u16))
+                .as_ref(),
+        );
+    }
+    fn dec(d: &mut Dec) -> Result<Self, EngineError> {
+        let local = d.str()?;
+        let offset = match d.opt::<u32>()? {
+            Some(m) => Some(u16::try_from(m).map_err(|_| EngineError::SessionCorrupt)? as i16),
+            None => None,
+        };
+        Ok(FsTime {
+            local,
+            utc_offset_minutes: offset,
+        })
+    }
+}
+
+impl Codec for FsOrigin {
+    fn enc(&self, e: &mut Enc) {
+        let FsOrigin {
+            volume,
+            folder,
+            name,
+            state,
+            placement,
+            size,
+            created,
+            modified,
+        } = self;
+        e.u32(*volume);
+        e.opt(folder.as_ref());
+        e.str(name);
+        e.put(state);
+        e.put(placement);
+        e.u64(*size);
+        e.opt(created.as_ref());
+        e.opt(modified.as_ref());
+    }
+    fn dec(d: &mut Dec) -> Result<Self, EngineError> {
+        Ok(FsOrigin {
+            volume: d.u32()?,
+            folder: d.opt()?,
+            name: d.str()?,
+            state: d.get()?,
+            placement: d.get()?,
+            size: d.u64()?,
+            created: d.opt()?,
+            modified: d.opt()?,
+        })
+    }
+}
+
+impl Codec for Volume {
+    fn enc(&self, e: &mut Enc) {
+        let Volume {
+            index,
+            fs,
+            offset,
+            len,
+            sector_size,
+            cluster_size,
+            heap_offset,
+            cluster_count,
+            label,
+            serial,
+            from_backup,
+            scheme,
+        } = self;
+        e.u32(*index);
+        e.put(fs);
+        e.u64(*offset);
+        e.u64(*len);
+        e.u32(*sector_size);
+        e.u64(*cluster_size);
+        e.u64(*heap_offset);
+        e.u32(*cluster_count);
+        e.opt(label.as_ref());
+        e.u32(*serial);
+        e.bool(*from_backup);
+        e.put(scheme);
+    }
+    fn dec(d: &mut Dec) -> Result<Self, EngineError> {
+        Ok(Volume {
+            index: d.u32()?,
+            fs: d.get()?,
+            offset: d.u64()?,
+            len: d.u64()?,
+            sector_size: d.u32()?,
+            cluster_size: d.u64()?,
+            heap_offset: d.u64()?,
+            cluster_count: d.u32()?,
+            label: d.opt()?,
+            serial: d.u32()?,
+            from_backup: d.bool()?,
+            scheme: d.get()?,
+        })
+    }
+}
+
+impl Codec for FsFile {
+    fn enc(&self, e: &mut Enc) {
+        let FsFile {
+            origin,
+            kind,
+            pieces,
+            trusted,
+        } = self;
+        e.put(origin);
+        e.put(kind);
+        e.seq(pieces);
+        e.bool(*trusted);
+    }
+    fn dec(d: &mut Dec) -> Result<Self, EngineError> {
+        let f = FsFile {
+            origin: d.get()?,
+            kind: d.get()?,
+            pieces: d.seq()?,
+            trusted: d.bool()?,
+        };
+        // Every listed file has a first piece (the scan keys on it).
+        if f.pieces.is_empty() {
+            return Err(EngineError::SessionCorrupt);
+        }
+        Ok(f)
+    }
+}
+
+impl Codec for Listing {
+    fn enc(&self, e: &mut Enc) {
+        let Listing {
+            volumes,
+            files,
+            live,
+            others,
+            truncated,
+            walked,
+        } = self;
+        e.seq(volumes);
+        e.seq(files);
+        e.seq(live);
+        e.seq(others);
+        e.bool(*truncated);
+        e.seq(walked);
+    }
+    fn dec(d: &mut Dec) -> Result<Self, EngineError> {
+        let volumes: Vec<Volume> = d.seq()?;
+        let n = d.count()?;
+        let mut files = Vec::with_capacity(n);
+        // Files of one folder share its string again, as when listed.
+        let mut folders: std::collections::HashMap<Arc<str>, ()> = Default::default();
+        for _ in 0..n {
+            let mut f: FsFile = d.get()?;
+            if let Some(folder) = f.origin.folder.take() {
+                let shared = match folders.get_key_value(&folder) {
+                    Some((k, _)) => Arc::clone(k),
+                    None => {
+                        folders.insert(Arc::clone(&folder), ());
+                        folder
+                    }
+                };
+                f.origin.folder = Some(shared);
+            }
+            files.push(f);
+        }
+        let listing = Listing {
+            volumes,
+            files,
+            live: d.seq()?,
+            others: d.seq()?,
+            truncated: d.bool()?,
+            walked: d.seq()?,
+        };
+        let sorted = listing
+            .files
+            .windows(2)
+            .all(|w| w[0].pieces[0].start <= w[1].pieces[0].start);
+        if listing.volumes.len() > super::MAX_VOLUMES || !sorted {
+            return Err(EngineError::SessionCorrupt);
+        }
+        Ok(listing)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listing_round_trips_and_shares_folders() {
+        use crate::codec::{from_bytes, to_bytes};
+        let folder: Arc<str> = "DCIM/100MSDCF".into();
+        let file = |start: u64, name: &str| FsFile {
+            origin: FsOrigin {
+                volume: 0,
+                folder: Some(Arc::clone(&folder)),
+                name: name.into(),
+                state: FsState::Live,
+                placement: Placement::Chain,
+                size: 1000,
+                created: None,
+                modified: Some(FsTime {
+                    local: "2026-10-25T11:00:00".into(),
+                    utc_offset_minutes: Some(330),
+                }),
+            },
+            kind: FileKind::Jpeg,
+            pieces: vec![Fragment { start, len: 1000 }],
+            trusted: true,
+        };
+        let listing = Listing {
+            volumes: vec![volume()],
+            files: vec![file(4096, "A.JPG"), file(8192, "B.JPG")],
+            live: vec![Fragment {
+                start: 4096,
+                len: 8192,
+            }],
+            others: vec![Fragment {
+                start: 65536,
+                len: 512,
+            }],
+            truncated: true,
+            walked: vec![Fragment {
+                start: 2048,
+                len: 512,
+            }],
+        };
+        let bytes = to_bytes(&listing);
+        let back: Listing = from_bytes(&bytes).unwrap();
+        assert_eq!(back, listing);
+        assert_eq!(to_bytes(&back), bytes);
+        let (a, b) = (&back.files[0].origin.folder, &back.files[1].origin.folder);
+        assert!(Arc::ptr_eq(a.as_ref().unwrap(), b.as_ref().unwrap()));
+        for cut in 0..bytes.len() {
+            assert!(from_bytes::<Listing>(&bytes[..cut]).is_err(), "cut {cut}");
+        }
+        // Files out of order are corruption.
+        let mut swapped = listing.clone();
+        swapped.files.swap(0, 1);
+        assert!(matches!(
+            from_bytes::<Listing>(&to_bytes(&swapped)),
+            Err(EngineError::SessionCorrupt)
+        ));
+    }
 
     fn volume() -> Volume {
         Volume {

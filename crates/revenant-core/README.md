@@ -27,6 +27,7 @@ Every engine error is an `EngineError`; each variant has a stable `snake_case` c
 | `MapCorrupt`          | `map_corrupt`           |
 | `MapMismatch`         | `map_mismatch`          |
 | `MapOtherSource`      | `map_other_source`      |
+| `SessionCorrupt`     | `session_corrupt`       |
 
 ```rust
 use revenant_core::EngineError;
@@ -1431,6 +1432,52 @@ A source that vanishes during the scan (`DeviceGone`, or a short read) stops it 
 exactly the first ones of the scan the device would have allowed, with no `Unreadable` for the missing sectors. A
 file-system listing read while cancelled or after the source vanished (including the FAT32 high-word heads read beside
 the cache) is never used: the scan returns that error before emitting any `Volume`.
+
+## Resumable scans
+
+A scan can be stopped and taken up again where it was, with exactly the events it would have emitted had it not stopped.
+The saved session that stores this on disk is not there yet (it comes next); inside the engine, `scan_with` (crate
+private; `scan` is `scan_with` with neither a resume nor a hook) hands a hook three kinds of checkpoint:
+
+- `Listing`, once, after the file-system listing (an empty one with `filesystems: false`) and before any event. A
+  listing read while the scan was cancelled or after the source vanished is never handed over (nor any `Volume`
+  emitted): the scan returns `cancelled` or `device_gone` instead (ruling P3).
+- `Boundary`, at every block boundary, right after its `Progress` and its `DiskFailing` (the fixed order is `Progress`,
+  `DiskFailing`, `Rate`), with the bytes read and the events emitted so far. Every event counts except `Rate`, which is
+  timing and never part of a saved scan (ruling P4). The state is built only when the hook asks for it.
+- `Paired`, after the pairing step, before the `Updated` events.
+
+**What the state holds** (ruling D22): the position (the next block's start) and the event count; everything the
+in-order half of the scan carries from block to block (the summary, the open unreadable run, the `Unreadable` count and
+whether `DiskFailing` was sent, the findings not yet emitted, the next id, the orphan `moov` candidates and the ranges of
+the ISO BMFF findings that rule some out, the `Damaged` videos kept for pairing, the caps' flags, the start of every
+finding, the next listed file, the own-file starts of `Partial` RAWs with their owners' ranges, the old-folder
+candidates and the findings on a cluster grid they may name); the skip ranges; the last bytes the `moov` and old-folder
+searches saw before the position (a header across the boundary is still found); the cache's **whole** bad map (ruling
+P5) and its coverage from the position on. The capture names every field of the commit loop, so a field added later
+does not compile until it is saved or rebuilt. Rebuilt on resume, not stored: the cluster grids, the volumes and what the
+scan keeps of the listing, from the listing saved once at `Listing`. Encoded with the engine's own binary format (no
+`serde`): integers little-endian, enums by their `as_str` name, every length checked against what remains, so damaged
+bytes (or a state that cannot belong to the scan: a position past the end or off a block boundary, runs out of order, a
+cap passed) are `session_corrupt`, never a panic.
+
+**The guarantee**: for a source that answers the same every time (the same bytes, the same unreadable sectors), a scan
+resumed from any checkpoint emits exactly the events the uninterrupted scan emitted after it, ids and summary included,
+for any `threads` and `cache_bytes` on either side.
+
+**What a resume reads again** (ruling D24): the blocks the stopped scan had read ahead past the position (at most the
+read-ahead, `lookahead_blocks × block`, plus what was read since the last saved checkpoint), the pieces below the
+position of listed files that start after it, and what the pairing loads (a resume from `Paired` runs the pairing again).
+Never: the listing (ruling D23: read again with a fuller bad map it could come out different), a sector of the saved bad
+map (the cache starts with it, including runs below the position that the pairing or a file's pieces may touch), or a
+block wholly inside an `Intact` finding across the position whose bytes the cache had already read (its coverage comes
+back with the state; for that the cache now keeps its coverage from the walk's position on, not from the read-ahead's).
+Starting from the position, a scan without file systems or pairing reads nothing below it.
+
+**Memory**: the state is bounded by the caps the scan already has (pending findings, 4096 + 4096 pairing candidates,
+65,536 own-file starts, 65,536 old-folder candidates, 262,144 grid findings and one start per finding), plus the bad map
+(at most 2^20 runs, 16 bytes each in the saved form: about 16 MiB) and at most 65,536 coverage runs. The listing is
+saved once, up to a few hundred MiB in the worst case of the listing's caps.
 
 ## Deduplication
 

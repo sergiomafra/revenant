@@ -63,6 +63,9 @@ pub enum EngineError {
     /// A rescue map was made from another source than the one being copied.
     #[error("map_other_source")]
     MapOtherSource,
+    /// A saved scan state or session record is damaged: cut short, a length past its end, or a value out of range.
+    #[error("session_corrupt")]
+    SessionCorrupt,
 }
 
 impl EngineError {
@@ -87,6 +90,7 @@ impl EngineError {
             Self::MapCorrupt => "map_corrupt",
             Self::MapMismatch => "map_mismatch",
             Self::MapOtherSource => "map_other_source",
+            Self::SessionCorrupt => "session_corrupt",
         }
     }
 }
@@ -130,6 +134,7 @@ mod tests {
         assert_eq!(EngineError::MapCorrupt.code(), "map_corrupt");
         assert_eq!(EngineError::MapMismatch.code(), "map_mismatch");
         assert_eq!(EngineError::MapOtherSource.code(), "map_other_source");
+        assert_eq!(EngineError::SessionCorrupt.code(), "session_corrupt");
         let io = || std::io::Error::other("x");
         assert_eq!(
             EngineError::Read {

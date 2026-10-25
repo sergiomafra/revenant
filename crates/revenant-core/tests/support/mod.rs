@@ -672,3 +672,277 @@ pub fn disk_info(id: &str, size: u64) -> DiskInfo {
         volumes: Vec::new(),
     }
 }
+
+/// The cards of the resumable-scan tests (Task 9), built once here and shared with the session tests (Task 10). Each
+/// one is a [`SimSource`] in memory with its unreadable ranges set.
+pub mod cards {
+    use revenant_testkit::fs::{DeleteStyle, FsBuilder, FsType, Partitioning, disk};
+    use revenant_testkit::{
+        AvcOptions, AvcVideo, Mp4Options, Rw2Options, TestExif, TiffRaw, TiffRawOptions,
+        TiffVariant, avc_video, jpeg, jpeg_smooth, mp4, panasonic_rw2, tiff_raw,
+    };
+
+    use super::SimSource;
+
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    /// Where every card volume starts (MBR entry at LBA 8192).
+    const VOL: u64 = 8192 * 512;
+    const DIR: &str = "DCIM/100MSDCF";
+
+    /// A card: its source and what the tests look at.
+    pub struct Card {
+        pub source: SimSource,
+        /// The unreadable ranges `[start, end)` the source simulates, ascending.
+        pub bad: Vec<(u64, u64)>,
+        /// Card A: its separated `moov` box; card E: the video; as `[start, end)`.
+        pub file: Option<(u64, u64)>,
+        /// Cards B and C: where the volume's data clusters start (cluster 2); 0 for the others.
+        pub data_start: u64,
+    }
+
+    fn card(bytes: Vec<u8>, bad: Vec<(u64, u64)>) -> Card {
+        let mut source = SimSource::new(bytes);
+        for &(s, e) in &bad {
+            source = source.bad(s, e - s);
+        }
+        Card {
+            source,
+            bad,
+            file: None,
+            data_start: 0,
+        }
+    }
+
+    /// Deterministic noise (SplitMix64).
+    pub fn noise(len: u64, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        let mut out = Vec::with_capacity(len as usize + 8);
+        while (out.len() as u64) < len {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            out.extend_from_slice(&z.to_le_bytes());
+        }
+        out.truncate(len as usize);
+        out
+    }
+
+    fn put(img: &mut [u8], at: u64, data: &[u8]) {
+        img[at as usize..at as usize + data.len()].copy_from_slice(data);
+    }
+
+    /// The pairing tests' camera video (`moov` at the end, small NAL units), its `mdat` padded so that its `moov` starts
+    /// 8 bytes before a sector boundary (504 modulo 512).
+    fn split_video() -> AvcVideo {
+        let with = |mdat_pad| {
+            avc_video(&AvcOptions {
+                samples: 120,
+                seed: 1,
+                mov: false,
+                mdat_pad,
+                small_nals: true,
+            })
+        };
+        let r = with(0).moov.start % 512;
+        let v = with((504 + 512 - r) % 512);
+        assert_eq!(v.moov.start % 512, 504);
+        v
+    }
+
+    /// Where A's video starts. Its second part (the rest of its `mdat`, then its `moov`) starts about 6 MiB after the
+    /// first part ends, placed so that the `moov` header straddles a 1 MiB block boundary (8 bytes on each side).
+    pub const A_VIDEO: u64 = 20 * MIB;
+
+    /// A: 48 MiB of noise, 8 JPEGs (two across a 1 MiB block boundary), 3 unreadable runs (one inside a JPEG, one
+    /// between the video's two parts, one in the noise) and, unless `video` is false, a video whose `moov` lies about
+    /// 6 MiB after its first part (paired after the scan); `file` is then the `moov` box.
+    pub fn a_with(video: bool) -> Card {
+        let mut img = noise(48 * MIB, 41);
+        let photos: [(u64, Vec<u8>); 8] = [
+            (64 * KIB, jpeg(64, 64, 1, 0)),
+            (MIB - 4 * KIB, jpeg_smooth(512, 384, 2)),
+            (3 * MIB + 512, jpeg(96, 64, 3, 2000)),
+            (7 * MIB - 8 * KIB, jpeg_smooth(640, 480, 4)),
+            (12 * MIB, jpeg(64, 96, 5, 0)),
+            (30 * MIB, jpeg_smooth(800, 600, 6)),
+            (33 * MIB + 4096, jpeg(64, 64, 7, 4000)),
+            (45 * MIB - 512, jpeg(128, 128, 8, 0)),
+        ];
+        for (at, data) in &photos {
+            put(&mut img, *at, data);
+        }
+        let mut bad = vec![
+            (30 * MIB + 8 * KIB, 30 * MIB + 8 * KIB + 1024),
+            (40 * MIB + 512, 40 * MIB + 1024),
+        ];
+        let mut moov = None;
+        if video {
+            let v = split_video();
+            let p = &v.mdat_payload;
+            let cut = ((p.start + p.len() * 2 / 5) as u64).div_ceil(512) * 512;
+            put(&mut img, A_VIDEO, &v.bytes[..cut as usize]);
+            let to_moov = v.moov.start as u64 - cut;
+            let boundary = (A_VIDEO + cut + 6 * MIB + to_moov + 8).next_multiple_of(MIB);
+            let rest = boundary - 8 - to_moov;
+            assert_eq!(rest % 512, 0);
+            put(&mut img, rest, &v.bytes[cut as usize..]);
+            moov = Some((boundary - 8, boundary - 8 + v.moov.len() as u64));
+        }
+        bad.push((A_VIDEO + 3 * MIB, A_VIDEO + 3 * MIB + 512));
+        bad.sort_unstable();
+        let mut c = card(img, bad);
+        c.file = moov;
+        c
+    }
+
+    /// Card A with its video (see [`a_with`]).
+    pub fn a() -> Card {
+        a_with(true)
+    }
+
+    /// FAT32, 48 MiB, 512-byte clusters.
+    fn fat32() -> FsBuilder {
+        FsBuilder::new(FsType::Fat32, 48 * MIB, 512)
+    }
+
+    /// `v` at LBA 8192 of a disk 8 MiB longer than it.
+    fn placed(v: &[u8]) -> Vec<u8> {
+        disk(
+            Partitioning::Mbr { first_lba: 8192 },
+            v,
+            v.len() + 8 * MIB as usize,
+        )
+    }
+
+    fn at(b: &FsBuilder, c: u32) -> u64 {
+        VOL + b.cluster_offset(c)
+    }
+
+    fn arw_with_preview() -> TiffRaw {
+        tiff_raw(&TiffRawOptions {
+            variant: TiffVariant::Arw,
+            big_endian: false,
+            raw_len: 300_000,
+            seed: 7,
+            preview: Some((320, 240)),
+            preview_sector_aligned: true,
+            exif: TestExif::default(),
+        })
+    }
+
+    fn avc(samples: usize) -> AvcVideo {
+        avc_video(&AvcOptions {
+            samples,
+            seed: 5,
+            mov: false,
+            mdat_pad: 0,
+            small_nals: false,
+        })
+    }
+
+    /// `data` written in 2 runs of clusters 4 MiB apart, from 8 MiB into the volume's heap.
+    fn two_runs(b: &mut FsBuilder, path: &str, data: &[u8]) {
+        let cluster = 512;
+        let n = (data.len() as u64).div_ceil(cluster) as u32;
+        let first = (8 * MIB / cluster) as u32 + 2;
+        let gap = (4 * MIB / cluster) as u32;
+        let h = n / 2;
+        let runs: Vec<u32> = (first..first + h)
+            .chain(first + h + gap..first + gap + n)
+            .collect();
+        b.add_at(path, data, &runs);
+    }
+
+    /// B: the 1.4 FAT32 card of `fs_events_identical_across_threads_and_caches`: live files (an ARW, a JPEG, a video in
+    /// 2 runs, a JPEG in 2 runs around another one), a deleted JPEG and a deleted ARW, 2 unreadable sectors (one inside
+    /// a live JPEG, one in the first FAT).
+    pub fn b() -> Card {
+        let mut b = fat32();
+        b.add(&format!("{DIR}/DSC01234.ARW"), &arw_with_preview().bytes);
+        b.add(&format!("{DIR}/DSC01235.JPG"), &jpeg(64, 64, 11, 2000));
+        two_runs(&mut b, &format!("{DIR}/C0001.MP4"), &avc(60).bytes);
+        let (j36, j37) = (jpeg_smooth(1024, 768, 1), jpeg_smooth(1024, 768, 2));
+        let need = |len: usize| (len as u64).div_ceil(512) as u32;
+        let s = (16 * MIB / 512) as u32 + 2;
+        let (n36, n37) = (need(j36.len()), need(j37.len()));
+        let h36 = n36 / 2;
+        let c37: Vec<u32> = (s + h36..s + h36 + n37).collect();
+        let c36: Vec<u32> = (s..s + h36).chain(s + h36 + n37..s + n37 + n36).collect();
+        b.add_at(&format!("{DIR}/DSC01236.JPG"), &j36, &c36);
+        b.add_at(&format!("{DIR}/DSC01237.JPG"), &j37, &c37);
+        b.add(&format!("{DIR}/DSC00100.JPG"), &jpeg(64, 64, 31, 0));
+        b.add(&format!("{DIR}/DSC00101.ARW"), &arw_with_preview().bytes);
+        b.delete(&format!("{DIR}/DSC00100.JPG"), DeleteStyle::Camera);
+        b.delete(&format!("{DIR}/DSC00101.ARW"), DeleteStyle::Camera);
+        let img = placed(&b.build());
+        let jpg = at(&b, b.clusters(&format!("{DIR}/DSC01235.JPG"))[0]) + 1024;
+        // A sector of the first FAT (FAT32: 32 reserved sectors).
+        let fat = VOL + 32 * 512 + 3 * 512;
+        let mut c = card(img, vec![(fat, fat + 512), (jpg, jpg + 512)]);
+        c.data_start = at(&b, 2);
+        c
+    }
+
+    /// C: a quick-formatted FAT32 card (old folders, ruling D11) holding a JPEG and a video written in 2 runs 4 MiB
+    /// apart (its `moov` in the second: paired after the scan), with one unreadable sector in the free space between the
+    /// runs.
+    pub fn c() -> Card {
+        let mut b = fat32();
+        b.add(&format!("{DIR}/DSC01234.JPG"), &jpeg(64, 64, 11, 2000));
+        two_runs(&mut b, &format!("{DIR}/C0001.MP4"), &avc(60).bytes);
+        let img = placed(&b.build_quick_formatted());
+        let gap = at(&b, (10 * MIB / 512) as u32 + 2);
+        let mut c = card(img, vec![(gap, gap + 512)]);
+        c.data_start = at(&b, 2);
+        c
+    }
+
+    /// D: 4 MiB of noise and a `Partial` Panasonic RW2 starting 512 bytes before 1 MiB, so its JpgFromRaw (an own file,
+    /// ruling D12) starts at the 1 MiB block boundary; a foreign JPEG inside its raw data is still a finding.
+    pub fn d() -> Card {
+        let f = panasonic_rw2(&Rw2Options {
+            width: 280,
+            height: 200,
+            raw_format: 5,
+            bits: 12,
+            raw_len: 98_304,
+            strip_len: 0,
+            seed: 3,
+            exif: TestExif::default(),
+        });
+        let mut img = noise(4 * MIB, 43);
+        let start = MIB - 512;
+        put(&mut img, start, &f.bytes);
+        let foreign = start + (f.raw.start as u64 + 8192).next_multiple_of(512);
+        put(&mut img, foreign, &jpeg(32, 32, 5, 0));
+        card(img, Vec::new())
+    }
+
+    /// E: 48 MiB of noise and a 40 MiB contiguous MP4 (index at the end) from 2 MiB + 512 bytes, across many blocks.
+    pub fn e() -> Card {
+        let video = mp4(&Mp4Options {
+            mdat_len: 40 * MIB as usize,
+            moov_at_end: true,
+            mov: false,
+            mdat_64bit: false,
+        });
+        let mut img = noise(48 * MIB, 44);
+        let start = 2 * MIB + 512;
+        put(&mut img, start, &video);
+        let mut c = card(img, Vec::new());
+        c.file = Some((start, start + video.len() as u64));
+        c
+    }
+
+    /// 16 MiB of noise with 20 isolated unreadable sectors 256 KiB apart from 1 MiB on: `DiskFailing` fires at a block
+    /// boundary.
+    pub fn failing() -> Card {
+        let bad = (0..20)
+            .map(|i| (MIB + i * 256 * KIB, MIB + i * 256 * KIB + 512))
+            .collect();
+        card(noise(16 * MIB, 45), bad)
+    }
+}

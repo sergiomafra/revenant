@@ -30,6 +30,9 @@ const MAX_BAD_RUNS: usize = 1 << 20;
 /// Most merged runs of coverage kept; the lowest are dropped past it (a dropped run only means a block is read again).
 const MAX_COVERAGE_RUNS: usize = 1 << 16;
 
+/// Half-open runs `(start, end)`, ascending (a saved bad map or coverage).
+pub(crate) type RunList = Vec<(u64, u64)>;
+
 /// Merged, non-overlapping, non-adjacent half-open runs `start -> end`.
 #[derive(Default)]
 pub(crate) struct Runs(BTreeMap<u64, u64>);
@@ -99,6 +102,20 @@ impl Runs {
 
     pub(crate) fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// The runs as `(start, end)`, ascending.
+    pub(crate) fn to_vec(&self) -> Vec<(u64, u64)> {
+        self.0.iter().map(|(&s, &e)| (s, e)).collect()
+    }
+
+    /// The runs `(start, end)` as [`Runs::to_vec`] gives them: `None` unless each is non-empty and each starts past the
+    /// previous one's end (ascending, disjoint, not touching), and there are at most `cap`.
+    pub(crate) fn from_vec(runs: Vec<(u64, u64)>, cap: usize) -> Option<Runs> {
+        let valid = runs.len() <= cap
+            && runs.iter().all(|&(s, e)| s < e)
+            && runs.windows(2).all(|w| w[0].1 < w[1].0);
+        valid.then(|| Runs(runs.into_iter().collect()))
     }
 }
 
@@ -242,6 +259,25 @@ impl<'a> CachedSource<'a> {
     /// Unreadable runs `(start, len)` inside [start, end), merged, ascending.
     pub(crate) fn bad_runs(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
         self.lock().bad.within(start, end)
+    }
+
+    /// A consistent copy of the bad map (whole) and of the coverage runs that end past `pos`, as `(start, end)` runs (a
+    /// saved scan state, ruling D22).
+    pub(crate) fn snapshot(&self, pos: u64) -> (RunList, RunList) {
+        let st = self.lock();
+        let coverage = st.coverage.0.range(..).filter(|&(_, &e)| e > pos);
+        (st.bad.to_vec(), coverage.map(|(&s, &e)| (s, e)).collect())
+    }
+
+    /// Restores a bad map and coverage [`CachedSource::snapshot`] gave (a resumed scan, before any read): a known bad
+    /// sector is never read again. `None` when either does not fit the caps or is not ascending disjoint runs.
+    pub(crate) fn restore(&self, bad: RunList, coverage: RunList) -> Option<()> {
+        let bad = Runs::from_vec(bad, self.bad_cap)?;
+        let coverage = Runs::from_vec(coverage, MAX_COVERAGE_RUNS)?;
+        let mut st = self.lock();
+        st.bad = bad;
+        st.coverage = coverage;
+        Some(())
     }
 
     /// The scan tells the cache its position: coverage runs entirely below `pos` are pruned (keeps ≤ 65,536 runs).
