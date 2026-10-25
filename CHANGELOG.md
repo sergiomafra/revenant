@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Recovered files keep their original name, or get a readable one from the date and camera
+  (`2025-12-14_07-12-05_ILCE-7M4.JPG`); names are made safe, so extraction never leaves the destination folder, and a
+  name already taken gets `_2`, `_3`… (also on case-insensitive disks). `revenant-dev --previews` names a preview after its file.
 - After a quick format, photos and videos get their old names and folders back when the old folders survive: each one
   found by its signature that an old folder lists comes out again (`updated`) with its name, the folder path (`?` for a
   folder whose own name was in the lost root, as in `?/100MSDCF/DSC01234.JPG`) and its dates; a file whose recorded

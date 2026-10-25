@@ -1,6 +1,5 @@
 //! `revenant-dev`: developer command line for the Revenant engine. Not the end-user app.
 
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -8,11 +7,13 @@ use std::process::ExitCode;
 mod bench;
 
 use clap::{Parser, Subcommand};
+use revenant_core::extract::create_unique;
 use revenant_core::formats::all_formats;
+use revenant_core::naming::{fallback_name, file_name, sanitize, split_name};
 use revenant_core::source::{FileSource, Source, VolumeId, volume_of};
 use revenant_core::{
     CancelToken, EngineError, Event, Finding, Fragment, Inspection, Preview, ScanOptions, Volume,
-    extract, inspect, scan,
+    extract_as, inspect, scan,
 };
 use revenant_testkit::BenchImage;
 use serde::Serialize;
@@ -299,17 +300,15 @@ fn finding_fields(f: &Finding, details: Inspection, out: Outputs) -> Box<FoundLi
     })
 }
 
-/// How many `_N` suffixes are tried for a preview's file name (as `extract` does).
-const MAX_NAME_ATTEMPTS: u32 = 10_000;
-
-/// Writes the preview's bytes (all its pieces, in order) to `<dir>/revenant_<finding start as 12 hex digits>.preview.jpg` (`_2`, `_3`… if it
-/// exists; never overwrites), the same naming as `extract` with a `.preview.jpg` suffix. A read or write error removes
-/// the incomplete file.
+/// Writes the preview's bytes (all its pieces, in order) to `<dir>/<stem of the file's name>.preview.jpg` (`_2`, `_3`…
+/// if it exists; never overwrites), so a file and its preview sit side by side. A read or write error removes the
+/// incomplete file.
 fn write_preview(
     source: &dyn Source,
     f: &Finding,
     p: &Preview,
     dir: &Path,
+    file_name: &str,
 ) -> Result<PathBuf, EngineError> {
     // The engine bounds a preview's length (JPEG_MAX_LEN), so it fits in memory; its pieces are written in order.
     let mut data = Vec::with_capacity(p.len as usize);
@@ -324,31 +323,17 @@ fn write_preview(
         }
         data.extend_from_slice(&piece);
     }
-    for n in 1..=MAX_NAME_ATTEMPTS {
-        let name = if n == 1 {
-            format!("revenant_{:012x}.preview.jpg", f.start)
-        } else {
-            format!("revenant_{:012x}_{n}.preview.jpg", f.start)
-        };
-        let path = dir.join(name);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                return match file.write_all(&data).and_then(|()| file.flush()) {
-                    Ok(()) => Ok(path),
-                    Err(cause) => {
-                        drop(file);
-                        let _ = std::fs::remove_file(&path);
-                        Err(EngineError::Write { cause })
-                    }
-                };
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(cause) => return Err(EngineError::Write { cause }),
+    let name = sanitize(file_name).unwrap_or_else(|| fallback_name(f));
+    let (stem, _) = split_name(&name);
+    let (path, mut file) = create_unique(dir, stem, ".preview.jpg")?;
+    match file.write_all(&data).and_then(|()| file.flush()) {
+        Ok(()) => Ok(path),
+        Err(cause) => {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            Err(EngineError::Write { cause })
         }
     }
-    Err(EngineError::Write {
-        cause: std::io::Error::other("no free file name"),
-    })
 }
 
 /// The extraction folder must exist and be a directory; checked once, before scanning.
@@ -371,16 +356,17 @@ fn finding_line(
     previews: Option<&Path>,
 ) -> Result<(Inspection, Outputs), EngineError> {
     let mut out = Outputs::default();
+    let details = inspect(source, f);
+    let name = file_name(f, Some(&details.metadata));
     if let Some(dest) = dest {
-        match extract(source, f, dest) {
+        match extract_as(source, f, dest, &name) {
             Ok(p) => out.file = Some(p.display().to_string()),
             Err(EngineError::DestinationOnSource) => return Err(EngineError::DestinationOnSource),
             Err(e) => out.error = Some(e.code()),
         }
     }
-    let details = inspect(source, f);
     if let (Some(dir), Some(p)) = (previews, &details.preview) {
-        match write_preview(source, f, p, dir) {
+        match write_preview(source, f, p, dir, &name) {
             Ok(path) => out.preview_file = Some(path.display().to_string()),
             Err(e) => out.preview_error = Some(e.code()),
         }
@@ -612,7 +598,7 @@ mod tests {
             ],
         };
         let out = tempfile::tempdir().unwrap();
-        let path = write_preview(&source, &f, &p, out.path()).unwrap();
+        let path = write_preview(&source, &f, &p, out.path(), "revenant_000000001000.jpg").unwrap();
         let mut expected = bytes[4096..5096].to_vec();
         expected.extend_from_slice(&bytes[512..1012]);
         assert_eq!(std::fs::read(path).unwrap(), expected);

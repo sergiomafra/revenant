@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::EngineError;
+use crate::naming::{fallback_name, file_name, sanitize, split_name};
 use crate::scan::Finding;
 use crate::source::{Source, volume_of};
 
@@ -15,23 +16,42 @@ const SECTOR: u64 = 512;
 /// How many `_N` suffixes are tried before giving up.
 const MAX_NAME_ATTEMPTS: u32 = 10_000;
 
-/// Copies the finding's bytes into `dest_dir`, named `revenant_<start as 12 hex digits>.<ext>`
-/// (`_2`, `_3`… if it exists; never overwrites). Refuses if the directory is on the source's volume.
-///
-/// A file found in pieces is written as its pieces in file order. Stretches that cannot be read are written as zeros, so a
-/// partial file comes out instead of none. Each piece stops at the source's end even if it runs past it.
-/// A write error returns [`EngineError::Write`] and removes the incomplete file.
+/// Copies the finding's bytes into `dest_dir` under [`file_name`]`(finding, None)`: the original name of a finding with
+/// a file-system origin, else `revenant_<start as 12 hex digits>.<ext>` (`_2`, `_3`… if it exists; never overwrites).
+/// Same as [`extract_as`].
 pub fn extract(
     source: &dyn Source,
     finding: &Finding,
     dest_dir: &Path,
+) -> Result<PathBuf, EngineError> {
+    extract_as(source, finding, dest_dir, &file_name(finding, None))
+}
+
+/// Copies the finding's bytes into `dest_dir` under [`sanitize`]`(name)` (`revenant_<start as 12 hex digits>.<ext>` when
+/// nothing is left of it), then `<stem>_2.<ext>`, `<stem>_3.<ext>`… when the name is taken (10,000 tries; never
+/// overwrites). Refuses if the directory is on the source's volume.
+///
+/// The file is created with `create_new`, so a taken name is detected by the volume itself: it is right on case-sensitive
+/// and case-insensitive volumes alike and for different Unicode forms of one name. The result is always a single
+/// component inside `dest_dir`.
+///
+/// A file found in pieces is written as its pieces in file order. Stretches that cannot be read are written as zeros, so a
+/// partial file comes out instead of none. Each piece stops at the source's end even if it runs past it.
+/// A write error returns [`EngineError::Write`] and removes the incomplete file.
+pub fn extract_as(
+    source: &dyn Source,
+    finding: &Finding,
+    dest_dir: &Path,
+    name: &str,
 ) -> Result<PathBuf, EngineError> {
     let dest_volume = volume_of(dest_dir)?;
     if source.volume() == Some(dest_volume) {
         return Err(EngineError::DestinationOnSource);
     }
 
-    let (path, mut file) = create_unique(finding, dest_dir)?;
+    let name = sanitize(name).unwrap_or_else(|| fallback_name(finding));
+    let (stem, suffix) = split_name(&name);
+    let (path, mut file) = create_unique(dest_dir, stem, suffix)?;
     if let Err(cause) = copy(source, finding, &mut file) {
         drop(file);
         let _ = std::fs::remove_file(&path);
@@ -40,13 +60,14 @@ pub fn extract(
     Ok(path)
 }
 
-fn create_unique(finding: &Finding, dir: &Path) -> Result<(PathBuf, File), EngineError> {
-    let ext = finding.kind.extension();
+/// Creates `<stem><suffix>` in `dir`, else `<stem>_2<suffix>`, `<stem>_3<suffix>`… (never overwriting; at most 10,000
+/// names tried). `stem` and `suffix` must already be safe name parts.
+pub fn create_unique(dir: &Path, stem: &str, suffix: &str) -> Result<(PathBuf, File), EngineError> {
     for n in 1..=MAX_NAME_ATTEMPTS {
         let name = if n == 1 {
-            format!("revenant_{:012x}.{ext}", finding.start)
+            format!("{stem}{suffix}")
         } else {
-            format!("revenant_{:012x}_{n}.{ext}", finding.start)
+            format!("{stem}_{n}{suffix}")
         };
         let path = dir.join(name);
         match OpenOptions::new().write(true).create_new(true).open(&path) {

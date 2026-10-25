@@ -1115,17 +1115,41 @@ photo), a heavy case; the real camera samples (below) all still come out as one 
 ## Extract
 
 `extract(source, &Finding, dest_dir) -> Result<PathBuf, EngineError>` copies a finding's bytes (in 1 MiB chunks) into `dest_dir`
-as `revenant_<start as 12 hex digits>.<ext>`; if that exists, `_2`, `_3`… are tried (files are created with `create_new`, so
-nothing is ever overwritten; after 10,000 attempts it fails with `write_failed`).
+under `naming::file_name(finding, None)`: the original name of a finding the file system listed, else
+`revenant_<start as 12 hex digits>.<ext>`. `extract_as(source, &Finding, dest_dir, name)` does the same under a name you
+choose: `sanitize(name)`, or `revenant_<start>.<ext>` when nothing is left of it. If the name exists, `<stem>_2.<ext>`,
+`<stem>_3.<ext>`… are tried. Files are created with `create_new` (O_EXCL), so the volume itself decides what is taken:
+nothing is ever overwritten, on case-sensitive and case-insensitive volumes alike and for NFC/NFD forms of one name
+(`DSC00001.JPG` and `dsc00001.jpg` give two files; after 10,000 attempts it fails with `write_failed`).
 
 - Refuses with `destination_on_source` when the destination is on the source's volume (writing to a damaged card could destroy
   what is still recoverable). If the source's volume is unknown (`None`) extraction is allowed. If the destination's volume
   cannot be determined (e.g. the directory does not exist) it returns `open_failed` and writes nothing.
 - A finding in pieces is written as its pieces (`Finding::ranges()`) one after another, in file order; the file is still
-  named after `start` (the first piece's start).
+  named after the original name or, without one, after `start` (the first piece's start).
 - A chunk that cannot be read is re-read sector by sector (512 bytes); only the unreadable sectors are written as zeros, so a
   partial file comes out instead of none. Each piece stops at the source's end, even if its length runs past it.
 - A write error returns `write_failed` and removes the incomplete file.
+
+## Names
+
+`naming::file_name(&Finding, Option<&Metadata>)` gives the name a recovered file is written under:
+
+1. The original name from the file system (`origin.name()` alone, never the folder), sanitized. A deleted file keeps the
+   name the entry still holds (`_SC01235.JPG`).
+2. Else `YYYY-MM-DD_HH-MM-SS[_<camera>].<EXT>` from the capture time (`Metadata::captured_at`; else the origin's modified
+   time), `EXT` being the kind's extension in upper case. The camera part is the model without the make's first word,
+   only ASCII letters, digits and `-`, at most 24 chars: make `Canon`, model `Canon EOS R5` gives
+   `2025-12-14_07-12-05_EOSR5.CR3`.
+3. Else `revenant_<start as 12 hex digits>.<ext>` (what 1.3 wrote).
+
+`naming::sanitize(name) -> Option<String>` makes one safe component, so extraction never leaves the destination folder:
+`/ \ : * ? " < > |`, control characters (below 0x20 and 0x7F), format controls (U+200B–200F, U+202A–202E, U+2066–2069,
+U+FEFF, which can disguise an extension) and U+FFFD become `_`; leading and trailing `.` and spaces are trimmed (`..`
+gives `None`); a Windows reserved stem (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`, their superscript
+forms, `CONIN$`, `CONOUT$`; any case; the stem is what precedes the first `.`, so `CON.tar.gz` counts) gets a `_` in
+front; at most 200 bytes, cut on a char boundary, keeping an extension of up to 16 bytes. A total path over 260
+characters on Windows is a write error (`write_failed`) there, never an escape.
 
 ## Tested against real files
 

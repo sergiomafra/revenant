@@ -17,11 +17,13 @@ revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-vol
 ```
 
 - `<IMAGE>`: a disk image file (scanning devices directly comes in a later part).
-- `--extract <DIR>`: copies each finding into `<DIR>` as soon as it is found. `<DIR>` must already exist and be a folder;
+- `--extract <DIR>`: copies each finding into `<DIR>` as soon as it is found, under its original name when the file
+  system listed one, else `YYYY-MM-DD_HH-MM-SS[_<camera>].<EXT>` from its details, else `revenant_<start as 12 hex digits>.<ext>`
+  (`_2`, `_3`… if the name exists; see "Names" in the core README). `<DIR>` must already exist and be a folder;
   otherwise the command stops before scanning with `error: open_failed` (exit 1). The engine refuses to extract onto the
   source's own volume (error `destination_on_source`, exit 1), so use a folder on another disk.
 - `--previews <DIR>`: writes each finding's embedded preview JPEG (the one in the `preview` field) into `<DIR>` as
-  `revenant_<start as 12 hex digits>.preview.jpg` (`_2`, `_3`… if the name exists; never overwrites), the same naming as
+  `<stem of the file's name>.preview.jpg` (`DSC01235.ARW` gives `DSC01235.preview.jpg`; `_2`, `_3`… if the name exists; never overwrites), the same naming as
   `--extract`, so a file and its preview sit side by side. Same folder rules as `--extract`: `<DIR>` must exist
   (`open_failed` otherwise) and must not be on the source's volume (`destination_on_source`, exit 1, checked before
   scanning).

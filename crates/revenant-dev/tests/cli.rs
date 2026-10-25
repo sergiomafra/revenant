@@ -273,7 +273,7 @@ fn previews_are_written() {
     let path = f["preview_file"].as_str().expect("preview_file field");
     assert_eq!(
         std::path::Path::new(path).file_name().unwrap(),
-        "revenant_000000002000.preview.jpg"
+        "2024-05-06_07-08-09_ModelX.preview.jpg"
     );
     let written = std::fs::read(path).unwrap();
     assert_eq!(written, raw.bytes[raw.preview.clone().unwrap()]);
@@ -592,4 +592,88 @@ fn bench_knows_the_exfat_card() {
         .map(|e| e["image"].as_str().unwrap().to_string())
         .collect();
     assert!(names.contains(&"exfat-card".to_string()), "{names:?}");
+}
+
+#[test]
+fn extract_uses_original_and_readable_names() {
+    let named = jpeg(64, 48, 3, 0);
+    let raw = tiff_raw(&TiffRawOptions {
+        variant: TiffVariant::Arw,
+        big_endian: false,
+        raw_len: 20_000,
+        seed: 5,
+        preview: Some((320, 240)),
+        preview_sector_aligned: false,
+        exif: exif(),
+    });
+    let carved = revenant_testkit::jpeg_with_exif(
+        64,
+        48,
+        9,
+        &TestExif {
+            make: Some("SONY".into()),
+            model: Some("ILCE-7M4".into()),
+            lens: None,
+            serial: None,
+            iso: None,
+            date: Some("2025:12:14 07:12:05".into()),
+        },
+    );
+    let mut b = FsBuilder::new(FsType::Fat32, 48 << 20, 512);
+    b.mkdir("DCIM/100MSDCF");
+    b.add("DCIM/100MSDCF/DSC01234.JPG", &named);
+    b.add("DCIM/100MSDCF/DSC01235.ARW", &raw.bytes);
+    let free = b.cluster_offset(b.cluster_count() - 200) as usize;
+    let volume = b.build();
+    let mut bytes = disk(
+        Partitioning::Mbr { first_lba: 8192 },
+        &volume,
+        (4 << 20) + volume.len() + 4096,
+    );
+    bytes[(4 << 20) + free..(4 << 20) + free + carved.len()].copy_from_slice(&carved);
+    let mut img = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut img, &bytes).unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let previews = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .arg("scan")
+        .arg(img.path())
+        .arg("--extract")
+        .arg(dest.path())
+        .arg("--previews")
+        .arg(previews.path())
+        .arg("--allow-same-volume")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events = lines(&out);
+    let files: Vec<String> = events
+        .iter()
+        .filter_map(|e| e["file"].as_str())
+        .map(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    for want in [
+        "DSC01234.JPG",
+        "DSC01235.ARW",
+        "2025-12-14_07-12-05_ILCE-7M4.JPG",
+    ] {
+        assert!(files.iter().any(|f| f == want), "{want} in {files:?}");
+    }
+    let previews: Vec<String> = std::fs::read_dir(previews.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        previews.iter().any(|f| f == "DSC01235.preview.jpg"),
+        "{previews:?}"
+    );
 }
