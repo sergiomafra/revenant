@@ -6,6 +6,7 @@
 
 mod alloc;
 mod boot;
+mod exfat;
 mod fat;
 mod fat_deleted;
 mod listing;
@@ -38,6 +39,8 @@ pub(crate) const MAX_ENTRIES: u64 = 4_000_000;
 pub(crate) const MAX_DEPTH: u32 = 32;
 /// Most bytes of one FAT directory read (65,536 entries).
 pub(crate) const MAX_FAT_DIR_BYTES: u64 = 2 << 20;
+/// Most bytes of one exFAT directory read (8,388,608 entries; the entry cap per volume comes first).
+pub(crate) const MAX_EXFAT_DIR_BYTES: u64 = 256 << 20;
 /// Most contested clusters recorded per volume; past it the volume's live files are all untrusted (ruling C11).
 pub(crate) const MAX_CONTESTED: usize = 65_536;
 /// Longest path (folder + '/' + name, in UTF-8 bytes) a listed file keeps; past it the file keeps its name and loses its
@@ -64,6 +67,7 @@ pub(crate) struct Limits {
     pub entries: u64,
     pub depth: u32,
     pub fat_dir_bytes: u64,
+    pub exfat_dir_bytes: u64,
     pub contested: usize,
     pub path_bytes: usize,
     pub path_budget: usize,
@@ -79,6 +83,7 @@ impl Limits {
         entries: MAX_ENTRIES,
         depth: MAX_DEPTH,
         fat_dir_bytes: MAX_FAT_DIR_BYTES,
+        exfat_dir_bytes: MAX_EXFAT_DIR_BYTES,
         contested: MAX_CONTESTED,
         path_bytes: MAX_PATH_BYTES,
         path_budget: MAX_PATH_BUDGET,

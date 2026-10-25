@@ -528,9 +528,9 @@ No read is larger than 128 KiB, and none is allocated before it is known to lie 
 
 ## File systems: FAT
 
-`filesystem::read(source, cancel)` returns a `Listing` of the live and deleted files of every FAT12/16/32 volume
-`volumes` finds (exFAT volumes are listed in `volumes` but not walked yet; a volume of more than 2^28 clusters is not
-walked). It never fails: a broken volume yields fewer files. Cancellation is checked before each directory; a cancelled
+`filesystem::read(source, cancel)` returns a `Listing` of the live and deleted files of every FAT12/16/32 and exFAT
+volume `volumes` finds (exFAT: see [File systems: exFAT](#file-systems-exfat); a volume of more than 2^28 clusters is
+not walked). It never fails: a broken volume yields fewer files. Cancellation is checked before each directory; a cancelled
 read returns what was listed so far. Written from fatgen103 (FAT entries, directory entries, long names). The scan
 (Task 7) calls the crate-internal `read_with(meta, probe, cancel)`: metadata through its cache, the FAT32 high-word
 heads through a `Probe` over the raw source (see Deleted files); `read` uses the given source for both.
@@ -539,8 +539,10 @@ heads through a `Probe` over the raw source (see Deleted files); `read` uses the
   mov, cr2, cr3, nef nrw, arw, dng, orf ori, rw2, raf, heic heif hif, tif tiff; any case). Each is an `FsFile`:
   - `origin`: `volume` (the volume's index), `folder` (components joined by `/`, from the root, no leading `/`, `""`
     for the root; `None` when dropped, see Bounds; one string shared by the files of a folder), `name`, `state` (`live`,
-    or `deleted`), `placement` (`chain` for a live file, `guessed` for a deleted one), `size` as recorded, `created` and `modified` as `FsTime` (local time
-    `YYYY-MM-DDTHH:MM:SS`, no offset on FAT; `None` when a field is out of range: month, day for that month and year,
+    or `deleted`), `placement` (`chain` for a live file, `guessed` for a deleted one; exFAT adds `recorded`), `size` as
+    recorded, `created` and `modified` as `FsTime` (local time
+    `YYYY-MM-DDTHH:MM:SS`, no offset on FAT, exFAT's UTC offset when recorded; `Display` appends `+HH:MM`/`-HH:MM`
+    then; `None` when a field is out of range: month, day for that month and year,
     hour, minute, seconds, or a creation 10 ms count above 199). The creation time adds its 10 ms count, floored to the
     second. `name()`, `folder()` (an `Option`) and `path()` (`folder/name`, or the name alone) read them.
   - `pieces`: absolute byte ranges in file order, consecutive clusters joined, holding the first `size` bytes; a piece
@@ -710,6 +712,77 @@ block may be read again after the cache is emptied), each directory cluster once
 folder's clusters too), and the FAT12/16 root region once (at most 2 MiB). Besides: up to 65,536 reads of 512 bytes
 (32 MiB) for the FAT32 high-word checks, through the `Probe` (the scan's raw source, outside the cache, never a range
 the cache knows to be unreadable); the only exception to reading each byte once.
+
+## File systems: exFAT
+
+exFAT volumes go into the same `Listing` as FAT ones, with the same fields, caps, path rules, truncation flag and
+sorting (see [File systems: FAT](#file-systems-fat)); what differs is below. Written from Microsoft's exFAT
+specification (FAT §4.1, allocation bitmap §7.1, up-case table §7.2, entry sets §6.3, File §7.4, Stream Extension §7.6
+and File Name §7.7 entries).
+
+- **Root and bitmap.** The root is the FAT chain from `FirstClusterOfRootDirectory` (at most 256 MiB; trusted, and in
+  `live`, when it ends there with no cycle or cross-link, as a FAT directory). Its first allocation-bitmap entry
+  (`0x81`, BitmapFlags bit 0 clear) is read as soon as it is met: FirstCluster (byte 20) inside the heap, DataLength
+  (byte 24) at least `ceil(ClusterCount / 8)` and at most that rounded up to whole clusters, its FAT chain holding
+  those bytes, every byte readable. Otherwise there is no bitmap (below). The bitmap's and the up-case table's
+  (`0x82`) clusters are claimed like a live chain. Live entries of the root met before the bitmap entry wait for it.
+- **Entry sets.** A File entry (`0x85`; `0x05` deleted) with SecondaryCount (byte 1) in 2..=18, then a Stream
+  Extension (`0xC0`/`0x40`), then `ceil(NameLength / 15)` File Name entries (`0xC1`/`0x41`), then any other secondary
+  entries the count holds (skipped). NameLength (stream byte 3) is 1..=255 and `1 + ceil(NameLength / 15)` must fit
+  in SecondaryCount. The SetChecksum (bytes 2–3 of the File entry) is computed over all `SecondaryCount + 1` entries,
+  bytes 2–3 skipped, with every type byte's InUse bit (`0x80`) set first, so a deleted set keeps the checksum of its
+  live form; a set that breaks any of these rules is skipped (an entry that breaks a set is read again as the
+  possible start of the next one). `0x00` ends a directory; an unreadable stretch of a directory is skipped, and a
+  set across it is lost. Names are the UTF-16 units decoded lossily, `/` and NUL becoming `_`.
+- **Fields.** File entry: FileAttributes (byte 4, `0x10` directory); created and modified timestamps (bytes 8 and 12:
+  the DOS date in the high 16 bits, the time in the low 16), their 10 ms counts (bytes 20 and 21, added and floored to
+  the second; above 199 the time is `None`), their UTC offsets (bytes 22 and 23: bit 7 valid, bits 0–6 signed
+  15-minute units, `utc_offset_minutes`). Stream: GeneralSecondaryFlags (byte 1: bit 0 AllocationPossible, bit 1
+  NoFatChain), ValidDataLength (byte 8), FirstCluster (byte 20), DataLength (byte 24, the `size`). An entry without
+  AllocationPossible or with DataLength 0 has no clusters and is not listed.
+- **Live files and folders.** NoFatChain: one run of `ceil(DataLength / cluster)` clusters from FirstCluster, claimed;
+  otherwise the FAT chain is followed for that many clusters (as on FAT32, but the whole 32-bit entry:
+  `0xFFFFFFF7` bad, `0xFFFFFFF8` and above end). Claims, cross-links and the contested set work as on FAT (a run that
+  reaches a claimed cluster stops there). A live file is trusted when its run or chain is complete with no conflict,
+  every cluster of a NoFatChain run is in use in the bitmap, and ValidDataLength equals DataLength. A directory's
+  DataLength is its size, at most 256 MiB (past it only 256 MiB are read, the directory is not trusted and the listing
+  is truncated); it is trusted when every cluster that size needs is claimed with no conflict (a FAT chain ending
+  there, or a NoFatChain run the bitmap shows in use). A directory whose first cluster is outside the heap or already
+  claimed is not entered.
+- **Deleted files and folders.** A set is deleted when its File entry's InUse bit is clear, or a folder above it is
+  deleted. Deleted photos/videos wait, and are placed only once the live walk is done, against the live claims (a
+  claimed cluster is in use whatever the bitmap says; ruling R10), with what the live files left of the caps:
+  - NoFatChain: the run as recorded (`placement` `recorded`, cut at the heap's end); trusted only when every cluster
+    of it is free in the bitmap today;
+  - FAT-chained: its old FAT chain (exFAT frees clusters in the bitmap only) when it has exactly
+    `ceil(DataLength / cluster)` clusters, all free today, the last one's entry end-of-chain (`guessed`, trusted only
+    when it is one run); otherwise the FAT rule D4 guess (`guessed`, trusted only when one run and not short);
+  - a first cluster outside the heap or in use today: not listed (overwritten);
+  - ValidDataLength short of (or past) DataLength: not trusted.
+
+  Deleted folders met in the live tree wait, and are walked once it is done, depth first, never twice the same first
+  cluster: placed the same way (at most 256 MiB), a recorded run read only as far as its clusters are free today.
+  The old chains, the bitmap checks and the guesses spend the volume's budget of 2^26 cluster examinations (one per
+  cluster looked at; a bitmap check stops at the first cluster in use); once spent, the remaining deleted files are
+  not listed and no further deleted folder is read, and the listing is truncated. Cancel is checked before each
+  directory and every 1024 placements.
+- **No bitmap** (missing, unreadable, or out of bounds): every cluster no live chain claims reads free, so the
+  placements see the live claims only, and every deleted file is untrusted. Live files skip the bitmap check.
+
+Bounds: as on FAT (65,536 directories and 4,000,000 entries per volume, depth 32, the listing's caps), with 256 MiB per
+directory instead of 2 MiB. The work is linear in what is read: each cluster is claimed at most once, the bitmap is
+counted 64 clusters at a time, and every deleted placement is paid from the step budget.
+
+Memory (on top of FAT's figures, which hold for the listing itself). The bitmap: one bit per cluster, ≤ 32 MiB at 2^28
+clusters, freed with the walk. A directory is read 128 KiB at a time and parsed entry by entry, holding one entry set
+(≤ 608 B) besides the chunk, so a 256 MiB directory never sits in memory; the entries of the root met before its
+bitmap entry are held until it (each ≈ 100 B plus a name ≤ 765 B; formatters write the bitmap entry first). A name is
+at most 255 UTF-16 units, ≤ 765 bytes of UTF-8. Deleted photos/videos waiting to be placed: ≈ 100 B each besides
+their names, ≤ 262,144 of them with the live photos; deleted folders waiting: ≤ 65,536 × 64 B.
+
+Reads: the boot sector again, the FAT in 32 KiB blocks cached up to 8 MiB (sectors no FAT copy gives stop a chain),
+the bitmap once (≤ 128 KiB per read), each directory cluster once (≤ 128 KiB per read; a deleted folder's clusters
+too), all through the given source. exFAT has no high-word check: no read goes through the `Probe`.
 
 ## Inspect
 

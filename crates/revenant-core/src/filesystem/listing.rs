@@ -4,9 +4,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use super::alloc::{Chain, Claims, Guess};
+use super::alloc::{Chain, Claims};
 use super::fat_deleted::Probes;
-use super::{FsKind, Limits, MAX_WALKED_CLUSTERS, Probe, SourceProbe, Volume, fat, volumes};
+use super::{FsKind, Limits, MAX_WALKED_CLUSTERS, Probe, SourceProbe, Volume, exfat, fat, volumes};
 use crate::formats::{FileKind, Fragment};
 use crate::scan::CancelToken;
 use crate::source::Source;
@@ -190,7 +190,7 @@ pub(crate) fn read_limited(
                 &mut probes,
                 &mut out,
             ),
-            FsKind::Exfat => {}
+            FsKind::Exfat => exfat::walk(source, v, cancel, limits, &mut budget, &mut out),
         }
     }
     out.truncated |= budget.truncated || probes.ran_out();
@@ -323,7 +323,8 @@ impl<'a> Collector<'a> {
         });
     }
 
-    /// A deleted photo/video of `kind` and its guessed clusters (ruling D4); never in `live`, never claiming. Not
+    /// A deleted photo/video of `kind` and where its clusters probably are (FAT: the D4 guess; exFAT: the recorded run,
+    /// the old chain or the guess), `ok` when that placement alone allows trust; never in `live`, never claiming. Not
     /// listed when it has no cluster or the budget runs out. As for a live file, a path past the path cap drops the
     /// folder.
     pub(super) fn deleted(
@@ -331,9 +332,10 @@ impl<'a> Collector<'a> {
         budget: &mut Budget,
         mut origin: FsOrigin,
         kind: FileKind,
-        guess: Guess,
+        runs: Vec<(u32, u32)>,
+        ok: bool,
     ) {
-        if guess.runs.is_empty() || !budget.take(guess.runs.len(), true) {
+        if runs.is_empty() || !budget.take(runs.len(), true) {
             return;
         }
         if let Some(f) = &origin.folder
@@ -346,8 +348,8 @@ impl<'a> Collector<'a> {
             size: origin.size,
             origin: Some(Box::new(origin)),
             kind: Some(kind),
-            chain_ok: guess.runs.len() == 1 && !guess.short,
-            runs: guess.runs,
+            chain_ok: ok,
+            runs,
             live: false,
         });
     }

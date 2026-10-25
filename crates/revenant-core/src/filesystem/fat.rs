@@ -438,7 +438,8 @@ impl<'a> Walk<'a, '_, '_> {
                 continue;
             };
             let origin = self.origin(f.folder, f.child, FsState::Deleted, Placement::Guessed);
-            self.col.deleted(self.budget, origin, f.kind, g);
+            let ok = g.runs.len() == 1 && !g.short;
+            self.col.deleted(self.budget, origin, f.kind, g.runs, ok);
         }
         if self.steps.exhausted() {
             self.budget.truncated = true;
@@ -867,7 +868,7 @@ fn short_name(e: &[u8; 32]) -> String {
 
 /// A FAT date and time (local), with the creation time's 10 ms count (0..=199) added and floored to the second.
 /// `None` when any field is out of range.
-fn fat_time(date: u16, time: u16, centis: Option<u8>) -> Option<FsTime> {
+pub(super) fn fat_time(date: u16, time: u16, centis: Option<u8>) -> Option<FsTime> {
     let year = 1980 + (date >> 9) as u32;
     let month = ((date >> 5) & 0x0F) as u32;
     let day = (date & 0x1F) as u32;
@@ -908,8 +909,9 @@ fn days_in(year: u32, month: u32) -> u32 {
     }
 }
 
-/// A FAT read through a block cache; a sector the first copy cannot give is read from the next copy.
-struct FatMap<'a> {
+/// A FAT read through a block cache; a sector the first copy cannot give is read from the next copy. exFAT reads its FAT
+/// through it too (the whole 32-bit entry; whether a cluster is in use comes from its bitmap instead).
+pub(super) struct FatMap<'a> {
     source: &'a dyn Source,
     fs: FsKind,
     count: u32,
@@ -924,7 +926,7 @@ struct Block {
 }
 
 impl<'a> FatMap<'a> {
-    fn new(source: &'a dyn Source, v: &Volume, layout: &Layout) -> Self {
+    pub(super) fn new(source: &'a dyn Source, v: &Volume, layout: &Layout) -> Self {
         FatMap {
             source,
             fs: v.fs,
@@ -1006,9 +1008,8 @@ impl<'a> FatMap<'a> {
                 Some(if c & 1 == 1 { v >> 4 } else { v & 0x0FFF })
             }
             FsKind::Fat16 => Some(u16::from_le_bytes(self.bytes(2 * c64)?) as u32),
-            FsKind::Fat32 | FsKind::Exfat => {
-                Some(u32::from_le_bytes(self.bytes(4 * c64)?) & 0x0FFF_FFFF)
-            }
+            FsKind::Fat32 => Some(u32::from_le_bytes(self.bytes(4 * c64)?) & 0x0FFF_FFFF),
+            FsKind::Exfat => Some(u32::from_le_bytes(self.bytes(4 * c64)?)),
         }
     }
 
@@ -1028,7 +1029,9 @@ impl ClusterMap for FatMap<'_> {
         let (bad, eoc) = match self.fs {
             FsKind::Fat12 => (0xFF7, 0xFF8),
             FsKind::Fat16 => (0xFFF7, 0xFFF8),
-            _ => (0x0FFF_FFF7, 0x0FFF_FFF8),
+            FsKind::Fat32 => (0x0FFF_FFF7, 0x0FFF_FFF8),
+            // exFAT spec §4.1: 0xFFFFFFF7 bad, 0xFFFFFFFF end (0xFFFFFFF8..=0xFFFFFFFE, media values, read as end).
+            FsKind::Exfat => (0xFFFF_FFF7, 0xFFFF_FFF8),
         };
         match v {
             0 => Entry::Free,

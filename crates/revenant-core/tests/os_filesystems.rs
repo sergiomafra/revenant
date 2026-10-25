@@ -1,5 +1,6 @@
 //! Opt-in: volumes of images that macOS itself formatted (`hdiutil create`) and wrote to (attached by `OsImage` only).
-//! Run with `REVENANT_OS_FS=1 cargo test -p revenant-core --test os_filesystems -- --ignored`.
+//! Run with `REVENANT_OS_FS=1 cargo test -p revenant-core --test os_filesystems -- --ignored --test-threads=1` (one at
+//! a time: every image's volume is named `RVT`, and a second one mounted at once would land on `/Volumes/RVT 1`).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -69,6 +70,25 @@ fn files_under(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
 #[test]
 #[ignore]
 fn os_made_fat_lists_live_and_deleted() {
+    lists_live_and_deleted(&[
+        (OsFs::Fat32, OsLayout::Mbr, 64),
+        (OsFs::Fat16, OsLayout::None, 32),
+    ]);
+}
+
+#[test]
+#[ignore]
+fn os_made_exfat_lists_live_and_deleted() {
+    lists_live_and_deleted(&[
+        (OsFs::Exfat, OsLayout::Mbr, 64),
+        (OsFs::Exfat, OsLayout::Gpt, 64),
+    ]);
+}
+
+/// On each image the OS formats: six photos written to `DCIM/100TEST`, two deleted, all through the OS driver. Every
+/// live photo is listed live with the bytes the mount reads and trusted; each deleted one is listed once, by its name,
+/// with its original bytes.
+fn lists_live_and_deleted(cases: &[(OsFs, OsLayout, u32)]) {
     if !available() {
         return;
     }
@@ -81,10 +101,7 @@ fn os_made_fat_lists_live_and_deleted() {
         "DSC00006.JPG",
     ];
     let gone = ["DSC00003.JPG", "Long name photo.jpg"];
-    for (os, layout, size) in [
-        (OsFs::Fat32, OsLayout::Mbr, 64),
-        (OsFs::Fat16, OsLayout::None, 32),
-    ] {
+    for &(os, layout, size) in cases {
         let img = OsImage::create(os, layout, size).expect("hdiutil create");
         let photos: Vec<Vec<u8>> = (0..names.len())
             .map(|i| jpeg(320, 240, 50 + i as u64, 0))
@@ -144,7 +161,7 @@ fn os_made_fat_lists_live_and_deleted() {
                 .filter(|f| {
                     f.origin.state == FsState::Deleted
                         && f.origin.folder() == Some("DCIM/100TEST")
-                        // The long name exactly; DSC00003's first letter from its live siblings DSC0000x.
+                        // The long name exactly; on FAT DSC00003's first letter from its live siblings DSC0000x.
                         && f.origin.name() == n
                 })
                 .collect();

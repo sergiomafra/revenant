@@ -183,6 +183,31 @@ pub(crate) fn follow(
     chain
 }
 
+/// Claims the `need` consecutive clusters from `first` (an exFAT NoFatChain run, which has no FAT chain to follow). It
+/// stops at the end of the heap or at a cluster another chain already holds (a conflict: that cluster becomes contested).
+/// `complete` (and `ended`) when every one of the `need` clusters was claimed. The work is at most the clusters claimed.
+pub(crate) fn claim_run(claims: &mut Claims, first: u32, need: u64) -> Chain {
+    let mut chain = Chain::default();
+    if need == 0 || !claims.in_heap(first) {
+        return chain;
+    }
+    let want = need.min((claims.last - first) as u64 + 1);
+    let free = claims.run_len(first, first + (want - 1) as u32, false);
+    for c in first..first + free as u32 {
+        claims.claim(c);
+    }
+    if free > 0 {
+        chain.runs.push((first, free as u32));
+    }
+    if free < want {
+        chain.conflict = true;
+        claims.contest(first + free as u32);
+    }
+    chain.complete = free == need;
+    chain.ended = chain.complete;
+    chain
+}
+
 /// The allocation as the deleted-file guesses must see it once the live walk is done (ruling R10): a cluster any live
 /// chain claims is in use, even when its FAT entry reads free (a chain broken there, or cross-linked into it).
 pub(crate) struct Unclaimed<'m> {
@@ -622,6 +647,29 @@ mod tests {
         let g = guess(&mut u, &mut Budget::new(1000), 24, 3, 1000).unwrap();
         assert_eq!(g.runs, vec![(24, 1), (26, 2)]);
         assert!(g.skipped);
+    }
+
+    #[test]
+    fn claim_run_stops_at_claimed_clusters_and_the_heap_end() {
+        let mut claims = Claims::new(100, 16);
+        let a = claim_run(&mut claims, 10, 5);
+        assert_eq!(a.runs, vec![(10, 5)]);
+        assert!(a.complete && a.ended && !a.conflict);
+        assert!(claims.is_claimed(14) && !claims.is_claimed(15));
+        // Into a claimed cluster: stops there, contested.
+        let b = claim_run(&mut claims, 8, 4);
+        assert_eq!(b.runs, vec![(8, 2)]);
+        assert!(b.conflict && !b.complete && !b.ended);
+        assert!(claims.touches_contested(&[(10, 1)]));
+        // Starting on a claimed cluster: nothing.
+        let c = claim_run(&mut claims, 12, 1);
+        assert!(c.runs.is_empty() && c.conflict);
+        // Past the heap's end (the last cluster is 101): short, no conflict.
+        let d = claim_run(&mut claims, 99, 10);
+        assert_eq!(d.runs, vec![(99, 3)]);
+        assert!(!d.complete && !d.conflict);
+        assert!(claim_run(&mut claims, 102, 1).runs.is_empty());
+        assert!(claim_run(&mut claims, 50, 0).runs.is_empty());
     }
 
     #[test]
