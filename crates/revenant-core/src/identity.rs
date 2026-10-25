@@ -7,6 +7,7 @@
 use crate::EngineError;
 use crate::device::DiskInfo;
 use crate::filesystem::{first_volume, volatile_boot_bytes};
+use crate::rescue::MappedSource;
 use crate::source::{Source, read_full};
 
 const MIB: u64 = 1 << 20;
@@ -40,6 +41,14 @@ pub enum SourceIdentity {
     },
     /// An image file (or any other source): its size and the digest of its first, middle and last MiB.
     Image { size: u64, digest: u64 },
+    /// A rescue copy's image read through its map (ruling P7): its size, the digest `Image` would have with every byte
+    /// not rescued counted as zero, and `origin`, the identity of the source the map records. Rescuing more of those
+    /// three MiB (a copy resumed meanwhile) changes it.
+    Mapped {
+        size: u64,
+        digest: u64,
+        origin: Box<SourceIdentity>,
+    },
 }
 
 impl SourceIdentity {
@@ -84,19 +93,33 @@ impl SourceIdentity {
     /// 1 MiB) and its last MiB, in that order (less where the source is smaller). Read errors fail.
     pub fn of_image(source: &dyn Source) -> Result<SourceIdentity, EngineError> {
         let size = source.len();
-        let mut digest = FNV_OFFSET;
-        let mut buf = Vec::new();
-        for start in [0, (size / 2) & !(MIB - 1), size.saturating_sub(MIB)] {
-            buf.resize((size - start.min(size)).min(MIB) as usize, 0);
-            read_full(source, start, &mut buf)?;
-            digest = fnv1a64(digest, &buf);
-        }
+        let digest = three_mib_digest(size, |at, buf| read_full(source, at, buf))?;
         Ok(SourceIdentity::Image { size, digest })
+    }
+
+    /// A rescue copy's image read through its map (P7): the digest of [`SourceIdentity::of_image`], taken with every
+    /// byte the map does not call rescued read as zero, and the identity the map records as `origin`.
+    pub fn of_mapped(source: &MappedSource) -> Result<SourceIdentity, EngineError> {
+        let size = source.len();
+        let digest = three_mib_digest(size, |at, buf| {
+            let n = source.read_zero_filled(at, buf)?;
+            if n < buf.len() {
+                return Err(EngineError::DeviceGone {
+                    offset: at + n as u64,
+                });
+            }
+            Ok(())
+        })?;
+        Ok(SourceIdentity::Mapped {
+            size,
+            digest,
+            origin: Box::new(source.map().identity().clone()),
+        })
     }
 
     /// Whether `other` is the same card (or image). Devices: sizes, models and `table`s equal, and the serials too when
     /// both sides have one (an extra check, never a substitute for `table`: readers often report their own serial).
-    /// Images: equal. A device is never the same as an image.
+    /// Images, and mapped images: equal. A device, an image and a mapped image are never the same as one another.
     pub fn same_source(&self, other: &SourceIdentity) -> bool {
         match (self, other) {
             (
@@ -119,10 +142,27 @@ impl SourceIdentity {
                 };
                 size == size2 && model == model2 && table == table2 && serials_agree
             }
-            (a @ SourceIdentity::Image { .. }, b @ SourceIdentity::Image { .. }) => a == b,
+            (a @ SourceIdentity::Image { .. }, b @ SourceIdentity::Image { .. })
+            | (a @ SourceIdentity::Mapped { .. }, b @ SourceIdentity::Mapped { .. }) => a == b,
             _ => false,
         }
     }
+}
+
+/// The FNV-1a 64 of the first MiB of a source of `size` bytes, the MiB at its middle (aligned down to 1 MiB) and its last
+/// MiB, in that order (less where the source is smaller), each filled by `read`.
+fn three_mib_digest(
+    size: u64,
+    read: impl Fn(u64, &mut [u8]) -> Result<(), EngineError>,
+) -> Result<u64, EngineError> {
+    let mut digest = FNV_OFFSET;
+    let mut buf = Vec::new();
+    for start in [0, (size / 2) & !(MIB - 1), size.saturating_sub(MIB)] {
+        buf.resize((size - start.min(size)).min(MIB) as usize, 0);
+        read(start, &mut buf)?;
+        digest = fnv1a64(digest, &buf);
+    }
+    Ok(digest)
 }
 
 /// Whether sector 0 is a protective MBR: signed, with a partition of type 0xEE.

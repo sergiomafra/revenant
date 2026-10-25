@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Scanning a card image together with its rescue map treats the parts of the card that were never rescued as unreadable,
+  never as zeros, so no photo or video in them is called intact. The map (`<image>.rvmap`) is saved so that a crash
+  or power loss leaves the previous map or the new one, never a damaged one.
 - The engine unmounts a card's volumes without ejecting it (macOS and Windows), so the system stops writing to it while
   it is read; it says which volumes are still in use when that fails, never remounts by itself, and remounts on request.
 - The engine lists the connected disks (macOS and Windows) with their size, sector sizes, maker, model, whether they are

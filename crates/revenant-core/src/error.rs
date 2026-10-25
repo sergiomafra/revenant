@@ -54,6 +54,15 @@ pub enum EngineError {
     /// The disk holds the running system: the engine never unmounts it.
     #[error("system_disk")]
     SystemDisk,
+    /// A rescue map file is damaged: cut short, checksum wrong, or not a map at all.
+    #[error("map_corrupt")]
+    MapCorrupt,
+    /// A rescue map does not describe its image (the sizes differ).
+    #[error("map_mismatch")]
+    MapMismatch,
+    /// A rescue map was made from another source than the one being copied.
+    #[error("map_other_source")]
+    MapOtherSource,
 }
 
 impl EngineError {
@@ -75,6 +84,9 @@ impl EngineError {
             Self::UnmountFailed { .. } => "unmount_failed",
             Self::RemountFailed => "remount_failed",
             Self::SystemDisk => "system_disk",
+            Self::MapCorrupt => "map_corrupt",
+            Self::MapMismatch => "map_mismatch",
+            Self::MapOtherSource => "map_other_source",
         }
     }
 }
@@ -115,6 +127,9 @@ mod tests {
         );
         assert_eq!(EngineError::RemountFailed.code(), "remount_failed");
         assert_eq!(EngineError::SystemDisk.code(), "system_disk");
+        assert_eq!(EngineError::MapCorrupt.code(), "map_corrupt");
+        assert_eq!(EngineError::MapMismatch.code(), "map_mismatch");
+        assert_eq!(EngineError::MapOtherSource.code(), "map_other_source");
         let io = || std::io::Error::other("x");
         assert_eq!(
             EngineError::Read {

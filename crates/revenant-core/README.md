@@ -21,6 +21,12 @@ Every engine error is an `EngineError`; each variant has a stable `snake_case` c
 | `SystemTool`          | `system_tool_failed`    |
 | `Unsupported`         | `unsupported_platform`  |
 | `DestinationUnknown`  | `destination_unknown`   |
+| `UnmountFailed`       | `unmount_failed`        |
+| `RemountFailed`       | `remount_failed`        |
+| `SystemDisk`          | `system_disk`           |
+| `MapCorrupt`          | `map_corrupt`           |
+| `MapMismatch`         | `map_mismatch`          |
+| `MapOtherSource`      | `map_other_source`      |
 
 ```rust
 use revenant_core::EngineError;
@@ -180,14 +186,58 @@ the volume of the folder (`GetVolumePathNameW`, `GetVolumeNameForVolumeMountPoin
   device that is gone is `device_gone`.
 - `SourceIdentity::of_image(&source)` = size and the FNV-1a 64 of the first MiB, the MiB at the middle (aligned down to
   1 MiB) and the last MiB.
+- `SourceIdentity::of_mapped(&mapped_source)` = a rescue copy's image read through its map (below): `Mapped { size,
+  digest, origin }`, the digest `of_image` would give with every byte not rescued counted as zero, and `origin`, the
+  identity of the source the map records. Rescuing more of those three MiB (a copy resumed meanwhile) changes it.
 - `same_source`: devices match when sizes, models and `table`s are equal, and the serials too when both sides have one
-  (readers often report their own serial, so it is only an extra check). Two identical cloned cards look the same.
+  (readers often report their own serial, so it is only an extra check). Two identical cloned cards look the same. Images and
+  mapped images match when equal; a device, an image and a mapped image never match one another.
 
 `source::Fragmented::new(source, pieces)` is a read-only logical view of pieces (`Fragment { start, len }`, absolute ranges)
 of a source, in the given order: offset 0 is the first byte of the first piece. Each piece is first clamped to the inner
 source's end (as `extract` clamps it), and `len()` is the sum of the clamped lengths. A read crosses pieces in order; a read
 error is the inner source's, so its offset is absolute in the inner source; `volume()` is the inner source's.
 `absolute(start, len)` maps a logical range back to absolute pieces of the source, merging pieces that touch.
+
+## Rescue copy
+
+`revenant_core::rescue` holds the map of a rescue copy (a whole card copied into an image file, design §5.4) and reads
+the image back through it.
+
+`RescueMap::new(size, sector, identity)` covers `[0, size)` with merged regions (neighbors always differ in state), all
+`Untried` at first. A region is `Untried` (not read yet), `Rescued` (the image holds the card's bytes), `ToTrim` or
+`ToScrape` (a failed block whose edges or middle are still to be read sector by sector) or `Bad` (sectors that failed
+one by one). `set(start, len, state)` takes multiples of the sector (the end clamps to the size) and merges; `state_at`,
+`regions()` (ascending, contiguous from 0, summing to the size) and `totals()` (bytes per state) read it. The map also
+records the source's `SourceIdentity` and the copy's pass and position (`pass()`, `set_pass`: `Fast`, `Skipped`, `Trim`,
+`Scrape`, `Retry(n)`, `Done`).
+
+The map holds at most `MAX_MAP_REGIONS` (2^20) regions: a `set` that would need more returns false and changes nothing
+(the copy then marks a failed block bad whole, without reading its edges, so on a disk with millions of scattered errors
+some good sectors next to bad ones are lost).
+
+The map lives next to the image as `<image>.rvmap` (`map_path`), in our own text format (UTF-8, decimal numbers, one
+space between fields):
+
+```text
+revenant-rescue-map 1
+size <u64> sector <u32>
+identity device <size> <hex model or -> <hex serial or -> <table hex> | identity image <size> <digest hex>
+pass <fast|skipped|trim|scrape|retry:N|done> <pos>
+<start> <len> <state>          (one line per region, ascending; state untried|rescued|to_trim|to_scrape|bad)
+end <crc32 of every byte before this line, 8 lowercase hex digits>
+```
+
+Hex values are lowercase (model and serial as the hex of their UTF-8 bytes; digests as 16 digits). `save(path)` writes
+`<path>.tmp`, `sync_all`s it, renames it over `path` and (on Unix) syncs the folder, so a crash at any moment leaves
+the previous map or the new one, never a mix; failures are `write_failed`. `load(path)` refuses anything that is not
+exactly such a file (`map_corrupt`): cut short anywhere, a checksum that does not match, regions that do not cover the
+size, more than 2^20 regions, or a file over 64 MiB; a file that cannot be opened is `open_failed`.
+
+`MappedSource::open(image)` opens the image read-only with its map (`map_mismatch` when the map's size is not the
+image's length). A read touching any byte that is not `Rescued` fails with `Read { offset }` of the first such byte, as
+a bad sector of the card would: the scan reports the holes as `Unreadable` and calls nothing in them `Intact`, where a
+plain `FileSource` of the image would read the zeros the copy left there as data. `volume()` is the image file's.
 
 ## Formats: JPEG
 

@@ -20,6 +20,7 @@ pub(crate) mod identity;
 pub mod inspect;
 pub mod naming;
 pub(crate) mod pairing;
+pub mod rescue;
 pub mod scan;
 pub mod source;
 pub(crate) mod tiff;
