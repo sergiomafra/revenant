@@ -102,14 +102,27 @@ fn letter_of_rvt(text: &str) -> Option<char> {
     })
 }
 
+/// The full long path of the folder `dir` (8.3 short names expanded), without the `\\?\` prefix diskpart does not take.
+fn long_path(dir: &Path) -> Result<PathBuf, String> {
+    let full = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+    let text = full.to_string_lossy();
+    let plain = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    if plain.starts_with(r"\\") {
+        return Err(format!("unexpected temp path {}", full.display()));
+    }
+    Ok(PathBuf::from(plain))
+}
+
 /// The created, attached and formatted VHD, its disk number and its drive letter.
 fn make_vhd() -> Result<(Vhd, u32, char), String> {
     let dir = tempfile::Builder::new()
         .prefix("revenant-vhd-")
         .tempdir()
         .map_err(|e| e.to_string())?;
+    // diskpart attaches under the long path: an 8.3 short name in %TEMP% (`RUNNER~1`) would select another vdisk.
+    let long = long_path(dir.path())?;
     let vhd = Vhd {
-        path: dir.path().join("card.vhd"),
+        path: long.join("card.vhd"),
         dir,
     };
     let create = format!(
@@ -310,12 +323,12 @@ fn windows_vhd_round_trip() {
     assert!(guard.held() >= 1, "no volume lock held");
     let info = listed(&d);
     eprintln!(
-        "after the unmount: mount points {:?}; the lock and dismount took a {} handle (not observable here)",
+        "after the unmount: mount points {:?}; whether the lock and dismount took a read-only or a read-write volume \
+         handle is not observable here",
         info.volumes
             .iter()
             .map(|v| &v.mount_point)
             .collect::<Vec<_>>(),
-        "read-only or read-write"
     );
     let locked = std::fs::read_dir(&card);
     assert!(locked.is_err(), "the volume is still readable while locked");
