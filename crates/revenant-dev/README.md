@@ -83,9 +83,11 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   {"event":"found","id":2,"start":101888,"len":8250,"kind":"jpeg","health":"intact","width":64,"height":64,"preview":{"start":101888,"len":8250,"width":64,"height":64}}
   ```
 - `updated`: a better version of an earlier `found` line with the same `id`, with the same fields; it replaces that
-  line. These lines come after every `found` line, just before the summary, whose `updated` counts them. Today: a
+  line. These lines come after every `found` line, just before the summary, whose `updated` counts them, one per `id`
+  in `id` order. Today: a file found by its signature on a quick-formatted card that an old folder names (the same line
+  with its `name`, `path` such as `?/100MSDCF/DSC01234.JPG`, `state` `orphaned` and `placement` `carved`), and a
   camera video whose index (`moov`) ended up elsewhere on the card, found `damaged` and then put back together from its
-  two pieces:
+  two pieces (both in one line when both apply):
 
   ```json
   {"event":"found","id":1,"start":1048576,"len":55090,"kind":"mp4","health":"damaged"}

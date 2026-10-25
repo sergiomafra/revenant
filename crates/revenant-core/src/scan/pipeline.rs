@@ -11,6 +11,7 @@ use std::time::Duration;
 use super::fs::{FsJobResult, FsPlan, fs_job};
 use super::{CancelToken, HEAD_LEN};
 use crate::cache::{CachedSource, Runs};
+use crate::filesystem::{OrphanDir, OrphanFinder};
 use crate::formats::{
     CancelScope, Format, Fragment, Health, MAX_OWN_FILES, MOOV_MAX_LEN, Measurement,
 };
@@ -155,10 +156,23 @@ pub(super) struct Block {
     pub(super) moovs: Vec<(u64, u64)>,
     /// More candidates than [`MAX_BLOCK_MOOVS`] were met in this block: the rest were not kept.
     pub(super) moovs_capped: bool,
+    /// Old-directory candidates whose head ends in this block (see [`OrphanFinder`]), ascending.
+    pub(super) orphans: Vec<OrphanDir>,
+    /// More than [`MAX_BLOCK_ORPHANS`] were met in this block: the rest were not kept.
+    pub(super) orphans_capped: bool,
 }
 
 /// Most `moov` candidates kept per block.
 pub(super) const MAX_BLOCK_MOOVS: usize = 4096;
+/// Most old-directory candidates kept per block (a 4 MiB block of 512-byte clusters has 8192 cluster starts).
+pub(super) const MAX_BLOCK_ORPHANS: usize = 8192;
+
+/// The searches the read stage runs over the bytes it reads: orphan `moov` boxes and old directories.
+#[derive(Default)]
+pub(super) struct Finders {
+    pub(super) moov: MoovFinder,
+    pub(super) orphan: Option<OrphanFinder>,
+}
 
 /// Bytes of a candidate `moov` box header looked at: size, `moov`, the first child's size and `mvhd`.
 const MOOV_HEAD: usize = 16;
@@ -365,8 +379,9 @@ impl<'s> Shared<'s> {
     }
 
     /// Reads the block `[pos, end)` (or defers it) and, with workers, queues a job for each head to examine and for each
-    /// kept file-system file starting in it. `finder` searches the bytes read for orphan `moov` candidates.
-    pub(super) fn fill(&self, pos: u64, end: u64, workers: bool, finder: &mut MoovFinder) -> Block {
+    /// kept file-system file starting in it. `finders` search the bytes read for orphan `moov` candidates and old
+    /// directories.
+    pub(super) fn fill(&self, pos: u64, end: u64, workers: bool, finders: &mut Finders) -> Block {
         let sector = self.sector;
         let sectors = (end - pos).div_ceil(sector) as usize;
         if lock(&self.skips).covers(pos, end) && self.cache.covered(pos, end) {
@@ -377,7 +392,10 @@ impl<'s> Shared<'s> {
                 let last = ((s + l - pos).div_ceil(sector) as usize).min(sectors);
                 flags[first..last].fill(true);
             }
-            finder.reset();
+            finders.moov.reset();
+            if let Some(o) = &mut finders.orphan {
+                o.reset();
+            }
             return Block {
                 pos,
                 end,
@@ -386,13 +404,22 @@ impl<'s> Shared<'s> {
                 deferred: true,
                 moovs: Vec::new(),
                 moovs_capped: false,
+                orphans: Vec::new(),
+                orphans_capped: false,
             };
         }
         let mut bad: Option<Vec<bool>> = None;
         let mut heads = Vec::new();
         let (mut moovs, mut moovs_capped) = (Vec::new(), false);
+        let (mut orphans, mut orphans_capped) = (Vec::new(), false);
         self.cache.visit(pos, end, |from, bytes, runs| {
-            finder.feed(from, bytes, &mut moovs, MAX_BLOCK_MOOVS, &mut moovs_capped);
+            finders
+                .moov
+                .feed(from, bytes, &mut moovs, MAX_BLOCK_MOOVS, &mut moovs_capped);
+            if let Some(o) = &mut finders.orphan {
+                // At most block / 512 × 16 volumes here; the block's cap is applied once it is sorted.
+                o.feed(from, bytes, &mut orphans, usize::MAX, &mut orphans_capped);
+            }
             let mut run = runs.iter().peekable();
             let mut at = from;
             let stop = from + bytes.len() as u64;
@@ -424,6 +451,11 @@ impl<'s> Shared<'s> {
                 at = sector_end;
             }
         });
+        orphans.sort_unstable();
+        if orphans.len() > MAX_BLOCK_ORPHANS {
+            orphans.truncate(MAX_BLOCK_ORPHANS);
+            orphans_capped = true;
+        }
         let kept = self.fs.kept_in(pos, end);
         if !kept.is_empty() {
             heads = with_kept(heads, kept.map(|k| (self.fs.starts[k], k)));
@@ -452,6 +484,8 @@ impl<'s> Shared<'s> {
             deferred: false,
             moovs,
             moovs_capped,
+            orphans,
+            orphans_capped,
         }
     }
 

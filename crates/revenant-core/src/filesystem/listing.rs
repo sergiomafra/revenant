@@ -139,6 +139,10 @@ pub struct Listing {
     /// files not listed because a volume's guess budget or the listing's high-word probes ran out, or deleted folders
     /// not walked because too many were waiting.
     pub truncated: bool,
+    /// Merged absolute ranges of every directory cluster the walks read, live or deleted, trusted or not, FAT and exFAT
+    /// (at most [`super::MAX_PIECES`] runs per volume before merging): an old directory found there by the scan is no
+    /// orphan (ruling D11).
+    pub(crate) walked: Vec<Fragment>,
 }
 
 /// Lists the files of every volume (cancel checked per directory), live and deleted. Never fails: a broken file system
@@ -203,7 +207,21 @@ pub(crate) fn read_limited(
     });
     out.others.sort_by_key(|f| (f.start, f.len));
     out.live = merged(std::mem::take(&mut out.live));
+    out.walked = merged(std::mem::take(&mut out.walked));
     out
+}
+
+/// Records that the walk read `len` bytes of directory at absolute `start` into `walked` (a run continuing the last
+/// one extends it); once `walked` holds `cap` runs, further ones are not recorded (they only keep a few more clusters
+/// from being looked at as old directories).
+pub(super) fn note_walked(walked: &mut Vec<Fragment>, start: u64, len: u64, cap: usize) {
+    if let Some(last) = walked.last_mut()
+        && last.start.saturating_add(last.len) == start
+    {
+        last.len += len;
+    } else if walked.len() < cap {
+        walked.push(Fragment { start, len });
+    }
 }
 
 /// What is left of the listing's caps, shared by every volume, and whether one of them dropped something.

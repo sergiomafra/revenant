@@ -320,3 +320,76 @@ fn os_made_cards_scan_end_to_end() {
         }
     }
 }
+
+/// A FAT32 card macOS formatted and wrote four photos to `DCIM/100TEST`, then quick-formatted by the testkit on the
+/// partition's bytes of the test's own image file (never `newfs` on a device): the old folders survive, so the scan
+/// finds each photo by its signature and names it `?/100TEST/<name>` (orphaned, carved).
+#[test]
+#[ignore]
+fn os_made_card_after_a_quick_format() {
+    if !available() {
+        return;
+    }
+    let names = [
+        "DSC00001.JPG",
+        "DSC00002.JPG",
+        "DSC00003.JPG",
+        "DSC00004.JPG",
+    ];
+    let img = OsImage::create(OsFs::Fat32, OsLayout::Mbr, 64).expect("hdiutil create");
+    let photos: Vec<Vec<u8>> = (0..names.len())
+        .map(|i| jpeg(320, 240, 70 + i as u64, 0))
+        .collect();
+    img.with_mounted(|m| {
+        let dir = m.join("DCIM/100TEST");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (n, data) in names.iter().zip(&photos) {
+            std::fs::write(dir.join(n), data).unwrap();
+        }
+    });
+    let mut bytes = std::fs::read(&img.path).unwrap();
+    let off = 512 * first_lba(&bytes, OsLayout::Mbr) as usize;
+    revenant_testkit::fs::quick_format_in_place(&mut bytes[off..]);
+    std::fs::write(&img.path, &bytes).unwrap();
+    let mut events = Vec::new();
+    let summary = scan(
+        &FileSource::open(&img.path).unwrap(),
+        &all_formats(),
+        &ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |e| events.push(e),
+    )
+    .unwrap();
+    let updated: Vec<&Finding> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Updated(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    for (n, data) in names.iter().zip(&photos) {
+        let path = format!("?/100TEST/{n}");
+        let u = updated
+            .iter()
+            .find(|u| u.origin.as_ref().is_some_and(|o| o.path() == path))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{path} not updated: {:?}",
+                    updated
+                        .iter()
+                        .map(|u| u.origin.as_ref().map(|o| o.path()))
+                        .collect::<Vec<_>>()
+                )
+            });
+        let o = u.origin.as_ref().unwrap();
+        assert_eq!(o.state, FsState::Orphaned, "{path}");
+        assert_eq!(o.size, data.len() as u64, "{path}");
+        assert_eq!(u.len, data.len() as u64, "{path}");
+        assert_eq!(u.health, Health::Intact, "{path}");
+        assert_eq!(
+            &bytes[u.start as usize..(u.start + u.len) as usize],
+            &data[..]
+        );
+    }
+    assert!(summary.updated >= names.len() as u64);
+}

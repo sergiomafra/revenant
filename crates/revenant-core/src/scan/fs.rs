@@ -27,6 +27,8 @@ pub(crate) struct FsPlan {
     pub others: Vec<u64>,
     /// Merged, ascending ranges of every live file and trusted live directory (ruling D7).
     pub live: Vec<Fragment>,
+    /// Merged, ascending ranges of every directory the listing walked (an old directory there is no orphan, D11).
+    pub walked: Vec<Fragment>,
 }
 
 impl FsPlan {
@@ -51,6 +53,7 @@ impl FsPlan {
             starts,
             others,
             live: listing.live,
+            walked: listing.walked,
         }
     }
 
@@ -66,11 +69,19 @@ impl FsPlan {
 
     /// Whether `[start, end)` overlaps a live range.
     pub(crate) fn overlaps_live(&self, start: u64, end: u64) -> bool {
-        let i = self
-            .live
-            .partition_point(|r| r.start.saturating_add(r.len) <= start);
-        self.live.get(i).is_some_and(|r| r.start < end)
+        overlaps(&self.live, start, end)
     }
+
+    /// Whether `[start, end)` overlaps a directory the listing walked.
+    pub(crate) fn overlaps_walked(&self, start: u64, end: u64) -> bool {
+        overlaps(&self.walked, start, end)
+    }
+}
+
+/// Whether `[start, end)` overlaps one of `ranges` (sorted, disjoint).
+fn overlaps(ranges: &[Fragment], start: u64, end: u64) -> bool {
+    let i = ranges.partition_point(|r| r.start.saturating_add(r.len) <= start);
+    ranges.get(i).is_some_and(|r| r.start < end)
 }
 
 /// Whether `a` is kept over `b` at the same start: live before deleted, then the latest `modified` (a missing one loses
@@ -216,6 +227,22 @@ fn tail_ok(
         }
     }
     false
+}
+
+/// Ruling D6 for a name from an old directory (D11): the `len` bytes at `start` (contiguous, inside the source) are
+/// padding or up to [`MAX_TAIL_FILES`] whole files then padding.
+pub(crate) fn tail_fits(
+    formats: &[Box<dyn Format>],
+    source: &dyn Source,
+    start: u64,
+    len: u64,
+    cancel: &CancelToken,
+) -> bool {
+    if start.checked_add(len).is_none_or(|end| end > source.len()) {
+        return false;
+    }
+    let view = Fragmented::new(source, vec![Fragment { start, len }]);
+    tail_ok(formats, &view, 0, cancel)
 }
 
 /// The detectors over `Fragmented(f.pieces)` at 0, then the D6 tail check.

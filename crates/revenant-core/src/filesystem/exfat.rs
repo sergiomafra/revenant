@@ -16,9 +16,11 @@ use super::boot::{self, Root};
 use super::fat::{FatMap, fat_time};
 use super::listing::{
     Budget, Collector, FsOrigin, FsState, FsTime, Listing, Placement, component, extension,
+    note_walked,
 };
+use super::orphans::OldEntry;
 use super::{Limits, Volume, read_exact, u16_at, u32_at, u64_at};
-use crate::formats::FileKind;
+use crate::formats::{FileKind, Fragment};
 use crate::scan::CancelToken;
 use crate::source::Source;
 
@@ -78,13 +80,20 @@ pub(super) fn walk(
         waiting: Vec::new(),
         later: Vec::new(),
         seen: BTreeSet::new(),
+        walked: Vec::new(),
     };
     let root = w.root_chain(root);
     if w.live(root) {
         w.deleted_dirs();
     }
     w.place();
-    let Walk { col, claims, .. } = w;
+    let Walk {
+        col,
+        claims,
+        walked,
+        ..
+    } = w;
+    out.walked.extend(walked);
     col.finish(&claims, out);
 }
 
@@ -121,6 +130,8 @@ struct Walk<'a, 'b> {
     later: Vec<Later>,
     /// First clusters of the deleted directories walked (a deleted tree has no claims to stop a loop).
     seen: BTreeSet<u32>,
+    /// The directory clusters read, live and deleted ([`Listing::walked`]).
+    walked: Vec<Fragment>,
 }
 
 /// A deleted photo/video waiting to be placed.
@@ -357,6 +368,7 @@ impl<'a> Walk<'a, '_> {
             let Some(at) = v.cluster_offset(c) else {
                 break;
             };
+            note_walked(&mut self.walked, at, cs, self.limits.pieces);
             let mut off = 0;
             while off < cs {
                 let n = READ_CHUNK.min(cs - off);
@@ -900,6 +912,60 @@ impl Sets {
     }
 }
 
+/// What one entry of an old directory gave (ruling D11).
+pub(super) enum OldStep {
+    None,
+    /// `0x00`: the directory ends.
+    End,
+    /// An entry set whose File entry is in use.
+    Entry(OldEntry),
+}
+
+/// An old directory met by the scan (ruling D11), parsed with the live walk's rules ([`Sets`]); deleted sets are left
+/// out.
+#[derive(Default)]
+pub(super) struct OldSets(Sets);
+
+impl OldSets {
+    pub(super) fn push(&mut self, e: &[u8; 32]) -> OldStep {
+        match self.0.push(e) {
+            Step::End => OldStep::End,
+            Step::Set(ch) if !ch.deleted => OldStep::Entry(OldEntry {
+                created: exfat_time(ch.created),
+                modified: exfat_time(ch.modified),
+                name: ch.name,
+                dir: ch.dir,
+                first: ch.first,
+                size: ch.len,
+            }),
+            _ => OldStep::None,
+        }
+    }
+}
+
+/// Whether `b` (a cluster's first bytes) starts with a whole entry set: a File entry (`0x85`, or `0x05` deleted) whose
+/// SecondaryCount is 2..=18 and whose set, inside `b`, holds together with a valid SetChecksum (InUse bits forced).
+pub(super) fn starts_set(b: &[u8]) -> bool {
+    if !matches!(b.first(), Some(0x85 | 0x05)) {
+        return false;
+    }
+    let count = b[1] as usize;
+    let need = (count + 1) * 32;
+    if !(MIN_SECONDARY..=MAX_SECONDARY).contains(&count) || need > b.len() {
+        return false;
+    }
+    let mut sets = Sets::default();
+    let entries = b[..need].as_chunks::<32>().0;
+    let (last, rest) = entries.split_last().expect("at least 3 entries");
+    for (k, e) in rest.iter().enumerate() {
+        // Each entry must extend the set that started at byte 0 (not drop it and start another).
+        if !matches!(sets.push(e), Step::None) || sets.len != k + 1 {
+            return false;
+        }
+    }
+    matches!(sets.push(last), Step::Set(_))
+}
+
 /// SetChecksum (spec §6.3.3) over every entry of `set`, bytes 2–3 of the primary skipped, with each type byte's InUse
 /// bit set first: a deleted set keeps the checksum of its live form.
 fn set_checksum(set: &[[u8; 32]]) -> u16 {
@@ -975,6 +1041,41 @@ fn count_bits(w: &[u64], last: u32, from: u32, to: u32, free: bool) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walked_holds_every_directory_read() {
+        use crate::filesystem::listing::read_limited;
+        use crate::filesystem::{Limits, SourceProbe};
+        use crate::formats::tests::Mem;
+        use revenant_testkit::fs::{DeleteStyle, FsBuilder, FsType, Partitioning, disk};
+        let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, 4096);
+        let jpg = b.add("DCIM/100MSDCF/A.JPG", &[1; 10_000]);
+        b.add("DCIM/OLD/B.JPG", &[2; 1024]);
+        b.delete("DCIM/OLD", DeleteStyle::Camera);
+        let v = b.build();
+        let len = v.len() + (8 << 20);
+        let src = Mem(disk(Partitioning::Mbr { first_lba: 8192 }, &v, len));
+        let l = read_limited(
+            &src,
+            &SourceProbe::new(&src),
+            &CancelToken::default(),
+            &Limits::DEFAULT,
+        );
+        let inside = |set: &[Fragment], c: u32| {
+            let at = 8192 * 512 + b.cluster_offset(c);
+            set.iter().any(|r| r.start <= at && at < r.start + r.len)
+        };
+        for dir in ["", "DCIM", "DCIM/100MSDCF", "DCIM/OLD"] {
+            for c in b.clusters(dir) {
+                assert!(inside(&l.walked, c), "{dir:?} cluster {c}");
+            }
+        }
+        assert!(!inside(&l.live, b.clusters("DCIM/OLD")[0]));
+        assert!(
+            jpg.iter()
+                .all(|&c| inside(&l.live, c) && !inside(&l.walked, c))
+        );
+    }
 
     #[test]
     fn utc_offsets_and_ten_millisecond_counts() {

@@ -775,3 +775,277 @@ fn listed_partial_raw_hides_its_own_jpegs() {
     assert_eq!((raw.kind, raw.health), (FileKind::Rw2, Health::Partial));
     assert_eq!(founds(&ev).len(), 1, "{:#?}", summary(&ev));
 }
+
+// ---- After a quick format: names from the old folders (ruling D11) ----
+
+/// The volume of `b`, quick-formatted, at LBA 8192 of a disk 8 MiB longer than the volume.
+fn quick_placed(b: &FsBuilder) -> Vec<u8> {
+    let v = b.build_quick_formatted();
+    let len = v.len() + 8 * MIB;
+    disk(Partitioning::Mbr { first_lba: 8192 }, &v, len)
+}
+
+fn updates(events: &[Event]) -> Vec<&Finding> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Updated(f) => Some(f),
+            _ => None,
+        })
+        .collect()
+}
+
+fn summary_of(bytes: &[u8], opts: &ScanOptions) -> (ScanSummary, Vec<Event>) {
+    let (_file, src) = source(bytes, &[]);
+    let (r, events) = run_on(&src, opts);
+    (r.unwrap(), events)
+}
+
+/// `DCIM/100MSDCF`: DSC01234.JPG, DSC01235.ARW, C0001.MP4, each contiguous; their bytes by name.
+fn quick_files(b: &mut FsBuilder) -> Vec<(&'static str, Vec<u8>)> {
+    let files = vec![
+        ("DSC01234.JPG", jpeg(64, 64, 11, 2000)),
+        ("DSC01235.ARW", arw_with_preview().bytes),
+        (
+            "C0001.MP4",
+            avc_video(&AvcOptions {
+                samples: 60,
+                seed: 5,
+                mov: false,
+                mdat_pad: 0,
+                small_nals: false,
+            })
+            .bytes,
+        ),
+    ];
+    for (name, data) in &files {
+        b.add(&format!("{DIR}/{name}"), data);
+    }
+    files
+}
+
+/// Each file of `files` is found once without an origin, then updated once with its old name: the same finding, with
+/// `origin { state: Orphaned, placement: Carved, path "?/100MSDCF/<name>" }`.
+fn check_quick(b: &FsBuilder, files: &[(&str, Vec<u8>)], img: &[u8]) {
+    let (sum, ev) = summary_of(img, &ScanOptions::default());
+    let found = founds(&ev);
+    assert_eq!(found.len(), files.len(), "{:#?}", summary(&ev));
+    assert!(
+        found.iter().all(|f| f.origin.is_none()),
+        "{:#?}",
+        summary(&ev)
+    );
+    let up = updates(&ev);
+    assert_eq!(up.len(), files.len(), "{up:#?}");
+    assert_eq!(sum.updated, files.len() as u64);
+    // Every `Updated` comes after every `Found`, in id order.
+    let first_update = ev
+        .iter()
+        .position(|e| matches!(e, Event::Updated(_)))
+        .unwrap();
+    assert!(
+        ev[first_update..]
+            .iter()
+            .all(|e| !matches!(e, Event::Found(_)))
+    );
+    assert!(up.windows(2).all(|w| w[0].id < w[1].id));
+    for (name, data) in files {
+        let start = at(b, b.clusters(&format!("{DIR}/{name}"))[0]) as u64;
+        let f = found.iter().find(|f| f.start == start).expect(name);
+        let u = up.iter().find(|u| u.id == f.id).expect(name);
+        let o = u.origin.as_ref().expect("an origin");
+        assert_eq!(o.path(), format!("?/100MSDCF/{name}"));
+        assert_eq!(o.folder(), Some("?/100MSDCF"));
+        assert_eq!(o.state, FsState::Orphaned);
+        assert_eq!(o.placement, Placement::Carved);
+        assert_eq!(o.size, data.len() as u64);
+        assert_eq!(o.volume, 0);
+        assert!(o.modified.is_some());
+        // Health and everything else unchanged.
+        assert_eq!(
+            &Finding {
+                origin: None,
+                ..(*u).clone()
+            },
+            *f
+        );
+        assert_eq!(f.health, Health::Intact, "{name}");
+    }
+}
+
+#[test]
+fn quick_formatted_fat32_card_keeps_names() {
+    let mut b = card();
+    let files = quick_files(&mut b);
+    check_quick(&b, &files, &quick_placed(&b));
+}
+
+#[test]
+fn quick_formatted_exfat_card_keeps_names() {
+    let mut b = FsBuilder::new(FsType::Exfat, 32 * MIB as u64, 32 * 1024);
+    let files = quick_files(&mut b);
+    check_quick(&b, &files, &quick_placed(&b));
+}
+
+/// A JPEG and C0001.MP4 written in 2 runs 4 MiB apart (its `moov` in the second), then a quick format.
+fn quick_split_video(cluster: u64, b: &mut FsBuilder) -> AvcVideo {
+    b.add(&format!("{DIR}/DSC01234.JPG"), &jpeg(64, 64, 11, 2000));
+    let mp4 = avc_video(&AvcOptions {
+        samples: 60,
+        seed: 5,
+        mov: false,
+        mdat_pad: 0,
+        small_nals: false,
+    });
+    let n = (mp4.bytes.len() as u64).div_ceil(cluster) as u32;
+    let first = (8 * MIB as u64 / cluster) as u32 + 2;
+    let gap = (4 * MIB as u64 / cluster) as u32;
+    let h = n / 2;
+    let runs: Vec<u32> = (first..first + h)
+        .chain(first + h + gap..first + gap + n)
+        .collect();
+    b.add_at(&format!("{DIR}/C0001.MP4"), &mp4.bytes, &runs);
+    mp4
+}
+
+#[test]
+fn orphan_events_identical_across_threads_and_caches() {
+    let mut b = card();
+    quick_split_video(512, &mut b);
+    let img = quick_placed(&b);
+    let opts = |threads, cache_bytes| ScanOptions {
+        threads,
+        cache_bytes,
+        ..ScanOptions::default()
+    };
+    let base = events_with(&img, &[], &opts(1, 256 * MIB));
+    let up = updates(&base);
+    assert_eq!(up.len(), 2, "{up:#?}");
+    assert!(up.iter().all(|u| u.origin.is_some()));
+    assert!(up.iter().any(|u| u.fragments.len() == 2));
+    for (threads, cache) in [
+        (2, 256 * MIB),
+        (8, 256 * MIB),
+        (16, 256 * MIB),
+        (8, MIB),
+        (1, MIB),
+    ] {
+        assert_eq!(
+            events_with(&img, &[], &opts(threads, cache)),
+            base,
+            "threads {threads}, cache {cache}"
+        );
+    }
+}
+
+/// A recorded size past the photo: noise after it makes the named finding `Partial` (ruling D6); padding after it, or
+/// the exact size, keeps it `Intact`.
+#[test]
+fn orphan_entry_size_mismatch_is_partial() {
+    let mut b = card();
+    let jpg = jpeg(64, 64, 11, 2000);
+    let mut noisy = jpg.clone();
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    noisy.extend((0..jpg.len() / 2).map(|_| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x as u8
+    }));
+    let mut padded = jpeg(64, 64, 12, 2000);
+    let clean = padded.len();
+    padded.resize(clean * 3 / 2, 0);
+    b.add(&format!("{DIR}/NOISE.JPG"), &noisy);
+    b.add(&format!("{DIR}/PADDED.JPG"), &padded);
+    b.add(&format!("{DIR}/EXACT.JPG"), &jpeg(64, 64, 13, 2000));
+    let ev = events(&quick_placed(&b));
+    let health = |name: &str| {
+        let u = updates(&ev)
+            .into_iter()
+            .find(|u| u.origin.as_ref().is_some_and(|o| o.name() == name))
+            .unwrap_or_else(|| panic!("{name}: {:#?}", updates(&ev)));
+        let f = founds(&ev).into_iter().find(|f| f.id == u.id).unwrap();
+        assert_eq!(f.health, Health::Intact, "{name} as carved");
+        u.health
+    };
+    assert_eq!(health("NOISE.JPG"), Health::Partial);
+    assert_eq!(health("PADDED.JPG"), Health::Intact);
+    assert_eq!(health("EXACT.JPG"), Health::Intact);
+}
+
+#[test]
+fn orphan_finder_ignores_live_and_noise() {
+    // The card before its quick format: every folder is live, every photo has its live origin.
+    let mut b = card();
+    quick_files(&mut b);
+    let ev = events(&placed(&b));
+    assert!(updates(&ev).is_empty(), "{:#?}", updates(&ev));
+    // A deleted folder (walked by the file-system phase, not live) whose photo's clusters a live file took over: the
+    // photo found inside that file has no origin, and the folder's old entry does not name it.
+    let mut b = card();
+    let jpg = jpeg(64, 64, 21, 0);
+    let clusters = b.add(&format!("{DIR}/OLD/DSC09999.JPG"), &jpg);
+    b.delete(&format!("{DIR}/OLD"), DeleteStyle::Camera);
+    let mut data = vec![0x5Au8; 512];
+    data.extend_from_slice(&jpg);
+    let mut chain = vec![30_000];
+    chain.extend_from_slice(&clusters);
+    b.add_at("MISC/DATA.BIN", &data, &chain);
+    let ev = events(&placed(&b));
+    let inside = founds(&ev)
+        .into_iter()
+        .find(|f| f.start == at(&b, clusters[0]) as u64)
+        .unwrap_or_else(|| panic!("{:#?}", summary(&ev)));
+    assert!(inside.origin.is_none());
+    assert!(updates(&ev).is_empty(), "{:#?}", updates(&ev));
+    // Noise with fake "." and ".." entries every 512 bytes and no volume.
+    let mut noise = vec![0u8; 16 * MIB];
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for byte in noise.iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *byte = x as u8;
+    }
+    for s in (0..noise.len()).step_by(512) {
+        noise[s..s + 11].copy_from_slice(b".          ");
+        noise[s + 11] = 0x10;
+        noise[s + 32..s + 43].copy_from_slice(b"..         ");
+        noise[s + 43] = 0x10;
+        noise[s + 64..s + 75].copy_from_slice(b"DSC00001JPG");
+        noise[s + 75] = 0x20;
+    }
+    let j = jpeg(64, 64, 22, 0);
+    noise[MIB..MIB + j.len()].copy_from_slice(&j);
+    let ev = events(&noise);
+    assert!(!ev.iter().any(|e| matches!(e, Event::Volume { .. })));
+    assert!(!founds(&ev).is_empty());
+    assert!(updates(&ev).is_empty(), "{:#?}", updates(&ev));
+}
+
+#[test]
+fn orphan_name_and_pairing_merge_into_one_update() {
+    let mut b = card();
+    let mp4 = quick_split_video(512, &mut b);
+    let (sum, ev) = summary_of(&quick_placed(&b), &ScanOptions::default());
+    let start = at(&b, b.clusters(&format!("{DIR}/C0001.MP4"))[0]) as u64;
+    let video = founds(&ev)
+        .into_iter()
+        .find(|f| f.start == start)
+        .expect("the video's first piece");
+    assert_eq!(video.health, Health::Damaged);
+    let mine: Vec<_> = updates(&ev)
+        .into_iter()
+        .filter(|u| u.id == video.id)
+        .collect();
+    assert_eq!(mine.len(), 1, "{:#?}", updates(&ev));
+    let u = mine[0];
+    assert_eq!(u.fragments.len(), 2);
+    assert_eq!(u.len, mp4.bytes.len() as u64);
+    let o = u.origin.as_ref().expect("an origin");
+    assert_eq!(o.path(), "?/100MSDCF/C0001.MP4");
+    assert_eq!(o.state, FsState::Orphaned);
+    // The JPEG's update and the video's: one `Updated` each.
+    assert_eq!(sum.updated, 2);
+    assert_eq!(updates(&ev).len(), 2);
+}

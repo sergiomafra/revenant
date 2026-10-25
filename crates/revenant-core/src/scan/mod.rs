@@ -12,11 +12,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::EngineError;
 use crate::cache::{CACHE_WINDOW, CachedSource, Runs};
-use crate::filesystem::{FsOrigin, FsState, SourceProbe, Volume};
+use crate::filesystem::{
+    FsOrigin, FsState, MAX_FILES, MAX_HEAD, MAX_ORPHAN_DIRS, OrphanDir, OrphanFinder, Placement,
+    SourceProbe, Volume, head_len, kind_class, orphan_entries,
+};
 use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
 use crate::source::Source;
-use fs::{FsJobResult, FsPlan, merge};
-use pipeline::{Block, CloseQueue, Head, Measured, MoovFinder, Outcome, Shared};
+use fs::{FsJobResult, FsPlan, merge, tail_fits};
+use pipeline::{Block, CloseQueue, Finders, Head, Measured, Outcome, Shared};
 
 /// Bytes of a sector start shown to `Format::recognizes`.
 const HEAD_LEN: usize = 16;
@@ -94,7 +97,8 @@ const MAX_THREADS: usize = 64;
 /// plus about 200 B per recognized sector start in the read-ahead (at most lookahead × block / sector of them), plus the
 /// orphan `moov` candidates and `Damaged` videos kept for pairing (at most 4096 + 4096 per block read ahead, and 4096
 /// findings) and the start of every finding (8 B each), plus the own-file starts of `Partial` RAWs (at most 65,536,
-/// about 50 B each, plus each RAW's ranges), plus the file-system listing: up to 262,144 files and 2^20
+/// about 50 B each, plus each RAW's ranges), plus the old-directory candidates (16 B each, at most 65,536 kept) and the
+/// findings without origin on a cluster grid they may name (≈ 64 B each, at most 262,144), plus the file-system listing: up to 262,144 files and 2^20
 /// pieces, ≈ 355 MiB kept for the whole scan in the worst case at those caps, with a peak of ≈ 640 MiB while it is read
 /// (on exFAT, plus the allocation bitmap, ≤ 32 MiB, and the root entries waiting for it, ≤ 68 MiB; core README), and,
 /// after the scan, the pairing step's one `moov` and its sample lists (up to about 128 MiB). So with
@@ -206,7 +210,8 @@ pub enum Event {
         len: u64,
     },
     /// A better version of a finding already reported: it replaces the earlier `Found` with the same `id`. Emitted after
-    /// every `Found`, before `scan` returns (today: a video put back together with its separated `moov`).
+    /// every `Found`, before `scan` returns, one per id in id order (today: a video put back together with its separated
+    /// `moov`, and a finding an old folder of a quick-formatted card names, ruling D11; both merged into one).
     Updated(Finding),
 }
 
@@ -216,7 +221,9 @@ pub struct ScanSummary {
     pub unreadable_bytes: u64,
     /// `Updated` events emitted.
     pub updated: u64,
-    /// The file-system listing was truncated by one of its caps or budgets (see [`Event::Volume`]).
+    /// The file-system listing was truncated by one of its caps or budgets (see [`Event::Volume`]), or a cap of the
+    /// old folders of a quick-formatted card dropped some of them or some of their names (ruling R7; the `Volume`
+    /// events, emitted before the search, do not carry that part).
     pub listing_truncated: bool,
 }
 
@@ -242,6 +249,31 @@ fn within(inner: &[Fragment], outer: &[Fragment]) -> bool {
             .sum();
         covered == r.len
     })
+}
+
+/// A finding emitted without origin that starts on a volume's cluster grid: an old directory may name it (ruling D11).
+struct Carved {
+    id: u64,
+    start: u64,
+    len: u64,
+    kind: FileKind,
+    health: Health,
+    fragments: Box<[Fragment]>,
+}
+
+impl Carved {
+    /// The finding as it was emitted.
+    fn finding(&self) -> Finding {
+        Finding {
+            id: self.id,
+            start: self.start,
+            len: self.len,
+            kind: self.kind,
+            health: self.health,
+            fragments: self.fragments.to_vec(),
+            origin: None,
+        }
+    }
 }
 
 /// A finding not yet emitted.
@@ -281,8 +313,18 @@ struct Commit<'a, 's> {
     own: BTreeMap<u64, Vec<Rc<[Fragment]>>>,
     /// Entries (start, finding) in `own`.
     own_len: usize,
-    /// `(heap offset, cluster size, heap end)` of each volume, for the pairing (ruling D13).
+    /// `(heap offset, cluster size, heap end)` of each volume, for the pairing (ruling D13) and the old directories.
     grids: Vec<(u64, u64, u64)>,
+    /// The volumes of the listing (for the old directories, ruling D11).
+    volumes: Vec<Volume>,
+    /// Bytes of a cluster start each volume's old-directory check looks at, by volume index.
+    orphan_heads: Vec<u64>,
+    /// Old-directory candidates kept, in commit order (at most [`MAX_ORPHAN_DIRS`]).
+    dirs: Vec<OrphanDir>,
+    /// Findings emitted without origin on a cluster grid, in id (and start) order (at most [`MAX_FILES`]).
+    carved: Vec<Carved>,
+    /// A cap dropped old-directory candidates or carved findings: some names may be missing (ruling R7).
+    orphans_capped: bool,
 }
 
 #[cfg(test)]
@@ -317,6 +359,24 @@ impl Commit<'_, '_> {
     fn emit_found(&mut self, p: Pending) -> Result<(), EngineError> {
         self.summary.found += 1;
         let f = &p.finding;
+        if f.origin.is_none()
+            && self.grids.iter().any(|&(heap, cluster, end)| {
+                f.start >= heap && f.start < end && (f.start - heap).is_multiple_of(cluster)
+            })
+        {
+            if self.carved.len() < MAX_FILES {
+                self.carved.push(Carved {
+                    id: f.id,
+                    start: f.start,
+                    len: f.len,
+                    kind: f.kind,
+                    health: f.health,
+                    fragments: f.fragments.clone().into_boxed_slice(),
+                });
+            } else {
+                self.orphans_capped = true;
+            }
+        }
         if f.health == Health::Damaged && matches!(f.kind, FileKind::Mp4 | FileKind::Mov) {
             if self.videos.len() < MAX_VIDEOS {
                 self.videos.push(f.clone());
@@ -351,10 +411,39 @@ impl Commit<'_, '_> {
         }
     }
 
-    /// After the scan: pairs `Damaged` moov-less videos with orphan `moov`s and emits each video put back together.
-    fn pair(&mut self) -> Result<(), EngineError> {
+    /// Keeps the old-directory candidates of a block just examined with the rules of [`Commit::keep_moovs`]: one whose
+    /// head overlaps a committed skip range is dropped, and the per-block cap counts only for a block that skip ranges
+    /// do not wholly cover; so is one inside a live range or a directory the listing walked (ruling D11). The global cap
+    /// keeps the first ones in commit order.
+    fn keep_orphans(&mut self, (pos, end): (u64, u64), found: Vec<OrphanDir>, capped: bool) {
+        let skips = pipeline::lock(&self.shared.skips);
+        self.orphans_capped |= capped && !skips.covers(pos, end);
+        let fs = &self.shared.fs;
+        for c in found {
+            let head = self
+                .orphan_heads
+                .get(c.volume as usize)
+                .copied()
+                .unwrap_or(1);
+            if skips.overlaps(c.at, c.at.saturating_add(head))
+                || fs.overlaps_live(c.at, c.at + 1)
+                || fs.overlaps_walked(c.at, c.at + 1)
+            {
+                continue;
+            }
+            if self.dirs.len() < MAX_ORPHAN_DIRS {
+                self.dirs.push(c);
+            } else {
+                self.orphans_capped = true;
+            }
+        }
+    }
+
+    /// After the scan: pairs `Damaged` moov-less videos with orphan `moov`s; returns each video put back together.
+    fn pair(&mut self) -> Result<Vec<Finding>, EngineError> {
+        let mut out = Vec::new();
         if self.videos.is_empty() || self.moovs.is_empty() {
-            return Ok(());
+            return Ok(out);
         }
         let cancel = self.shared.cancel;
         let paired = crate::pairing::pair_videos(
@@ -378,6 +467,79 @@ impl Commit<'_, '_> {
             if self.capped && f.health == Health::Intact {
                 f.health = Health::Partial;
             }
+            out.push(f);
+        }
+        Ok(out)
+    }
+
+    /// After the pairing: the names the old directories give (ruling D11), merged with the pairing's updates, then one
+    /// `Updated` per id, in id order. A finding named by an entry of another recorded size is at most `Partial` when it
+    /// is longer, or when what follows it up to that size (contiguous) is neither padding nor whole files (ruling D6).
+    fn update(&mut self, paired: Vec<Finding>) -> Result<(), EngineError> {
+        let mut out: BTreeMap<u64, Finding> = paired.into_iter().map(|f| (f.id, f)).collect();
+        let cancel = self.shared.cancel;
+        if !self.dirs.is_empty() && !self.carved.is_empty() {
+            let wanted: Vec<(u64, u8)> = self
+                .carved
+                .iter()
+                .map(|r| (r.start, kind_class(r.kind)))
+                .collect();
+            let fs = &self.shared.fs;
+            let (entries, truncated) = orphan_entries(
+                &self.shared.cache,
+                &self.volumes,
+                &self.dirs,
+                &fs.walked,
+                &fs.live,
+                &wanted,
+                cancel,
+            );
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
+            self.summary.listing_truncated |= truncated;
+            for e in entries {
+                let Ok(k) = self.carved.binary_search_by_key(&e.start, |r| r.start) else {
+                    continue;
+                };
+                let r = &self.carved[k];
+                let mut f = out.remove(&r.id).unwrap_or_else(|| r.finding());
+                if f.health == Health::Intact && f.len != e.size {
+                    let end = ranges(f.start, f.len, &f.fragments)
+                        .last()
+                        .map_or(f.start, |p| p.start.saturating_add(p.len));
+                    let fits = f.len < e.size
+                        && tail_fits(
+                            self.shared.formats,
+                            &self.shared.cache,
+                            end,
+                            e.size - f.len,
+                            cancel,
+                        );
+                    if !fits {
+                        f.health = Health::Partial;
+                    }
+                }
+                f.origin = Some(FsOrigin {
+                    volume: e.volume,
+                    folder: e.folder,
+                    name: e.name,
+                    state: FsState::Orphaned,
+                    placement: Placement::Carved,
+                    size: e.size,
+                    created: e.created,
+                    modified: e.modified,
+                });
+                out.insert(f.id, f);
+            }
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
+        }
+        if self.orphans_capped && !self.dirs.is_empty() {
+            self.summary.listing_truncated = true;
+        }
+        for f in out.into_values() {
             self.summary.updated += 1;
             self.emit(Event::Updated(f))?;
         }
@@ -681,6 +843,14 @@ impl Commit<'_, '_> {
 /// reads; one whose header overlaps a committed skip range (those blocks may not be read at all) or lies inside a
 /// non-`Damaged` MP4/MOV/CR3/HEIC finding is dropped.
 ///
+/// After a quick format (ruling D11): every block read is also searched for old directories at the cluster starts of
+/// each volume (a FAT `.`/`..` pair, an exFAT entry set), not inside a live range, a walked directory or (head
+/// included) a committed skip range; at most 65,536. After the pairing they are parsed, and each file entry names the
+/// finding without origin that starts at its first cluster with its kind: that finding comes out as an `Updated` with
+/// `origin { state: Orphaned, placement: Carved, .. }` (folder `?` where the old root's name is lost), at most
+/// `Partial` when its recorded size disagrees (ruling D6). One `Updated` per id, pairing and naming merged, in id order.
+/// See the core README ("File systems: after a quick format").
+///
 /// The scan and every `measure` read through one [`CachedSource`] of `opts.cache_bytes`, so each sector is read from
 /// `source` once and a sector found unreadable is never read again (the pairing step reads the samples it checks and
 /// the `moov`s it loads again, through the same cache). A block wholly inside an `Intact` finding whose bytes
@@ -770,15 +940,23 @@ pub fn scan(
             own: BTreeMap::new(),
             own_len: 0,
             grids,
+            orphan_heads: volumes.iter().map(head_len).collect(),
+            volumes: volumes.clone(),
+            dirs: Vec::new(),
+            carved: Vec::new(),
+            orphans_capped: false,
         };
         commit.summary.listing_truncated = listing_truncated;
-        for volume in volumes {
+        for volume in &volumes {
             commit.emit(Event::Volume {
-                volume,
+                volume: volume.clone(),
                 listing_truncated,
             })?;
         }
-        let mut finder = MoovFinder::default();
+        let mut finders = Finders {
+            orphan: (!volumes.is_empty()).then(|| OrphanFinder::new(&volumes)),
+            ..Finders::default()
+        };
         let mut ahead: VecDeque<Block> = VecDeque::with_capacity(lookahead);
         let mut fill_pos = 0u64;
         loop {
@@ -790,7 +968,7 @@ pub fn scan(
                     return Err(EngineError::Cancelled);
                 }
                 let end = (fill_pos + block).min(total);
-                ahead.push_back(shared.fill(fill_pos, end, workers > 0, &mut finder));
+                ahead.push_back(shared.fill(fill_pos, end, workers > 0, &mut finders));
                 fill_pos = end;
                 shared.cache.forget_coverage_below(fill_pos);
             }
@@ -800,12 +978,15 @@ pub fn scan(
             let read = b.end;
             let (span, moovs, capped) =
                 ((b.pos, b.end), std::mem::take(&mut b.moovs), b.moovs_capped);
+            let (orphans, orphans_capped) = (std::mem::take(&mut b.orphans), b.orphans_capped);
             commit.block(b)?;
             commit.drop_own_below(read);
             commit.keep_moovs(span, moovs, capped);
-            // A `moov` header may start up to 15 bytes before the next block: keep the ranges that could still overlap it.
+            commit.keep_orphans(span, orphans, orphans_capped);
+            // A `moov` header may start up to 15 bytes before the next block, an old directory's head up to
+            // `MAX_HEAD - 1`: keep the skip ranges that could still overlap them.
             let keep_from = read.saturating_sub(MOOV_HEAD);
-            shared.prune_skips(keep_from);
+            shared.prune_skips(read.saturating_sub(MOOV_HEAD.max(MAX_HEAD)));
             commit.own_moovs.drop_below(keep_from);
             commit.emit(Event::Progress { read, total })?;
         }
@@ -816,7 +997,8 @@ pub fn scan(
         if total == 0 {
             commit.emit(Event::Progress { read: 0, total })?;
         }
-        commit.pair()?;
+        let paired = commit.pair()?;
+        commit.update(paired)?;
         Ok(commit.summary)
     })
 }

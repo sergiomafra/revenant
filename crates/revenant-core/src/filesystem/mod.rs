@@ -10,6 +10,7 @@ mod exfat;
 mod fat;
 mod fat_deleted;
 mod listing;
+mod orphans;
 mod partitions;
 
 use crate::cache::CachedSource;
@@ -18,6 +19,7 @@ use partitions::Candidate;
 
 pub(crate) use listing::read_with;
 pub use listing::{FsFile, FsOrigin, FsState, FsTime, Listing, Placement, read};
+pub(crate) use orphans::{MAX_HEAD, OrphanDir, OrphanFinder, head_len, kind_class, orphan_entries};
 
 /// Most volumes reported for one source (the lowest offsets are kept).
 pub(crate) const MAX_VOLUMES: usize = 16;
@@ -53,6 +55,8 @@ pub(crate) const MAX_WALKED_CLUSTERS: u32 = 1 << 28;
 /// Cluster examinations per volume shared by the deleted-file guesses (ruling C7); once spent, the volume's remaining
 /// deleted files are not listed.
 pub(crate) const MAX_GUESS_STEPS: u64 = 1 << 26;
+/// Most old-directory candidates the scan keeps (ruling D11; 16 B each), the first ones in commit order.
+pub(crate) const MAX_ORPHAN_DIRS: usize = 65_536;
 /// Head checks of 512 bytes through the [`Probe`] per listing (ruling D10/C2): 32 MiB read outside the cache at most.
 pub(crate) const MAX_PROBES: usize = 65_536;
 

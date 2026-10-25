@@ -804,6 +804,68 @@ Reads: the boot sector again, the FAT in 32 KiB blocks cached up to 8 MiB (secto
 the bitmap once (≤ 128 KiB per read), each directory cluster once (≤ 128 KiB per read; a deleted folder's clusters
 too), all through the given source. exFAT has no high-word check: no read goes through the `Probe`.
 
+## File systems: after a quick format
+
+A quick format writes a new boot region, new FATs (exFAT: a new bitmap and up-case table) and an empty root, and leaves
+everything else as it was: the old folders' clusters still hold their entries, with each file's name, size, times and
+first cluster. The old root is gone, so the top folders' names are lost. The scan (`scan::scan`, with
+`ScanOptions::filesystems`) uses those old folders to give the photos and videos it finds by their signature their old
+names back (ruling D11). They only ever name findings; they never place data, so a file whose head no format
+recognizes does not come back through them.
+
+- **Which clusters.** While reading its blocks, the scan looks at every cluster start of every volume found (on the
+  volume's grid as it is today: a quick format with the same geometry keeps the old grid). An old FAT folder starts
+  with its `.` entry (11 bytes `".          "`, the directory attribute) then its `..` entry (`"..         "`, the
+  directory attribute), whose cluster names its parent (0 for the root); an old exFAT folder starts with an entry set:
+  a File entry (`0x85`, or `0x05`) with SecondaryCount 2..=18 whose whole set, within the cluster's first 608 bytes,
+  holds together with a valid SetChecksum (the InUse bits forced, as for deleted sets). Not counted: a cluster start
+  inside the listing's live ranges or inside any directory the listing walked (live or deleted, trusted or not), and,
+  as for orphan `moov` candidates, one whose head (64 bytes on FAT, up to 608 on exFAT) overlaps a committed skip range
+  (those blocks may not be read at all). At most 8192 per block (counted only for a block skip ranges do not wholly
+  cover) and 65,536 per scan (the first ones in commit order), 16 B each.
+- **Which findings.** Every finding emitted without origin that starts on a cluster start of a volume is kept (its id,
+  start, length, kind, health and pieces, ≈ 64 B; at most 262,144).
+- **After the search and the pairing,** each old folder is read, in offset order, through the scan's cache: its first
+  cluster, then the next ones while they lie in the heap, are no other old folder's start, are neither live nor walked,
+  can be read and still read as directory entries (FAT: up to the first free entry, long-name parts with a cluster
+  word 0 and short entries with printable name bytes, no reserved attribute bit and no `.`; exFAT: known entry types),
+  at most 2 MiB. Entries are parsed with the live walk's rules (long names with their checksum, exFAT entry sets with
+  their SetChecksum, `/` and NUL in a name become `_`); erased FAT entries and deleted exFAT sets are left out (their
+  names are not whole, and their clusters may have been reused). The volume's entry cap (4,000,000) counts these
+  entries too.
+- **Folder names.** A folder entry gives an old folder its name when its first cluster is that folder's (FAT: and the
+  folder's `..` names the folder holding the entry; exFAT has no `..`): the first such entry in offset order. A folder
+  no entry names is `?`, so a photo of `DCIM/100MSDCF` whose root entry for `DCIM` is gone comes out as
+  `?/100MSDCF/DSC01234.JPG`. At most 32 levels are followed up (and a loop stops): past them the top is `?`. Paths obey
+  the listing's caps (ruling R6): a folder string longer than 4096 bytes, or one past the 64 MiB folder budget, is
+  dropped (the file keeps its name, `folder()` is `None`), and so is a folder whose path with the file's name would
+  pass 4096 bytes.
+- **Which name.** A file entry with a photo/video extension and a size names the finding without origin that starts
+  at its first cluster with the same kind (MP4 and MOV count as one). When several entries name one finding (a file
+  copied to two folders, a cross-link), the latest `modified` wins (a missing one loses), then the lowest folder
+  offset.
+- **The update.** The finding gets `origin: Some(FsOrigin { state: Orphaned, placement: Carved, .. })` with the entry's
+  volume, folder, name, recorded size and times, and comes out again as an `Event::Updated` with the same id. An
+  `Intact` finding named by an entry of another size is at most `Partial` when the finding is longer than the size, or
+  when the bytes from its end (the end of its last piece) up to that size, contiguous and inside the source, are not
+  coherent (the tail check of ruling D6: padding, or up to 8 whole files then padding). Health is otherwise unchanged:
+  the old folder is evidence of a name, never of integrity. A finding the pairing also put back together comes out
+  once, merged (its two pieces and its origin). All `Updated` events, of the pairing and of the old folders, come out
+  one per id, in id order.
+- **Truncation.** When a cap drops old folders (per block or per scan) or kept findings, when the entry cap stops the
+  old folders' parsing, or when the path cap or budget drops a folder, `ScanSummary::listing_truncated` is set (ruling
+  R7; the `Volume` events, emitted before the search, cannot carry it).
+
+Reads: each old folder's clusters once, through the cache, after the search (so read again from the source when the
+cache no longer holds them); a folder's clusters stop at the next old folder of any volume, so within a volume no
+cluster is read for two folders. The tail check reads, through the cache, the bytes between a named finding's end and
+its recorded size.
+
+Memory: the candidates (16 B each, ≤ 65,536 kept, ≤ 131,072 per block read ahead before the block cap) and the kept
+findings (≈ 64 B each plus their pieces, ≤ 262,144) during the search; afterwards, per old folder its name and the
+folder string (each folder held once, ≤ 64 MiB of folder strings), one 2 MiB read at a time, and one best entry per
+kept finding (≈ 150 B plus its name).
+
 ## Inspect
 
 `inspect(source, &Finding) -> Inspection` reads what a found file says about itself: `Metadata` (make, model, lens, serial,
@@ -896,8 +958,10 @@ a probe over the raw source that refuses, without reading it, any range the cach
 
 Reading once, with the file systems: the metadata goes through the cache like every other read. The exceptions are the
 FAT32 high-word heads (at most 65,536 reads of 512 bytes, outside the cache; see Deleted files and folders), the later
-pieces of a fragmented file, which its view may read again when the cache no longer holds them, and the bytes between
-a file's structural end and its recorded size, which the tail check reads (from the cache when the file fits in it).
+pieces of a fragmented file, which its view may read again when the cache no longer holds them, the bytes between
+a file's structural end and its recorded size, which the tail check reads (from the cache when the file fits in it),
+and the old folders of a quick-formatted card, read after the search (see
+[File systems: after a quick format](#file-systems-after-a-quick-format)).
 And the listing runs before the first block, so the cache windows it loads (the boot sectors and probe offsets, the
 FATs, the directories) are read again by the scan when the cache no longer holds them once the scan reaches them:
 directories far into a large card, or, with a cache of a few MiB, the up to 5 windows the volume search loads on a
@@ -951,7 +1015,8 @@ every scan in the process, plus the decoder's internal buffers), plus what each 
 lookahead × block / sector of them), plus the `moov` candidates (16 B each: at most 4096 per block read ahead, and
 4096 kept), the `Damaged` videos kept for pairing (at most 4096 findings), the start of every finding (8 B each) and
 the own-file starts of `Partial` RAWs (at most 65,536 at once, about 50 B each in the ordered map, plus each RAW's
-ranges),
+ranges), the old-directory candidates and the findings they may name (see
+[File systems: after a quick format](#file-systems-after-a-quick-format)),
 plus the file-system listing, kept for the whole scan: at most 262,144 photo/video files and 2^20 pieces, ≈ 355 MiB
 in the worst case at those caps (mostly names; see the Memory paragraph of [File systems: FAT](#file-systems-fat)),
 and while it is read before the first block, a peak of ≈ 640 MiB in the worst case (on exFAT, plus the allocation
@@ -976,7 +1041,8 @@ Events:
 - `Updated(Finding)`: a better version of a finding already reported, which replaces the earlier `Found` with the same
   `id`. Emitted after every `Found` (and the last `Progress`), before `scan` returns, in id order; counted in
   `ScanSummary::updated`. Today: a video put back together with its separated `moov` (see "Video with a separated
-  index").
+  index"), and a finding an old folder of a quick-formatted card names (see
+  [File systems: after a quick format](#file-systems-after-a-quick-format)); one event per id, both merged.
 
 `CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block
 examined and each block read ahead, before and after every event and while waiting for a measurement. Once it is seen no

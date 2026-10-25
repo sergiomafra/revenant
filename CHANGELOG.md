@@ -7,6 +7,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- After a quick format, photos and videos get their old names and folders back when the old folders survive: each one
+  found by its signature that an old folder lists comes out again (`updated`) with its name, the folder path (`?` for a
+  folder whose own name was in the lost root, as in `?/100MSDCF/DSC01234.JPG`) and its dates; a file whose recorded
+  size does not match what was found is at most partial.
 - `revenant-dev` prints the volumes (`volume` lines) and, for each file the file system lists, its name, folder, state
   and dates; `bench` gains an `exfat-card` image.
 - JPEG photo detection: exact length from the marker structure (an embedded EXIF thumbnail does not end the file), health

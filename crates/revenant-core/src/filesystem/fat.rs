@@ -12,9 +12,11 @@ use super::boot::{self, Layout, Root};
 use super::fat_deleted::{FirstBytes, Gone, Probes, high_words, key, pack, set_first};
 use super::listing::{
     Budget, Collector, FsOrigin, FsState, FsTime, Listing, Placement, component, extension,
+    note_walked,
 };
+use super::orphans::OldEntry;
 use super::{FsKind, Limits, Volume, read_exact, u16_at, u32_at};
-use crate::formats::FileKind;
+use crate::formats::{FileKind, Fragment};
 use crate::scan::CancelToken;
 use crate::source::Source;
 
@@ -73,6 +75,7 @@ pub(super) fn walk(
         waiting: Vec::new(),
         later: Vec::new(),
         seen: BTreeSet::new(),
+        walked: Vec::new(),
     };
     let root = match layout.root {
         Root::Fixed { sector, entries } => Region::Fixed {
@@ -88,7 +91,8 @@ pub(super) fn walk(
         w.deleted();
     }
     w.place();
-    let (col, claims) = w.into_parts();
+    let (col, claims, walked) = w.into_parts();
+    out.walked.extend(walked);
     col.finish(&claims, out);
 }
 
@@ -124,6 +128,8 @@ struct Walk<'a, 'b, 'p> {
     later: Vec<Later>,
     /// First clusters of the deleted directories walked (a deleted tree has no claims to stop a loop).
     seen: BTreeSet<u32>,
+    /// The directory clusters read, live and deleted ([`Listing::walked`]).
+    walked: Vec<Fragment>,
 }
 
 /// A first letter to settle (ruling D9) once the live walk is done.
@@ -148,11 +154,16 @@ enum Waiting {
 }
 
 impl<'a> Walk<'a, '_, '_> {
-    /// The collector and the claims; everything else (the first-letter tables, the FAT cache) is freed before
-    /// `finish` builds the listing.
-    fn into_parts(self) -> (Collector<'a>, Claims) {
-        let Walk { col, claims, .. } = self;
-        (col, claims)
+    /// The collector, the claims and the directory clusters read; everything else (the first-letter tables, the FAT
+    /// cache) is freed before `finish` builds the listing.
+    fn into_parts(self) -> (Collector<'a>, Claims, Vec<Fragment>) {
+        let Walk {
+            col,
+            claims,
+            walked,
+            ..
+        } = self;
+        (col, claims, walked)
     }
 
     /// The live tree; false when the walk of the volume must stop there (cancelled, or the entry cap reached).
@@ -532,6 +543,7 @@ impl<'a> Walk<'a, '_, '_> {
                         break;
                     };
                     let cluster = read_exact(source, at, v.cluster_size as usize);
+                    note_walked(&mut self.walked, at, v.cluster_size, self.limits.pieces);
                     if !r.feed(cluster.as_deref()) || k + 1 == clusters {
                         break;
                     }
@@ -557,6 +569,7 @@ impl<'a> Walk<'a, '_, '_> {
                             break;
                         };
                         let cluster = read_exact(source, at, v.cluster_size as usize);
+                        note_walked(&mut self.walked, at, v.cluster_size, self.limits.pieces);
                         if k == 0 {
                             is_dir = cluster
                                 .as_deref()
@@ -765,6 +778,58 @@ impl DirReader<'_> {
             });
         }
         true
+    }
+}
+
+/// An old directory met by the scan (ruling D11), parsed with the live walk's rules ([`DirReader`]): its intact entries
+/// (`.`, `..`, the volume label, long-name parts and erased entries left out), each name sanitized.
+pub(super) struct OldDir<'e> {
+    r: DirReader<'e>,
+}
+
+impl<'e> OldDir<'e> {
+    /// Counts each 32-byte slot in `entries`, up to `cap`.
+    pub(super) fn new(fat32: bool, entries: &'e mut u64, cap: u64) -> Self {
+        OldDir {
+            r: DirReader {
+                fat32,
+                deleted: false,
+                entries,
+                cap,
+                capped: false,
+                long: LongName::default(),
+                gone: Gone::default(),
+                known: Vec::new(),
+                out: Vec::new(),
+            },
+        }
+    }
+
+    /// Parses one chunk (`None`: unreadable); false once the directory has ended or the entry cap is reached.
+    pub(super) fn feed(&mut self, chunk: Option<&[u8]>) -> bool {
+        self.r.feed(chunk)
+    }
+
+    /// The entry cap was reached.
+    pub(super) fn capped(&self) -> bool {
+        self.r.capped
+    }
+
+    /// The intact entries parsed since the last call, in on-disk order.
+    pub(super) fn take(&mut self) -> Vec<OldEntry> {
+        self.r.known.clear();
+        std::mem::take(&mut self.r.out)
+            .into_iter()
+            .filter(|ch| !ch.deleted())
+            .map(|ch| OldEntry {
+                created: fat_time(ch.created.0, ch.created.1, Some(ch.created.2)),
+                modified: fat_time(ch.modified.0, ch.modified.1, None),
+                name: ch.name,
+                dir: ch.dir,
+                first: ch.first,
+                size: ch.size as u64,
+            })
+            .collect()
     }
 }
 
@@ -1152,6 +1217,38 @@ mod tests {
     fn in_live(l: &Listing, b: &FsBuilder, c: u32) -> bool {
         let at = VOL + b.cluster_offset(c);
         l.live.iter().any(|r| r.start <= at && at < r.start + r.len)
+    }
+
+    fn in_walked(l: &Listing, b: &FsBuilder, c: u32) -> bool {
+        let at = VOL + b.cluster_offset(c);
+        l.walked
+            .iter()
+            .any(|r| r.start <= at && at < r.start + r.len)
+    }
+
+    #[test]
+    fn walked_holds_every_directory_read() {
+        let mut b = card();
+        let jpg = b.add("DCIM/100MSDCF/A.JPG", &[1; 1024]);
+        b.add("DCIM/OLD/B.JPG", &[2; 1024]);
+        b.delete("DCIM/OLD", revenant_testkit::fs::DeleteStyle::Camera);
+        let l = list(&b, &Limits::DEFAULT);
+        for dir in ["", "DCIM", "DCIM/100MSDCF", "DCIM/OLD"] {
+            for c in b.clusters(dir) {
+                assert!(in_walked(&l, &b, c), "{dir:?} cluster {c}");
+            }
+        }
+        // The deleted folder is walked but not live; a file's clusters are live but not walked.
+        assert!(!in_live(&l, &b, b.clusters("DCIM/OLD")[0]));
+        assert!(
+            jpg.iter()
+                .all(|&c| in_live(&l, &b, c) && !in_walked(&l, &b, c))
+        );
+        assert!(
+            l.walked
+                .windows(2)
+                .all(|w| w[0].start + w[0].len < w[1].start)
+        );
     }
 
     #[test]
