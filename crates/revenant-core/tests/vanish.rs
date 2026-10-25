@@ -131,13 +131,16 @@ fn shrinking_source_is_gone() {
     }
 }
 
-/// A FAT32 superfloppy holding one JPEG; its first FAT starts at 16 KiB (32 reserved sectors).
+/// A FAT32 superfloppy holding one JPEG; its first FAT starts at 16 KiB (32 reserved sectors). The boot sector, the FATs
+/// and the directories all lie in the first 1 MiB window.
 fn fat_card() -> (Vec<u8>, u64) {
     let mut b = FsBuilder::new(FsType::Fat32, 48 * MIB, 512);
     b.add("DCIM/100CANON/IMG_0001.JPG", &testkit::jpeg(640, 480, 1, 0));
     (b.build(), 32 * 512)
 }
 
+/// The whole listing lies in window 0, so the device vanishes on the listing's very first load; and a cancel during a slow
+/// read of the FAT is `cancelled`. Either way no `Volume` is emitted.
 #[test]
 fn vanished_device_during_the_listing_is_gone() {
     let (vol, fat) = fat_card();
@@ -236,5 +239,49 @@ fn cancel_is_prompt_during_a_long_measurement() {
         );
         assert_eq!(code(&r), Some("cancelled"), "{threads}");
         assert!(took < Duration::from_secs(1), "{threads}: {took:?}");
+    }
+}
+
+/// A FAT32 card whose deleted file (Windows style: high word of its first cluster zeroed) lies at cluster 70,000: the
+/// listing finds it by probing the head of cluster 70,000 (35 MiB) with a raw 512-byte read beside the cache, which loads
+/// only the first window. The device vanishes there: only the probe sees it, and the listing is never used (ruling P3).
+#[test]
+fn vanished_device_seen_only_by_the_listing_probe_is_gone() {
+    let mut b = FsBuilder::new(FsType::Fat32, 48 * MIB, 512);
+    b.add("DCIM/100CANON/IMG_0001.JPG", &testkit::jpeg(160, 120, 1, 0));
+    let photo = testkit::jpeg(160, 120, 2, 0);
+    let n = (photo.len() as u32).div_ceil(512);
+    b.add_at(
+        "DCIM/100CANON/IMG_0002.JPG",
+        &photo,
+        &(70_000..70_000 + n).collect::<Vec<_>>(),
+    );
+    b.delete(
+        "DCIM/100CANON/IMG_0002.JPG",
+        testkit::fs::DeleteStyle::WindowsFat32,
+    );
+    let vol = b.build();
+    let probe_at = b.cluster_offset(70_000);
+    let default_cache = ScanOptions::default().cache_bytes;
+    // Without the vanish: the probe reads that head first, before any load through the cache reaches it.
+    let source = SimSource::new(vol.clone());
+    let (r, events) = run(&source, &opts(1, default_cache), &CancelToken::default());
+    r.unwrap();
+    assert!(matches!(events[0], Event::Volume { .. }));
+    let reads = source.reads();
+    let first = reads
+        .iter()
+        .position(|&(o, l)| o + l as u64 > probe_at)
+        .unwrap();
+    assert_eq!(reads[first], (probe_at, 512));
+    for threads in [1, 8] {
+        let source = SimSource::new(vol.clone()).gone_at(probe_at);
+        let (r, events) = run(
+            &source,
+            &opts(threads, default_cache),
+            &CancelToken::default(),
+        );
+        assert_eq!(code(&r), Some("device_gone"), "{threads}");
+        assert!(events.is_empty(), "{threads}: {events:?}");
     }
 }

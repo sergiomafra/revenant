@@ -212,6 +212,11 @@ impl<'a> CachedSource<'a> {
         self.lock().gone.get_or_insert(offset);
     }
 
+    /// Whether the cache's cancel token is set or the source has vanished: a reader beside the cache stops reading then.
+    pub(crate) fn stopped(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) || self.gone().is_some()
+    }
+
     fn check_cancel(&self) -> Result<(), EngineError> {
         match &self.cancel {
             Some(c) if c.is_cancelled() => Err(EngineError::Cancelled),
@@ -398,6 +403,7 @@ impl<'a> CachedSource<'a> {
                 push_run(&mut bad, from, to);
                 continue;
             }
+            self.check_cancel()?;
             let rel = (from - start) as usize;
             let stretch = &mut data[rel..(to - start) as usize];
             match read_full(self.inner, from, stretch) {

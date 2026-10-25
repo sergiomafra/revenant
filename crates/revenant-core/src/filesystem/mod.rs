@@ -100,7 +100,8 @@ impl Limits {
 /// scan's cache. `None` means "does not recognize": a read error, the end of the source, or (ruling C2) a range the
 /// cache already knows to hold an unreadable sector, which is then not read at all. Beside the scan's cache, a source
 /// that vanished (`DeviceGone`, or a short read before its length) is reported to the cache (ruling P3), so the scan
-/// stops with `device_gone` instead of using the listing.
+/// stops with `device_gone` instead of using the listing; and once the scan is cancelled or the source has vanished
+/// nothing is read at all (each check would be one more slow read of a dying card).
 pub(crate) trait Probe {
     fn read512(&self, at: u64) -> Option<[u8; 512]>;
 }
@@ -133,7 +134,7 @@ impl Probe for SourceProbe<'_, '_> {
     fn read512(&self, at: u64) -> Option<[u8; 512]> {
         let end = at.checked_add(512)?;
         if let Some(cache) = self.known_bad
-            && !cache.bad_runs(at, end).is_empty()
+            && (cache.stopped() || !cache.bad_runs(at, end).is_empty())
         {
             return None;
         }
@@ -334,10 +335,25 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
 
-    /// 1 MiB of zeros that has vanished past `gone` (`DeviceGone`), or reads short past it (`short`).
+    /// 1 MiB of zeros that has vanished past `gone` (`DeviceGone`), or reads short past it (`short`); counts its reads.
     struct Vanishing {
         gone: u64,
         short: bool,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl Vanishing {
+        fn new(gone: u64, short: bool) -> Self {
+            Vanishing {
+                gone,
+                short,
+                reads: Default::default(),
+            }
+        }
+
+        fn reads(&self) -> u64 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     impl Source for Vanishing {
@@ -346,6 +362,7 @@ mod tests {
         }
 
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let end = offset + buf.len() as u64;
             if end <= self.gone {
                 buf.fill(0);
@@ -367,7 +384,7 @@ mod tests {
     #[test]
     fn probe_reports_a_vanished_source_to_the_cache() {
         for short in [false, true] {
-            let raw = Vanishing { gone: 8192, short };
+            let raw = Vanishing::new(8192, short);
             let cache = CachedSource::new(&raw, 512, 1 << 20);
             let probe = SourceProbe::beside(&raw, &cache);
             assert!(probe.read512(4096).is_some());
@@ -376,6 +393,27 @@ mod tests {
             let want = if short { 8192 } else { 8192 - 256 };
             assert_eq!(cache.gone(), Some(want), "{short}");
         }
+    }
+
+    #[test]
+    fn probe_beside_a_stopped_cache_reads_nothing() {
+        // Cancelled.
+        let raw = Vanishing::new(u64::MAX, false);
+        let cancel = crate::scan::CancelToken::default();
+        let cache = CachedSource::new(&raw, 512, 1 << 20).with_cancel(cancel.clone());
+        let probe = SourceProbe::beside(&raw, &cache);
+        assert!(probe.read512(4096).is_some());
+        let before = raw.reads();
+        cancel.cancel();
+        assert!(probe.read512(4096).is_none());
+        assert_eq!(raw.reads(), before);
+        // Gone (seen by the cache).
+        let raw = Vanishing::new(u64::MAX, false);
+        let cache = CachedSource::new(&raw, 512, 1 << 20);
+        cache.mark_gone(1 << 19);
+        let probe = SourceProbe::beside(&raw, &cache);
+        assert!(probe.read512(4096).is_none());
+        assert_eq!(raw.reads(), 0);
     }
 
     #[test]

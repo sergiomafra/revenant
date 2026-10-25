@@ -21,7 +21,8 @@ pub enum EngineError {
     },
     #[error("cancelled")]
     Cancelled,
-    /// The source vanished (a card pulled out, a cable cut): never a bad sector. `offset` is where it was seen.
+    /// The source vanished (a card pulled out, a cable cut): never a bad sector. `offset` is the offset of the read that
+    /// failed, or the first byte a short read did not return.
     #[error("device_gone")]
     DeviceGone { offset: u64 },
 }
