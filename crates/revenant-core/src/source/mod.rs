@@ -36,6 +36,22 @@ pub trait Source: Send + Sync {
     fn volume(&self) -> Option<VolumeId>;
 }
 
+/// Fills `buf` from `offset` of a source whose `len()` covers it. A short read means the source vanished there: it is
+/// `DeviceGone` at the first byte missing (ruling D1).
+pub(crate) fn read_full(
+    source: &dyn Source,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<(), EngineError> {
+    let n = source.read_at(offset, buf)?;
+    if n < buf.len() {
+        return Err(EngineError::DeviceGone {
+            offset: offset + n as u64,
+        });
+    }
+    Ok(())
+}
+
 /// Volume of an existing path (file or directory).
 pub fn volume_of(path: &std::path::Path) -> Result<VolumeId, EngineError> {
     let file = platform::open_read_only(path).map_err(|cause| EngineError::Open { cause })?;

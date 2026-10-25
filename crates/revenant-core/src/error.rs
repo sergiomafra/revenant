@@ -21,6 +21,9 @@ pub enum EngineError {
     },
     #[error("cancelled")]
     Cancelled,
+    /// The source vanished (a card pulled out, a cable cut): never a bad sector. `offset` is where it was seen.
+    #[error("device_gone")]
+    DeviceGone { offset: u64 },
 }
 
 impl EngineError {
@@ -32,6 +35,7 @@ impl EngineError {
             Self::DestinationOnSource => "destination_on_source",
             Self::Write { .. } => "write_failed",
             Self::Cancelled => "cancelled",
+            Self::DeviceGone { .. } => "device_gone",
         }
     }
 }
@@ -47,6 +51,7 @@ mod tests {
             "destination_on_source"
         );
         assert_eq!(EngineError::Cancelled.code(), "cancelled");
+        assert_eq!(EngineError::DeviceGone { offset: 0 }.code(), "device_gone");
         let io = || std::io::Error::other("x");
         assert_eq!(
             EngineError::Read {

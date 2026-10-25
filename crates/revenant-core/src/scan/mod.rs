@@ -335,17 +335,12 @@ thread_local! {
 }
 
 impl Commit<'_, '_> {
-    /// Emits `event` unless the scan is cancelled; a cancel seen afterwards stops the scan before anything else is
-    /// emitted.
+    /// Emits `event` unless the scan is cancelled or the source has vanished; either seen afterwards stops the scan
+    /// before anything else is emitted.
     fn emit(&mut self, event: Event) -> Result<(), EngineError> {
-        if self.shared.cancel.is_cancelled() {
-            return Err(EngineError::Cancelled);
-        }
+        self.shared.check()?;
         (self.on_event)(event);
-        if self.shared.cancel.is_cancelled() {
-            return Err(EngineError::Cancelled);
-        }
-        Ok(())
+        self.shared.check()
     }
 
     fn flush_run(&mut self) -> Result<(), EngineError> {
@@ -883,7 +878,13 @@ impl Commit<'_, '_> {
 /// never straddles two blocks. Cancellation is checked before each block examined or read ahead, before and after
 /// every event, while waiting for a measurement and during the pairing step: once it is seen no further event is
 /// emitted, the measuring threads drop their remaining jobs, and the scan returns `Err(Cancelled)` after they have all
-/// stopped; findings still pending and `Updated` events not yet emitted are dropped.
+/// stopped; findings still pending and `Updated` events not yet emitted are dropped. The cache also checks it before each
+/// window load and each sector of a sector-by-sector resolution (ruling D3), so a running measurement ends quickly.
+///
+/// A source that vanishes (ruling D1: `DeviceGone`, or a short read before its length, seen by the cache or by the
+/// FAT32 high-word probe) stops the scan like a cancel, with `Err(DeviceGone)`; its sectors are never reported
+/// `Unreadable`, so the events emitted are a prefix of the scan's events on the whole source. A listing read while
+/// cancelled or after the source vanished is never used (ruling P3): no `Volume` is emitted.
 pub fn scan(
     source: &dyn Source,
     formats: &[Box<dyn Format>],
@@ -896,7 +897,8 @@ pub fn scan(
     let lookahead = opts.lookahead_blocks();
     let threads = opts.resolved_threads();
     let workers = if threads > 1 { threads } else { 0 };
-    let cache = CachedSource::new(source, sector, opts.cache_bytes.max(CACHE_WINDOW));
+    let cache = CachedSource::new(source, sector, opts.cache_bytes.max(CACHE_WINDOW))
+        .with_cancel(cancel.clone());
     let mut shared = Shared::new(cache, formats, cancel, sector);
     let total = shared.total;
     // The file systems first (ruling D1): metadata through the cache, the high-word heads through a probe over the raw
@@ -913,6 +915,8 @@ pub fn scan(
     } else {
         (Vec::new(), false)
     };
+    // A listing read while cancelled or after the source vanished may lack what it could not read: never used (P3).
+    shared.check()?;
     #[cfg(test)]
     {
         shared.reuse = !opts.no_reuse;
@@ -972,15 +976,11 @@ pub fn scan(
         let mut ahead: VecDeque<Block> = VecDeque::with_capacity(lookahead);
         let mut fill_pos = 0u64;
         loop {
-            if cancel.is_cancelled() {
-                return Err(EngineError::Cancelled);
-            }
+            shared.check()?;
             while ahead.len() < lookahead && fill_pos < total {
-                if cancel.is_cancelled() {
-                    return Err(EngineError::Cancelled);
-                }
+                shared.check()?;
                 let end = (fill_pos + block).min(total);
-                ahead.push_back(shared.fill(fill_pos, end, workers > 0, &mut finders));
+                ahead.push_back(shared.fill(fill_pos, end, workers > 0, &mut finders)?);
                 fill_pos = end;
                 shared.cache.forget_coverage_below(fill_pos);
             }
@@ -1011,6 +1011,8 @@ pub fn scan(
         }
         let paired = commit.pair()?;
         commit.update(paired)?;
+        // The pairing and the old directories read through the cache too: a source gone then may have changed them.
+        shared.check()?;
         Ok(commit.summary)
     })
 }

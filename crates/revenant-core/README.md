@@ -14,6 +14,7 @@ Every engine error is an `EngineError`; each variant has a stable `snake_case` c
 | `DestinationOnSource` | `destination_on_source` |
 | `Write`               | `write_failed`          |
 | `Cancelled`           | `cancelled`             |
+| `DeviceGone`          | `device_gone`           |
 
 ```rust
 use revenant_core::EngineError;
@@ -30,6 +31,12 @@ Windows); reading devices directly comes in a later part. `source::volume_of(pat
 path (device id on Unix, volume serial number on Windows), so extraction onto the source's own volume can be refused. A test
 scans `src/source/` to ensure no write-capable open flags are ever introduced, and another checks that the image's bytes and
 modification time are unchanged after a full scan that extracts every finding.
+
+A source that vanishes (a card pulled out, a cable cut) is `EngineError::DeviceGone { offset }` (`device_gone`), never a
+bad sector: a source returns it when it can tell, and a read that comes back short before the length the source announced
+counts as vanished too. The scan stops with it (below), extraction stops with it and removes the incomplete file, and the
+scan's cache never remembers those sectors as unreadable: it keeps the first offset and loads nothing from the source
+again (what it already holds is still served).
 
 `source::Fragmented::new(source, pieces)` is a read-only logical view of pieces (`Fragment { start, len }`, absolute ranges)
 of a source, in the given order: offset 0 is the first byte of the first piece. Each piece is first clamped to the inner
@@ -1066,7 +1073,16 @@ further event is emitted (a cancel from inside the callback makes that event the
 their remaining jobs, and `scan` returns `EngineError::Cancelled` after every thread has stopped (a measurement already
 running is finished first, except a JPEG gap search, which gives up as soon as it sees the cancel, and a `zune-jpeg`
 validation decode, which is skipped when the cancel is seen before waiting for the decode budget or once the budget is
-granted); findings still pending are dropped.
+granted); findings still pending are dropped. Cancellation is also seen inside the reads: the scan's cache checks it
+before loading each 1 MiB window and before each sector of a window resolved sector by sector, and then fails the read
+(keeping nothing), so any measurement still running ends quickly and a slow failing device stops within about one sector
+read.
+
+A source that vanishes during the scan (`DeviceGone`, or a short read) stops it the same way with
+`EngineError::DeviceGone`: it is checked before and after every event and before each block, so the events emitted are
+exactly the first ones of the scan the device would have allowed, with no `Unreadable` for the missing sectors. A
+file-system listing read while cancelled or after the source vanished (including the FAT32 high-word heads read beside
+the cache) is never used: the scan returns that error before emitting any `Volume`.
 
 ## Deduplication
 
@@ -1155,6 +1171,8 @@ nothing is ever overwritten, on case-sensitive and case-insensitive volumes alik
 - A chunk that cannot be read is re-read sector by sector (512 bytes); only the unreadable sectors are written as zeros, so a
   partial file comes out instead of none. Each piece stops at the source's end, even if its length runs past it.
 - A write error returns `write_failed` and removes the incomplete file.
+- A source that vanishes (`device_gone`, or a read coming back short before the source's end) is never written as zeros:
+  the copy stops, the incomplete file is removed and `device_gone` is returned.
 
 ## Grouping
 

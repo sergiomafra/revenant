@@ -13,6 +13,7 @@ mod listing;
 mod orphans;
 mod partitions;
 
+use crate::EngineError;
 use crate::cache::CachedSource;
 use crate::source::Source;
 use partitions::Candidate;
@@ -97,7 +98,9 @@ impl Limits {
 
 /// Reads the head of a cluster for the FAT32 high-word check (ruling D10): 512 bytes from the raw source, outside the
 /// scan's cache. `None` means "does not recognize": a read error, the end of the source, or (ruling C2) a range the
-/// cache already knows to hold an unreadable sector, which is then not read at all.
+/// cache already knows to hold an unreadable sector, which is then not read at all. Beside the scan's cache, a source
+/// that vanished (`DeviceGone`, or a short read before its length) is reported to the cache (ruling P3), so the scan
+/// stops with `device_gone` instead of using the listing.
 pub(crate) trait Probe {
     fn read512(&self, at: u64) -> Option<[u8; 512]>;
 }
@@ -134,7 +137,20 @@ impl Probe for SourceProbe<'_, '_> {
         {
             return None;
         }
-        read_exact(self.source, at, 512)?.try_into().ok()
+        if end > self.source.len() {
+            return None;
+        }
+        let mut buf = [0u8; 512];
+        let gone = match self.source.read_at(at, &mut buf) {
+            Ok(512) => return Some(buf),
+            Ok(n) => at + n as u64,
+            Err(EngineError::DeviceGone { offset }) => offset,
+            Err(_) => return None,
+        };
+        if let Some(cache) = self.known_bad {
+            cache.mark_gone(gone);
+        }
+        None
     }
 }
 
@@ -317,6 +333,50 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 1 MiB of zeros that has vanished past `gone` (`DeviceGone`), or reads short past it (`short`).
+    struct Vanishing {
+        gone: u64,
+        short: bool,
+    }
+
+    impl Source for Vanishing {
+        fn len(&self) -> u64 {
+            1 << 20
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+            let end = offset + buf.len() as u64;
+            if end <= self.gone {
+                buf.fill(0);
+                Ok(buf.len())
+            } else if self.short {
+                let n = self.gone.saturating_sub(offset) as usize;
+                buf[..n].fill(0);
+                Ok(n)
+            } else {
+                Err(EngineError::DeviceGone { offset })
+            }
+        }
+
+        fn volume(&self) -> Option<crate::source::VolumeId> {
+            None
+        }
+    }
+
+    #[test]
+    fn probe_reports_a_vanished_source_to_the_cache() {
+        for short in [false, true] {
+            let raw = Vanishing { gone: 8192, short };
+            let cache = CachedSource::new(&raw, 512, 1 << 20);
+            let probe = SourceProbe::beside(&raw, &cache);
+            assert!(probe.read512(4096).is_some());
+            assert_eq!(cache.gone(), None);
+            assert!(probe.read512(8192 - 256).is_none());
+            let want = if short { 8192 } else { 8192 - 256 };
+            assert_eq!(cache.gone(), Some(want), "{short}");
+        }
+    }
 
     #[test]
     fn crc32_check_value() {

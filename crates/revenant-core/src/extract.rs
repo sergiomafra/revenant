@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::EngineError;
 use crate::naming::{fallback_name, file_name, is_unsafe_char, sanitize, split_name};
 use crate::scan::Finding;
-use crate::source::{Source, volume_of};
+use crate::source::{Source, read_full, volume_of};
 
 /// Copy granularity.
 const CHUNK: usize = 1024 * 1024;
@@ -37,7 +37,9 @@ pub fn extract(
 ///
 /// A file found in pieces is written as its pieces in file order. Stretches that cannot be read are written as zeros, so a
 /// partial file comes out instead of none. Each piece stops at the source's end even if it runs past it.
-/// A write error returns [`EngineError::Write`] and removes the incomplete file.
+/// A write error returns [`EngineError::Write`] and removes the incomplete file. A source that vanishes
+/// ([`EngineError::DeviceGone`], or a read coming back short before the source's length) is never written as zeros: the
+/// copy stops, the incomplete file is removed and `DeviceGone` is returned.
 pub fn extract_as(
     source: &dyn Source,
     finding: &Finding,
@@ -50,10 +52,10 @@ pub fn extract_as(
     }
 
     let (path, mut file) = create_named(dest_dir, finding, name, None)?;
-    if let Err(cause) = copy(source, finding, &mut file) {
+    if let Err(e) = copy(source, finding, &mut file) {
         drop(file);
         let _ = std::fs::remove_file(&path);
-        return Err(EngineError::Write { cause });
+        return Err(e);
     }
     Ok(path)
 }
@@ -115,7 +117,8 @@ pub(crate) fn create_unique(
 }
 
 /// Copies the finding's ranges in file order.
-fn copy(source: &dyn Source, finding: &Finding, out: &mut File) -> std::io::Result<()> {
+fn copy(source: &dyn Source, finding: &Finding, out: &mut File) -> Result<(), EngineError> {
+    let write = |cause| EngineError::Write { cause };
     let mut buf = vec![0u8; CHUNK];
     for range in finding.ranges() {
         // Never past the source's end, whatever the finding claims.
@@ -123,18 +126,20 @@ fn copy(source: &dyn Source, finding: &Finding, out: &mut File) -> std::io::Resu
         let mut pos = range.start;
         while pos < end {
             let n = (end - pos).min(CHUNK as u64) as usize;
-            read_lenient(source, pos, &mut buf[..n]);
-            out.write_all(&buf[..n])?;
+            read_lenient(source, pos, &mut buf[..n])?;
+            out.write_all(&buf[..n]).map_err(write)?;
             pos += n as u64;
         }
     }
-    out.flush()
+    out.flush().map_err(write)
 }
 
-/// Fills `buf` from `offset`; anything unreadable (or missing past the source's end) becomes zeros.
-fn read_lenient(source: &dyn Source, offset: u64, buf: &mut [u8]) {
-    match source.read_at(offset, buf) {
-        Ok(n) => buf[n..].fill(0),
+/// Fills `buf` from `offset` (inside the source); anything unreadable becomes zeros. A vanished source (`DeviceGone`,
+/// or a short read: `buf` lies inside the source's length) is an error, never zeros.
+fn read_lenient(source: &dyn Source, offset: u64, buf: &mut [u8]) -> Result<(), EngineError> {
+    match read_full(source, offset, buf) {
+        Ok(()) => Ok(()),
+        Err(e @ EngineError::DeviceGone { .. }) => Err(e),
         Err(_) => {
             // Retry sector by sector (aligned to absolute sector boundaries) so only bad sectors are lost.
             let mut done = 0;
@@ -142,12 +147,14 @@ fn read_lenient(source: &dyn Source, offset: u64, buf: &mut [u8]) {
                 let abs = offset + done as u64;
                 let step = ((SECTOR - abs % SECTOR) as usize).min(buf.len() - done);
                 let piece = &mut buf[done..done + step];
-                match source.read_at(abs, piece) {
-                    Ok(n) => piece[n..].fill(0),
+                match read_full(source, abs, piece) {
+                    Ok(()) => {}
+                    Err(e @ EngineError::DeviceGone { .. }) => return Err(e),
                     Err(_) => piece.fill(0),
                 }
                 done += step;
             }
+            Ok(())
         }
     }
 }

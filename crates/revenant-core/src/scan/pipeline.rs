@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use super::fs::{FsJobResult, FsPlan, fs_job};
 use super::{CancelToken, HEAD_LEN};
+use crate::EngineError;
 use crate::cache::{CachedSource, Runs};
 use crate::filesystem::{OrphanDir, OrphanFinder};
 use crate::formats::{
@@ -314,6 +315,17 @@ impl<'s> Shared<'s> {
         }
     }
 
+    /// `Err(Cancelled)` once the scan is cancelled, else `Err(DeviceGone)` once the source has vanished (ruling D1).
+    pub(super) fn check(&self) -> Result<(), EngineError> {
+        if self.cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        match self.cache.gone() {
+            Some(offset) => Err(EngineError::DeviceGone { offset }),
+            None => Ok(()),
+        }
+    }
+
     /// Whether a committed skip range holds the sector start `at`.
     pub(super) fn skipped(&self, at: u64) -> bool {
         lock(&self.skips).covers(at, at + 1)
@@ -380,8 +392,15 @@ impl<'s> Shared<'s> {
 
     /// Reads the block `[pos, end)` (or defers it) and, with workers, queues a job for each head to examine and for each
     /// kept file-system file starting in it. `finders` search the bytes read for orphan `moov` candidates and old
-    /// directories.
-    pub(super) fn fill(&self, pos: u64, end: u64, workers: bool, finders: &mut Finders) -> Block {
+    /// directories. Fails (nothing queued) when a window of the block cannot be loaded: the scan was cancelled or the
+    /// source vanished.
+    pub(super) fn fill(
+        &self,
+        pos: u64,
+        end: u64,
+        workers: bool,
+        finders: &mut Finders,
+    ) -> Result<Block, EngineError> {
         let sector = self.sector;
         let sectors = (end - pos).div_ceil(sector) as usize;
         if lock(&self.skips).covers(pos, end) && self.cache.covered(pos, end) {
@@ -396,7 +415,7 @@ impl<'s> Shared<'s> {
             if let Some(o) = &mut finders.orphan {
                 o.reset();
             }
-            return Block {
+            return Ok(Block {
                 pos,
                 end,
                 bad,
@@ -406,7 +425,7 @@ impl<'s> Shared<'s> {
                 moovs_capped: false,
                 orphans: Vec::new(),
                 orphans_capped: false,
-            };
+            });
         }
         let mut bad: Option<Vec<bool>> = None;
         let mut heads = Vec::new();
@@ -450,7 +469,7 @@ impl<'s> Shared<'s> {
                 }
                 at = sector_end;
             }
-        });
+        })?;
         orphans.sort_unstable();
         if orphans.len() > MAX_BLOCK_ORPHANS {
             orphans.truncate(MAX_BLOCK_ORPHANS);
@@ -476,7 +495,7 @@ impl<'s> Shared<'s> {
             drop(q);
             self.queued.notify_all();
         }
-        Block {
+        Ok(Block {
             pos,
             end,
             bad,
@@ -486,7 +505,7 @@ impl<'s> Shared<'s> {
             moovs_capped,
             orphans,
             orphans_capped,
-        }
+        })
     }
 
     /// The head at `at` read now (for a deferred block), if the sector is readable and some format recognizes it.

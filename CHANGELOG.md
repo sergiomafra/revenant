@@ -94,6 +94,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- A card or disk disconnected in the middle of a scan or an extraction stops it with `device_gone` instead of being
+  reported as unreadable sectors (or extracted as zeros); cancelling is prompt on slow or failing devices.
 - A partial RAW (TIFF-based RAW, RAF, CR3) no longer lists its own preview (or full-size JPEG) as a separate photo; a
   damaged RAW still does, and a photo written elsewhere inside a RAW is still found.
 - Videos on a FAT/exFAT card are put back together on cluster boundaries, so more come out intact; a video the file

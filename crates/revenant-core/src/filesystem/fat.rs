@@ -1681,7 +1681,7 @@ mod tests {
             let meta = Counting::new(bytes.clone(), bad);
             let raw = Counting::new(bytes.clone(), bad);
             let cache = CachedSource::new(&meta, 512, 64 << 20);
-            cache.visit(bad.0, bad.1, |_, _, _| {});
+            cache.visit(bad.0, bad.1, |_, _, _| {}).unwrap();
             assert!(!cache.bad_runs(bad.0, bad.1).is_empty());
             let probe = SourceProbe::beside(&raw, &cache);
             let limits = Limits {
