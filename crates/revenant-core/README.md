@@ -823,6 +823,10 @@ recognizes does not come back through them.
   as for orphan `moov` candidates, one whose head (64 bytes on FAT, up to 608 on exFAT) overlaps a committed skip range
   (those blocks may not be read at all). At most 8192 per block (counted only for a block skip ranges do not wholly
   cover) and 65,536 per scan (the first ones in commit order), 16 B each.
+- **A folder longer than a cluster (exFAT).** A later cluster of an old exFAT folder whose first bytes happen to
+  start a whole entry set is a candidate of its own: the first cluster's reading stops there, and the files listed
+  from it on come out under a folder no entry names, as `?/<name>` (FAT continuation clusters never start with `.`, so
+  they are never candidates).
 - **Which findings.** Every finding emitted without origin that starts on a cluster start of a volume is kept (its id,
   start, length, kind, health and pieces, ≈ 64 B; at most 262,144).
 - **After the search and the pairing,** each old folder is read, in offset order, through the scan's cache: its first
@@ -861,7 +865,9 @@ cache no longer holds them); a folder's clusters stop at the next old folder of 
 cluster is read for two folders. The tail check reads, through the cache, the bytes between a named finding's end and
 its recorded size.
 
-Memory: the candidates (16 B each, ≤ 65,536 kept, ≤ 131,072 per block read ahead before the block cap) and the kept
+Memory: the listing's `walked` ranges (merged runs of the directory clusters the walks read, at most 2^20 runs of
+16 B per volume before merging, so ≤ 16 MiB per volume; a directory read in one run costs one), the candidates (16 B
+each, ≤ 65,536 kept, ≤ 131,072 per block read ahead before the block cap) and the kept
 findings (≈ 64 B each plus their pieces, ≤ 262,144) during the search; afterwards, per old folder its name and the
 folder string (each folder held once, ≤ 64 MiB of folder strings), one 2 MiB read at a time, and one best entry per
 kept finding (≈ 150 B plus its name).

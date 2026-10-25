@@ -297,6 +297,8 @@ fn read_dir(
         .saturating_add(u64::from(v.cluster_count).saturating_mul(cs))
         .min(source.len());
     let exfat = v.fs == FsKind::Exfat;
+    // exFAT counts here and adds at the end; the volume's earlier folders count too.
+    let before = *entries;
     let mut fat = OldDir::new(v.fs == FsKind::Fat32, entries, MAX_ENTRIES);
     let mut sets = OldSets::default();
     let mut exfat_entries = 0u64;
@@ -325,7 +327,7 @@ fn read_dir(
         first = false;
         if exfat {
             for e in b.as_chunks::<32>().0 {
-                if exfat_entries >= MAX_ENTRIES {
+                if before.saturating_add(exfat_entries) >= MAX_ENTRIES {
                     capped = true;
                     break 'dir;
                 }
