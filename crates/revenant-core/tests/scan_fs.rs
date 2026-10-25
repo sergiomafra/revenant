@@ -744,3 +744,34 @@ fn moov_inside_a_live_file_is_no_orphan() {
         .expect("the video's first piece");
     assert_eq!(video.health, Health::Damaged);
 }
+
+/// A listed RW2 that measures `Intact` but whose merged finding is only `Partial` (here bytes that are neither padding
+/// nor files after its structure, ruling D6) still hides its own JpgFromRaw, and the thumbnail inside it (ruling R24).
+#[test]
+fn listed_partial_raw_hides_its_own_jpegs() {
+    let r = revenant_testkit::panasonic_rw2(&revenant_testkit::Rw2Options {
+        width: 280,
+        height: 200,
+        raw_format: 4,
+        bits: 12,
+        raw_len: 65_536,
+        strip_len: 0,
+        seed: 3,
+        exif: TestExif::default(),
+    });
+    let mut data = r.bytes.clone();
+    let mut x = 5u64;
+    data.extend((0..3000).map(|_| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x as u8
+    }));
+    let mut b = card();
+    let path = format!("{DIR}/P1000001.RW2");
+    b.add(&path, &data);
+    let ev = events(&placed(&b));
+    let raw = named(&ev, &path);
+    assert_eq!((raw.kind, raw.health), (FileKind::Rw2, Health::Partial));
+    assert_eq!(founds(&ev).len(), 1, "{:#?}", summary(&ev));
+}

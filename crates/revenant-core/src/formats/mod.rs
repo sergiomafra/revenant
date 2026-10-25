@@ -158,9 +158,9 @@ pub trait Format: Send + Sync {
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement>;
 
     /// Embedded files the file at `start` holds in its own data (JPEG previews, thumbnails, JPEG-compressed strips or
-    /// tiles, a CR3's PRVW and full-size JPEG), absolute, at most [`MAX_OWN_FILES`]. Called only for a measurement that
-    /// is not `Intact` (the scan asks only for a `Partial` one, ruling D12): a file found there is the file's own, not
-    /// another photo. The default holds none.
+    /// tiles, a CR3's PRVW and full-size JPEG), absolute, at most [`MAX_OWN_FILES`]. The scan asks for every measurement
+    /// that is not `Damaged` and uses them once the finding is `Partial` (it may lower an `Intact` measurement; rulings
+    /// D12, R24): a file found there is the file's own, not another photo. The default holds none.
     fn own_files(&self, source: &dyn Source, start: u64) -> Vec<Fragment> {
         let _ = (source, start);
         Vec::new()

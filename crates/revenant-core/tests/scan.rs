@@ -1865,3 +1865,24 @@ fn partial_cr3_hides_its_own_jpegs() {
         vec![(8192, FileKind::Cr3, Health::Partial)]
     );
 }
+
+/// A foreign JPEG written at the start of a `Partial` RAW's own JpgFromRaw that runs past the RAW's end is not inside
+/// the RAW: it is found (ruling D12 needs the file wholly inside its owner).
+#[test]
+fn foreign_jpeg_at_an_own_start_running_past_the_raw_is_found() {
+    let f = unchecked_rw2();
+    let p = f.preview.clone().unwrap();
+    let foreign = testkit::jpeg(1024, 768, 9, 0);
+    let mut img = DiskImage::noise(8192 + p.start + foreign.len() + 65_536, 21);
+    img.put(8192, &f.bytes).put(8192 + p.start, &foreign);
+    let found = scan_found(&img);
+    assert_eq!(
+        found[0],
+        (8192, FileKind::Rw2, Health::Partial),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&((8192 + p.start) as u64, FileKind::Jpeg, Health::Intact)),
+        "{found:?}"
+    );
+}

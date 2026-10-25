@@ -23,16 +23,17 @@ pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A measurement and the file's own embedded files ([`Format::own_files`], only for a `Partial` one: ruling D12).
+/// A measurement and the file's own embedded files ([`Format::own_files`], for any measurement that is not `Damaged`:
+/// the scan or the merge may lower an `Intact` one to `Partial` afterwards; rulings D12, R24).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Measured {
     pub m: Measurement,
-    /// Absolute, at most [`MAX_OWN_FILES`]; empty unless `m` is `Partial`.
+    /// Absolute, at most [`MAX_OWN_FILES`]; empty when `m` is `Damaged`.
     pub own: Vec<Fragment>,
 }
 
 /// The first measurement of the formats that recognize `head`, as the sequential scan takes it, with the own files of
-/// the format that measured it when it is `Partial`. The one measurement function of every path (a worker, the commit
+/// the format that measured it unless it is `Damaged`. The one measurement function of every path (a worker, the commit
 /// loop, a file-system file's job), so the result does not depend on who ran it. A long measurement gives up once
 /// `cancel` is set (its result is then never used).
 pub(super) fn measure(
@@ -45,7 +46,7 @@ pub(super) fn measure(
     let _scope = CancelScope::enter(cancel);
     formats.iter().filter(|f| f.recognizes(head)).find_map(|f| {
         let m = f.measure(source, at)?;
-        let mut own = if m.health == Health::Partial {
+        let mut own = if m.health != Health::Damaged {
             f.own_files(source, at)
         } else {
             Vec::new()

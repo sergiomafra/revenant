@@ -5,7 +5,7 @@
 mod fs;
 mod pipeline;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,7 +94,7 @@ const MAX_THREADS: usize = 64;
 /// plus about 200 B per recognized sector start in the read-ahead (at most lookahead × block / sector of them), plus the
 /// orphan `moov` candidates and `Damaged` videos kept for pairing (at most 4096 + 4096 per block read ahead, and 4096
 /// findings) and the start of every finding (8 B each), plus the own-file starts of `Partial` RAWs (at most 65,536,
-/// 24 B each, with each RAW's ranges), plus the file-system listing: up to 262,144 files and 2^20
+/// about 50 B each, plus each RAW's ranges), plus the file-system listing: up to 262,144 files and 2^20
 /// pieces, ≈ 355 MiB kept for the whole scan in the worst case at those caps, with a peak of ≈ 640 MiB while it is read
 /// (on exFAT, plus the allocation bitmap, ≤ 32 MiB, and the root entries waiting for it, ≤ 68 MiB; core README), and,
 /// after the scan, the pairing step's one `moov` and its sample lists (up to about 128 MiB). So with
@@ -276,9 +276,11 @@ struct Commit<'a, 's> {
     starts: Vec<u64>,
     /// The next kept file-system file the walk has not reached (index in `FsPlan::kept`).
     next_kept: usize,
-    /// Where an own file of a `Partial` finding starts, with that finding's ranges, ascending by start (ruling D12; at
+    /// Where an own file of a `Partial` finding starts → the ranges of each such finding, in add order (ruling D12; at
     /// most [`MAX_OWN_STARTS`], pruned below the scan position).
-    own: Vec<(u64, Rc<[Fragment]>)>,
+    own: BTreeMap<u64, Vec<Rc<[Fragment]>>>,
+    /// Entries (start, finding) in `own`.
+    own_len: usize,
     /// `(heap offset, cluster size, heap end)` of each volume, for the pairing (ruling D13).
     grids: Vec<(u64, u64, u64)>,
 }
@@ -489,18 +491,19 @@ impl Commit<'_, '_> {
     /// Ruling D12: whether the carved measurement `m` at `at` is the own file of an earlier `Partial` finding, one of
     /// whose own files starts at `at` and whose ranges hold all of `m`'s.
     fn is_own(&self, at: u64, m: &Measurement) -> bool {
-        let i = self.own.partition_point(|(s, _)| *s < at);
-        let inner = ranges(at, m.len, &m.fragments);
-        self.own[i..]
-            .iter()
-            .take_while(|(s, _)| *s == at)
-            .any(|(_, owner)| within(&inner, owner))
+        self.own.get(&at).is_some_and(|owners| {
+            let inner = ranges(at, m.len, &m.fragments);
+            owners.iter().any(|owner| within(&inner, owner))
+        })
     }
 
     /// Forgets the own-file starts below `pos` (the walk is past them).
     fn drop_own_below(&mut self, pos: u64) {
-        let n = self.own.partition_point(|(s, _)| *s < pos);
-        self.own.drain(..n);
+        while let Some(entry) = self.own.first_entry()
+            && *entry.key() < pos
+        {
+            self.own_len -= entry.remove().len();
+        }
     }
 
     /// The index of the kept file-system file starting at `at`, if any (`at` only grows during a scan).
@@ -615,15 +618,19 @@ impl Commit<'_, '_> {
         }
         if m.health == Health::Partial && !own.is_empty() {
             let owner: Rc<[Fragment]> = ranges.clone().into();
-            for o in own {
-                if o.start <= at
-                    || !o.start.is_multiple_of(sector)
-                    || self.own.len() >= MAX_OWN_STARTS
-                {
-                    continue;
+            let mut starts: Vec<u64> = own
+                .iter()
+                .map(|o| o.start)
+                .filter(|&s| s > at && s.is_multiple_of(sector))
+                .collect();
+            starts.sort_unstable();
+            starts.dedup();
+            for s in starts {
+                if self.own_len >= MAX_OWN_STARTS {
+                    break;
                 }
-                let i = self.own.partition_point(|(s, _)| *s <= o.start);
-                self.own.insert(i, (o.start, Rc::clone(&owner)));
+                self.own.entry(s).or_default().push(Rc::clone(&owner));
+                self.own_len += 1;
             }
         }
         self.starts.push(at);
@@ -760,7 +767,8 @@ pub fn scan(
             capped: false,
             starts: Vec::new(),
             next_kept: 0,
-            own: Vec::new(),
+            own: BTreeMap::new(),
+            own_len: 0,
             grids,
         };
         commit.summary.listing_truncated = listing_truncated;

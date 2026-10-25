@@ -841,17 +841,20 @@ file never hides the rest of the disk; a damaged file may then overlap another f
 (not just the block), so files may cross block boundaries. Before the first block the scan reads the source's file
 systems (below), so the files they list come out with their name, folder and dates, once each.
 
-A `Partial` RAW's own JPEGs (ruling D12): when a measurement is `Partial`, the format that measured it also lists the
-embedded files it references in its own data (`Format::own_files`: a TIFF RAW's previews and JPEG-coded strips/tiles, a
-RAF's embedded JPEG, a CR3's `PRVW` and full-size JPEG; at most 64), in the same measuring step on every path (a
-measuring thread, the scan thread, a listed file's job, whose view offsets are mapped back through its pieces), so the
-events do not depend on who measured. For a listed file the own files are those of the measurement its finding took
-(the view's, or the carving's when it replaced the view). The scan keeps their sector-aligned starts after the RAW's
-start, with the RAW's ranges (at most 65,536 at once, dropped once the walk is past them). A file found by its
-signature alone at one of those starts whose ranges lie wholly inside that RAW's is not reported (it gets no id);
-when it measures `Intact` it still skips its range (ruling R10), so a thumbnail inside a hidden preview is not
-reported either. A listed file is always reported, a `Damaged` finding hides nothing, and a foreign file elsewhere in
-the RAW (which cuts it) is found as before.
+A `Partial` RAW's own JPEGs (rulings D12, R24): for every measurement that is not `Damaged`, the format that measured it
+also lists the embedded files it references in its own data (`Format::own_files`: a TIFF RAW's previews and JPEG-coded
+strips/tiles, a RAF's embedded JPEG, a CR3's `PRVW` and full-size JPEG; at most 64), in the same measuring step on every
+path (a measuring thread, the scan thread, a listed file's job, whose view offsets are mapped back through its pieces),
+so the events do not depend on who measured. An `Intact` measurement needs them too: the finding may still come out
+`Partial` (a listed file whose placement is not trusted, whose tail is not coherent or whose view joined pieces; a
+carved file over live clusters, ruling D7). For a listed file the own files are those of the measurement its finding
+took (the view's, or the carving's when it replaced the view). When the finding is `Partial`, the scan keeps their
+distinct sector-aligned starts after the RAW's start, each with the RAW's ranges (at most 65,536 at once, in an ordered
+map, dropped once the walk is past them). A file found by its signature alone at one of those starts whose ranges lie
+wholly inside that RAW's is not reported (it gets no id); when its own measurement is `Intact` it still skips its range
+(ruling R10), so a thumbnail inside a hidden preview is not reported either. A listed file is always reported, a
+`Damaged` finding hides nothing, and a foreign file elsewhere in the RAW (which cuts it), or one at an own start that
+runs past the RAW's end, is found as before.
 
 ### File systems in the scan
 
@@ -947,7 +950,8 @@ every scan in the process, plus the decoder's internal buffers), plus what each 
 200 B per recognized sector start in the read-ahead (at most
 lookahead × block / sector of them), plus the `moov` candidates (16 B each: at most 4096 per block read ahead, and
 4096 kept), the `Damaged` videos kept for pairing (at most 4096 findings), the start of every finding (8 B each) and
-the own-file starts of `Partial` RAWs (at most 65,536 at once, 24 B each, with each RAW's ranges),
+the own-file starts of `Partial` RAWs (at most 65,536 at once, about 50 B each in the ordered map, plus each RAW's
+ranges),
 plus the file-system listing, kept for the whole scan: at most 262,144 photo/video files and 2^20 pieces, ≈ 355 MiB
 in the worst case at those caps (mostly names; see the Memory paragraph of [File systems: FAT](#file-systems-fat)),
 and while it is read before the first block, a peak of ≈ 640 MiB in the worst case (on exFAT, plus the allocation
