@@ -39,9 +39,32 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
 {"event":"found","id":1,"start":0,"len":12345,"kind":"jpeg","health":"intact","width":64,"height":48,"preview":{"start":0,"len":12345,"width":64,"height":48}}
 {"event":"unreadable","start":1044480,"len":4096}
 {"event":"found","id":2,"start":1049088,"len":13507425,"kind":"nef","health":"intact","make":"NIKON CORPORATION","model":"NIKON Z 6","lens":"NIKKOR Z 24-70mm f/4 S","iso":100,"captured_at":"2019-11-29T17:15:20","width":4548,"height":3030,"preview":{"start":3215360,"len":432488,"width":3024,"height":2016}}
-{"event":"summary","found":2,"unreadable_bytes":4096,"updated":0}
+{"event":"summary","found":2,"unreadable_bytes":4096,"updated":0,"listing_truncated":false}
 ```
 
+- When the image holds FAT12/16/32 or exFAT volumes, a `volume` line per volume comes first (before any other line), in
+  offset order; images with no volume print none:
+
+  ```json
+  {"event":"volume","index":0,"fs":"fat32","scheme":"mbr","offset":4194304,"len":50331648,"sector_size":512,"cluster_size":512,"heap_offset":4290048,"cluster_count":98000,"label":"REVENANT","serial":305419896,"from_backup":false,"listing_truncated":false}
+  ```
+
+  `fs`: `fat12`, `fat16`, `fat32` or `exfat`; `scheme`: `none`, `mbr` or `gpt`; `offset`, `len` and `heap_offset` are
+  absolute bytes in the image; `label` is omitted when the volume has none; `from_backup` is true when the backup boot
+  sector had to be used. `listing_truncated` is true when a limit of the file-system listing dropped or degraded some
+  files (some may lack their name, folder or dates); it is the same on every `volume` line and in the summary.
+- A `found` (or `updated`) line for a file the file system lists also carries where it came from: `name`, `path`
+  (`folder/name`, root-relative, `/`-separated; the name alone when the folder is unknown), `state` (`live`, `deleted` or
+  `orphaned`), `placement` (`chain`, `recorded`, `guessed` or `carved`: how its clusters were found), `volume` (the
+  `index` of its `volume` line), `fs_size` (the size the directory entry records) and, when the entry has them,
+  `created` and `modified` (`YYYY-MM-DDTHH:MM:SS` as recorded, with `+HH:MM`/`-HH:MM` when the volume stores the UTC
+  offset):
+
+  ```json
+  {"event":"found","id":1,"start":4296192,"len":2612,"kind":"jpeg","health":"intact","name":"DSC01234.JPG","path":"DCIM/100MSDCF/DSC01234.JPG","state":"live","placement":"chain","volume":0,"fs_size":2612,"modified":"2025-12-14T07:12:06","width":64,"height":48}
+  ```
+
+  Files found by the byte scan alone carry none of these keys, and lines without them are exactly as before.
 - `kind`: `jpeg`, `mp4`, `mov`, `cr2`, `nef`, `arw`, `dng`, `orf`, `rw2`, `raf`, `cr3`, `heic` or `tiff`.
   `health`: `intact`, `partial` or `damaged`.
 - `health` follows the engine: a file containing unreadable sectors is never `intact`. Files inside a `partial` or
@@ -94,6 +117,10 @@ Images (files go back to back, each at the next 512-byte boundary, the rest is s
 - `dense-jpeg`: 8 distinct camera-like JPEGs cycled (3000x2000 from 512 MiB up, else 320x240).
 - `dense-raw`: 4 TIFF-based RAWs (ARW, NEF, CR2, DNG) with a JPEG preview, cycled.
 - `video`: MP4 files with `moov` at the end (256 MiB `mdat` from 512 MiB up, else 8 MiB).
+- `exfat-card`: an exFAT volume (4 KiB clusters) on an MBR disk (first sector 8192) that fills the image, holding the
+  `dense-jpeg` photos as files in `DCIM/100TEST`, every 4th one deleted; `placed` counts them all and `found` should
+  equal it. It measures the scan with the file-system listing. It is built in memory, so its peak memory is the image
+  size (1 GiB at the default `--size-mib`).
 - `cut-jpeg`: like `dense-jpeg` but the second half of every file is noise. It has no speed target (each cut JPEG starts
   a gap search that may re-read its 64 MiB window); it is only measured and reported.
 
@@ -160,6 +187,18 @@ print `skipped: <reason>` and pass.
 It only ever attaches image files it created in a temp directory (`-nobrowse -noverify -noautofsck`, read-only except
 for the helper's own OS-formatted image), detaches only the device `hdiutil attach` printed for them (also on panic),
 and never calls `diskutil`, `sudo` or any real disk, so the "no real disks" rule still holds.
+
+Another opt-in test, in the engine, formats images with the OS (FAT32 and exFAT on MBR, exFAT on GPT, FAT16 without a
+table), writes photos, a RAW, a video and a few bigger files through the mount (deleting some), and scans the result end
+to end:
+
+```sh
+REVENANT_OS_FS=1 cargo test -p revenant-core --test os_filesystems -- --ignored --test-threads=1
+```
+
+It checks that every live file is found once with its path, `Intact` and extracting to the bytes written, and that each
+deleted photo whose clusters were not reused is found `Deleted` and `Intact`. Run it with `--test-threads=1`: every image's
+volume is named `RVT`, so two mounted at once would clash.
 
 ## Real camera samples
 

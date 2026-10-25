@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `revenant-dev` prints the volumes (`volume` lines) and, for each file the file system lists, its name, folder, state
+  and dates; `bench` gains an `exfat-card` image.
 - JPEG photo detection: exact length from the marker structure (an embedded EXIF thumbnail does not end the file), health
   from a real decode.
 - MP4/MOV video detection: exact length from the box structure, health from the `moov` chunk and sample tables; a video

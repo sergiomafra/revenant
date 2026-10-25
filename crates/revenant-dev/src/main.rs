@@ -11,8 +11,8 @@ use clap::{Parser, Subcommand};
 use revenant_core::formats::all_formats;
 use revenant_core::source::{FileSource, Source, VolumeId, volume_of};
 use revenant_core::{
-    CancelToken, EngineError, Event, Finding, Fragment, Inspection, Preview, ScanOptions, extract,
-    inspect, scan,
+    CancelToken, EngineError, Event, Finding, Fragment, Inspection, Preview, ScanOptions, Volume,
+    extract, inspect, scan,
 };
 use revenant_testkit::BenchImage;
 use serde::Serialize;
@@ -55,12 +55,12 @@ enum Command {
         /// Scans per image; the best run is reported.
         #[arg(long, value_name = "N", default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
         runs: u32,
-        /// Images to measure: noise, dense-jpeg, dense-raw, video, cut-jpeg.
+        /// Images to measure: noise, dense-jpeg, dense-raw, video, cut-jpeg, exfat-card.
         #[arg(
             long,
             value_delimiter = ',',
             value_parser = parse_bench_image,
-            default_values = ["noise", "dense-jpeg", "dense-raw", "video", "cut-jpeg"]
+            default_values = ["noise", "dense-jpeg", "dense-raw", "video", "cut-jpeg", "exfat-card"]
         )]
         images: Vec<BenchImage>,
         /// Folder for the temporary images (default: the system temp dir).
@@ -79,6 +79,8 @@ fn parse_bench_image(s: &str) -> Result<BenchImage, String> {
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "lowercase")]
 enum Line {
+    /// A FAT/exFAT volume of the source, before every other line.
+    Volume(Box<VolumeLine>),
     Found(Box<FoundLine>),
     Unreadable {
         start: u64,
@@ -90,7 +92,44 @@ enum Line {
         found: u64,
         unreadable_bytes: u64,
         updated: u64,
+        listing_truncated: bool,
     },
+}
+
+#[derive(Serialize)]
+struct VolumeLine {
+    index: u32,
+    fs: &'static str,
+    scheme: &'static str,
+    offset: u64,
+    len: u64,
+    sector_size: u32,
+    cluster_size: u64,
+    heap_offset: u64,
+    cluster_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    serial: u32,
+    from_backup: bool,
+    listing_truncated: bool,
+}
+
+fn volume_line(v: &Volume, listing_truncated: bool) -> Line {
+    Line::Volume(Box::new(VolumeLine {
+        index: v.index,
+        fs: v.fs.as_str(),
+        scheme: v.scheme.as_str(),
+        offset: v.offset,
+        len: v.len,
+        sector_size: v.sector_size,
+        cluster_size: v.cluster_size,
+        heap_offset: v.heap_offset,
+        cluster_count: v.cluster_count,
+        label: v.label.clone(),
+        serial: v.serial,
+        from_backup: v.from_backup,
+        listing_truncated,
+    }))
 }
 
 #[derive(Serialize)]
@@ -141,6 +180,22 @@ struct FoundLine {
     health: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     fragments: Option<Vec<FragmentLine>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placement: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fs_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     make: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,6 +263,20 @@ fn finding_fields(f: &Finding, details: Inspection, out: Outputs) -> Box<FoundLi
             revenant_core::formats::Health::Damaged => "damaged",
         },
         fragments: fragment_lines(&f.fragments),
+        name: f.origin.as_ref().map(|o| o.name().to_string()),
+        path: f.origin.as_ref().map(|o| o.path()),
+        state: f.origin.as_ref().map(|o| o.state.as_str()),
+        placement: f.origin.as_ref().map(|o| o.placement.as_str()),
+        volume: f.origin.as_ref().map(|o| o.volume),
+        fs_size: f.origin.as_ref().map(|o| o.size),
+        created: f
+            .origin
+            .as_ref()
+            .and_then(|o| o.created.as_ref().map(ToString::to_string)),
+        modified: f
+            .origin
+            .as_ref()
+            .and_then(|o| o.modified.as_ref().map(ToString::to_string)),
         make: m.make,
         model: m.model,
         lens: m.lens,
@@ -380,8 +449,14 @@ fn run_scan(
                     cancel.cancel();
                 }
             }
-            // The scan lines do not show volumes yet.
-            Event::Volume { .. } => {}
+            Event::Volume {
+                volume,
+                listing_truncated,
+            } => {
+                if !emit(&volume_line(&volume, listing_truncated)) {
+                    cancel.cancel();
+                }
+            }
             Event::Progress { read, total } => {
                 let pct = (read * 100).checked_div(total).unwrap_or(100);
                 if pct != last_pct {
@@ -399,6 +474,7 @@ fn run_scan(
         found: summary.found,
         unreadable_bytes: summary.unreadable_bytes,
         updated: summary.updated,
+        listing_truncated: summary.listing_truncated,
     });
     Ok(())
 }

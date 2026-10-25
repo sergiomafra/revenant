@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use revenant_testkit::fs::{FsBuilder, FsStamp, FsType, Partitioning, disk};
 use revenant_testkit::{
     DiskImage, Mp4Options, TestExif, TiffRaw, TiffRawOptions, TiffVariant, jpeg, mp4, tiff_raw,
 };
@@ -472,4 +473,122 @@ fn updated_lines_follow_found_lines() {
     assert_eq!(std::fs::read(second).unwrap(), v.bytes);
     assert_eq!(events[2]["updated"], 1);
     assert_eq!(events[2]["found"], 1);
+}
+
+#[test]
+fn volume_and_origin_keys() {
+    let named = jpeg(64, 48, 3, 0);
+    let stray = jpeg(64, 48, 4, 0);
+    let mut b = FsBuilder::new(FsType::Fat32, 48 << 20, 512);
+    b.mkdir("DCIM/100MSDCF");
+    b.add("DCIM/100MSDCF/DSC01234.JPG", &named);
+    let at = FsStamp {
+        year: 2025,
+        month: 12,
+        day: 14,
+        hour: 7,
+        min: 12,
+        sec: 6,
+        utc_offset_min: None,
+    };
+    b.stamp("DCIM/100MSDCF/DSC01234.JPG", at, at);
+    let free = b.cluster_offset(b.cluster_count() - 200) as usize;
+    let volume = b.build();
+    let mut bytes = disk(
+        Partitioning::Mbr { first_lba: 8192 },
+        &volume,
+        (4 << 20) + volume.len() + 4096,
+    );
+    bytes[(4 << 20) + free..(4 << 20) + free + stray.len()].copy_from_slice(&stray);
+    let mut img = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut img, &bytes).unwrap();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .arg("scan")
+        .arg(img.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events = lines(&out);
+    let v = &events[0];
+    assert_eq!(v["event"], "volume");
+    assert_eq!(v["index"], 0);
+    assert_eq!(v["fs"], "fat32");
+    assert_eq!(v["scheme"], "mbr");
+    assert_eq!(v["offset"], 4194304);
+    assert_eq!(v["sector_size"], 512);
+    assert_eq!(v["cluster_size"], 512);
+    assert_eq!(v["label"], "REVENANT");
+    assert_eq!(v["serial"], 0x1234_5678);
+    assert_eq!(v["from_backup"], false);
+    assert_eq!(v["listing_truncated"], false);
+    let found: Vec<_> = events.iter().filter(|e| e["event"] == "found").collect();
+    assert_eq!(found.len(), 2, "{events:?}");
+    let a = found.iter().find(|f| f.get("name").is_some()).unwrap();
+    assert_eq!(a["name"], "DSC01234.JPG");
+    assert_eq!(a["path"], "DCIM/100MSDCF/DSC01234.JPG");
+    assert_eq!(a["state"], "live");
+    assert_eq!(a["placement"], "chain");
+    assert_eq!(a["volume"], 0);
+    assert_eq!(a["fs_size"], named.len());
+    assert_eq!(a["modified"], "2025-12-14T07:12:06");
+    let other = found.iter().find(|f| f.get("name").is_none()).unwrap();
+    for k in [
+        "path",
+        "state",
+        "placement",
+        "volume",
+        "fs_size",
+        "created",
+        "modified",
+    ] {
+        assert!(other.get(k).is_none(), "{k}: {other}");
+    }
+    let last = events.last().unwrap();
+    assert_eq!(last["event"], "summary");
+    assert_eq!(last["listing_truncated"], false);
+}
+
+#[test]
+fn bench_knows_the_exfat_card() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .args([
+            "bench",
+            "--size-mib",
+            "16",
+            "--runs",
+            "1",
+            "--images",
+            "exfat-card",
+            "--dir",
+        ])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let events = lines(&out);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["image"], "exfat-card");
+    assert!(events[0]["placed"].as_u64().unwrap() >= 4);
+    assert_eq!(events[0]["found"], events[0]["placed"]);
+    let out = Command::cargo_bin("revenant-dev")
+        .unwrap()
+        .args(["bench", "--size-mib", "16", "--runs", "1", "--dir"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let names: Vec<_> = lines(&out)
+        .iter()
+        .map(|e| e["image"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"exfat-card".to_string()), "{names:?}");
 }

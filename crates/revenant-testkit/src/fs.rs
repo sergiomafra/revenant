@@ -1440,6 +1440,20 @@ fn place(d: &mut [u8], lba: u64, volume: &[u8]) {
     d[at..at + volume.len()].copy_from_slice(volume);
 }
 
+/// For an image streamed in two parts (no copy of the volume): records `first_lba` in `volume`'s own boot sector, as
+/// [`disk`] does, and returns the `first_lba` sectors that go before it (zeros but for one MBR entry of the volume's
+/// type, filling the volume to the end of the image).
+pub fn mbr_head(volume: &mut [u8], first_lba: u32) -> Vec<u8> {
+    assert!(first_lba >= 1, "the MBR takes sector 0");
+    let sectors = sectors_of(volume) as u32;
+    set_hidden_sectors(volume, first_lba as u64);
+    let mut head = vec![0u8; first_lba as usize * 512];
+    mbr_entry(&mut head, 0, mbr_type(volume), first_lba, sectors);
+    head[510] = 0x55;
+    head[511] = 0xAA;
+    head
+}
+
 /// Zeros of `disk_len` bytes holding `volume` at the partitioning's offset. MBR: one primary entry, type 0x01 (FAT12),
 /// 0x0E (FAT16), 0x0C (FAT32), 0x07 (exFAT), read from the volume's own boot sector. GPT: protective MBR (0xEE),
 /// header at LBA 1 and entries at LBA 2 (128 × 128 B), backup entries and header at the end, CRC32s set, one Basic
