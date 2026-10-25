@@ -94,10 +94,42 @@ fn resume(
     listing: &[u8],
     point: &Point,
 ) -> (Result<ScanSummary, EngineError>, Vec<Event>) {
+    let (r, events, _) = resume_points(source, opts, listing, point);
+    (r, events)
+}
+
+/// [`resume`], with the checkpoints of the resumed scan.
+fn resume_points(
+    source: &dyn Source,
+    opts: &ScanOptions,
+    listing: &[u8],
+    point: &Point,
+) -> (Result<ScanSummary, EngineError>, Vec<Event>, Vec<Point>) {
     let mut events = Vec::new();
+    let mut points = Vec::new();
     let resume = Resume {
         listing: from_bytes(listing).unwrap(),
         state: from_bytes(&point.state).unwrap(),
+    };
+    let mut hook = |c: Checkpoint| {
+        match c {
+            Checkpoint::Listing(_) => panic!("a resumed scan reads no listing"),
+            Checkpoint::Boundary {
+                read,
+                events,
+                state,
+            } => points.push(Point {
+                events,
+                read: Some(read),
+                state: to_bytes(&state()),
+            }),
+            Checkpoint::Paired { events, state } => points.push(Point {
+                events,
+                read: None,
+                state: to_bytes(&state()),
+            }),
+        }
+        Ok(())
     };
     let r = scan_with(
         source,
@@ -106,9 +138,56 @@ fn resume(
         &CancelToken::default(),
         &mut |e| events.push(e),
         Some(resume),
-        None,
+        Some(&mut hook),
     );
-    (r, events)
+    (r, events, points)
+}
+
+/// What of a saved state does not depend on timing: everything but the coverage, the finders' tails (a block read
+/// ahead may be deferred or read, which resets them or not; the tails have their own test) and the bad runs past the
+/// position (found by read-ahead or measurements whenever they ran).
+fn deterministic(bytes: &[u8]) -> ScanState {
+    let mut s: ScanState = from_bytes(bytes).unwrap();
+    s.coverage.clear();
+    s.tails = Default::default();
+    s.bad = below(&s.bad, s.position);
+    s
+}
+
+/// Resumes `r`'s scan at `p` with `opts`: the events after it, the summary, and the state at every later checkpoint
+/// (its deterministic part) are those of the uninterrupted scan, so a state field not put back is seen at the next
+/// boundary even when it changes no event.
+fn check_resume(name: &str, source: &dyn Source, r: &Recorded, opts: &ScanOptions, p: &Point) {
+    let (got, events, points) = resume_points(source, opts, &r.listing, p);
+    let at = format!(
+        "{name}: threads {} cache {}, resumed at {:?} after {} events",
+        opts.threads, opts.cache_bytes, p.read, p.events
+    );
+    let mut whole = r.events[..p.events as usize].to_vec();
+    whole.extend(events);
+    assert_eq!(whole, r.events, "{at}");
+    assert_eq!(got.unwrap(), r.summary, "{at}");
+    let i = r
+        .points
+        .iter()
+        .position(|q| (q.events, q.read) == (p.events, p.read))
+        .expect("a recorded point");
+    // A resume from the pairing point runs the pairing again, so it reaches that point again.
+    let later = &r.points[if p.read.is_none() { i } else { i + 1 }..];
+    assert_eq!(points.len(), later.len(), "{at}");
+    for (mine, theirs) in points.iter().zip(later) {
+        assert_eq!(
+            (mine.events, mine.read),
+            (theirs.events, theirs.read),
+            "{at}"
+        );
+        assert_eq!(
+            deterministic(&mine.state),
+            deterministic(&theirs.state),
+            "{at}: state at {:?}",
+            theirs.read
+        );
+    }
 }
 
 /// splitmix64.
@@ -142,6 +221,7 @@ fn all_cards() -> Vec<(&'static str, Card)> {
         ("C", cards::c()),
         ("D", cards::d()),
         ("E", cards::e()),
+        ("failing", cards::failing()),
     ]
 }
 
@@ -225,16 +305,34 @@ fn resume_at_any_block_equals_the_whole_scan() {
             let r = record(&card.source, &o);
             assert_eq!(r.events, base, "{name}: threads {threads} cache {cache}");
             for p in chosen(&r.points, 6, (n * 16 + k) as u64) {
-                let (got, events) = resume(&card.source, &o, &r.listing, &p);
-                let mut whole = r.events[..p.events as usize].to_vec();
-                whole.extend(events);
-                assert_eq!(
-                    whole, r.events,
-                    "{name}: threads {threads} cache {cache}, resumed at {:?} after {} events",
-                    p.read, p.events
-                );
-                assert_eq!(got.unwrap(), r.summary, "{name} at {:?}", p.read);
+                check_resume(name, &card.source, &r, &o, &p);
             }
+        }
+    }
+}
+
+#[test]
+fn resume_with_other_threads_and_cache() {
+    // Saved by a scan with 8 threads and 256 MiB, resumed by one with 1 or 16 threads and a 1 MiB cache.
+    for (n, (name, card)) in all_cards().into_iter().enumerate() {
+        let r = record(&card.source, &opts(8, 256 << 20));
+        for (k, threads) in [1, 16].into_iter().enumerate() {
+            for p in chosen(&r.points, 3, (n * 4 + k) as u64 + 1000) {
+                check_resume(name, &card.source, &r, &opts(threads, 1 << 20), &p);
+            }
+        }
+    }
+}
+
+/// Release builds only (about 10 minutes in a debug build): every boundary of every card, one configuration.
+#[cfg(not(debug_assertions))]
+#[test]
+fn resume_at_every_boundary() {
+    for (name, card) in all_cards() {
+        let o = opts(8, 1 << 20);
+        let r = record(&card.source, &o);
+        for p in &r.points {
+            check_resume(name, &card.source, &r, &o, p);
         }
     }
 }
@@ -277,7 +375,14 @@ fn below(runs: &[(u64, u64)], end: u64) -> Vec<(u64, u64)> {
 
 #[test]
 fn resume_never_rereads_known_bad_sectors() {
-    for (name, card) in [("A", cards::a()), ("B", cards::b()), ("C", cards::c())] {
+    // A with a bad sector inside its video's first part: the pairing, run again by every resume, reads around it far
+    // below the position (P5's below-position half).
+    for (name, card) in [
+        ("A", cards::a()),
+        ("A, bad in the video", cards::a_bad_in_video()),
+        ("B", cards::b()),
+        ("C", cards::c()),
+    ] {
         let o = opts(8, 1 << 20);
         let r = record(&card.source, &o);
         let boundaries: Vec<Point> = r
@@ -292,8 +397,8 @@ fn resume_never_rereads_known_bad_sectors() {
             .iter()
             .filter_map(|&(_, e)| boundaries.iter().find(|p| p.read.unwrap() >= e).cloned())
             .collect();
+        picks.truncate(3);
         picks.push(boundaries.last().unwrap().clone());
-        picks.truncate(4);
         assert!(!picks.is_empty());
         for p in picks {
             let pos = p.read.unwrap();
@@ -575,6 +680,43 @@ fn a_state_off_the_scan_is_corrupt() {
             .code()
     };
     assert_eq!(bad(|s| s.position += 512), "session_corrupt");
+    // Saved by a scan of another shape (ruling P44).
+    assert_eq!(bad(|s| s.shape.block *= 2), "session_corrupt");
+    assert_eq!(bad(|s| s.shape.sector = 4096), "session_corrupt");
+    assert_eq!(bad(|s| s.shape.filesystems = false), "session_corrupt");
+    assert_eq!(bad(|s| s.shape.total += 512), "session_corrupt");
+    let other = |o: ScanOptions| {
+        resume(&card.source, &o, &r.listing, p)
+            .0
+            .unwrap_err()
+            .code()
+    };
+    assert_eq!(
+        other(ScanOptions {
+            block: 2 << 20,
+            ..opts(2, 256 << 20)
+        }),
+        "session_corrupt"
+    );
+    assert_eq!(
+        other(ScanOptions {
+            sector: 4096,
+            ..opts(2, 256 << 20)
+        }),
+        "session_corrupt"
+    );
+    assert_eq!(
+        other(ScanOptions {
+            filesystems: false,
+            ..opts(2, 256 << 20)
+        }),
+        "session_corrupt"
+    );
+    let shorter = SimSource::new(cards::noise(card.source.len() - 512, 1));
+    assert_eq!(
+        resume(&shorter, &o, &r.listing, p).0.unwrap_err().code(),
+        "session_corrupt"
+    );
     assert_eq!(bad(|s| s.position = 64 * MIB), "session_corrupt");
     assert_eq!(bad(|s| s.skips = vec![(10, 5)]), "session_corrupt");
     assert_eq!(
@@ -593,4 +735,25 @@ fn a_state_off_the_scan_is_corrupt() {
         from_bytes::<ScanState>(&to_bytes(&s)),
         Err(EngineError::SessionCorrupt)
     ));
+}
+
+#[test]
+fn the_caps_flags_come_back() {
+    // No card reaches a cap; a state saying one was reached keeps saying it after a resume (it lowers a pairing's
+    // health at the end).
+    let card = cards::d();
+    let o = opts(2, 256 << 20);
+    let r = record(&card.source, &o);
+    let mut state: ScanState = from_bytes(&r.points[0].state).unwrap();
+    assert!(!state.capped && !state.orphans_capped);
+    state.capped = true;
+    state.orphans_capped = true;
+    let p = Point {
+        state: to_bytes(&state),
+        ..r.points[0].clone()
+    };
+    let (got, _, points) = resume_points(&card.source, &o, &r.listing, &p);
+    got.unwrap();
+    let next: ScanState = from_bytes(&points[0].state).unwrap();
+    assert!(next.capped && next.orphans_capped);
 }

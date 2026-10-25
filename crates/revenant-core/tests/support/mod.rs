@@ -803,6 +803,17 @@ pub mod cards {
         a_with(true)
     }
 
+    /// Card A with one more unreadable sector, inside the video's first part (8 KiB in): the pairing, after the scan,
+    /// reads around it, far below the last positions (it may then fail to pair; the events are what they are).
+    pub fn a_bad_in_video() -> Card {
+        let mut c = a();
+        let at = A_VIDEO + 8 * KIB;
+        c.source = c.source.bad(at, 512);
+        c.bad.push((at, at + 512));
+        c.bad.sort_unstable();
+        c
+    }
+
     /// FAT32, 48 MiB, 512-byte clusters.
     fn fat32() -> FsBuilder {
         FsBuilder::new(FsType::Fat32, 48 * MIB, 512)
@@ -937,12 +948,15 @@ pub mod cards {
         c
     }
 
-    /// 16 MiB of noise with 20 isolated unreadable sectors 256 KiB apart from 1 MiB on: `DiskFailing` fires at a block
-    /// boundary.
+    /// 16 MiB of noise with 20 isolated unreadable sectors 256 KiB apart from 1 MiB on (`DiskFailing` fires at a block
+    /// boundary), then a run across the 8 MiB boundary (`[8 MiB - 1 KiB, 8 MiB + 1 KiB)`) and one ending at the 10 MiB
+    /// boundary: at both boundaries an unreadable run is still open.
     pub fn failing() -> Card {
-        let bad = (0..20)
+        let mut bad: Vec<(u64, u64)> = (0..20)
             .map(|i| (MIB + i * 256 * KIB, MIB + i * 256 * KIB + 512))
             .collect();
+        bad.push((8 * MIB - KIB, 8 * MIB + KIB));
+        bad.push((10 * MIB - 512, 10 * MIB));
         card(noise(16 * MIB, 45), bad)
     }
 }

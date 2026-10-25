@@ -15,9 +15,21 @@ use crate::filesystem::{Listing, MAX_FILES, MAX_ORPHAN_DIRS, OrphanDir};
 use crate::formats::Fragment;
 use crate::scan::Finding;
 
+/// What a state is valid for: a scan of a source of `total` bytes, with these sector and block sizes (as the scan uses
+/// them: normalized) and file systems on or off (ruling P44). A state is resumed only by a scan of the same shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Shape {
+    pub(super) sector: u64,
+    pub(super) block: u64,
+    pub(super) filesystems: bool,
+    pub(super) total: u64,
+}
+
 /// A scan's state at a block boundary, right after its `Progress` (and its `DiskFailing`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScanState {
+    /// The scan it belongs to.
+    shape: Shape,
     /// The next block's start.
     position: u64,
     /// Events emitted so far, every one but `Rate` (ruling P4).
@@ -102,6 +114,7 @@ pub(super) fn capture(
     shared: &Shared,
     ahead: &VecDeque<Block>,
     finders: &Finders,
+    shape: Shape,
     position: u64,
 ) -> ScanState {
     // Every field named: a new one fails to compile until it is saved or listed as rebuilt.
@@ -138,6 +151,7 @@ pub(super) fn capture(
         .map_or_else(|| finders.tails(), |b| b.tails.clone());
     let (bad, coverage) = shared.cache.snapshot(position);
     ScanState {
+        shape,
         position,
         events: *events,
         summary: summary.clone(),
@@ -172,17 +186,18 @@ fn corrupt<T>() -> Result<T, EngineError> {
 }
 
 impl ScanState {
-    /// Puts the state back into a fresh scan of `total` bytes in `block`-byte blocks: the commit loop, the skip ranges,
-    /// the finders and the cache (before anything is read). Returns the position to read from. `SessionCorrupt` when
-    /// the state cannot belong to such a scan.
+    /// Puts the state back into a fresh scan of `shape`: the commit loop, the skip ranges, the finders and the cache
+    /// (before anything is read). Returns the position to read from. `SessionCorrupt` when the state cannot belong to
+    /// such a scan: saved by a scan of another shape (ruling P44), or not consistent with it.
     pub(super) fn apply(
         self,
         commit: &mut Commit,
         shared: &Shared,
         finders: &mut Finders,
-        block: u64,
+        shape: Shape,
     ) -> Result<u64, EngineError> {
         let ScanState {
+            shape: saved,
             position,
             events,
             summary,
@@ -207,8 +222,11 @@ impl ScanState {
             bad,
             coverage,
         } = self;
-        let total = shared.total;
-        if position > total || (position != total && !position.is_multiple_of(block)) {
+        let (total, block) = (shape.total, shape.block);
+        if saved != shape
+            || position > total
+            || (position != total && !position.is_multiple_of(block))
+        {
             return corrupt();
         }
         if !own.windows(2).all(|w| w[0].0 < w[1].0) {
@@ -340,9 +358,33 @@ impl Codec for FinderTails {
     }
 }
 
+impl Codec for Shape {
+    fn enc(&self, e: &mut Enc) {
+        let Shape {
+            sector,
+            block,
+            filesystems,
+            total,
+        } = self;
+        e.u64(*sector);
+        e.u64(*block);
+        e.bool(*filesystems);
+        e.u64(*total);
+    }
+    fn dec(d: &mut Dec) -> Result<Self, EngineError> {
+        Ok(Shape {
+            sector: d.u64()?,
+            block: d.u64()?,
+            filesystems: d.bool()?,
+            total: d.u64()?,
+        })
+    }
+}
+
 impl Codec for ScanState {
     fn enc(&self, e: &mut Enc) {
         let ScanState {
+            shape,
             position,
             events,
             summary,
@@ -367,6 +409,7 @@ impl Codec for ScanState {
             bad,
             coverage,
         } = self;
+        e.put(shape);
         e.u64(*position);
         e.u64(*events);
         e.put(summary);
@@ -394,6 +437,7 @@ impl Codec for ScanState {
 
     fn dec(d: &mut Dec) -> Result<Self, EngineError> {
         let state = ScanState {
+            shape: d.get()?,
             position: d.u64()?,
             events: d.u64()?,
             summary: d.get()?,

@@ -87,6 +87,16 @@ fn corrupt<T>() -> Result<T, EngineError> {
     Err(EngineError::SessionCorrupt)
 }
 
+/// Most items reserved ahead for a decoded sequence: a count is checked only against the bytes that remain (each item
+/// takes at least one), while an item in memory may take hundreds of bytes, so a damaged count must not reserve that
+/// much at once. Past it the vector grows as items actually decode.
+const MAX_PREALLOC: usize = 1024;
+
+/// The capacity reserved for a sequence of `n` items.
+pub(crate) fn prealloc(n: usize) -> usize {
+    n.min(MAX_PREALLOC)
+}
+
 impl<'a> Dec<'a> {
     pub(crate) fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
@@ -158,7 +168,7 @@ impl<'a> Dec<'a> {
 
     pub(crate) fn seq<T: Codec>(&mut self) -> Result<Vec<T>, EngineError> {
         let n = self.count()?;
-        let mut out = Vec::with_capacity(n);
+        let mut out = Vec::with_capacity(prealloc(n));
         for _ in 0..n {
             out.push(T::dec(self)?);
         }
@@ -730,6 +740,22 @@ mod tests {
             from_bytes::<SourceIdentity>(&to_bytes(&deeper)),
             Err(EngineError::SessionCorrupt)
         ));
+    }
+
+    #[test]
+    fn an_inflated_count_reserves_little_and_is_corruption() {
+        // A count as large as the bytes that remain (it passes `count`), over items that do not decode: corruption,
+        // with a bounded reservation (an unbounded one of 64 Mi findings would need gigabytes).
+        let mut e = Enc::new();
+        e.len(64 << 20);
+        let mut bytes = e.into_bytes();
+        bytes.resize(4 + (64 << 20), 0xFF);
+        assert!(matches!(
+            from_bytes::<Vec<Finding>>(&bytes),
+            Err(EngineError::SessionCorrupt)
+        ));
+        assert_eq!(prealloc(64 << 20), MAX_PREALLOC);
+        assert_eq!(prealloc(3), 3);
     }
 
     #[test]

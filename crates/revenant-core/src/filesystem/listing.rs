@@ -692,7 +692,7 @@ impl Codec for Listing {
     fn dec(d: &mut Dec) -> Result<Self, EngineError> {
         let volumes: Vec<Volume> = d.seq()?;
         let n = d.count()?;
-        let mut files = Vec::with_capacity(n);
+        let mut files = Vec::with_capacity(crate::codec::prealloc(n));
         // Files of one folder share its string again, as when listed.
         let mut folders: std::collections::HashMap<Arc<str>, ()> = Default::default();
         for _ in 0..n {

@@ -1447,7 +1447,9 @@ private; `scan` is `scan_with` with neither a resume nor a hook) hands a hook th
   timing and never part of a saved scan (ruling P4). The state is built only when the hook asks for it.
 - `Paired`, after the pairing step, before the `Updated` events.
 
-**What the state holds** (ruling D22): the position (the next block's start) and the event count; everything the
+**What the state holds** (ruling D22): the shape of the scan it belongs to (the sector and block sizes as the scan
+uses them, file systems on or off, the source's length: a scan of another shape refuses it, ruling P44), the position
+(the next block's start) and the event count; everything the
 in-order half of the scan carries from block to block (the summary, the open unreadable run, the `Unreadable` count and
 whether `DiskFailing` was sent, the findings not yet emitted, the next id, the orphan `moov` candidates and the ranges of
 the ISO BMFF findings that rule some out, the `Damaged` videos kept for pairing, the caps' flags, the start of every
@@ -1458,8 +1460,9 @@ P5) and its coverage from the position on. The capture names every field of the 
 does not compile until it is saved or rebuilt. Rebuilt on resume, not stored: the cluster grids, the volumes and what the
 scan keeps of the listing, from the listing saved once at `Listing`. Encoded with the engine's own binary format (no
 `serde`): integers little-endian, enums by their `as_str` name, every length checked against what remains, so damaged
-bytes (or a state that cannot belong to the scan: a position past the end or off a block boundary, runs out of order, a
-cap passed) are `session_corrupt`, never a panic.
+bytes (or a state that cannot belong to the scan: another shape, a position past the end or off a block boundary, runs
+out of order, a cap passed) are `session_corrupt`, never a panic. A damaged count reserves at most 1024 items ahead (the
+rest grows only as items actually decode), so it cannot make the decoder reserve gigabytes.
 
 **The guarantee**: for a source that answers the same every time (the same bytes, the same unreadable sectors), a scan
 resumed from any checkpoint emits exactly the events the uninterrupted scan emitted after it, ids and summary included,

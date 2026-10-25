@@ -1004,6 +1004,12 @@ pub(crate) fn scan_with(
         .with_cancel(cancel.clone());
     let mut shared = Shared::new(cache, formats, cancel, sector);
     let total = shared.total;
+    let shape = state::Shape {
+        sector,
+        block,
+        filesystems: opts.filesystems,
+        total,
+    };
     let (listing, state) = match resume {
         Some(Resume { listing, state }) => (listing, Some(state)),
         None => {
@@ -1083,7 +1089,7 @@ pub(crate) fn scan_with(
         let resumed = state.is_some();
         // Restored before any read: a known bad sector is never read again (ruling P5).
         let position = match state {
-            Some(state) => state.apply(&mut commit, &shared, &mut finders, block)?,
+            Some(state) => state.apply(&mut commit, &shared, &mut finders, shape)?,
             None => 0,
         };
         for _ in 0..workers {
@@ -1134,7 +1140,7 @@ pub(crate) fn scan_with(
             shared.cache.forget_coverage_below(read);
             commit.progress(read, total)?;
             if let Some(h) = hook.as_mut() {
-                let state = || state::capture(&commit, &shared, &ahead, &finders, read);
+                let state = || state::capture(&commit, &shared, &ahead, &finders, shape, read);
                 h(Checkpoint::Boundary {
                     read,
                     events: commit.events,
@@ -1149,7 +1155,7 @@ pub(crate) fn scan_with(
         if total == 0 && !resumed {
             commit.progress(0, total)?;
             if let Some(h) = hook.as_mut() {
-                let state = || state::capture(&commit, &shared, &ahead, &finders, 0);
+                let state = || state::capture(&commit, &shared, &ahead, &finders, shape, 0);
                 h(Checkpoint::Boundary {
                     read: 0,
                     events: commit.events,
@@ -1161,7 +1167,7 @@ pub(crate) fn scan_with(
         if let Some(h) = hook.as_mut() {
             // A source gone during the pairing: the last boundary stays the point to resume from.
             shared.check()?;
-            let state = || state::capture(&commit, &shared, &ahead, &finders, total);
+            let state = || state::capture(&commit, &shared, &ahead, &finders, shape, total);
             h(Checkpoint::Paired {
                 events: commit.events,
                 state: &state,
