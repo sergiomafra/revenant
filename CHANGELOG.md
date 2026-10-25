@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A bad-sector-tolerant, resumable copy of a card or disk into an image file: the readable parts are copied first, the
+  damaged areas are skipped and come back later sector by sector, each bad sector is read once (no retries unless
+  asked), and the copy reports bytes rescued, bad and left, speed and time left. It resumes where it stopped after a
+  crash, a cancel or the card being pulled out (which never marks sectors bad), refuses to resume onto another card, and
+  refuses up front a destination without room for it or on FAT32 when the card is over 4 GiB (the image is never split).
 - Scanning a card image together with its rescue map treats the parts of the card that were never rescued as unreadable,
   never as zeros, so no photo or video in them is called intact. The map (`<image>.rvmap`) is saved so that a crash
   or power loss leaves the previous map or the new one, never a damaged one.

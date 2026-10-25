@@ -94,8 +94,8 @@ pub struct MapTotals {
 }
 
 /// The map of a rescue copy: merged regions covering `[0, size)` (neighbors always differ in state), the source's
-/// identity, and the pass with its position.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// identity, and the pass with its position. Two maps are equal when all of that is (the region cap is not compared).
+#[derive(Clone, Debug)]
 pub struct RescueMap {
     size: u64,
     sector: u32,
@@ -106,6 +106,29 @@ pub struct RescueMap {
     pos: u64,
     cap: usize,
 }
+
+impl PartialEq for RescueMap {
+    fn eq(&self, other: &RescueMap) -> bool {
+        // `cap` is a limit of this copy in memory, not part of what the map says (a loaded map has the default one).
+        let RescueMap {
+            size,
+            sector,
+            identity,
+            regions,
+            pass,
+            pos,
+            cap: _,
+        } = self;
+        *size == other.size
+            && *sector == other.sector
+            && *identity == other.identity
+            && *regions == other.regions
+            && *pass == other.pass
+            && *pos == other.pos
+    }
+}
+
+impl Eq for RescueMap {}
 
 /// The map file of an image: `<image>.rvmap`.
 pub fn map_path(image: &Path) -> PathBuf {
@@ -166,6 +189,11 @@ impl RescueMap {
             pos,
             cap: MAX_MAP_REGIONS,
         }
+    }
+
+    /// Changes the cap of regions (ruling P1: a copy resumed under a test cap). Regions already there are kept.
+    pub(crate) fn set_cap(&mut self, cap: usize) {
+        self.cap = cap.max(1);
     }
 
     pub fn size(&self) -> u64 {
@@ -318,9 +346,19 @@ impl RescueMap {
     }
 
     /// Writes the map to `path` so that a crash at any moment leaves either the previous file or this one: into
-    /// `<path>.tmp`, `sync_all`, renamed over `path`, then (on Unix) the folder synced. Failures are `write_failed`.
+    /// `<path>.tmp`, `sync_all`, renamed over `path`, then (on Unix) the folder synced. Failures are `write_failed`,
+    /// except the folder sync, which is best effort (ruling P33): the new file is complete and synced by then, and some
+    /// file systems refuse to sync a folder; at worst a crash right after brings the previous map back.
+    ///
+    /// A map whose identity nests `mapped` deeper than the file format reads back (4) is refused (`write_failed`,
+    /// nothing written), so a map that saves always loads.
     pub fn save(&self, path: &Path) -> Result<(), EngineError> {
         let write = |cause| EngineError::Write { cause };
+        if !text::identity_fits(&self.identity) {
+            return Err(write(std::io::Error::from(
+                std::io::ErrorKind::InvalidInput,
+            )));
+        }
         let tmp = tmp_path(path);
         let mut file = File::create(&tmp).map_err(write)?;
         file.write_all(&text::encode(self)).map_err(write)?;
@@ -333,7 +371,7 @@ impl RescueMap {
                 Some(p) if !p.as_os_str().is_empty() => p,
                 _ => Path::new("."),
             };
-            File::open(dir).and_then(|d| d.sync_all()).map_err(write)?;
+            let _ = File::open(dir).and_then(|d| d.sync_all());
         }
         Ok(())
     }
@@ -375,5 +413,23 @@ mod tests {
         assert!(!map.set(100, 512, RegionState::Bad));
         assert!(!map.set(0, 100, RegionState::Bad));
         assert_eq!(map.regions(), [(0, 1 << 20, RegionState::Rescued)]);
+    }
+
+    #[test]
+    fn equality_ignores_the_cap() {
+        let identity = SourceIdentity::Image {
+            size: 1 << 20,
+            digest: 1,
+        };
+        let small = RescueMap::with_cap(1 << 20, 512, identity.clone(), 8);
+        let mut big = RescueMap::new(1 << 20, 512, identity);
+        assert_eq!(small, big);
+        big.set_cap(3);
+        assert_eq!(small, big);
+        assert!(big.set(0, 512, RegionState::Bad));
+        assert_ne!(small, big);
+        let mut moved = small.clone();
+        moved.set_pass(Pass::Trim, 0);
+        assert_ne!(small, moved);
     }
 }

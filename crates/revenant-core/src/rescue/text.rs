@@ -48,6 +48,17 @@ pub(super) fn encode(map: &RescueMap) -> Vec<u8> {
     out.into_bytes()
 }
 
+/// Whether `id` nests `mapped` at most [`MAX_NESTING`] deep, as `decode` reads it back.
+pub(super) fn identity_fits(id: &SourceIdentity) -> bool {
+    let mut depth = 0;
+    let mut id = id;
+    while let SourceIdentity::Mapped { origin, .. } = id {
+        depth += 1;
+        id = origin;
+    }
+    depth <= MAX_NESTING
+}
+
 fn encode_identity(id: &SourceIdentity, out: &mut String) {
     let hex_or_dash = |s: &Option<String>| match s {
         Some(s) => s.bytes().map(|b| format!("{b:02x}")).collect(),

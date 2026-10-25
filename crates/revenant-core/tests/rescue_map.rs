@@ -465,3 +465,43 @@ fn map_mismatch_is_refused() {
         Ok(_) => panic!("opened a map of another size"),
     }
 }
+
+#[test]
+fn map_nested_deeper_than_the_file_reads_is_not_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("card.img.rvmap");
+    let mut id = image_identity(MIB);
+    let mut last_saved = None;
+    for depth in 1..=5u64 {
+        id = SourceIdentity::Mapped {
+            size: MIB,
+            digest: depth,
+            origin: Box::new(id),
+        };
+        let map = RescueMap::new(MIB, 512, id.clone());
+        let saved = map.save(&path);
+        if depth <= 4 {
+            saved.unwrap();
+            assert_eq!(RescueMap::load(&path).unwrap(), map, "depth {depth}");
+            last_saved = Some(map);
+        } else {
+            assert_eq!(saved.unwrap_err().code(), "write_failed");
+            assert!(!dir.path().join("card.img.rvmap.tmp").exists());
+            assert_eq!(RescueMap::load(&path).ok(), last_saved);
+        }
+    }
+}
+
+#[test]
+fn a_save_failing_before_the_rename_keeps_the_old_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("card.img.rvmap");
+    let old = random_map(9, 50);
+    old.save(&path).unwrap();
+    // The temporary file cannot be created: a folder is in its place.
+    std::fs::create_dir(dir.path().join("card.img.rvmap.tmp")).unwrap();
+    let mut new = old.clone();
+    assert!(new.set(0, 512, RegionState::Bad));
+    assert_eq!(new.save(&path).unwrap_err().code(), "write_failed");
+    assert_eq!(RescueMap::load(&path).unwrap(), old);
+}

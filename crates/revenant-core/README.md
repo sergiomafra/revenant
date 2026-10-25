@@ -201,8 +201,61 @@ error is the inner source's, so its offset is absolute in the inner source; `vol
 
 ## Rescue copy
 
-`revenant_core::rescue` holds the map of a rescue copy (a whole card copied into an image file, design §5.4) and reads
-the image back through it.
+`revenant_core::rescue` copies a whole card (or disk) into an image file around its bad sectors (`copy`, design §5.4),
+keeps the map of what the image holds, and reads the image back through it.
+
+### Copying
+
+```rust,ignore
+let dest = Destination::check(&SystemDevices, &device, dir)?; // never on the card's disk
+let opts = CopyOptions { sector: device.scan_sector(), ..CopyOptions::default() };
+let summary = rescue::copy(&device, &identity, &dest, "card.img", &opts, &cancel, &mut |event| { /* … */ })?;
+```
+
+`copy(source, identity, dest, image, opts, cancel, on_event)` writes `dest.dir()/image` and its map
+`<image>.rvmap`. The image is created sparse at the source's length (nothing is allocated until written) and never
+split into pieces. `image` must be a plain, safe file name, and an existing `image` that is not a regular file (a link)
+is refused (`write_failed`); the folder must still be on the volume it was checked on (`destination_on_source`).
+
+Before creating or touching anything, when the destination knows what it lives on (`dest.info()`, a device source):
+its largest file (`max_file_bytes`, 4 GiB − 1 on FAT32) must hold the whole image, and its free space what is still to
+copy (the whole length on a fresh copy, the bytes not yet rescued on a resume); otherwise `write_failed` and no file is
+created. A copy from an image file (no `info()`) skips these two checks.
+
+The source is read directly (not through the scan's cache), in passes (`CopyOptions` defaults in brackets):
+
+1. **Fast** — the untried bytes in block-aligned chunks [1 MiB]. A chunk that fails becomes `ToTrim`, and the next
+   `skip` bytes are jumped over (left untried): [64 KiB] after the first failure, doubling on each consecutive one up to
+   `min(1 GiB, size / 64)`, back to the minimum after a good chunk. A failing area is left early instead of being read
+   block by block, so most of a damaged card is copied while it still works.
+2. **Skipped** — what the jumps left, in the same chunks, without jumping.
+3. **Trim** — each `ToTrim` run sector by sector from its start until a sector fails, then from its end backward until
+   one fails (those are `Bad`); the middle becomes `ToScrape`.
+4. **Scrape** — each `ToScrape` sector once: read → `Rescued`, failed → `Bad`.
+5. **Retry** — only with `retries > 0` [0]: each `Bad` sector read once more per repetition. None by default, so a dying
+   card is not hammered on the sectors that already failed; without retries a bad sector is read at most twice (in its
+   failing block, then alone). On a finished map, `retries` runs only the repetitions not done yet (a copy that ended
+   after `n` stores `Pass::Retry(n)`, one that ended with none `Pass::Done`).
+
+`sector` [512] is the map's and the sector-by-sector passes' granularity: against a device pass
+`DeviceSource::scan_sector()`, so a bad physical sector is read once. A source that vanishes (`device_gone`, or a read
+that comes back short) or a cancel (`cancelled`) stops the copy: the map is saved and the error returned, and nothing
+is marked for the read that stopped it, so pulling the card out never turns sectors bad. A write error is `write_failed`.
+
+Resume by calling `copy` again with the same `image`: the map's identity must be `same_source` as `identity`
+(`map_other_source`: another card), and its size and sector the source's and `opts.sector`, the image's length the
+map's (`map_mismatch`). The copy goes on from the pass and position the map records and never reads again what is
+rescued. The map is saved (after the image's `sync_data`, so it never claims bytes the image does not hold) every
+`save_every` [30 s] or `save_bytes` rescued [256 MiB], at each pass change and when the copy stops; a crash or power
+loss resumes from the last save.
+
+`on_event` gets `CopyEvent::Progress { pass, pos, totals, bytes_per_sec, eta_secs }` after every read (bytes in each
+state, the reading speed smoothed by `rate::RateMeter` with a 10 s half-life, and the seconds left at that speed), `Bad
+{ start, len }` when a region is marked bad and `Saved` after each map save; the last `Progress` of a finished copy has
+`Pass::Done`. The result is `CopySummary { totals, complete }`, `complete` when nothing is left untried, to trim or to
+scrape.
+
+### The map
 
 `RescueMap::new(size, sector, identity)` covers `[0, size)` with merged regions (neighbors always differ in state), all
 `Untried` at first. A region is `Untried` (not read yet), `Rescued` (the image holds the card's bytes), `ToTrim` or
@@ -212,9 +265,11 @@ one by one). `set(start, len, state)` takes multiples of the sector (the end cla
 records the source's `SourceIdentity` and the copy's pass and position (`pass()`, `set_pass`: `Fast`, `Skipped`, `Trim`,
 `Scrape`, `Retry(n)`, `Done`).
 
-The map holds at most `MAX_MAP_REGIONS` (2^20) regions: a `set` that would need more returns false and changes nothing
-(the copy then marks a failed block bad whole, without reading its edges, so on a disk with millions of scattered errors
-some good sectors next to bad ones are lost).
+The map holds at most `MAX_MAP_REGIONS` (2^20) regions: a `set` that would need more returns false and changes nothing.
+The copy then finishes coarsely, never failing: each `ToTrim` and `ToScrape` region becomes `Bad` whole without being
+read; the untried bytes are still read in blocks, a failed block is marked `Bad` whole when the map has room, and when
+not even that fits, the rest of that untried stretch is marked `Bad` unread. On a disk with millions of scattered errors
+good sectors near bad ones are lost that way; nothing unread is ever called rescued.
 
 The map lives next to the image as `<image>.rvmap` (`map_path`), in our own text format (UTF-8, decimal numbers, one
 space between fields):
@@ -230,7 +285,10 @@ end <crc32 of every byte before this line, 8 lowercase hex digits>
 
 Hex values are lowercase (model and serial as the hex of their UTF-8 bytes; digests as 16 digits). `save(path)` writes
 `<path>.tmp`, `sync_all`s it, renames it over `path` and (on Unix) syncs the folder, so a crash at any moment leaves
-the previous map or the new one, never a mix; failures are `write_failed`. `load(path)` refuses anything that is not
+the previous map or the new one, never a mix; failures are `write_failed`, except the folder sync, which is best effort
+(the file is complete and synced by then; some file systems refuse it, and at worst a crash right after brings back the
+previous map). A map whose identity nests `mapped` more than 4 deep is not saved (`write_failed`), so a map that saves
+always loads. Two maps are `==` when their contents are. `load(path)` refuses anything that is not
 exactly such a file (`map_corrupt`): cut short anywhere, a checksum that does not match, regions that do not cover the
 size, more than 2^20 regions, or a file over 64 MiB; a file that cannot be opened is `open_failed`.
 

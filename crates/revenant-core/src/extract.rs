@@ -91,6 +91,15 @@ impl Destination {
     pub fn info(&self) -> Option<&DestInfo> {
         self.info.as_ref()
     }
+
+    /// Refuses (`destination_on_source`) a folder no longer on the volume it was checked on (it could have been
+    /// replaced since).
+    pub(crate) fn still_checked(&self) -> Result<(), EngineError> {
+        if volume_of(&self.dir)? != self.volume {
+            return Err(EngineError::DestinationOnSource);
+        }
+        Ok(())
+    }
 }
 
 /// Copies the finding's bytes into the checked destination under [`sanitize`]`(name)` (`revenant_<start as 12 hex
@@ -113,10 +122,7 @@ pub fn extract_to(
     dest: &Destination,
     name: &str,
 ) -> Result<PathBuf, EngineError> {
-    // The folder must still be on the volume it was checked on (it could have been replaced since).
-    if volume_of(dest.dir())? != dest.volume {
-        return Err(EngineError::DestinationOnSource);
-    }
+    dest.still_checked()?;
     let (path, mut file) = create_named(dest.dir(), finding, name, None)?;
     if let Err(e) = copy(source, finding, &mut file) {
         drop(file);
