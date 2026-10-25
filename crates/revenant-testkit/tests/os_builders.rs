@@ -1,5 +1,7 @@
 //! Opt-in: the synthetic FAT/exFAT volumes, read back by the real macOS drivers.
 //! Run with `REVENANT_OS_FS=1 cargo test -p revenant-testkit --test os_builders -- --ignored`.
+//! macOS only (it mounts with `hdiutil` and reads Unix file times); empty on other systems.
+#![cfg(target_os = "macos")]
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;

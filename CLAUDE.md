@@ -41,4 +41,9 @@ binário já existe (`which`, `~/.cargo/bin`, `target/release`) e reaproveitar. 
 
 ## Armadilhas
 
-(vazio) Regra: todo erro vira uma instrução aqui.
+Regra: todo erro vira uma instrução aqui.
+
+- O CI compila no Windows e este Mac não (sem `rustup`, sem alvo Windows). Código ou teste que usa API só de Unix/macOS
+  (`std::os::unix`, `hdiutil`) fica atrás de `#[cfg(target_os = "macos")]` (num arquivo de teste: `#![cfg(...)]` no
+  topo). Antes do PR, `grep -rn "os::unix" crates` e conferir que cada uso está protegido. (PR #5: `os_builders.rs`
+  quebrou o CI do Windows.)
