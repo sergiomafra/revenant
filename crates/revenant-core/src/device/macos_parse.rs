@@ -1,9 +1,18 @@
-//! A whole disk's geometry from what macOS tools print (ruling D5): `diskutil info -plist diskN` gives the size
-//! (`TotalSize`, else `Size`) and the logical sector (`DeviceBlockSize`); `ioreg -a -r -c IOBlockStorageDevice -l` gives
-//! the physical sector of the device whose whole-disk media is `diskN`, when it says.
+//! What macOS tools print about disks, parsed (pure; tested on every platform).
+//!
+//! - Geometry (ruling D5): `diskutil info -plist diskN` gives the size (`TotalSize`, else `Size`) and the logical sector
+//!   (`DeviceBlockSize`); `ioreg -a -r -c IOBlockStorageDevice -l` gives the physical sector of the device whose whole-disk
+//!   media is `diskN`, when it says.
+//! - The disk list (D8): whole disks of `diskutil list -plist` without the synthesized APFS containers; the system disk
+//!   is the one holding `/` (`ParentWholeDisk` and the disks of the `APFSPhysicalStores` of `diskutil info -plist /`).
+//! - A destination (D12): `df -P -k <folder>` (the volume's node and free space) and `diskutil info -plist <node>`.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use super::plist::Plist;
-use crate::source::Geometry;
+use super::{DestInfo, DiskInfo, FAT_MAX_FILE, VolumeInfo, push_unique, sort_disks};
+use crate::source::{DiskId, Geometry};
 
 /// Largest sector size believed (anything above, or not a power of two from 512, is a misread).
 const MAX_SECTOR: i64 = 1 << 16;
@@ -70,6 +79,227 @@ fn device_of<'a>(ioreg: &'a Plist, bsd: &str) -> Option<&'a Plist> {
     })
 }
 
+/// A non-empty, trimmed string value.
+fn text(v: Option<&Plist>) -> Option<String> {
+    let s = v?.as_str()?.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+fn flag(info: &Plist, key: &str) -> bool {
+    info.get(key).and_then(Plist::as_bool).unwrap_or(false)
+}
+
+/// The whole disk of a BSD name: "disk0s2" → disk0, "/dev/disk3s1s1" → disk3, "disk4" → disk4.
+pub(crate) fn whole_of(bsd: &str) -> Option<DiskId> {
+    let name = bsd.strip_prefix("/dev/").unwrap_or(bsd);
+    let digits = name.strip_prefix("disk")?;
+    let n = digits.bytes().take_while(u8::is_ascii_digit).count();
+    let rest = &digits[n..];
+    if !(rest.is_empty() || rest.starts_with('s')) {
+        return None;
+    }
+    DiskId::parse(&name[..4 + n]).ok()
+}
+
+/// Whether `s` is a BSD disk name diskutil printed ("disk4", "disk4s1", "disk3s1s1"): safe to pass back to it.
+pub(crate) fn is_bsd_name(s: &str) -> bool {
+    s.strip_prefix("disk").is_some_and(|rest| {
+        !rest.is_empty()
+            && rest
+                .split('s')
+                .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// The disks a volume's `diskutil info` names: its `ParentWholeDisk`, then the whole disk of each APFS physical store.
+fn disks_of(info: &Plist) -> Vec<DiskId> {
+    let mut out = Vec::new();
+    if let Some(parent) = info.get("ParentWholeDisk").and_then(Plist::as_str)
+        && let Some(id) = whole_of(parent)
+    {
+        push_unique(&mut out, id);
+    }
+    let stores = info
+        .get("APFSPhysicalStores")
+        .and_then(Plist::as_array)
+        .unwrap_or(&[]);
+    for store in stores {
+        if let Some(id) = store
+            .get("APFSPhysicalStore")
+            .and_then(Plist::as_str)
+            .and_then(whole_of)
+        {
+            push_unique(&mut out, id);
+        }
+    }
+    out
+}
+
+/// The entries of `diskutil list -plist` that are whole disks a user can pick: those with an id, without
+/// `APFSPhysicalStores` (a synthesized APFS container, shown through its physical disks).
+pub(crate) fn whole_disks(list: &Plist) -> Vec<&Plist> {
+    list.get("AllDisksAndPartitions")
+        .and_then(Plist::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|e| e.get("APFSPhysicalStores").is_none())
+        .filter(|e| {
+            e.get("DeviceIdentifier")
+                .and_then(Plist::as_str)
+                .is_some_and(|id| whole_of(id).is_some_and(|w| w.as_str() == id))
+        })
+        .collect()
+}
+
+/// The partitions' ids of a `diskutil list` entry.
+pub(crate) fn partition_ids(entry: &Plist) -> Vec<&str> {
+    entry
+        .get("Partitions")
+        .and_then(Plist::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|p| p.get("DeviceIdentifier").and_then(Plist::as_str))
+        .filter(|id| is_bsd_name(id))
+        .collect()
+}
+
+/// The connected whole disks (ruling D8) from `diskutil list -plist`, the `diskutil info -plist` of each whole disk and
+/// partition (`infos`, by id), `diskutil info -plist /` (`root`) and the `ioreg` plist. A whole disk without its info or
+/// a plausible geometry is left out; a partition without info keeps what the list says. Sorted by id.
+pub(crate) fn disks(
+    list: &Plist,
+    infos: &BTreeMap<String, Plist>,
+    root: &Plist,
+    ioreg: Option<&Plist>,
+) -> Vec<DiskInfo> {
+    let system = disks_of(root);
+    let mut out = Vec::new();
+    for entry in whole_disks(list) {
+        let Some(bsd) = entry.get("DeviceIdentifier").and_then(Plist::as_str) else {
+            continue;
+        };
+        let Some(info) = infos.get(bsd) else { continue };
+        if info.get("APFSPhysicalStores").is_some() {
+            continue;
+        }
+        let (Some(id), Some(geometry)) = (whole_of(bsd), geometry(info, ioreg, bsd)) else {
+            continue;
+        };
+        let device = ioreg.and_then(|r| device_of(r, bsd));
+        let characteristic = |key: &str| {
+            device.and_then(|d| {
+                text(d.get("Device Characteristics").and_then(|c| c.get(key)))
+                    .or_else(|| text(d.get(key)))
+            })
+        };
+        let volumes = entry
+            .get("Partitions")
+            .and_then(Plist::as_array)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|p| volume(p, infos))
+            .collect();
+        out.push(DiskInfo {
+            system: system.contains(&id),
+            id,
+            geometry,
+            vendor: characteristic("Vendor Name"),
+            model: characteristic("Product Name").or_else(|| text(info.get("MediaName"))),
+            serial: characteristic("Serial Number"),
+            removable: flag(info, "Removable") || flag(info, "RemovableMedia"),
+            internal: flag(info, "Internal"),
+            virtual_disk: info.get("VirtualOrPhysical").and_then(Plist::as_str) == Some("Virtual")
+                || info.get("BusProtocol").and_then(Plist::as_str) == Some("Disk Image"),
+            solid_state: info.get("SolidState").and_then(Plist::as_bool),
+            volumes,
+        });
+    }
+    sort_disks(&mut out);
+    out
+}
+
+/// A partition of a `diskutil list` entry, completed by its `diskutil info` when there is one.
+fn volume(part: &Plist, infos: &BTreeMap<String, Plist>) -> Option<VolumeInfo> {
+    let id = part.get("DeviceIdentifier").and_then(Plist::as_str)?;
+    let info = infos.get(id);
+    let either = |key: &str| text(info.and_then(|i| i.get(key))).or_else(|| text(part.get(key)));
+    let size = part
+        .get("Size")
+        .or_else(|| info.and_then(|i| i.get("TotalSize").or_else(|| i.get("Size"))))
+        .and_then(Plist::as_int)
+        .filter(|&s| s >= 0)
+        .unwrap_or(0);
+    Some(VolumeInfo {
+        id: id.to_string(),
+        fs: text(info.and_then(|i| i.get("FilesystemType"))),
+        label: either("VolumeName"),
+        mount_point: either("MountPoint").map(PathBuf::from),
+        size: size as u64,
+    })
+}
+
+/// The volume's node and its available 1024-byte blocks, from `df -P -k` output (header line, then one line:
+/// `Filesystem 1024-blocks Used Available Capacity Mounted-on`). The node may hold spaces (a network share), so the
+/// numbers are found as three integers followed by a percentage.
+pub(crate) fn df_line(df: &str) -> Option<(String, u64)> {
+    let mut lines = df.lines();
+    lines.next()?;
+    let fields: Vec<&str> = lines.next()?.split_whitespace().collect();
+    let numeric = |s: &str| s.parse::<u64>().ok();
+    (1..fields.len().saturating_sub(4)).find_map(|i| {
+        let ok = numeric(fields[i]).is_some()
+            && numeric(fields[i + 1]).is_some()
+            && fields[i + 3].ends_with('%');
+        ok.then(|| Some((fields[..i].join(" "), numeric(fields[i + 2])?)))
+            .flatten()
+    })
+}
+
+/// Where a folder lives (ruling D12), from its `df -P -k` output and the `diskutil info -plist` of the node `df` names.
+/// `None` when `info` is about another node or names no whole disk.
+pub(crate) fn destination(df: &str, info: &Plist) -> Option<DestInfo> {
+    let (node, available) = df_line(df)?;
+    if info.get("DeviceNode").and_then(Plist::as_str) != Some(node.as_str()) {
+        return None;
+    }
+    let disks = disks_of(info);
+    if disks.is_empty() {
+        return None;
+    }
+    let fs = text(info.get("FilesystemType"));
+    let max_file_bytes = (fs.as_deref() == Some("msdos")).then_some(FAT_MAX_FILE);
+    Some(DestInfo {
+        disks,
+        fs,
+        free_bytes: available.checked_mul(1024)?,
+        max_file_bytes,
+    })
+}
+
+/// The `diskutil info` keys that tell one medium from another (none of them changes while a disk stays connected).
+const MEDIA_KEYS: [&str; 13] = [
+    "DeviceIdentifier",
+    "TotalSize",
+    "Size",
+    "DeviceBlockSize",
+    "MediaName",
+    "IORegistryEntryName",
+    "BusProtocol",
+    "Content",
+    "DiskUUID",
+    "Internal",
+    "Removable",
+    "RemovableMedia",
+    "VirtualOrPhysical",
+];
+
+/// Whether two `diskutil info` plists of a whole disk describe the same medium (the check after opening a device that
+/// the disk was not swapped since its geometry was read).
+pub(crate) fn same_media(a: &Plist, b: &Plist) -> bool {
+    matches!((a, b), (Plist::Dict(_), Plist::Dict(_)))
+        && MEDIA_KEYS.iter().all(|k| a.get(k) == b.get(k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::plist::parse;
@@ -78,6 +308,170 @@ mod tests {
     const INFO_SD: &str = include_str!("../../tests/fixtures/diskutil/info-sdcard.plist");
     const INFO_DISK0: &str = include_str!("../../tests/fixtures/diskutil/info-disk0.plist");
     const IOREG: &str = include_str!("../../tests/fixtures/diskutil/ioreg-sdcard.plist");
+    const LIST: &str = include_str!("../../tests/fixtures/diskutil/list.plist");
+    const INFO_ROOT: &str = include_str!("../../tests/fixtures/diskutil/info-root.plist");
+    const INFO_APFS: &str = include_str!("../../tests/fixtures/diskutil/info-apfs-volume.plist");
+    const INFO_EXFAT_DISK: &str =
+        include_str!("../../tests/fixtures/diskutil/info-exfat-disk.plist");
+    const INFO_EXFAT_VOLUME: &str =
+        include_str!("../../tests/fixtures/diskutil/info-exfat-volume.plist");
+    const INFO_MSDOS: &str = include_str!("../../tests/fixtures/diskutil/info-msdos-volume.plist");
+    const DF_ROOT: &str = include_str!("../../tests/fixtures/diskutil/df-root.txt");
+    const DF_MSDOS: &str = include_str!("../../tests/fixtures/diskutil/df-msdos.txt");
+
+    fn id(s: &str) -> DiskId {
+        DiskId::parse(s).unwrap()
+    }
+
+    /// The infos of the listing fixture: disk0 (internal SSD), disk1 (its synthesized APFS container), disk2 (an
+    /// attached image with an exFAT volume) and that volume.
+    fn infos() -> BTreeMap<String, Plist> {
+        let mut container = parse(INFO_EXFAT_DISK).unwrap();
+        // disk1: what diskutil says of a synthesized container (APFSPhysicalStores) — never listed.
+        if let Plist::Dict(d) = &mut container {
+            d.retain(|(k, _)| k != "DeviceIdentifier");
+            d.push(("DeviceIdentifier".into(), Plist::Str("disk1".into())));
+            d.push((
+                "APFSPhysicalStores".into(),
+                Plist::Array(vec![Plist::Dict(vec![(
+                    "APFSPhysicalStore".into(),
+                    Plist::Str("disk0s1".into()),
+                )])]),
+            ));
+        }
+        [
+            ("disk0", parse(INFO_DISK0).unwrap()),
+            ("disk1", container),
+            ("disk1s1", parse(INFO_APFS).unwrap()),
+            ("disk2", parse(INFO_EXFAT_DISK).unwrap()),
+            ("disk2s1", parse(INFO_EXFAT_VOLUME).unwrap()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    #[test]
+    fn lists_whole_disks_and_flags_the_system_disk() {
+        let list = parse(LIST).unwrap();
+        let root = parse(INFO_ROOT).unwrap();
+        let ioreg = parse(IOREG).unwrap();
+        let listed = disks(&list, &infos(), &root, Some(&ioreg));
+        let ids: Vec<&str> = listed.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["disk0", "disk2"]);
+        let (d0, d2) = (&listed[0], &listed[1]);
+        assert!(d0.system && d0.internal && !d0.removable && !d0.virtual_disk);
+        assert_eq!(d0.solid_state, Some(true));
+        assert_eq!(d0.geometry.logical_sector, 4096);
+        assert_eq!(d0.model.as_deref(), Some("APPLE SSD AP1024N"));
+        assert_eq!(d0.serial.as_deref(), Some("TESTSERIAL"));
+        assert_eq!(d0.vendor, None, "an empty Vendor Name is no vendor");
+        assert_eq!(d0.volumes.len(), 1);
+        assert_eq!(d0.volumes[0].id, "disk0s1");
+        assert_eq!(d0.volumes[0].fs, None, "a partition without info has no fs");
+
+        assert!(d2.virtual_disk && d2.removable && !d2.internal && !d2.system);
+        assert_eq!(d2.solid_state, None);
+        assert_eq!(d2.geometry.size, 64 << 20);
+        assert_eq!(d2.vendor.as_deref(), Some("Apple"));
+        assert_eq!(d2.model.as_deref(), Some("Disk Image"));
+        assert_eq!(
+            d2.volumes,
+            [VolumeInfo {
+                id: "disk2s1".into(),
+                fs: Some("exfat".into()),
+                label: Some("TESTCARD".into()),
+                mount_point: Some(PathBuf::from("/Volumes/TESTCARD")),
+                size: 67_108_352,
+            }]
+        );
+
+        // Without ioreg: no serial, the model from MediaName; the system disk is still found.
+        let plain = disks(&list, &infos(), &root, None);
+        assert_eq!(plain[0].serial, None);
+        assert_eq!(plain[0].model.as_deref(), Some("APPLE SSD AP1024N"));
+        assert!(plain[0].system);
+        // Another root (on disk2) moves the system flag.
+        let root2 = parse(INFO_EXFAT_VOLUME).unwrap();
+        let moved = disks(&list, &infos(), &root2, None);
+        assert!(!moved[0].system && moved[1].system);
+        // A whole disk without info is left out; garbage lists nothing.
+        let mut some = infos();
+        some.remove("disk0");
+        assert_eq!(disks(&list, &some, &root, None).len(), 1);
+        assert!(disks(&Plist::Bool(true), &infos(), &root, None).is_empty());
+    }
+
+    #[test]
+    fn destination_on_an_apfs_container_maps_to_its_physical_disk() {
+        let info = parse(INFO_APFS).unwrap();
+        let dest = destination(DF_ROOT, &info).unwrap();
+        assert_eq!(dest.disks, [id("disk1"), id("disk0")]);
+        assert_eq!(dest.fs.as_deref(), Some("apfs"));
+        assert_eq!(dest.free_bytes, 64_688 * 1024);
+        assert_eq!(dest.max_file_bytes, None);
+        // Info about another node is refused, as is df output without a data line.
+        let exfat = parse(INFO_EXFAT_VOLUME).unwrap();
+        assert_eq!(destination(DF_ROOT, &exfat), None);
+        assert_eq!(destination("Filesystem 1024-blocks\n", &info), None);
+        assert_eq!(destination("", &info), None);
+    }
+
+    #[test]
+    fn fat32_destination_caps_the_file_size() {
+        let info = parse(INFO_MSDOS).unwrap();
+        let dest = destination(DF_MSDOS, &info).unwrap();
+        assert_eq!(dest.max_file_bytes, Some(4_294_967_295));
+        assert_eq!(dest.fs.as_deref(), Some("msdos"));
+        assert_eq!(dest.disks, [id("disk5")]);
+        assert_eq!(dest.free_bytes, 64_509 * 1024);
+    }
+
+    #[test]
+    fn df_lines_and_bsd_names() {
+        let df = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
+                  map auto home   0    0    7    100%    /System/Volumes/Data/home\n";
+        assert_eq!(df_line(df), Some(("map auto home".into(), 7)));
+        assert_eq!(df_line(DF_ROOT), Some(("/dev/disk1s1".into(), 64_688)));
+        assert_eq!(df_line("h\n/dev/disk1 1 2 x 3% /"), None);
+        assert_eq!(whole_of("disk0s2"), Some(id("disk0")));
+        assert_eq!(whole_of("/dev/disk3s1s1"), Some(id("disk3")));
+        assert_eq!(whole_of("disk12"), Some(id("disk12")));
+        assert_eq!(whole_of("diskx"), None);
+        assert_eq!(whole_of("disk1x"), None);
+        for ok in ["disk4", "disk4s1", "disk3s1s1"] {
+            assert!(is_bsd_name(ok), "{ok}");
+        }
+        for bad in [
+            "disk",
+            "disks1",
+            "disk4s",
+            "-disk4",
+            "disk4 s1",
+            "/dev/disk4",
+            "disk4s1;x",
+        ] {
+            assert!(!is_bsd_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn swapped_media_is_told_apart() {
+        let a = parse(INFO_SD).unwrap();
+        assert!(same_media(&a, &a.clone()));
+        // Volatile keys do not matter; a different size or name does.
+        assert!(same_media(&a, &with(&a, "FreeSpace", Plist::Int(7))));
+        assert!(!same_media(&a, &with(&a, "TotalSize", Plist::Int(1 << 30))));
+        assert!(!same_media(
+            &a,
+            &with(&a, "MediaName", Plist::Str("Other".into()))
+        ));
+        assert!(!same_media(
+            &a,
+            &with(&a, "DiskUUID", Plist::Str("x".into()))
+        ));
+        assert!(!same_media(&Plist::Bool(true), &Plist::Bool(true)));
+    }
 
     fn without(p: &Plist, keys: &[&str]) -> Plist {
         match p {

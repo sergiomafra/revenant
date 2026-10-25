@@ -101,14 +101,6 @@ impl DeviceSource {
         }
     }
 
-    /// Opens the whole disk `disk` read-only (root or Administrator needed). Errors: `permission_denied`,
-    /// `device_not_found`, `system_tool_failed` (macOS, the geometry query), `open_failed`, and `unsupported_platform`
-    /// off macOS and Windows.
-    pub fn open(disk: &DiskId) -> Result<DeviceSource, EngineError> {
-        let raw = os::open(disk)?;
-        Ok(DeviceSource::new(Box::new(raw), disk.clone()))
-    }
-
     pub fn geometry(&self) -> Geometry {
         self.geometry
     }
@@ -200,6 +192,14 @@ impl Source for DeviceSource {
     }
 }
 
+/// Opens the whole disk `disk` read-only (root or Administrator needed); what `device::SystemDevices::open` serves.
+/// Errors: `permission_denied`, `device_not_found` (also when, on macOS, the disk changed between its geometry query and
+/// the open), `system_tool_failed` (macOS, the geometry query), `open_failed`, and `unsupported_platform` off macOS and
+/// Windows.
+pub(crate) fn open_raw(disk: &DiskId) -> Result<Box<dyn RawDevice>, EngineError> {
+    Ok(Box::new(os::open(disk)?))
+}
+
 /// The operating system's devices: opening `/dev/rdiskN` or `\\.\PhysicalDriveN` read-only and classifying read errors
 /// (ruling D2).
 #[cfg(any(target_os = "macos", windows))]
@@ -245,8 +245,10 @@ mod os {
         if !node.exists() {
             return Err(EngineError::DeviceNotFound);
         }
-        let geometry = crate::device::macos::geometry(disk.as_str())?;
+        let (geometry, info) = crate::device::macos::geometry(disk.as_str())?;
         let file = platform::open_device(&disk.device_path()).map_err(open_error)?;
+        // The node may name another medium by now (a card swapped meanwhile): the geometry must be the opened one's.
+        crate::device::macos::confirm(disk.as_str(), &info)?;
         Ok(OsDevice {
             file,
             geometry,

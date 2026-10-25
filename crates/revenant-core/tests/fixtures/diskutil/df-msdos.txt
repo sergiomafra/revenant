@@ -1,0 +1,2 @@
+Filesystem   1024-blocks Used Available Capacity  Mounted on
+/dev/disk5s1       64511    2     64509     1%    /Volumes/TESTFAT

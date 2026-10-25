@@ -6,7 +6,7 @@ mod fragmented;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 
 #[cfg(unix)]
 use unix as platform;
@@ -15,6 +15,7 @@ use windows as platform;
 
 use crate::EngineError;
 
+pub(crate) use device::open_raw;
 pub use device::{DeviceSource, DiskId, Geometry, RawDevice};
 pub use file::FileSource;
 pub use fragmented::Fragmented;

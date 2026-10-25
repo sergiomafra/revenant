@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!-- Captured on the dev Mac with `diskutil info -plist /dev/disk5s1`: the FAT32 volume of a 64 MiB hdiutil image (MBR),
+     mounted (the mount point renamed /Volumes/TESTFAT); UUIDs zeroed. -->
+<dict>
+	<key>Bootable</key>
+	<false/>
+	<key>BusProtocol</key>
+	<string>Disk Image</string>
+	<key>CanBeMadeBootable</key>
+	<false/>
+	<key>CanBeMadeBootableRequiresDestroy</key>
+	<false/>
+	<key>Content</key>
+	<string>DOS_FAT_32</string>
+	<key>DeviceBlockSize</key>
+	<integer>512</integer>
+	<key>DeviceIdentifier</key>
+	<string>disk5s1</string>
+	<key>DeviceNode</key>
+	<string>/dev/disk5s1</string>
+	<key>DeviceTreePath</key>
+	<string>IODeviceTree:/</string>
+	<key>Ejectable</key>
+	<true/>
+	<key>EjectableMediaAutomaticUnderSoftwareControl</key>
+	<true/>
+	<key>EjectableOnly</key>
+	<true/>
+	<key>FilesystemName</key>
+	<string>MS-DOS FAT32</string>
+	<key>FilesystemType</key>
+	<string>msdos</string>
+	<key>FilesystemUserVisibleName</key>
+	<string>MS-DOS (FAT32)</string>
+	<key>FreeSpace</key>
+	<integer>66057728</integer>
+	<key>GlobalPermissionsEnabled</key>
+	<false/>
+	<key>IOKitSize</key>
+	<integer>67108352</integer>
+	<key>IORegistryEntryName</key>
+	<string>Untitled 1</string>
+	<key>Internal</key>
+	<false/>
+	<key>MediaName</key>
+	<string></string>
+	<key>MediaType</key>
+	<string>Generic</string>
+	<key>MountPoint</key>
+	<string>/Volumes/TESTFAT</string>
+	<key>OSInternalMedia</key>
+	<false/>
+	<key>ParentWholeDisk</key>
+	<string>disk5</string>
+	<key>PartitionMapPartition</key>
+	<true/>
+	<key>PartitionMapPartitionOffset</key>
+	<integer>512</integer>
+	<key>RAIDMaster</key>
+	<false/>
+	<key>RAIDSlice</key>
+	<false/>
+	<key>Removable</key>
+	<true/>
+	<key>RemovableMedia</key>
+	<true/>
+	<key>RemovableMediaOrExternalDevice</key>
+	<true/>
+	<key>SMARTDeviceSpecificKeysMayVaryNotGuaranteed</key>
+	<dict/>
+	<key>SMARTStatus</key>
+	<string>Not Supported</string>
+	<key>Size</key>
+	<integer>67108352</integer>
+	<key>SupportsGlobalPermissionsDisable</key>
+	<false/>
+	<key>SystemImage</key>
+	<false/>
+	<key>TotalSize</key>
+	<integer>66059776</integer>
+	<key>VolumeAllocationBlockSize</key>
+	<integer>512</integer>
+	<key>VolumeName</key>
+	<string>TESTFAT</string>
+	<key>VolumeSize</key>
+	<integer>66059776</integer>
+	<key>VolumeUUID</key>
+	<string>00000000-0000-0000-0000-000000000000</string>
+	<key>WholeDisk</key>
+	<false/>
+	<key>Writable</key>
+	<true/>
+	<key>WritableMedia</key>
+	<true/>
+	<key>WritableVolume</key>
+	<true/>
+</dict>
+</plist>

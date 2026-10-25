@@ -43,6 +43,13 @@ impl Plist {
         }
     }
 
+    pub(crate) fn as_bool(&self) -> Option<bool> {
+        match self {
+            Plist::Bool(v) => Some(*v),
+            _ => None,
+        }
+    }
+
     pub(crate) fn as_array(&self) -> Option<&[Plist]> {
         match self {
             Plist::Array(a) => Some(a),

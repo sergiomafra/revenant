@@ -40,6 +40,10 @@ pub enum EngineError {
     /// Reading devices is not supported on this operating system.
     #[error("unsupported_platform")]
     Unsupported,
+    /// The source is a device and the disks the destination folder lives on could not be determined (a network
+    /// folder, or the system query failed): writing there could land on the source itself.
+    #[error("destination_unknown")]
+    DestinationUnknown,
 }
 
 impl EngineError {
@@ -57,6 +61,7 @@ impl EngineError {
             Self::NotWholeDisk => "not_whole_disk",
             Self::SystemTool { .. } => "system_tool_failed",
             Self::Unsupported => "unsupported_platform",
+            Self::DestinationUnknown => "destination_unknown",
         }
     }
 }
@@ -84,6 +89,10 @@ mod tests {
             "system_tool_failed"
         );
         assert_eq!(EngineError::Unsupported.code(), "unsupported_platform");
+        assert_eq!(
+            EngineError::DestinationUnknown.code(),
+            "destination_unknown"
+        );
         let io = || std::io::Error::other("x");
         assert_eq!(
             EngineError::Read {

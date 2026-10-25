@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The engine lists the connected disks (macOS and Windows) with their size, sector sizes, maker, model, whether they are
+  removable, internal, the system disk, a disk image or a solid-state drive, and their volumes; APFS containers are shown
+  through their physical disk.
 - The engine reads a whole card or disk directly, read-only (macOS `/dev/rdiskN`, Windows `\\.\PhysicalDriveN`, with
   root or Administrator), including disks with 4096-byte sectors; a bad sector is read once, and a disk that disconnects
   is reported as gone, never as bad sectors.
@@ -97,6 +100,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Extraction from a whole card or disk refuses a destination on any volume of that device (also an APFS volume whose
+  container lives on it), and a destination whose disks cannot be determined (a network folder), so nothing is ever
+  written to the card being recovered.
 - A card or disk disconnected in the middle of a scan or an extraction stops it with `device_gone` instead of being
   reported as unreadable sectors (or extracted as zeros); cancelling is prompt on slow or failing devices.
 - A partial RAW (TIFF-based RAW, RAF, CR3) no longer lists its own preview (or full-size JPEG) as a separate photo; a

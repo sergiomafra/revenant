@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::EngineError;
+use crate::device::{DestInfo, DeviceOps, SystemDevices};
 use crate::naming::{fallback_name, file_name, is_unsafe_char, sanitize, split_name};
 use crate::scan::Finding;
 use crate::source::{Source, read_full, volume_of};
@@ -27,37 +28,102 @@ pub fn extract(
     extract_as(source, finding, dest_dir, &file_name(finding, None))
 }
 
-/// Copies the finding's bytes into `dest_dir` under [`sanitize`]`(name)` (`revenant_<start as 12 hex digits>.<ext>` when
-/// nothing is left of it), then `<stem>_2.<ext>`, `<stem>_3.<ext>`… when the name is taken (10,000 tries; never
-/// overwrites). Refuses if the directory is on the source's volume.
+/// A destination folder checked once against a source (ruling D13): extraction, copies and sessions write only into a
+/// `Destination`.
+///
+/// Refused (`destination_on_source`) when the folder is on the source's volume (an image file's) or when the folder's
+/// disks (an APFS container counts as its physical stores) include the disk [`Source::disk`] names: a card is never
+/// written to while it is being recovered, through any of its volumes. For a device source whose destination disks cannot
+/// be determined (a network folder, a failed query) the folder is refused too (`destination_unknown`): it could be the
+/// card. An image source (`disk()` is `None`) only gets the volume rule, and `ops` is not called.
+#[derive(Clone, Debug)]
+pub struct Destination {
+    dir: PathBuf,
+    info: Option<DestInfo>,
+}
+
+impl Destination {
+    /// Checks `dir` (an existing folder) against `source`. Errors: `open_failed` (the folder cannot be opened),
+    /// `destination_on_source`, `destination_unknown`.
+    pub fn check(
+        ops: &dyn DeviceOps,
+        source: &dyn Source,
+        dir: &Path,
+    ) -> Result<Destination, EngineError> {
+        let dest_volume = volume_of(dir)?;
+        if source.volume() == Some(dest_volume) {
+            return Err(EngineError::DestinationOnSource);
+        }
+        let info = match source.disk() {
+            None => None,
+            Some(disk) => {
+                let info = ops
+                    .destination(dir)
+                    .map_err(|_| EngineError::DestinationUnknown)?;
+                if info.disks.is_empty() {
+                    return Err(EngineError::DestinationUnknown);
+                }
+                if info.disks.contains(&disk) {
+                    return Err(EngineError::DestinationOnSource);
+                }
+                Some(info)
+            }
+        };
+        Ok(Destination {
+            dir: dir.to_path_buf(),
+            info,
+        })
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// What the folder lives on (disks, file system, free space, file-size limit); `None` for an image source.
+    pub fn info(&self) -> Option<&DestInfo> {
+        self.info.as_ref()
+    }
+}
+
+/// Copies the finding's bytes into the checked destination under [`sanitize`]`(name)` (`revenant_<start as 12 hex
+/// digits>.<ext>` when nothing is left of it), then `<stem>_2.<ext>`, `<stem>_3.<ext>`… when the name is taken (10,000
+/// tries; never overwrites).
 ///
 /// The file is created with `create_new`, so a taken name is detected by the volume itself: it is right on case-sensitive
 /// and case-insensitive volumes alike and for different Unicode forms of one name. The result is always a single
-/// component inside `dest_dir`.
+/// component inside the destination folder.
 ///
 /// A file found in pieces is written as its pieces in file order. Stretches that cannot be read are written as zeros, so a
 /// partial file comes out instead of none. Each piece stops at the source's end even if it runs past it.
 /// A write error returns [`EngineError::Write`] and removes the incomplete file. A source that vanishes
 /// ([`EngineError::DeviceGone`], or a read coming back short before the source's length) is never written as zeros: the
 /// copy stops, the incomplete file is removed and `DeviceGone` is returned.
-pub fn extract_as(
+pub fn extract_to(
     source: &dyn Source,
     finding: &Finding,
-    dest_dir: &Path,
+    dest: &Destination,
     name: &str,
 ) -> Result<PathBuf, EngineError> {
-    let dest_volume = volume_of(dest_dir)?;
-    if source.volume() == Some(dest_volume) {
-        return Err(EngineError::DestinationOnSource);
-    }
-
-    let (path, mut file) = create_named(dest_dir, finding, name, None)?;
+    let (path, mut file) = create_named(dest.dir(), finding, name, None)?;
     if let Err(e) = copy(source, finding, &mut file) {
         drop(file);
         let _ = std::fs::remove_file(&path);
         return Err(e);
     }
     Ok(path)
+}
+
+/// [`Destination::check`] against the running system ([`SystemDevices`]), then [`extract_to`]: refuses a folder on the
+/// source's volume and, for a device source, any volume of that device (or a folder whose disks cannot be told). Checks
+/// on every call (cheap for an image; with a device, `revenant-dev` checks once and uses [`extract_to`]).
+pub fn extract_as(
+    source: &dyn Source,
+    finding: &Finding,
+    dest_dir: &Path,
+    name: &str,
+) -> Result<PathBuf, EngineError> {
+    let dest = Destination::check(&SystemDevices, source, dest_dir)?;
+    extract_to(source, finding, &dest, name)
 }
 
 /// Creates a new file in `dir` named after `name` and returns its path and handle: `sanitize(name)` (the finding's

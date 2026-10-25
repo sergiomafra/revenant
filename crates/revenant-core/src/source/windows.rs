@@ -1,27 +1,33 @@
 //! Windows backend. Compiled only on Windows (verified by CI).
 
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{
-    ERROR_DEV_NOT_EXIST, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND, ERROR_NO_SUCH_DEVICE,
-    ERROR_NOT_READY,
+    ERROR_DEV_NOT_EXIST, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA,
+    ERROR_NO_SUCH_DEVICE, ERROR_NOT_READY, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFileInformationByHandle,
+    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
+    GetFileInformationByHandle, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+    GetVolumePathNameW, GetVolumePathNamesForVolumeNameW, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
     DISK_GEOMETRY_EX, GET_LENGTH_INFORMATION, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
     IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_CHECK_VERIFY2, IOCTL_STORAGE_QUERY_PROPERTY,
-    PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_PROPERTY_QUERY,
-    StorageAccessAlignmentProperty,
+    PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_PROPERTY_ID,
+    STORAGE_PROPERTY_QUERY, StorageAccessAlignmentProperty, StorageDeviceProperty,
+    StorageDeviceSeekPenaltyProperty,
 };
 
 use super::Geometry;
+use crate::device::win_parse::{self, WinDestRaw, WinDiskRaw, WinExtent, WinVolumeRaw};
 
 /// Opens read-only. `FILE_FLAG_BACKUP_SEMANTICS` is required to open directories.
 pub fn open_read_only(path: &Path) -> io::Result<File> {
@@ -82,6 +88,16 @@ fn ioctl<I, O>(file: &File, code: u32, input: Option<&I>, out: &mut O) -> io::Re
     Ok(returned)
 }
 
+/// Sends `IOCTL_STORAGE_QUERY_PROPERTY` (a standard query of `property`) and fills `out`.
+fn query_property<O>(file: &File, property: STORAGE_PROPERTY_ID, out: &mut O) -> io::Result<u32> {
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: property,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    ioctl(file, IOCTL_STORAGE_QUERY_PROPERTY, Some(&query), out)
+}
+
 /// Size (`IOCTL_DISK_GET_LENGTH_INFO`) and sector sizes (`StorageAccessAlignmentProperty`, else the bytes per sector of
 /// `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX` for both) of an open whole disk.
 pub(crate) fn device_geometry(file: &File) -> io::Result<Geometry> {
@@ -89,39 +105,54 @@ pub(crate) fn device_geometry(file: &File) -> io::Result<Geometry> {
     ioctl::<(), _>(file, IOCTL_DISK_GET_LENGTH_INFO, None, &mut length)?;
     let size =
         u64::try_from(length.Length).map_err(|_| io::Error::other("negative disk length"))?;
-    let query = STORAGE_PROPERTY_QUERY {
-        PropertyId: StorageAccessAlignmentProperty,
-        QueryType: PropertyStandardQuery,
-        AdditionalParameters: [0],
-    };
-    let mut align = STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR::default();
-    let full = size_of::<STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR>() as u32;
-    let (logical, physical) =
-        match ioctl(file, IOCTL_STORAGE_QUERY_PROPERTY, Some(&query), &mut align) {
-            Ok(n) if n >= full && plausible(align.BytesPerLogicalSector) => {
-                let physical = align.BytesPerPhysicalSector;
-                let physical = if plausible(physical) && physical >= align.BytesPerLogicalSector {
-                    physical
-                } else {
-                    align.BytesPerLogicalSector
-                };
-                (align.BytesPerLogicalSector, physical)
-            }
-            _ => {
-                let mut geo = DISK_GEOMETRY_EX::default();
-                ioctl::<(), _>(file, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, None, &mut geo)?;
-                let bytes = geo.Geometry.BytesPerSector;
-                if !plausible(bytes) {
-                    return Err(io::Error::other("implausible sector size"));
-                }
-                (bytes, bytes)
-            }
-        };
+    let (logical, physical) = sector_sizes(file)?;
     Ok(Geometry {
         size,
         logical_sector: logical,
         physical_sector: physical,
     })
+}
+
+/// The geometry of a disk opened without read access (a listing): the size from `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX`
+/// (`IOCTL_DISK_GET_LENGTH_INFO` needs read access), the sector sizes as [`device_geometry`].
+fn query_geometry(file: &File) -> io::Result<Geometry> {
+    let mut geo = DISK_GEOMETRY_EX::default();
+    ioctl::<(), _>(file, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, None, &mut geo)?;
+    let size = u64::try_from(geo.DiskSize).map_err(|_| io::Error::other("negative disk size"))?;
+    let (logical, physical) = sector_sizes(file)?;
+    Ok(Geometry {
+        size,
+        logical_sector: logical,
+        physical_sector: physical,
+    })
+}
+
+/// Logical and physical sector sizes: `StorageAccessAlignmentProperty`, else the bytes per sector of
+/// `IOCTL_DISK_GET_DRIVE_GEOMETRY_EX` for both.
+fn sector_sizes(file: &File) -> io::Result<(u32, u32)> {
+    let mut align = STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR::default();
+    let full = size_of::<STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR>() as u32;
+    let sizes = match query_property(file, StorageAccessAlignmentProperty, &mut align) {
+        Ok(n) if n >= full && plausible(align.BytesPerLogicalSector) => {
+            let physical = align.BytesPerPhysicalSector;
+            let physical = if plausible(physical) && physical >= align.BytesPerLogicalSector {
+                physical
+            } else {
+                align.BytesPerLogicalSector
+            };
+            (align.BytesPerLogicalSector, physical)
+        }
+        _ => {
+            let mut geo = DISK_GEOMETRY_EX::default();
+            ioctl::<(), _>(file, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, None, &mut geo)?;
+            let bytes = geo.Geometry.BytesPerSector;
+            if !plausible(bytes) {
+                return Err(io::Error::other("implausible sector size"));
+            }
+            (bytes, bytes)
+        }
+    };
+    Ok(sizes)
 }
 
 /// A sector size from 512 to 64 KiB, a power of two.
@@ -147,6 +178,208 @@ pub(crate) fn is_gone_code(raw: i32) -> bool {
     ]
     .iter()
     .any(|&c| c as i32 == raw)
+}
+
+/// Longest volume name or path read, in UTF-16 units.
+const NAME_LEN: usize = 1024;
+/// Most volumes looked at in a listing.
+const MAX_VOLUMES: usize = 256;
+/// Extents read per volume (a volume with more is described by its first ones).
+const MAX_EXTENTS: usize = 64;
+
+/// `s` as a NUL-terminated UTF-16 string.
+fn wide(s: &OsStr) -> Vec<u16> {
+    s.encode_wide().chain(Some(0)).collect()
+}
+
+/// The UTF-16 text of `buf` up to its first NUL.
+fn until_nul(buf: &[u16]) -> String {
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..end])
+}
+
+fn non_empty(s: String) -> Option<String> {
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Opens a device or volume for queries only (access 0: no read, no write), sharing read and write.
+fn open_query(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)
+}
+
+/// What `\\.\PhysicalDrive<number>` says of itself, opened for queries only; `None` when there is no such disk or it does
+/// not answer.
+pub(crate) fn disk_raw(number: u32) -> Option<WinDiskRaw> {
+    let file = open_query(Path::new(&format!(r"\\.\PhysicalDrive{number}"))).ok()?;
+    let mut desc = [0u8; 1024];
+    let n = query_property(&file, StorageDeviceProperty, &mut desc).ok()?;
+    let descriptor = win_parse::descriptor(&desc[..(n as usize).min(desc.len())])?;
+    let geometry = query_geometry(&file).ok()?;
+    // DEVICE_SEEK_PENALTY_DESCRIPTOR: Version, Size, then the BOOLEAN IncursSeekPenalty at byte 8 (read as a byte).
+    let mut penalty = [0u8; 12];
+    let seek_penalty = match query_property(&file, StorageDeviceSeekPenaltyProperty, &mut penalty) {
+        Ok(n) if n >= 9 => Some(penalty[8] != 0),
+        _ => None,
+    };
+    Some(WinDiskRaw {
+        number,
+        geometry,
+        descriptor,
+        seek_penalty,
+    })
+}
+
+/// The volume GUID path of the volume `path` lies on (`GetVolumePathNameW` + `GetVolumeNameForVolumeMountPointW`).
+pub(crate) fn volume_name_of(path: &Path) -> Option<String> {
+    let root = volume_root(path).ok()?;
+    let root = wide(root.as_os_str());
+    let mut buf = [0u16; NAME_LEN];
+    // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call; `buf` is a writable buffer of exactly
+    // `NAME_LEN` UTF-16 units, the length passed.
+    let ok = unsafe {
+        GetVolumeNameForVolumeMountPointW(root.as_ptr(), buf.as_mut_ptr(), NAME_LEN as u32)
+    };
+    (ok != 0).then(|| until_nul(&buf))
+}
+
+/// The root of the volume `path` lies on (`C:\`, or a mounted folder).
+fn volume_root(path: &Path) -> io::Result<PathBuf> {
+    let name = wide(path.as_os_str());
+    let mut buf = [0u16; NAME_LEN];
+    // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call; `buf` is a writable buffer of exactly
+    // `NAME_LEN` UTF-16 units, the length passed.
+    let ok = unsafe { GetVolumePathNameW(name.as_ptr(), buf.as_mut_ptr(), NAME_LEN as u32) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(PathBuf::from(until_nul(&buf)))
+}
+
+/// The label and file-system name of the volume whose root (or GUID path, with its trailing backslash) is `root`.
+fn volume_information(root: &OsStr) -> (Option<String>, Option<String>) {
+    let root = wide(root);
+    let mut label = [0u16; 261];
+    let mut fs = [0u16; 261];
+    // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call; `label` and `fs` are writable buffers of
+    // exactly the lengths passed; the serial, component-length and flags out-pointers are null, which the function
+    // accepts.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            label.as_mut_ptr(),
+            label.len() as u32,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs.as_mut_ptr(),
+            fs.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return (None, None);
+    }
+    (non_empty(until_nul(&label)), non_empty(until_nul(&fs)))
+}
+
+/// The disk extents of the volume `\\?\Volume{…}\` (`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` on the volume opened for
+/// queries only, without the trailing backslash); empty when it has none (a CD, a network volume) or does not answer.
+fn volume_extents(name: &str) -> Vec<WinExtent> {
+    let Ok(file) = open_query(Path::new(name.trim_end_matches('\\'))) else {
+        return Vec::new();
+    };
+    let mut buf = [0u8; 8 + 24 * MAX_EXTENTS];
+    match ioctl::<(), _>(&file, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, None, &mut buf) {
+        Ok(_) => win_parse::extents(&buf),
+        // More extents than the buffer holds: the first ones are there.
+        Err(e) if e.raw_os_error() == Some(ERROR_MORE_DATA as i32) => win_parse::extents(&buf),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The first path the volume is mounted at, if any (`GetVolumePathNamesForVolumeNameW`).
+fn mount_point(name: &str) -> Option<PathBuf> {
+    let name = wide(OsStr::new(name));
+    let mut buf = [0u16; NAME_LEN];
+    let mut returned = 0u32;
+    // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call; `buf` is a writable buffer of exactly
+    // `NAME_LEN` UTF-16 units, the length passed; `returned` is a valid out-pointer.
+    let ok = unsafe {
+        GetVolumePathNamesForVolumeNameW(
+            name.as_ptr(),
+            buf.as_mut_ptr(),
+            NAME_LEN as u32,
+            &mut returned,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    non_empty(until_nul(&buf)).map(PathBuf::from)
+}
+
+/// Every volume of the system (at most 256): its GUID path, file system, label, first mount point and disk extents.
+pub(crate) fn volumes_raw() -> Vec<WinVolumeRaw> {
+    let mut out = Vec::new();
+    let mut buf = [0u16; NAME_LEN];
+    // SAFETY: `buf` is a writable buffer of exactly `NAME_LEN` UTF-16 units, the length passed.
+    let find = unsafe { FindFirstVolumeW(buf.as_mut_ptr(), NAME_LEN as u32) };
+    if find == INVALID_HANDLE_VALUE {
+        return out;
+    }
+    loop {
+        let name = until_nul(&buf);
+        if !name.is_empty() {
+            let (label, fs) = volume_information(OsStr::new(&name));
+            out.push(WinVolumeRaw {
+                fs,
+                label,
+                mount_point: mount_point(&name),
+                extents: volume_extents(&name),
+                name,
+            });
+        }
+        if out.len() >= MAX_VOLUMES {
+            break;
+        }
+        // SAFETY: `find` is the search handle FindFirstVolumeW returned, not yet closed; `buf` as above.
+        if unsafe { FindNextVolumeW(find, buf.as_mut_ptr(), NAME_LEN as u32) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: `find` is a valid search handle, closed exactly once here.
+    unsafe { FindVolumeClose(find) };
+    out
+}
+
+/// The volume a destination folder lies on: its file system, the free space available to this user and its extents.
+pub(crate) fn dest_raw(dir: &Path) -> io::Result<WinDestRaw> {
+    let root = volume_root(dir)?;
+    let name = volume_name_of(&root).ok_or_else(io::Error::last_os_error)?;
+    let (_, fs) = volume_information(root.as_os_str());
+    let dir_w = wide(dir.as_os_str());
+    let mut free = 0u64;
+    // SAFETY: `dir_w` is a NUL-terminated UTF-16 string that outlives the call; `free` is a valid out-pointer; the
+    // total and total-free out-pointers are null, which the function accepts.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            dir_w.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(WinDestRaw {
+        fs,
+        free_bytes: free,
+        extents: volume_extents(&name),
+    })
 }
 
 #[cfg(test)]

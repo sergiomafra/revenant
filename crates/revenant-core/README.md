@@ -15,6 +15,12 @@ Every engine error is an `EngineError`; each variant has a stable `snake_case` c
 | `Write`               | `write_failed`          |
 | `Cancelled`           | `cancelled`             |
 | `DeviceGone`          | `device_gone`           |
+| `PermissionDenied`    | `permission_denied`     |
+| `DeviceNotFound`      | `device_not_found`      |
+| `NotWholeDisk`        | `not_whole_disk`        |
+| `SystemTool`          | `system_tool_failed`    |
+| `Unsupported`         | `unsupported_platform`  |
+| `DestinationUnknown`  | `destination_unknown`   |
 
 ```rust
 use revenant_core::EngineError;
@@ -44,14 +50,29 @@ again (what it already holds is still served).
 
 `source::DeviceSource` reads a whole card or disk directly, read-only. Only whole disks: `source::DiskId::parse` accepts
 `disk4`, `/dev/disk4`, `/dev/rdisk4`, `PhysicalDrive2` and `\\.\PhysicalDrive2` on every platform (canonical names `disk4`,
-`PhysicalDrive2`); a partition (`disk4s1`) or anything else is `not_whole_disk`. `DeviceSource::open(&disk)` opens the raw
-node on macOS (`/dev/rdisk4`, plain `File::open`) and `\\.\PhysicalDrive2` on Windows (`GENERIC_READ` only, sharing read
-and write); it needs root or Administrator (`permission_denied` otherwise), a missing disk is `device_not_found`, and other
-systems answer `unsupported_platform`. Its geometry (`Geometry { size, logical_sector, physical_sector }`) comes on macOS
-from `diskutil info -plist` (`TotalSize` or `Size`, `DeviceBlockSize`) and `ioreg -a -r -c IOBlockStorageDevice -l` (the
-device's `Physical Block Size`, else the logical size), tools run by absolute path with their output bounded to 16 MiB
-(any failure is `system_tool_failed`); on Windows from `IOCTL_DISK_GET_LENGTH_INFO` and the storage access alignment
+`PhysicalDrive2`); a partition (`disk4s1`) or anything else is `not_whole_disk`. A device is opened with
+`device::SystemDevices.open(&disk)` (see [Disks](#disks)) and wrapped with `DeviceSource::new(raw, disk)`:
+
+```rust,ignore
+use revenant_core::device::{DeviceOps, SystemDevices};
+use revenant_core::source::{DeviceSource, DiskId};
+let disk = DiskId::parse("disk4")?;
+let source = DeviceSource::new(SystemDevices.open(&disk)?, disk);
+```
+
+`open` reads the raw node on macOS (`/dev/rdisk4`, plain `File::open`) and `\\.\PhysicalDrive2` on Windows (`GENERIC_READ`
+only, sharing read and write); it needs root or Administrator (`permission_denied` otherwise), a missing disk is
+`device_not_found`, and other systems answer `unsupported_platform`. Its geometry (`Geometry { size, logical_sector,
+physical_sector }`) comes on macOS from `diskutil info -plist` (`TotalSize` or `Size`, `DeviceBlockSize`) and `ioreg -a -r
+-c IOBlockStorageDevice -l` (the device's `Physical Block Size`, else the logical size); after the node is opened,
+`diskutil info` is asked again and the open fails with `device_not_found` unless it still describes the same medium (size,
+sector size, names, `DiskUUID`…), so a card swapped between the query and the open is never read with the old geometry.
+On Windows the geometry comes from the open handle itself: `IOCTL_DISK_GET_LENGTH_INFO` and the storage access alignment
 property (else the drive geometry's bytes per sector).
+
+System tools are run by absolute path (`/usr/sbin/diskutil`, `/usr/sbin/ioreg`, `/bin/df`), with stdin and stderr closed,
+their output bounded to 16 MiB and their run time to 30 s (a tool stuck on a dying disk is killed); any failure is
+`system_tool_failed`, never a panic.
 
 A device reads only whole logical sectors; `DeviceSource` accepts any offset and length and aligns inside: an aligned
 request goes straight to the caller's buffer, a partial sector at either end through a sector buffer aligned to 4096 bytes.
@@ -62,6 +83,66 @@ left (macOS `ENOENT`/`ENXIO`/`ENODEV`; Windows `ERROR_DEVICE_NOT_CONNECTED`, `ER
 `ERROR_NOT_READY`, `ERROR_FILE_NOT_FOUND`) or when the device is no longer present (macOS: `/dev/diskN` is gone; Windows:
 `IOCTL_STORAGE_CHECK_VERIFY2` fails); otherwise it is a bad sector (`read_failed`). `source::RawDevice` (aligned reads
 and the geometry) is what `DeviceSource::new(raw, disk)` wraps, for a privileged helper or a test double.
+
+### Disks
+
+`device::DeviceOps` is what the engine asks the operating system about disks (`list`, `open`, `destination`), so a
+privileged helper (Module 2.1) or a test double can serve it; `device::SystemDevices` is the running system's (macOS,
+Windows; elsewhere every call is `unsupported_platform`). `destination` needs no privilege and may stay outside the helper.
+
+`list()` returns the connected whole disks, sorted by id (`disk2` before `disk10`), each a `DiskInfo`: `id`, `geometry`,
+`vendor`, `model`, `serial` (often the card reader's, not the card's), `removable`, `internal`, `system`, `virtual_disk`,
+`solid_state` (`None` when the system does not say) and its `volumes` (`VolumeInfo { id, fs, label, mount_point, size }`).
+
+- macOS: the whole disks of `diskutil list -plist`, each completed by `diskutil info -plist` of the disk and of each of
+  its partitions, plus one `ioreg -a -r -c IOBlockStorageDevice -l` (vendor, product, serial, physical sector). APFS
+  containers the system synthesizes (`disk3` on top of `disk0s2`) are not listed: they are shown through their physical
+  disk. The system disk is the one holding `/`: the `ParentWholeDisk` of `diskutil info -plist /` and the disks of its
+  `APFSPhysicalStores`. `removable` is `Removable` or `RemovableMedia`, `internal` is `Internal`, `solid_state` is
+  `SolidState`, and an image attached with `hdiutil` (`VirtualOrPhysical` `Virtual`, bus `Disk Image`) is `virtual_disk`.
+  A disk whose info cannot be read (it left meanwhile) is left out; the list, the info of `/` or `ioreg` failing fails
+  the listing with `system_tool_failed`.
+- Windows: `\\.\PhysicalDrive0` to `63`, opened without read access (queries only): `IOCTL_STORAGE_QUERY_PROPERTY` (vendor,
+  product, serial, removable media, bus type; the seek penalty for `solid_state`), the drive geometry and the access
+  alignment. Every volume (`FindFirstVolumeW`/`FindNextVolumeW`) is attached to the disks of its extents
+  (`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`), with its file system and label (`GetVolumeInformationW`) and first mount point.
+  The system disk holds the volume of `%SystemDrive%`; a dynamic volume spanning several disks marks them all. USB, SD,
+  MMC and 1394 buses are external, virtual buses (a VHD) are `virtual_disk`.
+
+### Destination
+
+`Destination::check(&ops, &source, dir)` checks a destination folder once against the source; extraction (`extract_to`),
+and later the copy and the session, write only into a `Destination`. The folder must exist (`open_failed` otherwise) and:
+
+- must not be on the source's volume (an image file's): `destination_on_source`;
+- for a device source (`Source::disk()` is `Some`), must not be on any volume of that disk: `ops.destination(dir)` gives
+  the disks the folder lives on (`DestInfo { disks, fs, free_bytes, max_file_bytes }`), and the source's disk among them
+  is `destination_on_source`. An APFS volume counts as its container and the disks of its physical stores, so a folder
+  on an APFS volume whose store is a partition of the card is refused too;
+- for a device source, when those disks cannot be told (a network folder, a failed query, no disk) the folder is refused
+  with `destination_unknown`: it could be the card itself, and nothing is ever written to the card being recovered.
+
+An image source (`disk()` is `None`) only gets the volume rule; `ops` is not called. `dir()` is the folder and `info()`
+what it lives on (`None` for an image source). On macOS `destination` runs `df -P -k <dir>` (the volume's node and the
+space available) and `diskutil info -plist <node>` (`ParentWholeDisk`, `APFSPhysicalStores`, `FilesystemType`); on Windows
+the volume of the folder (`GetVolumePathNameW`, `GetVolumeNameForVolumeMountPointW`), its extents, file system and
+`GetDiskFreeSpaceExW`. On FAT (macOS `msdos`, Windows `FAT`/`FAT32`) `max_file_bytes` is 4 GiB − 1 (`device::FAT_MAX_FILE`).
+
+### Source identity
+
+`SourceIdentity` recognizes a source later (a resumed copy, a reconnected card, a reopened session); compare two with
+`same_source`, never `==`.
+
+- `SourceIdentity::of_device(&info, &source)` = size, model, serial and `table`, always computed: the FNV-1a 64 digest of
+  sector 0, of sectors 1 to 33 when sector 0 is a protective MBR (a GPT), and of the boot sector of the first volume the
+  table names (each a logical sector). The bytes the system rewrites while a FAT or exFAT volume is mounted are zeroed
+  first (FAT12/16 byte 37, FAT32 byte 65, exFAT bytes 106, 107 and 112; also in sector 0 when the card has no partition
+  table), so mounting the card does not change it, while reformatting it does. An unreadable sector counts as zeros; a
+  device that is gone is `device_gone`.
+- `SourceIdentity::of_image(&source)` = size and the FNV-1a 64 of the first MiB, the MiB at the middle (aligned down to
+  1 MiB) and the last MiB.
+- `same_source`: devices match when sizes, models and `table`s are equal, and the serials too when both sides have one
+  (readers often report their own serial, so it is only an extra check). Two identical cloned cards look the same.
 
 `source::Fragmented::new(source, pieces)` is a read-only logical view of pieces (`Fragment { start, len }`, absolute ranges)
 of a source, in the given order: offset 0 is the first byte of the first piece. Each piece is first clamped to the inner
@@ -1189,9 +1270,15 @@ choose: `sanitize(name)`, or `revenant_<start>.<ext>` when nothing is left of it
 nothing is ever overwritten, on case-sensitive and case-insensitive volumes alike and for NFC/NFD forms of one name
 (`DSC00001.JPG` and `dsc00001.jpg` give two files; after 10,000 attempts it fails with `write_failed`).
 
+`extract_to(source, &Finding, &Destination, name)` writes into a folder already checked with `Destination::check` (see
+[Destination](#destination)); `extract_as` is `Destination::check(&SystemDevices, ..)` followed by `extract_to`, so it checks
+on every call (cheap for an image; with a device source it asks the system each time, so check once and use `extract_to`).
+
 - Refuses with `destination_on_source` when the destination is on the source's volume (writing to a damaged card could destroy
-  what is still recoverable). If the source's volume is unknown (`None`) extraction is allowed. If the destination's volume
-  cannot be determined (e.g. the directory does not exist) it returns `open_failed` and writes nothing.
+  what is still recoverable) or, for a device source, on any volume of that device; with a device source a destination
+  whose disks cannot be told is `destination_unknown`. If an image source's volume is unknown (`None`) extraction is
+  allowed. If the destination's volume cannot be determined (e.g. the directory does not exist) it returns `open_failed`
+  and writes nothing.
 - A finding in pieces is written as its pieces (`Finding::ranges()`) one after another, in file order; the file is still
   named after the original name or, without one, after `start` (the first piece's start).
 - A chunk that cannot be read is re-read sector by sector (512 bytes); only the unreadable sectors are written as zeros, so a

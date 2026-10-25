@@ -280,6 +280,23 @@ fn probe(source: &dyn Source) -> Vec<Volume> {
     out
 }
 
+/// Where the first volume starts according to the partition table (the lowest candidate offset inside the source; 0
+/// when sector 0 is itself a boot sector), whatever its file system. `None` without a table or a volume. Reads only
+/// the tables (bounded as in [`volumes`]); read errors count as no table.
+pub(crate) fn first_volume(source: &dyn Source) -> Option<u64> {
+    partitions::candidates(source)
+        .iter()
+        .map(|c| c.offset)
+        .filter(|&o| o < source.len())
+        .min()
+}
+
+/// The bytes of a boot sector the system rewrites while its volume is mounted (ruling D7); empty when `sector` is not a
+/// FAT or exFAT boot sector.
+pub(crate) fn volatile_boot_bytes(sector: &[u8]) -> &'static [usize] {
+    boot::volatile_bytes(sector)
+}
+
 /// Exactly `len` bytes at `offset`, or `None` (read error, or the source ends first).
 pub(crate) fn read_exact(source: &dyn Source, offset: u64, len: usize) -> Option<Vec<u8>> {
     if offset.checked_add(len as u64)? > source.len() {

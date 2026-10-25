@@ -2,13 +2,17 @@
 //!
 //! [`SimSource`] serves bytes from memory (or virtual zeros) and can make chosen ranges unreadable, flaky or slow, make
 //! the whole device vanish or shrink after some reads, and logs every read it receives. [`MemDevice`] is an in-memory
-//! [`RawDevice`] that insists on aligned reads.
+//! [`RawDevice`] that insists on aligned reads. [`FakeDevices`] is a [`DeviceOps`] over in-memory disks.
 #![allow(dead_code)]
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use revenant_core::EngineError;
+use revenant_core::device::{DestInfo, DeviceOps, DiskInfo};
 use revenant_core::source::{DiskId, Geometry, RawDevice, Source, VolumeId};
 
 enum Data {
@@ -320,5 +324,204 @@ impl RawDevice for MemDevice {
         let n = (size - offset).min(buf.len() as u64) as usize;
         buf[..n].copy_from_slice(&self.data[offset as usize..offset as usize + n]);
         Ok(n)
+    }
+}
+
+/// The [`EngineError`] with code `code` (the ones a fake system can answer); anything else is `open_failed`.
+pub fn error_of(code: &str) -> EngineError {
+    match code {
+        "system_tool_failed" => EngineError::SystemTool { tool: "/fake/tool" },
+        "unsupported_platform" => EngineError::Unsupported,
+        "permission_denied" => EngineError::PermissionDenied,
+        "device_not_found" => EngineError::DeviceNotFound,
+        "not_whole_disk" => EngineError::NotWholeDisk,
+        "device_gone" => EngineError::DeviceGone { offset: 0 },
+        "cancelled" => EngineError::Cancelled,
+        _ => EngineError::Open {
+            cause: std::io::Error::other(code.to_string()),
+        },
+    }
+}
+
+/// One connected fake disk: its info, the bytes it holds (zeros past them up to `info.geometry.size`) and whether it is
+/// still connected (an open device reads `DeviceGone` once removed).
+struct FakeDisk {
+    info: DiskInfo,
+    data: Arc<Vec<u8>>,
+    present: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct FakeState {
+    disks: BTreeMap<DiskId, FakeDisk>,
+    destinations: Vec<(PathBuf, Result<DestInfo, &'static str>)>,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+/// A [`DeviceOps`] over in-memory disks. Every method takes `&self` (state behind a mutex), so a test can connect and
+/// remove disks from another thread while the code under test lists and opens them. Every call is logged: "list",
+/// "open disk4", "read disk4 <offset>", "destination <dir>".
+#[derive(Default)]
+pub struct FakeDevices {
+    state: Mutex<FakeState>,
+}
+
+impl FakeDevices {
+    pub fn new() -> FakeDevices {
+        FakeDevices::default()
+    }
+
+    /// Connects a disk holding `data`; `info.geometry.size` is set to `data.len()`.
+    pub fn add(&self, mut info: DiskInfo, data: Vec<u8>) {
+        info.geometry.size = data.len() as u64;
+        self.add_virtual(info, data);
+    }
+
+    /// Connects a disk of `info.geometry.size` bytes holding `data` at its start and zeros after it (nothing more is
+    /// allocated: an 8 GiB disk costs only `data`).
+    pub fn add_virtual(&self, info: DiskInfo, data: Vec<u8>) {
+        let disk = FakeDisk {
+            info: info.clone(),
+            data: Arc::new(data),
+            present: Arc::new(AtomicBool::new(true)),
+        };
+        if let Some(old) = self.lock().disks.insert(info.id, disk) {
+            old.present.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Disconnects a disk: it leaves the list and its open devices read `DeviceGone`.
+    pub fn remove(&self, id: &str) {
+        let id = DiskId::parse(id).expect("a whole-disk id");
+        if let Some(old) = self.lock().disks.remove(&id) {
+            old.present.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// What `destination(dir)` answers for `dir` and any folder inside it (the longest matching `dir` wins): the info, or
+    /// the error with that code. A folder never set answers `system_tool_failed`.
+    pub fn set_destination(&self, dir: &Path, answer: Result<DestInfo, &'static str>) {
+        let mut st = self.lock();
+        st.destinations.retain(|(d, _)| d != dir);
+        st.destinations.push((dir.to_path_buf(), answer));
+    }
+
+    /// Every call so far, in order.
+    pub fn log(&self) -> Vec<String> {
+        let log = self.lock().log.clone();
+        log.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, FakeState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn note(&self, entry: String) {
+        let log = self.lock().log.clone();
+        log.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(entry);
+    }
+}
+
+impl DeviceOps for FakeDevices {
+    fn list(&self) -> Result<Vec<DiskInfo>, EngineError> {
+        self.note("list".into());
+        Ok(self.lock().disks.values().map(|d| d.info.clone()).collect())
+    }
+
+    fn open(&self, disk: &DiskId) -> Result<Box<dyn RawDevice>, EngineError> {
+        self.note(format!("open {}", disk.as_str()));
+        let st = self.lock();
+        let d = st.disks.get(disk).ok_or(EngineError::DeviceNotFound)?;
+        Ok(Box::new(FakeDevice {
+            id: disk.clone(),
+            geometry: d.info.geometry,
+            data: d.data.clone(),
+            present: d.present.clone(),
+            log: st.log.clone(),
+        }))
+    }
+
+    fn destination(&self, dir: &Path) -> Result<DestInfo, EngineError> {
+        self.note(format!("destination {}", dir.display()));
+        let st = self.lock();
+        let answer = st
+            .destinations
+            .iter()
+            .filter(|(d, _)| dir.starts_with(d))
+            .max_by_key(|(d, _)| d.as_os_str().len())
+            .map(|(_, a)| a.clone());
+        match answer {
+            Some(Ok(info)) => Ok(info),
+            Some(Err(code)) => Err(error_of(code)),
+            None => Err(error_of("system_tool_failed")),
+        }
+    }
+}
+
+/// An open fake disk: aligned reads only (it panics on others, as [`MemDevice`]), zeros past its data, `DeviceGone`
+/// once removed.
+struct FakeDevice {
+    id: DiskId,
+    geometry: Geometry,
+    data: Arc<Vec<u8>>,
+    present: Arc<AtomicBool>,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl RawDevice for FakeDevice {
+    fn geometry(&self) -> Geometry {
+        self.geometry
+    }
+
+    fn read_aligned(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        let sector = u64::from(self.geometry.logical_sector);
+        assert!(
+            offset.is_multiple_of(sector) && (buf.len() as u64).is_multiple_of(sector),
+            "misaligned device read: offset {offset}, len {}",
+            buf.len()
+        );
+        self.log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!("read {} {offset}", self.id.as_str()));
+        if !self.present.load(Ordering::SeqCst) {
+            return Err(EngineError::DeviceGone { offset });
+        }
+        let size = self.geometry.size;
+        if offset >= size {
+            return Ok(0);
+        }
+        let n = (size - offset).min(buf.len() as u64) as usize;
+        let have = (self.data.len() as u64)
+            .saturating_sub(offset)
+            .min(n as u64) as usize;
+        if have > 0 {
+            buf[..have].copy_from_slice(&self.data[offset as usize..offset as usize + have]);
+        }
+        buf[have..n].fill(0);
+        Ok(n)
+    }
+}
+
+/// A [`DiskInfo`] for a fake disk `id` of `size` bytes with 512-byte sectors: removable, external, nothing else set.
+pub fn disk_info(id: &str, size: u64) -> DiskInfo {
+    DiskInfo {
+        id: DiskId::parse(id).expect("a whole-disk id"),
+        geometry: Geometry {
+            size,
+            logical_sector: 512,
+            physical_sector: 512,
+        },
+        vendor: None,
+        model: Some("Fake Card".into()),
+        serial: None,
+        removable: true,
+        internal: false,
+        system: false,
+        virtual_disk: false,
+        solid_state: None,
+        volumes: Vec::new(),
     }
 }
