@@ -304,6 +304,30 @@ pub(crate) fn same_media(a: &Plist, b: &Plist) -> bool {
         && MEDIA_KEYS.iter().all(|k| a.get(k) == b.get(k))
 }
 
+/// Whether `diskutil unmountDisk` left `disk` unmounted (ruling D10): `ok` is whether the tool succeeded, `after` a
+/// listing taken afterwards. `Err` with the volumes of `disk` still mounted (empty when none is but the tool failed, or
+/// the disk is no longer listed): an unmount counts only when the tool says so and the system agrees.
+pub(crate) fn unmount_result(
+    ok: bool,
+    after: &[DiskInfo],
+    disk: &DiskId,
+) -> Result<(), Vec<String>> {
+    let Some(info) = after.iter().find(|d| d.id == *disk) else {
+        return Err(Vec::new());
+    };
+    let mounted: Vec<String> = info
+        .volumes
+        .iter()
+        .filter(|v| v.mount_point.is_some())
+        .map(|v| v.id.clone())
+        .collect();
+    if ok && mounted.is_empty() {
+        Ok(())
+    } else {
+        Err(mounted)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::plist::parse;
@@ -586,5 +610,39 @@ mod tests {
         let renamed = with(&info, "DeviceIdentifier", Plist::Str("disk9".into()));
         assert_eq!(geometry(&renamed, Some(&e512), "disk9"), Some(sd));
         assert_eq!(geometry(&Plist::Bool(true), Some(&ioreg), "disk2"), None);
+    }
+
+    #[test]
+    fn unmount_failure_lists_busy_volumes() {
+        let list = parse(LIST).unwrap();
+        let root = parse(INFO_ROOT).unwrap();
+        let mounted = disks(&list, &infos(), &root, None).unwrap();
+        let mut unmounted = mounted.clone();
+        for v in &mut unmounted[1].volumes {
+            v.mount_point = None;
+        }
+        let disk2 = id("disk2");
+        // The tool failed and disk2s1 is still mounted: that volume is named.
+        assert_eq!(
+            unmount_result(false, &mounted, &disk2),
+            Err(vec!["disk2s1".to_string()])
+        );
+        // The tool succeeded but the system still shows it mounted (remounted meanwhile): not unmounted.
+        assert_eq!(
+            unmount_result(true, &mounted, &disk2),
+            Err(vec!["disk2s1".to_string()])
+        );
+        // Success and no mount point left.
+        assert_eq!(unmount_result(true, &unmounted, &disk2), Ok(()));
+        // Other disks' mount points do not count (disk0s1 has none in the fixture; give it one).
+        let mut other = unmounted.clone();
+        other[0].volumes[0].mount_point = Some(PathBuf::from("/"));
+        assert_eq!(unmount_result(true, &other, &disk2), Ok(()));
+        // The tool failed though nothing is mounted, or the disk left: never taken as unmounted.
+        assert_eq!(unmount_result(false, &unmounted, &disk2), Err(Vec::new()));
+        assert_eq!(
+            unmount_result(true, &unmounted, &id("disk7")),
+            Err(Vec::new())
+        );
     }
 }

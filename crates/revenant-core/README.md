@@ -111,6 +111,28 @@ Windows; elsewhere every call is `unsupported_platform`). `destination` needs no
   the listing (`open_failed`). A destination volume with more extents than the 64 read is refused, never half-checked. USB, SD,
   MMC and 1394 buses are external, virtual buses (a VHD) are `virtual_disk`.
 
+`unmount(&disk)` unmounts every volume of a disk **without ejecting it**, so the system stops writing to the card while
+it is read, and returns an `UnmountGuard`; `remount(&disk, Some(guard))` mounts the volumes again. The engine never
+remounts by itself: remounting gives the system back the chance to write to the card, so it happens only when asked.
+
+- macOS: `diskutil unmountDisk diskN` (never `force`; it also unmounts the volumes of an APFS container on the disk and
+  succeeds when nothing is mounted), then a listing confirms it. The tool failing or a volume of the disk still mounted is
+  `unmount_failed` with `volumes` (the ones the listing shows mounted; an APFS container's volumes are not listed, so they
+  may be empty); a disk gone from the listing is `device_not_found`. The guard holds nothing. `remount` is `diskutil
+  mountDisk diskN`.
+- Windows: every volume with an extent on the disk is locked and dismounted (`FSCTL_LOCK_VOLUME`, then
+  `FSCTL_DISMOUNT_VOLUME`), and the guard keeps the locks for the session so Windows does not mount the volumes again;
+  dropping the guard releases them, after which Windows mounts a volume on its next access. A volume that cannot be
+  locked (in use) makes the call fail with `unmount_failed` naming it, and the others are released. Each volume is
+  opened read-only first; only when Windows refuses the lock or the dismount on that handle (`ERROR_ACCESS_DENIED`) is
+  it opened again with write access, solely to repeat the two requests. That handle never reads or writes data (the
+  engine's single exception to opening anything for writing, recorded in the project rules and checked by the
+  `source_has_no_write_path` test); the card's data is still read only through the read-only `\\.\PhysicalDriveN`.
+  `remount` releases the guard and queries each volume, which mounts it.
+
+Locking a volume on Windows needs Administrator. When the unmount fails, a scan can still go ahead with the card mounted: the engine
+still never writes to it, but the system may (warning the user is the app's job).
+
 ### Destination
 
 `Destination::check(&ops, &source, dir)` checks a destination folder once against the source; extraction (`extract_to`),

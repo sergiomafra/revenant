@@ -203,6 +203,27 @@ pub(crate) fn destination(raw: &WinDestRaw) -> Option<DestInfo> {
     })
 }
 
+/// The volume GUID paths of the volumes with an extent on `\\.\PhysicalDrive<number>`, in volume order (what an unmount
+/// of that disk locks and dismounts).
+pub(crate) fn volumes_on(volumes: &[WinVolumeRaw], number: u32) -> Vec<String> {
+    volumes
+        .iter()
+        .filter(|v| v.extents.iter().any(|e| e.disk == number))
+        .map(|v| v.name.clone())
+        .collect()
+}
+
+/// Which volumes stayed mounted or unlocked (ruling D10): each volume's lock-and-dismount result (`Err` holds the
+/// Windows error code). `Err` with the names of those that failed, in order.
+pub(crate) fn unmount_outcome(results: &[(String, Result<(), i32>)]) -> Result<(), Vec<String>> {
+    let stuck: Vec<String> = results
+        .iter()
+        .filter(|(_, r)| r.is_err())
+        .map(|(v, _)| v.clone())
+        .collect();
+    if stuck.is_empty() { Ok(()) } else { Err(stuck) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +421,50 @@ mod tests {
         e[0..4].copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(extents(&e).len(), 1, "never more than declared");
         assert!(extents(&e[..3]).is_empty());
+    }
+
+    #[test]
+    fn windows_unmount_outcome_lists_the_stuck_volumes() {
+        let ok = |v: &str| (v.to_string(), Ok(()));
+        let all_ok = [ok("a"), ok("b"), ok("c")];
+        assert_eq!(unmount_outcome(&all_ok), Ok(()));
+        assert_eq!(unmount_outcome(&[]), Ok(()));
+        let one_stuck = [ok("a"), ("b".to_string(), Err(5)), ok("c")];
+        assert_eq!(unmount_outcome(&one_stuck), Err(vec!["b".to_string()]));
+        let two_stuck = [
+            ("a".to_string(), Err(32)),
+            ok("b"),
+            ("c".to_string(), Err(5)),
+        ];
+        assert_eq!(
+            unmount_outcome(&two_stuck),
+            Err(vec!["a".to_string(), "c".to_string()])
+        );
+    }
+
+    #[test]
+    fn windows_unmount_locks_every_volume_of_the_disk() {
+        let volumes = [
+            volume("sys", "NTFS", Some(r"C:\"), vec![extent(0, 100)]),
+            volume("card1", "FAT32", Some(r"E:\"), vec![extent(1, 10)]),
+            volume("hidden", "FAT32", None, vec![extent(1, 10)]),
+            volume(
+                "span",
+                "NTFS",
+                Some(r"F:\"),
+                vec![extent(3, 5), extent(1, 7)],
+            ),
+            volume("cd", "CDFS", Some(r"G:\"), Vec::new()),
+        ];
+        assert_eq!(
+            volumes_on(&volumes, 1),
+            [
+                r"\\?\Volume{card1}\",
+                r"\\?\Volume{hidden}\",
+                r"\\?\Volume{span}\"
+            ]
+        );
+        assert_eq!(volumes_on(&volumes, 0), [r"\\?\Volume{sys}\"]);
+        assert!(volumes_on(&volumes, 9).is_empty());
     }
 }

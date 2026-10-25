@@ -44,6 +44,13 @@ pub enum EngineError {
     /// folder, or the system query failed): writing there could land on the source itself.
     #[error("destination_unknown")]
     DestinationUnknown,
+    /// Some volumes of a disk could not be unmounted (in use): `volumes` are those still mounted (macOS "disk4s1",
+    /// Windows the volume GUID path), empty when the system did not say which.
+    #[error("unmount_failed")]
+    UnmountFailed { volumes: Vec<String> },
+    /// The system refused to mount a disk's volumes again.
+    #[error("remount_failed")]
+    RemountFailed,
 }
 
 impl EngineError {
@@ -62,6 +69,8 @@ impl EngineError {
             Self::SystemTool { .. } => "system_tool_failed",
             Self::Unsupported => "unsupported_platform",
             Self::DestinationUnknown => "destination_unknown",
+            Self::UnmountFailed { .. } => "unmount_failed",
+            Self::RemountFailed => "remount_failed",
         }
     }
 }
@@ -93,6 +102,14 @@ mod tests {
             EngineError::DestinationUnknown.code(),
             "destination_unknown"
         );
+        assert_eq!(
+            EngineError::UnmountFailed {
+                volumes: vec!["disk4s1".into()]
+            }
+            .code(),
+            "unmount_failed"
+        );
+        assert_eq!(EngineError::RemountFailed.code(), "remount_failed");
         let io = || std::io::Error::other("x");
         assert_eq!(
             EngineError::Read {

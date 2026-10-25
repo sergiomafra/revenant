@@ -71,29 +71,110 @@ fn opening_missing_file_gives_code() {
     );
 }
 
+/// What would open something for writing. `GENERIC_WRITE` is allowed once, in `source/windows.rs`, inside
+/// `lock_volume_for_dismount` (the Windows volume lock exception, CLAUDE.md).
+const BANNED: [&str; 5] = [
+    "write(true)",
+    ".append(",
+    "create(true)",
+    "create_new(",
+    "GENERIC_WRITE",
+];
+const EXCEPTION_FN: &str = "fn lock_volume_for_dismount(";
+const EXCEPTION_MARK: &str = "WRITE-ACCESS EXCEPTION (CLAUDE.md)";
+
+/// Every banned string `text` holds, except the one write-access exception when `exception` allows it.
+fn write_paths(text: &str, exception: bool) -> Vec<String> {
+    let mut found: Vec<String> = BANNED
+        .iter()
+        .filter(|b| **b != "GENERIC_WRITE" && text.contains(*b))
+        .map(|b| b.to_string())
+        .collect();
+    let lines: Vec<&str> = text.lines().collect();
+    let writes: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i].contains("GENERIC_WRITE"))
+        .collect();
+    let allowed = exception
+        && writes.len() == 1
+        && text.matches("GENERIC_WRITE").count() == 1
+        && lines
+            .iter()
+            .position(|l| l.contains(EXCEPTION_FN))
+            .is_some_and(|f| {
+                let top_level = |l: &&str| l.starts_with("fn ") || l.starts_with("pub");
+                let next = lines[f + 1..]
+                    .iter()
+                    .position(top_level)
+                    .map_or(lines.len(), |n| f + 1 + n);
+                f > 0 && lines[f - 1].contains(EXCEPTION_MARK) && (f..next).contains(&writes[0])
+            });
+    if !writes.is_empty() && !allowed {
+        found.push(format!("GENERIC_WRITE on lines {writes:?}"));
+    }
+    found
+}
+
 #[test]
 fn source_has_no_write_path() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/source");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files: Vec<PathBuf> = Vec::new();
+    for dir in ["source", "device"] {
+        for entry in std::fs::read_dir(root.join(dir)).unwrap() {
+            files.push(entry.unwrap().path());
+        }
+    }
+    // P14: every module that touches a source; one that does not exist yet is covered once it does.
+    files.extend(
+        ["identity.rs", "preflight.rs"]
+            .iter()
+            .map(|f| root.join(f))
+            .filter(|p| p.exists()),
+    );
+    let windows = root.join("source/windows.rs");
     let mut checked = 0;
-    for entry in std::fs::read_dir(src).unwrap() {
-        let path = entry.unwrap().path();
-        let text = std::fs::read_to_string(&path).unwrap();
-        for banned in [
-            "write(true)",
-            ".append(",
-            "create(true)",
-            "create_new(",
-            "GENERIC_WRITE",
-        ] {
-            assert!(
-                !text.contains(banned),
-                "{} contains {banned}",
+    for path in &files {
+        let text = std::fs::read_to_string(path).unwrap();
+        let found = write_paths(&text, *path == windows);
+        assert!(found.is_empty(), "{} contains {found:?}", path.display());
+        if *path == windows {
+            // The exception exists, in its one place (a refactor that drops the marker fails here).
+            assert_eq!(
+                text.matches("GENERIC_WRITE").count(),
+                1,
+                "{}",
                 path.display()
             );
         }
         checked += 1;
     }
-    assert!(checked >= 3);
+    assert!(files.contains(&windows) && files.contains(&root.join("identity.rs")));
+    assert!(checked >= 12, "{checked}");
+}
+
+#[test]
+fn write_path_check_finds_misplaced_write_access() {
+    let mark = format!("// {EXCEPTION_MARK}");
+    let good = format!(
+        "use x;\n{mark}\npub(crate) {EXCEPTION_FN}v: &str) {{\n    open(GENERIC_WRITE);\n}}\n\nfn other() {{}}\n"
+    );
+    assert!(write_paths(&good, true).is_empty());
+    // Anywhere but the exception's file, or without the exception allowed, it is a write path.
+    assert!(!write_paths(&good, false).is_empty());
+    // Without the mark right above the function.
+    let unmarked = good.replace(&mark, "// lock");
+    assert!(!write_paths(&unmarked, true).is_empty());
+    // Outside the function (after the next top-level item), or imported at the top.
+    let outside = good.replace("    open(GENERIC_WRITE);", "    open(0);")
+        + "pub fn more() { open(GENERIC_WRITE); }\n";
+    assert!(!write_paths(&outside, true).is_empty());
+    let imported = format!("use y::GENERIC_WRITE;\n{good}");
+    assert!(!write_paths(&imported, true).is_empty());
+    // Twice in the function, even on one line.
+    let twice = good.replace("open(GENERIC_WRITE)", "open(GENERIC_WRITE | GENERIC_WRITE)");
+    assert!(!write_paths(&twice, true).is_empty());
+    // The other banned strings are never excepted.
+    let create = good.replace("open(GENERIC_WRITE)", "open(GENERIC_WRITE).create(true)");
+    assert_eq!(write_paths(&create, true), ["create(true)"]);
 }
 
 /// Fails every read that touches `[bad, bad + 1)`, reporting the first bad byte as the error offset.

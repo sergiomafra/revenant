@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The engine unmounts a card's volumes without ejecting it (macOS and Windows), so the system stops writing to it while
+  it is read; it says which volumes are still in use when that fails, never remounts by itself, and remounts on request.
 - The engine lists the connected disks (macOS and Windows) with their size, sector sizes, maker, model, whether they are
   removable, internal, the system disk, a disk image or a solid-state drive, and their volumes; APFS containers are shown
   through their physical disk.

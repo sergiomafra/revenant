@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use super::plist::{self, Plist};
 use super::{DestInfo, DiskInfo, macos_parse};
 use crate::EngineError;
-use crate::source::Geometry;
+use crate::source::{DiskId, Geometry};
 
 pub(crate) const DISKUTIL: &str = "/usr/sbin/diskutil";
 pub(crate) const IOREG: &str = "/usr/sbin/ioreg";
@@ -155,6 +155,28 @@ pub(crate) fn destination(dir: &Path) -> Result<DestInfo, EngineError> {
     }
     let info = info(&node)?;
     macos_parse::destination(&df, &info).ok_or(EngineError::SystemTool { tool: DISKUTIL })
+}
+
+/// Unmounts every volume of `disk` without ejecting it (ruling D10): `diskutil unmountDisk` (never `force`; it also
+/// unmounts the volumes of an APFS container on the disk, and succeeds when nothing is mounted), then a listing to
+/// confirm. A disk no longer listed is `device_not_found`; the tool failing, or a volume of the disk still mounted, is
+/// `unmount_failed` with the volumes the listing shows mounted (an APFS container's volumes are not among them, so they
+/// may be empty).
+pub(crate) fn unmount(disk: &DiskId) -> Result<(), EngineError> {
+    let ok = run(DISKUTIL, &["unmountDisk", disk.as_str()]).is_ok();
+    let after = list()?;
+    if !after.iter().any(|d| d.id == *disk) {
+        return Err(EngineError::DeviceNotFound);
+    }
+    macos_parse::unmount_result(ok, &after, disk)
+        .map_err(|volumes| EngineError::UnmountFailed { volumes })
+}
+
+/// Mounts the volumes of `disk` again (`diskutil mountDisk`); any failure is `remount_failed`.
+pub(crate) fn remount(disk: &DiskId) -> Result<(), EngineError> {
+    run(DISKUTIL, &["mountDisk", disk.as_str()])
+        .map(drop)
+        .map_err(|_| EngineError::RemountFailed)
 }
 
 #[cfg(test)]

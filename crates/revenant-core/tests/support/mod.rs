@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use revenant_core::EngineError;
-use revenant_core::device::{DestInfo, DeviceOps, DiskInfo};
+use revenant_core::device::{DestInfo, DeviceOps, DiskInfo, UnmountGuard};
 use revenant_core::source::{DiskId, Geometry, RawDevice, Source, VolumeId};
 
 enum Data {
@@ -337,18 +337,25 @@ pub fn error_of(code: &str) -> EngineError {
         "not_whole_disk" => EngineError::NotWholeDisk,
         "device_gone" => EngineError::DeviceGone { offset: 0 },
         "cancelled" => EngineError::Cancelled,
+        "unmount_failed" => EngineError::UnmountFailed {
+            volumes: Vec::new(),
+        },
+        "remount_failed" => EngineError::RemountFailed,
         _ => EngineError::Open {
             cause: std::io::Error::other(code.to_string()),
         },
     }
 }
 
-/// One connected fake disk: its info, the bytes it holds (zeros past them up to `info.geometry.size`) and whether it is
-/// still connected (an open device reads `DeviceGone` once removed).
+/// One connected fake disk: its info, the bytes it holds (zeros past them up to `info.geometry.size`), whether it is
+/// still connected (an open device reads `DeviceGone` once removed), whether its volumes are mounted (they are when it
+/// is connected) and the volumes an unmount leaves mounted, if it is set to fail.
 struct FakeDisk {
     info: DiskInfo,
     data: Arc<Vec<u8>>,
     present: Arc<AtomicBool>,
+    mounted: bool,
+    fail_unmount: Option<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -360,7 +367,7 @@ struct FakeState {
 
 /// A [`DeviceOps`] over in-memory disks. Every method takes `&self` (state behind a mutex), so a test can connect and
 /// remove disks from another thread while the code under test lists and opens them. Every call is logged: "list",
-/// "open disk4", "read disk4 <offset>", "destination <dir>".
+/// "open disk4", "read disk4 <offset>", "destination <dir>", "unmount disk4", "remount disk4".
 #[derive(Default)]
 pub struct FakeDevices {
     state: Mutex<FakeState>,
@@ -384,6 +391,8 @@ impl FakeDevices {
             info: info.clone(),
             data: Arc::new(data),
             present: Arc::new(AtomicBool::new(true)),
+            mounted: true,
+            fail_unmount: None,
         };
         if let Some(old) = self.lock().disks.insert(info.id, disk) {
             old.present.store(false, Ordering::SeqCst);
@@ -396,6 +405,21 @@ impl FakeDevices {
         if let Some(old) = self.lock().disks.remove(&id) {
             old.present.store(false, Ordering::SeqCst);
         }
+    }
+
+    /// From now on, unmounting disk `id` fails with `unmount_failed` naming `volumes` (still mounted).
+    pub fn fail_unmount(&self, id: &str, volumes: &[&str]) {
+        let id = DiskId::parse(id).expect("a whole-disk id");
+        if let Some(d) = self.lock().disks.get_mut(&id) {
+            d.fail_unmount = Some(volumes.iter().map(|v| v.to_string()).collect());
+        }
+    }
+
+    /// Whether disk `id` is connected with its volumes mounted (true from `add` until a successful `unmount`, and again
+    /// after `remount`).
+    pub fn mounted(&self, id: &str) -> bool {
+        let id = DiskId::parse(id).expect("a whole-disk id");
+        self.lock().disks.get(&id).is_some_and(|d| d.mounted)
     }
 
     /// What `destination(dir)` answers for `dir` (resolved, when it exists) and any folder inside it (the longest matching
@@ -465,6 +489,28 @@ impl DeviceOps for FakeDevices {
             Some(Err(code)) => Err(error_of(code)),
             None => Err(error_of("system_tool_failed")),
         }
+    }
+
+    fn unmount(&self, disk: &DiskId) -> Result<UnmountGuard, EngineError> {
+        self.note(format!("unmount {}", disk.as_str()));
+        let mut st = self.lock();
+        let d = st.disks.get_mut(disk).ok_or(EngineError::DeviceNotFound)?;
+        if let Some(volumes) = &d.fail_unmount {
+            return Err(EngineError::UnmountFailed {
+                volumes: volumes.clone(),
+            });
+        }
+        d.mounted = false;
+        Ok(UnmountGuard::empty())
+    }
+
+    fn remount(&self, disk: &DiskId, guard: Option<UnmountGuard>) -> Result<(), EngineError> {
+        drop(guard);
+        self.note(format!("remount {}", disk.as_str()));
+        let mut st = self.lock();
+        let d = st.disks.get_mut(disk).ok_or(EngineError::RemountFailed)?;
+        d.mounted = true;
+        Ok(())
     }
 }
 

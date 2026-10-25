@@ -5,11 +5,11 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{
-    ERROR_DEV_NOT_EXIST, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA,
-    ERROR_NO_SUCH_DEVICE, ERROR_NOT_READY, INVALID_HANDLE_VALUE,
+    ERROR_ACCESS_DENIED, ERROR_DEV_NOT_EXIST, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND,
+    ERROR_MORE_DATA, ERROR_NO_SUCH_DEVICE, ERROR_NOT_READY, GENERIC_READ, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -19,11 +19,11 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
-    DISK_GEOMETRY_EX, GET_LENGTH_INFORMATION, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
-    IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_CHECK_VERIFY2, IOCTL_STORAGE_QUERY_PROPERTY,
-    PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_PROPERTY_ID,
-    STORAGE_PROPERTY_QUERY, StorageAccessAlignmentProperty, StorageDeviceProperty,
-    StorageDeviceSeekPenaltyProperty,
+    DISK_GEOMETRY_EX, FSCTL_DISMOUNT_VOLUME, FSCTL_LOCK_VOLUME, GET_LENGTH_INFORMATION,
+    IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_LENGTH_INFO, IOCTL_STORAGE_CHECK_VERIFY2,
+    IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR,
+    STORAGE_PROPERTY_ID, STORAGE_PROPERTY_QUERY, StorageAccessAlignmentProperty,
+    StorageDeviceProperty, StorageDeviceSeekPenaltyProperty,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 
@@ -385,6 +385,49 @@ pub(crate) fn dest_raw(dir: &Path) -> io::Result<WinDestRaw> {
         free_bytes: free,
         extents: volume_extents(&name, false),
     })
+}
+
+/// Locks and dismounts the volume `volume` (its GUID path, `\\?\Volume{…}\`) so the system neither writes to it nor
+/// mounts it again while the returned handle stays open (ruling D10); closing the handle releases the lock, after which
+/// Windows may mount the volume on its next access. The volume is opened read-only first; only when the system refuses
+/// the lock or the dismount on that handle (`ERROR_ACCESS_DENIED`) is it opened again with write access, solely to
+/// repeat the two requests. The handle is never used to read or write data: it goes to [`lock_and_dismount`] and is then
+/// only held and closed.
+// WRITE-ACCESS EXCEPTION (CLAUDE.md): volume lock/dismount only, never reads or writes data.
+pub(crate) fn lock_volume_for_dismount(volume: &str) -> io::Result<OwnedHandle> {
+    let path = Path::new(volume.trim_end_matches('\\'));
+    let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+    let read_only = OpenOptions::new().read(true).share_mode(share).open(path)?;
+    let locked = match lock_and_dismount(&read_only) {
+        Ok(()) => read_only,
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            // Closed before the second open: a lock taken on it (lock accepted, dismount refused) would refuse that open.
+            drop(read_only);
+            // The exception (CLAUDE.md): write access on a VOLUME handle, only because the system demands it for the lock
+            // and dismount requests. This handle is passed to nothing but `lock_and_dismount`: no ReadFile, no WriteFile.
+            let for_lock = OpenOptions::new()
+                .access_mode(GENERIC_READ | windows_sys::Win32::Foundation::GENERIC_WRITE)
+                .share_mode(share)
+                .open(path)?;
+            lock_and_dismount(&for_lock)?;
+            for_lock
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(OwnedHandle::from(locked))
+}
+
+/// Sends `FSCTL_LOCK_VOLUME` then `FSCTL_DISMOUNT_VOLUME` on an open volume (neither takes nor returns data).
+fn lock_and_dismount(volume: &File) -> io::Result<()> {
+    ioctl::<(), ()>(volume, FSCTL_LOCK_VOLUME, None, &mut ())?;
+    ioctl::<(), ()>(volume, FSCTL_DISMOUNT_VOLUME, None, &mut ())?;
+    Ok(())
+}
+
+/// Whether the volume `volume` (its GUID path) answers a file-system query (`GetVolumeInformationW`), which makes Windows
+/// mount it when it is not.
+pub(crate) fn volume_answers(volume: &str) -> bool {
+    volume_information(OsStr::new(volume)).1.is_some()
 }
 
 /// The Windows folder of the running system (`GetSystemWindowsDirectoryW`, `C:\Windows`): the system disk holds its

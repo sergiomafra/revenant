@@ -1,5 +1,6 @@
 //! The operating system's disks: listing the connected ones ([`DeviceOps::list`]), opening one read-only
-//! ([`DeviceOps::open`]) and finding which disks a destination folder lives on ([`DeviceOps::destination`]).
+//! ([`DeviceOps::open`]), finding which disks a destination folder lives on ([`DeviceOps::destination`]) and unmounting a
+//! disk's volumes without ejecting it ([`DeviceOps::unmount`], [`DeviceOps::remount`]).
 //!
 //! macOS asks its tools (`diskutil`, `ioreg`, `df`; parsed in `macos_parse`), Windows asks its devices directly (FFI in
 //! `source/windows.rs`, assembled in `win_parse`); other systems answer `unsupported_platform`. The parsers are pure and
@@ -72,6 +73,31 @@ pub struct DestInfo {
     pub max_file_bytes: Option<u64>,
 }
 
+/// A volume lock an unmount holds: a Windows volume handle; nothing elsewhere (the type has no value there).
+#[cfg(windows)]
+type VolumeLock = std::os::windows::io::OwnedHandle;
+#[cfg(not(windows))]
+type VolumeLock = std::convert::Infallible;
+
+/// Keeps what an unmount must hold: nothing on macOS; on Windows the locked volume handles (released on drop, after
+/// which Windows may mount them again on the next access). Never remounts by itself.
+#[derive(Debug)]
+pub struct UnmountGuard {
+    locks: Vec<VolumeLock>,
+}
+
+impl UnmountGuard {
+    /// How many volume locks it holds (always 0 on macOS).
+    pub fn held(&self) -> usize {
+        self.locks.len()
+    }
+
+    /// A guard holding nothing (macOS, a disk with nothing mounted, a test double).
+    pub fn empty() -> UnmountGuard {
+        UnmountGuard { locks: Vec::new() }
+    }
+}
+
 /// Device operations a privileged helper could serve over a channel (Module 2.1). Errors are codes.
 ///
 /// `destination` needs no privilege; it stays here for convenience (the helper may not serve it).
@@ -82,6 +108,11 @@ pub trait DeviceOps: Send + Sync {
     fn open(&self, disk: &DiskId) -> Result<Box<dyn RawDevice>, EngineError>;
     /// The disks, file system and free space of the folder `dir`.
     fn destination(&self, dir: &Path) -> Result<DestInfo, EngineError>;
+    /// Unmounts every volume of `disk` without ejecting (D10). Nothing mounted → Ok(empty guard).
+    /// Failure → Err(EngineError::UnmountFailed { volumes }) with the volumes still mounted, code "unmount_failed".
+    fn unmount(&self, disk: &DiskId) -> Result<UnmountGuard, EngineError>;
+    /// macOS `diskutil mountDisk`; Windows: drops `guard` and queries each volume. Err code "remount_failed".
+    fn remount(&self, disk: &DiskId, guard: Option<UnmountGuard>) -> Result<(), EngineError>;
 }
 
 /// The running OS (macOS, Windows); elsewhere every call is `Err(Unsupported)`.
@@ -107,6 +138,18 @@ impl DeviceOps for SystemDevices {
     fn destination(&self, dir: &Path) -> Result<DestInfo, EngineError> {
         os_destination(dir)
     }
+
+    /// macOS: `diskutil unmountDisk` (never `force`, never eject) when a volume is mounted, then a listing to confirm;
+    /// Windows: `FSCTL_LOCK_VOLUME` + `FSCTL_DISMOUNT_VOLUME` on every volume with an extent on the disk, the locks kept
+    /// in the guard. Errors: `unmount_failed`, `device_not_found`, `system_tool_failed` (macOS), `unsupported_platform`.
+    fn unmount(&self, disk: &DiskId) -> Result<UnmountGuard, EngineError> {
+        os_unmount(disk)
+    }
+
+    /// Mounts the disk's volumes again, only when asked: nothing in the engine calls it by itself.
+    fn remount(&self, disk: &DiskId, guard: Option<UnmountGuard>) -> Result<(), EngineError> {
+        os_remount(disk, guard)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -119,6 +162,17 @@ fn os_destination(dir: &Path) -> Result<DestInfo, EngineError> {
     macos::destination(dir)
 }
 
+#[cfg(target_os = "macos")]
+fn os_unmount(disk: &DiskId) -> Result<UnmountGuard, EngineError> {
+    macos::unmount(disk).map(|()| UnmountGuard::empty())
+}
+
+#[cfg(target_os = "macos")]
+fn os_remount(disk: &DiskId, guard: Option<UnmountGuard>) -> Result<(), EngineError> {
+    drop(guard);
+    macos::remount(disk)
+}
+
 #[cfg(windows)]
 fn os_list() -> Result<Vec<DiskInfo>, EngineError> {
     win::list()
@@ -129,6 +183,18 @@ fn os_destination(dir: &Path) -> Result<DestInfo, EngineError> {
     win::destination(dir)
 }
 
+#[cfg(windows)]
+fn os_unmount(disk: &DiskId) -> Result<UnmountGuard, EngineError> {
+    win::unmount(disk).map(|locks| UnmountGuard { locks })
+}
+
+#[cfg(windows)]
+fn os_remount(disk: &DiskId, guard: Option<UnmountGuard>) -> Result<(), EngineError> {
+    // The locks go first: Windows mounts a volume again on its next access once nothing holds it.
+    drop(guard);
+    win::remount(disk)
+}
+
 #[cfg(not(any(target_os = "macos", windows)))]
 fn os_list() -> Result<Vec<DiskInfo>, EngineError> {
     Err(EngineError::Unsupported)
@@ -136,6 +202,16 @@ fn os_list() -> Result<Vec<DiskInfo>, EngineError> {
 
 #[cfg(not(any(target_os = "macos", windows)))]
 fn os_destination(_dir: &Path) -> Result<DestInfo, EngineError> {
+    Err(EngineError::Unsupported)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn os_unmount(_disk: &DiskId) -> Result<UnmountGuard, EngineError> {
+    Err(EngineError::Unsupported)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn os_remount(_disk: &DiskId, _guard: Option<UnmountGuard>) -> Result<(), EngineError> {
     Err(EngineError::Unsupported)
 }
 
