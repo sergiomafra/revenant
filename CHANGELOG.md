@@ -173,6 +173,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A complete HEIC photo followed by an unreadable sector, or by a stray `moov` box, is now intact and stays a HEIC (it was
+  partial, or taken for a video).
+- An MP4 video that lists a HEIC brand and lost its `moov` index is now reported as a damaged MP4, not a damaged HEIC.
+- A disk with 4096-byte sectors no longer shows the same volume twice when a partition entry points at its backup boot
+  sector.
+- When the listing of a card is full (262,144 photos and videos), live files of every volume are now listed before
+  deleted ones; a deleted file of an earlier volume no longer takes the place of a live one.
+
 - Half a photo followed by zeros, by another photo's data or by its own data with a gap, then an end-of-image marker, was
   reported intact (the decoder used for the check fills in what is missing), as a file of its own or as a RAW's preview.
   Common JPEGs are now verified by Revenant's own decoder, which checks every block is there (and is faster); such a

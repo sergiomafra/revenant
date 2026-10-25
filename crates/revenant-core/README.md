@@ -668,11 +668,11 @@ pieces are identical, and fragmented MP4 (`moof`).
 ## Formats: CR3 and HEIC (ISO BMFF)
 
 The same `IsoBmff` detector picks the kind from the `ftyp` brands: major brand `crx ` is `FileKind::Cr3` (extension
-`cr3`); a
-HEIC brand (`heic heix heim heis mif1 msf1`) as major or compatible brand, with no `moov` anywhere in the file, is
-`FileKind::Heic` (extension `heic`). An MP4 that merely lists `mif1` has a `moov` and stays `Mp4`; an `avif`/`avis`
-major
-brand is never HEIC.
+`cr3`); a HEIC brand (`heic heix heim heis mif1 msf1`) as major or compatible brand, with no `moov` in the file, is
+`FileKind::Heic` (extension `heic`) when that brand is the major one or the file has a top-level `meta` (ruling D27).
+An MP4 that merely lists `mif1` has a `moov` and stays `Mp4`; one that lists `heic` among its compatible brands, lost
+its `moov` (a cut before it) and has no `meta` is a `Damaged` `Mp4`; an `avif`/`avis` major brand is never HEIC. The
+price: an MP4 cut before its `moov` that carries a stray top-level `meta` and lists `mif1` is still taken for a HEIC.
 
 - CR3: the `moov`/`stco`/`stsz` rules above apply unchanged (a CR3 has `trak`s). In addition both of its JPEGs must
   decode strictly (the raw image itself is never verified) for `Intact`: the `PRVW` JPEG in the top-level `uuid`
@@ -691,6 +691,10 @@ brand is never HEIC.
   data reference, a zero length meaning "the whole resource", an `iloc` version above 2, more than 65,536 items or
   262,144 extents) make the file at best `Partial`. The pixel data is HEVC (or similar) and is never decoded: `Intact`
   means complete structure with every extent inside the file, not that the image decodes.
+  A HEIC is complete once every extent its `iloc` lists (all checkable) ends inside what the walk has covered (ruling
+  D27): from there the walk continues only through trailing `free skip wide uuid meta udta mfra` boxes, so a stray
+  `moov` after it neither joins it nor turns it into a video, and an unreadable sector right after it is what follows
+  the file (it stays `Intact`), as for a video whose `moov` and `mdat` were both seen.
 - A sector-aligned file head inside `mdat` is normally "another file starts here". For CR3 and HEIC the starts of the
   file's own data (CR3: the chunks of every track, which include its full-size JPEG; HEIC: the `iloc` extents) are
   skipped, so a JPEG the file itself keeps there does not cut it; so is, for a CR3, a head inside its full-size JPEG or
@@ -855,8 +859,17 @@ Layouts, tried from sector 0:
   (its primary, or this one as its backup), the earlier volume is reported if its primary is there, or if its first FAT
   starts where its boot sector says (FAT entry 0 = the media byte then `FF FF`) and the probed one's does not.
 
+Ghosts (1.4 T3): an MBR entry read with 4096-byte sectors can land on the backup boot sector of a 4K volume already
+found (sector 6 of a FAT32, the backup region at 12 of an exFAT: an entry at the volume's LBA + 6 or + 12). Such a
+candidate, the same file system with the same serial at the found volume's offset + 6 or 12 of its sectors, is dropped:
+the volume is reported once. Probe limit: when a probe offset is the backup boot sector of a volume whose primary boot
+sector and first FAT sector are both gone, nothing is left to tell the two apart, and the volume is reported at the probe
+offset (6 or 12 sectors past its real start).
+
 The partition's own record of where the volume sits (FAT `BPB_HiddSec`, exFAT `PartitionOffset`) is never used for
-placement: a volume is where its table entry (or probe) points.
+placement: a volume is where its table entry (or probe) points. The legacy variant in which a logical partition's
+`BPB_HiddSec` counts from its own EBR instead of from the start of the disk is not supported: nothing here reads it, and
+the testkit writes the absolute value for logical partitions too, as current formatters do.
 
 A FAT boot sector is valid with `55 AA` at 510, a jump (`EB ?? 90` or `E9`), BytsPerSec 512/1024/2048/4096, SecPerClus a
 power of two ≤ 128, RsvdSecCnt ≥ 1, NumFATs 1 or 2, a data region starting before the end, and at least one cluster. It
@@ -888,7 +901,9 @@ all (a test counts them on every hostile case):
 - when probing, 7 offsets, each at most 19 reads and 219,136 bytes (the offset and the one 6 or 12 sectors earlier, the
   two FAT entry-0 sectors, a label).
 
-No read is larger than 128 KiB, and none is allocated before it is known to lie inside the source.
+No read is larger than 128 KiB, and none is allocated before it is known to lie inside the source. A typical card (one
+FAT32 partition at LBA 8192) costs 8 reads, pinned by a test (`typical_card_reads_few_sectors`) so a change that reads
+more shows up.
 
 ## File systems: FAT
 
@@ -1017,7 +1032,10 @@ the deleted photos/videos wait, never more than the photo slots left (a later li
 
 Bounds (each lowerable in unit tests): per volume at most 65,536 directories, 4,000,000 directory entries (every
 32-byte slot read counts, the end marker included), depth 32 (the root is 0), 2 MiB per directory, 65,536 contested
-clusters; per listing at most 262,144 photo/video files and `MAX_PIECES` (2^20) pieces, counting a file's runs (a
+clusters; per listing at most 262,144 photo/video files (live files of every volume first, ruling D28: when the cap is
+full, a live photo/video takes the slot of the last deleted one listed, which is then dropped and the listing marked
+truncated; the price is that on a card at the cap the deleted files of later volumes lose their name, though the
+carving still finds them) and `MAX_PIECES` (2^20) pieces, counting a file's runs (a
 photo/video's pieces, an other file's ranges in `live`) and a directory's runs. A file that would pass either cap is not
 listed at all (not in `files`, `others` or `live`); a directory past the piece cap is still walked but its ranges are not
 in `live`. Once the entry cap is reached the walk of the volume stops: no further directory is read. Following chains
@@ -1123,7 +1141,9 @@ and File Name §7.7 entries).
   there, or a NoFatChain run the bitmap shows in use). A directory whose first cluster is outside the heap or already
   claimed is not entered.
 - **Deleted files and folders.** A set is deleted when its File entry's InUse bit is clear, or a folder above it is
-  deleted. Deleted photos/videos wait, and are placed only once the live walk is done, against the live claims (a
+  deleted. The File entry decides for the whole set: the InUse bits of its Stream Extension and File Name entries are
+  not looked at, so a set whose bits disagree (the File entry in use, a name entry not, or the reverse) is live or
+  deleted as its File entry says. Deleted photos/videos wait, and are placed only once the live walk is done, against the live claims (a
   claimed cluster is in use whatever the bitmap says; ruling R10), with what the live files left of the caps:
   - NoFatChain: the run as recorded (`placement` `recorded`, cut at the heap's end); trusted only when every cluster
     of it is free in the bitmap today;
@@ -1354,7 +1374,9 @@ only in part as wholly unreadable, which only makes health more conservative); e
 a read that overlaps it fails every time without touching the source again, also when its window is loaded again after
 being evicted (the load reads around the known bad runs). The map keeps at most 1,048,576 merged runs; past that, new
 unreadable sectors are not remembered and are read again when their window is loaded again (slower, with the same results
-and events). A block that lies wholly inside an `Intact` finding whose bytes have all gone through the cache already (the
+and events). Measured with a synthetic source (`bad_run_cap_measure`, ignored, release): 1 GiB of zeros and then 1 MiB
+with an isolated unreadable sector every KiB scans in about 0.4 s and leaves 1024 runs, far under the cap; a dying card
+is checked by hand. A block that lies wholly inside an `Intact` finding whose bytes have all gone through the cache already (the
 detector walked the file) is not read again; its unreadable sectors come from the bad-sector map, so its `Unreadable` events
 are the same. The cache is `Send + Sync`: windows are shared across threads, and a window being loaded by one thread is
 waited for by the others, never read twice at once. The scan looks at the heads of a block straight in the cache's windows,

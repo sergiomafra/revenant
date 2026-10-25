@@ -243,22 +243,39 @@ pub fn volumes(source: &dyn Source) -> Vec<Volume> {
 }
 
 /// Parses each distinct candidate offset inside the source, lowest first, until [`MAX_VOLUMES`] volumes are found. At
-/// an offset given both with and without a required sector size, the one without is kept.
+/// an offset given both with and without a required sector size, the one without is kept. A candidate whose boot
+/// sector is the backup of a volume already found (1.4 T3: an entry read with 4096-byte sectors can land there) is
+/// dropped: see [`is_backup_of`].
 fn parse_all(source: &dyn Source, mut cands: Vec<Candidate>) -> Vec<Volume> {
     let len = source.len();
     cands.retain(|c| c.offset < len);
     cands.sort_by_key(|c| (c.offset, c.sector_size.is_some()));
     cands.dedup_by_key(|c| c.offset);
-    let mut out = Vec::new();
+    let mut out: Vec<Volume> = Vec::new();
     for c in cands {
         if out.len() == MAX_VOLUMES {
             break;
         }
-        if let Some(v) = boot::parse(source, c.offset, c.scheme, c.sector_size) {
+        if let Some(v) = boot::parse(source, c.offset, c.scheme, c.sector_size)
+            && !out.iter().any(|w| is_backup_of(&v, w))
+        {
             out.push(v);
         }
     }
     out
+}
+
+/// Whether `v` was read from the backup boot sector of `w`: the same file system and serial, at `w`'s offset plus 6
+/// sectors (FAT32) or 12 (exFAT) of `w`'s sector size.
+fn is_backup_of(v: &Volume, w: &Volume) -> bool {
+    let back = match w.fs {
+        FsKind::Fat32 => 6,
+        FsKind::Exfat => 12,
+        FsKind::Fat12 | FsKind::Fat16 => return false,
+    };
+    v.fs == w.fs
+        && v.serial == w.serial
+        && w.offset.checked_add(back * u64::from(w.sector_size)) == Some(v.offset)
 }
 
 /// The volumes at the probe offsets (scheme `None`), one per offset, in offset order.

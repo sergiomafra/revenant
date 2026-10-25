@@ -23,7 +23,9 @@
 //!
 //! Kind from the `ftyp` brands: major brand `crx ` is a CR3, `qt  ` a MOV; a HEIC brand (`heic heix heim heis mif1
 //! msf1`, as the major or a compatible brand, but not with an `avif`/`avis` major brand) with no `moov` in the file is
-//! a HEIC (an MP4 that merely lists `mif1` has a `moov` and stays an MP4); anything else is an MP4.
+//! a HEIC when the major brand is a HEIC one or a top-level `meta` was walked (ruling D27); anything else is an MP4. So an
+//! MP4 that merely lists `mif1` has a `moov` and stays an MP4, and one that lists `heic` but lost its `moov` (and has no
+//! `meta`) is a `Damaged` MP4.
 //!
 //! CR3 follows the rules above (it has `trak`s), and in addition both its JPEGs must decode strictly for `Intact`: the
 //! `PRVW` preview (in the top-level `uuid` `eaf42b5e-1c98-4b88-b9fb-b7dc406e4d16`) and the full-size JPEG (first chunk
@@ -34,6 +36,11 @@
 //! The `PRVW` layout (after the 16-byte uuid and 8 bytes: the box with 4+2 reserved bytes,
 //! width, height, a 1, the JPEG size, then the JPEG) is from public format notes and the testkit; not yet checked on
 //! real files.
+//!
+//! A HEIC is complete once every extent its `iloc` lists (all checkable, see below) ends inside what was walked (ruling
+//! D27): from then on the walk continues only through trailing `free skip wide uuid meta udta mfra`, so a stray `moov`
+//! after it neither joins it nor changes its kind, and an unreadable box header after it is what follows the file, not
+//! a cut.
 //!
 //! HEIC has no `moov` or `mdat` rule: it needs a `meta` (at most [`MOOV_MAX_LEN`]) whose `iloc` lists the items'
 //! extents. Every extent (construction method 0 and data reference 0: offsets absolute in the file, plus the item's
@@ -272,7 +279,7 @@ impl Format for IsoBmff {
                 b"ftyp" if pos != start => return false,
                 b"ftyp" => {
                     let size = h.size.unwrap_or(0);
-                    heic = size >= 12 && heic_brand(&mut r, pos, &h, size);
+                    heic = size >= 12 && !matches!(heic_brand(&mut r, pos, &h, size), Brand::None);
                 }
                 b"mdat" => return true,
                 b"meta" => meta = true,
@@ -375,6 +382,10 @@ struct Walk {
     uuids: Vec<(u64, u64)>,
     /// The `ftyp` lists a HEIC brand (and does not make it an AVIF).
     heic_brand: bool,
+    /// That HEIC brand is the major one.
+    heic_major: bool,
+    /// Where (relative to the file) the last extent of the first `meta`'s `iloc` ends, when every extent is checkable.
+    heic_end: Option<u64>,
 }
 
 /// Top-level `uuid` boxes remembered while walking (the CR3 preview is the second or third one).
@@ -408,6 +419,8 @@ fn walk_boxes(
         meta: None,
         uuids: Vec::new(),
         heic_brand: false,
+        heic_major: false,
+        heic_end: None,
     };
     let mut pos = start;
     while pos < source_len {
@@ -415,7 +428,10 @@ fn walk_boxes(
             break;
         }
         let (head, n) = r.head(pos);
-        let complete = w.has_mdat && w.moov.is_some();
+        // A video with its index and its data, or a HEIC whose every extent ends inside what was walked (ruling D27).
+        let heic_complete =
+            w.heic_brand && w.moov.is_none() && w.heic_end.is_some_and(|e| e <= pos - start);
+        let complete = (w.has_mdat && w.moov.is_some()) || heic_complete;
         let Some(h) = parse_header(&head[..n]) else {
             // An unreadable box header: what follows is lost, as if the file were cut here, unless the video was
             // already complete (then it is only what comes after the file).
@@ -463,7 +479,11 @@ fn walk_boxes(
                 } else if &brand == b"crx " {
                     w.kind = FileKind::Cr3;
                 }
-                w.heic_brand = heic_brand(r, pos, &h, size);
+                (w.heic_brand, w.heic_major) = match heic_brand(r, pos, &h, size) {
+                    Brand::Major => (true, true),
+                    Brand::Compatible => (true, false),
+                    Brand::None => (false, false),
+                };
             }
             b"mdat" => w.has_mdat = true,
             b"moof" => w.has_moof = true,
@@ -471,7 +491,13 @@ fn walk_boxes(
                 w.moov = Some((pos + h.header_len, size.saturating_sub(h.header_len)))
             }
             b"meta" if w.meta.is_none() => {
-                w.meta = Some((pos + h.header_len, size.saturating_sub(h.header_len)))
+                let (at, len) = (pos + h.header_len, size.saturating_sub(h.header_len));
+                w.meta = Some((at, len));
+                if w.heic_brand && w.moov.is_none() {
+                    w.heic_end = load(r, at, len)
+                        .and_then(|m| meta_iloc(&m))
+                        .and_then(|iloc| iloc.end());
+                }
             }
             b"uuid" if w.uuids.len() < MAX_UUIDS => w.uuids.push((pos + h.header_len, pos + size)),
             _ => {}
@@ -483,25 +509,51 @@ fn walk_boxes(
         }
     }
     w.end = pos;
-    if w.heic_brand && w.moov.is_none() && w.kind == FileKind::Mp4 {
+    if heic_kind(
+        w.heic_brand,
+        w.heic_major,
+        w.meta.is_some(),
+        w.moov.is_some(),
+    ) && w.kind == FileKind::Mp4
+    {
         w.kind = FileKind::Heic;
     }
     w
 }
 
+/// Ruling D27: a file with a HEIC brand is a HEIC only without `moov`, and only when that brand is the major one or a
+/// top-level `meta` is there.
+fn heic_kind(brand: bool, major: bool, meta: bool, moov: bool) -> bool {
+    brand && !moov && (major || meta)
+}
+
+/// Whether an `ftyp` lists a HEIC brand.
+enum Brand {
+    None,
+    /// Among the compatible brands only.
+    Compatible,
+    /// As the major brand.
+    Major,
+}
+
 /// Whether the `ftyp` at `pos` (declared `size`) lists a HEIC brand, as the major or a compatible brand, and is not an
 /// AVIF or CR3.
-fn heic_brand(r: &mut Reader, pos: u64, h: &BoxHeader, size: u64) -> bool {
+fn heic_brand(r: &mut Reader, pos: u64, h: &BoxHeader, size: u64) -> Brand {
     let mut brand = [0u8; 4];
     r.read(pos + h.header_len, &mut brand);
     // Compatible brands follow the 4-byte minor version.
     let mut compat = vec![0u8; (size.saturating_sub(16) as usize / 4).min(MAX_BRANDS) * 4];
     r.read(pos + 16, &mut compat);
     let listed = |b: &[u8]| HEIC_BRANDS.iter().any(|h| h.as_slice() == b);
-    (listed(&brand) || compat.chunks(4).any(listed))
-        && &brand != b"avif"
-        && &brand != b"avis"
-        && &brand != b"crx "
+    if &brand == b"avif" || &brand == b"avis" || &brand == b"crx " {
+        Brand::None
+    } else if listed(&brand) {
+        Brand::Major
+    } else if compat.chunks(4).any(listed) {
+        Brand::Compatible
+    } else {
+        Brand::None
+    }
 }
 
 /// Loads a box payload for parsing; `None` when it is over [`MOOV_MAX_LEN`]. The reader keeps it: asking for the same
@@ -669,9 +721,8 @@ pub(crate) fn moovless_layout(r: &mut Reader, start: u64) -> Option<MdatLayout> 
         b"crx " => FileKind::Cr3,
         _ => FileKind::Mp4,
     };
-    if kind == FileKind::Mp4 && heic_brand(r, start, &h, size) {
-        kind = FileKind::Heic;
-    }
+    let heic = heic_brand(r, start, &h, size);
+    let mut meta = false;
     let mut pos = start + size;
     for _ in 0..CONFIRM_BOXES {
         let (head, n) = r.head(pos);
@@ -684,6 +735,14 @@ pub(crate) fn moovless_layout(r: &mut Reader, start: u64) -> Option<MdatLayout> 
                 if parse_header(&next[..n]).is_some_and(|b| &b.kind == b"moov") {
                     return None;
                 }
+                let (brand, major) = match heic {
+                    Brand::Major => (true, true),
+                    Brand::Compatible => (true, false),
+                    Brand::None => (false, false),
+                };
+                if kind == FileKind::Mp4 && heic_kind(brand, major, meta, false) {
+                    kind = FileKind::Heic;
+                }
                 return Some(MdatLayout {
                     kind,
                     mdat_at: pos,
@@ -692,6 +751,10 @@ pub(crate) fn moovless_layout(r: &mut Reader, start: u64) -> Option<MdatLayout> 
                 });
             }
             b"moov" | b"ftyp" | b"moof" => return None,
+            b"meta" => {
+                meta = true;
+                pos = pos.checked_add(size)?;
+            }
             _ => pos = pos.checked_add(size)?,
         }
     }
@@ -983,6 +1046,16 @@ struct Iloc {
     items: Vec<(u32, u64, u64)>,
     /// Some extent (or the whole table) cannot be checked against the file.
     unverifiable: bool,
+}
+
+impl Iloc {
+    /// Where the last extent ends (relative to the file), when every extent is checkable and there is at least one.
+    fn end(&self) -> Option<u64> {
+        if self.unverifiable {
+            return None;
+        }
+        self.extents.iter().map(|&(o, l)| o.saturating_add(l)).max()
+    }
 }
 
 const ILOC_MAX_ITEMS: u32 = 65_536;

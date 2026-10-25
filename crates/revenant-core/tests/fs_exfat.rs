@@ -705,3 +705,21 @@ fn hostile_exfat_is_bounded() {
         assert!(f.pieces.iter().all(|p| p.len > 0 && p.start + p.len <= end));
     }
 }
+
+/// 1.4 T6: the File entry's InUse bit decides for the whole set, whatever its secondary entries say.
+#[test]
+fn mixed_in_use_bits_follow_the_primary() {
+    let mut b = card();
+    b.add("DCIM/LIVE.JPG", &bytes(2000, 1));
+    b.add("DCIM/GONE.JPG", &bytes(2000, 2));
+    b.delete("DCIM/GONE.JPG", DeleteStyle::Camera);
+    let img = placed_with(&b, |v| {
+        // Primary in use, its File Name entry not.
+        patch_set(v, &b, "DCIM", "LIVE.JPG", |set| set[2][0] &= 0x7F);
+        // Primary not in use, its Stream Extension in use.
+        patch_set(v, &b, "DCIM", "GONE.JPG", |set| set[1][0] |= 0x80);
+    });
+    let l = listing(&img);
+    assert_eq!(file(&l, "DCIM/LIVE.JPG").origin.state, FsState::Live);
+    assert_eq!(file(&l, "DCIM/GONE.JPG").origin.state, FsState::Deleted);
+}

@@ -175,6 +175,8 @@ pub(crate) fn read_limited(
     };
     let mut budget = Budget {
         files: limits.files,
+        deleted: 0,
+        evicted: 0,
         pieces: limits.pieces,
         path_bytes: limits.path_bytes,
         paths: limits.path_budget,
@@ -203,6 +205,7 @@ pub(crate) fn read_limited(
         }
     }
     out.truncated |= budget.truncated || probes.ran_out();
+    evict_deleted(&mut out.files, budget.evicted);
     out.files.sort_by(|a, b| {
         let key = |f: &FsFile| (f.pieces[0].start, f.origin.volume, f.origin.folder.clone());
         key(a)
@@ -228,9 +231,27 @@ pub(super) fn note_walked(walked: &mut Vec<Fragment>, start: u64, len: u64, cap:
     }
 }
 
+/// Drops the last `n` deleted files listed (walk order: the latest volume's last ones first): the photo slots they held
+/// went to live files of later volumes (ruling D28).
+fn evict_deleted(files: &mut Vec<FsFile>, mut n: usize) {
+    let mut k = files.len();
+    while n > 0 && k > 0 {
+        k -= 1;
+        if files[k].origin.state != FsState::Live {
+            files.remove(k);
+            n -= 1;
+        }
+    }
+}
+
 /// What is left of the listing's caps, shared by every volume, and whether one of them dropped something.
 pub(super) struct Budget {
+    /// Photo/video slots left.
     files: usize,
+    /// Slots held by deleted photos/videos listed so far: a live one takes such a slot when none is left (ruling D28).
+    deleted: usize,
+    /// Deleted photos/videos whose slot a live one took; [`evict_deleted`] drops them at the end.
+    evicted: usize,
     pieces: usize,
     /// Longest path (folder + '/' + name) kept.
     path_bytes: usize,
@@ -240,20 +261,35 @@ pub(super) struct Budget {
 }
 
 impl Budget {
-    /// Photo/video slots left.
+    /// Photo/video slots left for a deleted one.
     pub(super) fn files_left(&self) -> usize {
         self.files
     }
 
-    /// Takes `pieces` (and a photo/video slot when `photo`); false, taking nothing and marking the listing truncated,
-    /// when either would run out.
-    fn take(&mut self, pieces: usize, photo: bool) -> bool {
-        if pieces > self.pieces || (photo && self.files == 0) {
+    /// Photo/video slots a live one can still take: those left and those deleted ones hold (ruling D28).
+    pub(super) fn live_files_left(&self) -> usize {
+        self.files + self.deleted
+    }
+
+    /// Takes `pieces` (and a photo/video slot for `slot`); false, taking nothing and marking the listing truncated,
+    /// when either would run out. A live photo/video with no slot left takes the one of the last deleted photo/video
+    /// listed (ruling D28), which is dropped at the end, and the listing is marked truncated.
+    fn take(&mut self, pieces: usize, slot: Slot) -> bool {
+        let photo = slot != Slot::None;
+        let evict = slot == Slot::Live && self.files == 0 && self.deleted > 0;
+        if pieces > self.pieces || (photo && self.files == 0 && !evict) {
             self.truncated = true;
             return false;
         }
         self.pieces -= pieces;
-        self.files -= usize::from(photo);
+        if evict {
+            self.deleted -= 1;
+            self.evicted += 1;
+            self.truncated = true;
+        } else if photo {
+            self.files -= 1;
+            self.deleted += usize::from(slot == Slot::Deleted);
+        }
         true
     }
 
@@ -277,6 +313,14 @@ impl Budget {
             Arc::from(format!("{parent}/{name}"))
         })
     }
+}
+
+/// What a file takes from the photo cap.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    None,
+    Live,
+    Deleted,
 }
 
 /// A file waiting for the end of its volume's walk. Only a photo/video keeps its origin, boxed, so another file costs
@@ -323,7 +367,12 @@ impl<'a> Collector<'a> {
             return;
         }
         let kind = extension(&origin.name).and_then(FileKind::from_extension);
-        if !budget.take(chain.runs.len(), kind.is_some()) {
+        let slot = if kind.is_some() {
+            Slot::Live
+        } else {
+            Slot::None
+        };
+        if !budget.take(chain.runs.len(), slot) {
             return;
         }
         let size = origin.size;
@@ -348,8 +397,8 @@ impl<'a> Collector<'a> {
 
     /// A deleted photo/video of `kind` and where its clusters probably are (FAT: the D4 guess; exFAT: the recorded run,
     /// the old chain or the guess), `ok` when that placement alone allows trust; never in `live`, never claiming. Not
-    /// listed when it has no cluster or the budget runs out. As for a live file, a path past the path cap drops the
-    /// folder.
+    /// listed when it has no piece inside the source or the budget runs out. As for a live file, a path past the path
+    /// cap drops the folder.
     pub(super) fn deleted(
         &mut self,
         budget: &mut Budget,
@@ -358,7 +407,11 @@ impl<'a> Collector<'a> {
         runs: Vec<(u32, u32)>,
         ok: bool,
     ) {
-        if runs.is_empty() || !budget.take(runs.len(), true) {
+        // One with no piece inside the source would never be listed: it takes no slot (so a slot a live file takes
+        // back always drops a listed file, ruling D28).
+        if pieces(self.volume, self.source_len, &runs, origin.size).is_empty()
+            || !budget.take(runs.len(), Slot::Deleted)
+        {
             return;
         }
         if let Some(f) = &origin.folder
@@ -379,7 +432,7 @@ impl<'a> Collector<'a> {
 
     /// A live directory's chain (its ranges are kept when the budget allows and it turns out trusted).
     pub(super) fn dir(&mut self, budget: &mut Budget, chain: &Chain) {
-        if chain.runs.is_empty() || !budget.take(chain.runs.len(), false) {
+        if chain.runs.is_empty() || !budget.take(chain.runs.len(), Slot::None) {
             return;
         }
         self.dirs.push(PendingDir {
@@ -823,6 +876,8 @@ mod tests {
         let v = volume();
         let mut budget = Budget {
             files: 10,
+            deleted: 0,
+            evicted: 0,
             pieces: 10,
             path_bytes: 4096,
             paths: 1 << 20,
@@ -912,6 +967,8 @@ mod tests {
     fn subfolders_respect_the_path_cap_and_budget() {
         let budget = |path_bytes, paths| Budget {
             files: 1,
+            deleted: 0,
+            evicted: 0,
             pieces: 1,
             path_bytes,
             paths,
@@ -949,6 +1006,77 @@ mod tests {
         assert_eq!(t(Some(-180)).to_string(), "2025-12-14T07:12:04-03:00");
         assert_eq!(t(Some(345)).to_string(), "2025-12-14T07:12:04+05:45");
         assert_eq!(t(Some(0)).to_string(), "2025-12-14T07:12:04+00:00");
+    }
+
+    /// Ruling D28: the photo cap goes to the live files of every volume before any deleted one. Lowered to 4 (the
+    /// `cfg(test)` twin of `MAX_FILES`, ruling P1): volume 0 lists 4 deleted photos, volume 1 has 2 live ones.
+    #[test]
+    fn live_files_are_kept_before_deleted_ones_across_volumes() {
+        use crate::formats::tests::Mem;
+        use revenant_testkit::fs::{DeleteStyle, FsBuilder, FsType, mbr_disk};
+        let fat12 = || FsBuilder::new(FsType::Fat12, 2 << 20, 1024);
+        let mut first = fat12();
+        for i in 0..4 {
+            let path = format!("DCIM/GONE{i}.JPG");
+            first.add(&path, &[i as u8 + 1; 3000]);
+            first.delete(&path, DeleteStyle::Camera);
+        }
+        let mut second = fat12();
+        for i in 0..2 {
+            second.add(&format!("DCIM/LIVE{i}.JPG"), &[i as u8 + 9; 3000]);
+        }
+        let (a, b) = (first.build(), second.build());
+        let src = Mem(mbr_disk(
+            &[(2048, &a, 0x01), (2048 + 4096 + 2048, &b, 0x01)],
+            &[],
+            12 << 20,
+        ));
+        let listed = |files| {
+            read_limited(
+                &src,
+                &SourceProbe::new(&src),
+                &CancelToken::default(),
+                &Limits {
+                    files,
+                    ..Limits::DEFAULT
+                },
+            )
+        };
+        // Room for all six: four deleted in volume 0, two live in volume 1.
+        let all = listed(6);
+        let states = |l: &Listing| -> Vec<(u32, FsState)> {
+            let mut v: Vec<_> = l
+                .files
+                .iter()
+                .map(|f| (f.origin.volume, f.origin.state))
+                .collect();
+            v.sort_by_key(|&(vol, s)| (vol, s.as_str()));
+            v
+        };
+        assert_eq!(all.files.len(), 6, "{:?}", states(&all));
+        assert!(!all.truncated);
+        // At the cap, the live files of volume 1 take the slots of the last deleted files of volume 0.
+        let capped = listed(4);
+        assert_eq!(
+            states(&capped),
+            [
+                (0, FsState::Deleted),
+                (0, FsState::Deleted),
+                (1, FsState::Live),
+                (1, FsState::Live)
+            ]
+        );
+        assert!(capped.truncated);
+        // The deleted files kept are the first ones of the walk.
+        let kept: Vec<&FsFile> = all
+            .files
+            .iter()
+            .filter(|f| f.origin.state == FsState::Deleted)
+            .take(2)
+            .collect();
+        for k in kept {
+            assert!(capped.files.contains(k), "{:?}", k.origin.path());
+        }
     }
 
     #[test]
