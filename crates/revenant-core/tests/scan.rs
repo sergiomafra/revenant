@@ -1033,9 +1033,11 @@ fn big_intact_video_is_read_once() {
             Health::Intact
         )]
     );
-    // The read-ahead (2 blocks here) fits in the cache, so at most it and the block being examined are read twice.
+    // The read-ahead (2 blocks here) fits in the cache, so at most it and the block being examined are read twice. The
+    // file-system step before the scan looks for a volume at sector 0 and the 7 probe offsets, loading their cache
+    // windows (5 distinct ones: 0, 1, 4, 16 and 32 MiB), which a 4 MiB cache may evict before the scan reaches them.
     let read = source.bytes();
-    let bound = (48 + (opts.lookahead_blocks() as u64 + 1)) * MIB as u64;
+    let bound = (48 + (opts.lookahead_blocks() as u64 + 1) + 5) * MIB as u64;
     eprintln!("inner bytes read: {read} (bound {bound})");
     assert!(read <= bound, "inner bytes read: {read}");
 }
@@ -1178,6 +1180,7 @@ fn block_not_read_again_still_reports_its_unreadable_sectors() {
                 kind: FileKind::Jpeg,
                 health: Health::Partial,
                 fragments: Vec::new(),
+                origin: None,
             }),
         ]
     );
@@ -1547,6 +1550,7 @@ fn fragmented_measurements_skip_only_their_pieces() {
                     len: 1024,
                 },
             ],
+            origin: None,
         })
     };
     let gap = |len: usize| {
@@ -1557,6 +1561,7 @@ fn fragmented_measurements_skip_only_their_pieces() {
             kind: FileKind::Jpeg,
             health: Health::Intact,
             fragments: Vec::new(),
+            origin: None,
         })
     };
     let (events, gap_jpeg) = scan_two_pieces(1024, Vec::new());

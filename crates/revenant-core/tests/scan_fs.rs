@@ -1,0 +1,743 @@
+//! The scan with the file systems: `Volume` events, findings with their origin, one finding per file (the merge of the
+//! file system's placement with the carving, rulings D3, D5, D6, D7).
+
+use std::io::Write;
+
+use revenant_core::filesystem::FsKind;
+use revenant_core::formats::{FileKind, Health, all_formats};
+use revenant_core::source::{FileSource, Source, VolumeId};
+use revenant_core::{
+    CancelToken, EngineError, Event, Finding, Fragment, FsState, Placement, ScanOptions,
+    ScanSummary, scan,
+};
+use revenant_testkit::fs::{DeleteStyle, FsBuilder, FsType, Partitioning, disk};
+use revenant_testkit::{
+    AvcOptions, AvcVideo, Mp4Options, TestExif, TiffRaw, TiffRawOptions, TiffVariant, avc_video,
+    jpeg, jpeg_smooth, mp4, tiff_raw,
+};
+
+const MIB: usize = 1 << 20;
+/// Where every test volume starts (MBR entry at LBA 8192).
+const VOL: u64 = 8192 * 512;
+const DIR: &str = "DCIM/100MSDCF";
+
+/// FAT32, 48 MiB, 512-byte clusters.
+fn card() -> FsBuilder {
+    FsBuilder::new(FsType::Fat32, 48 * MIB as u64, 512)
+}
+
+/// The volume of `b` at LBA 8192 of a disk 8 MiB longer than the volume.
+fn placed(b: &FsBuilder) -> Vec<u8> {
+    let v = b.build();
+    let len = v.len() + 8 * MIB;
+    disk(Partitioning::Mbr { first_lba: 8192 }, &v, len)
+}
+
+/// Absolute offset of cluster `c` of `b` once placed.
+fn at(b: &FsBuilder, c: u32) -> usize {
+    (VOL + b.cluster_offset(c)) as usize
+}
+
+/// Absolute pieces of `clusters` (file order) holding `size` bytes, consecutive clusters joined.
+fn pieces_of(b: &FsBuilder, clusters: &[u32], size: u64, cluster: u64) -> Vec<Fragment> {
+    let mut out: Vec<Fragment> = Vec::new();
+    let mut left = size;
+    for &c in clusters {
+        let len = cluster.min(left);
+        if len == 0 {
+            break;
+        }
+        left -= len;
+        let start = at(b, c) as u64;
+        match out.last_mut() {
+            Some(p) if p.start + p.len == start => p.len += len,
+            _ => out.push(Fragment { start, len }),
+        }
+    }
+    out
+}
+
+/// Fails every read touching one of `bad` (absolute `(start, end)`).
+struct Failing {
+    inner: FileSource,
+    bad: Vec<(u64, u64)>,
+}
+
+impl Source for Failing {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        let end = offset + buf.len() as u64;
+        if self.bad.iter().any(|&(s, e)| offset < e && s < end) {
+            return Err(EngineError::Read {
+                offset,
+                cause: std::io::Error::other("injected"),
+            });
+        }
+        self.inner.read_at(offset, buf)
+    }
+
+    fn volume(&self) -> Option<VolumeId> {
+        None
+    }
+}
+
+fn source(bytes: &[u8], bad: &[(u64, u64)]) -> (tempfile::NamedTempFile, Failing) {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(bytes).unwrap();
+    file.flush().unwrap();
+    let inner = FileSource::open(file.path()).unwrap();
+    (
+        file,
+        Failing {
+            inner,
+            bad: bad.to_vec(),
+        },
+    )
+}
+
+fn run_on(src: &dyn Source, opts: &ScanOptions) -> (Result<ScanSummary, EngineError>, Vec<Event>) {
+    let mut events = Vec::new();
+    let r = scan(
+        src,
+        &all_formats(),
+        opts,
+        &CancelToken::default(),
+        &mut |e| events.push(e),
+    );
+    (r, events)
+}
+
+fn events_with(bytes: &[u8], bad: &[(u64, u64)], opts: &ScanOptions) -> Vec<Event> {
+    let (_file, src) = source(bytes, bad);
+    let (r, events) = run_on(&src, opts);
+    r.unwrap();
+    events
+}
+
+fn events(bytes: &[u8]) -> Vec<Event> {
+    events_with(bytes, &[], &ScanOptions::default())
+}
+
+fn founds(events: &[Event]) -> Vec<&Finding> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Found(f) => Some(f),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The one `Found` whose origin path is `path`.
+fn named<'a>(events: &'a [Event], path: &str) -> &'a Finding {
+    let hits: Vec<_> = founds(events)
+        .into_iter()
+        .filter(|f| f.origin.as_ref().is_some_and(|o| o.path() == path))
+        .collect();
+    assert_eq!(hits.len(), 1, "{path}: {:#?}", summary(events));
+    hits[0]
+}
+
+/// (start, kind, health, path) of every `Found`, for failure messages.
+fn summary(events: &[Event]) -> Vec<(u64, FileKind, Health, Option<String>)> {
+    founds(events)
+        .into_iter()
+        .map(|f| {
+            (
+                f.start,
+                f.kind,
+                f.health,
+                f.origin.as_ref().map(|o| o.path()),
+            )
+        })
+        .collect()
+}
+
+/// A live `DSC09000.XML` in `DCIM/100MSDCF`: a deleted short name there gets its lost first letter `D` from it (ruling
+/// D9); it is no photo, so it makes no finding.
+fn sibling(b: &mut FsBuilder) {
+    b.add(&format!("{DIR}/DSC09000.XML"), b"<xml/>");
+}
+
+fn arw_with_preview() -> TiffRaw {
+    tiff_raw(&TiffRawOptions {
+        variant: TiffVariant::Arw,
+        big_endian: false,
+        raw_len: 300_000,
+        seed: 7,
+        preview: Some((320, 240)),
+        preview_sector_aligned: true,
+        exif: TestExif::default(),
+    })
+}
+
+/// The files of `live_files`, as written.
+struct Live {
+    arw: TiffRaw,
+    jpg: Vec<u8>,
+    mp4: AvcVideo,
+    j36: Vec<u8>,
+    j37: Vec<u8>,
+}
+
+/// `DCIM/100MSDCF`: DSC01234.ARW (preview sector-aligned), DSC01235.JPG, C0001.MP4 in 2 runs 4 MiB apart, DSC01236.JPG
+/// in 2 runs with DSC01237.JPG written whole in the gap (ruling Q7b). `cluster` is the volume's cluster size.
+fn live_files(b: &mut FsBuilder, cluster: u64) -> Live {
+    let arw = arw_with_preview();
+    b.add(&format!("{DIR}/DSC01234.ARW"), &arw.bytes);
+    let jpg = jpeg(64, 64, 11, 2000);
+    b.add(&format!("{DIR}/DSC01235.JPG"), &jpg);
+    let mp4 = avc_video(&AvcOptions {
+        samples: 60,
+        seed: 5,
+        mov: false,
+        mdat_pad: 0,
+        small_nals: false,
+    });
+    let need = |len: usize| (len as u64).div_ceil(cluster) as u32;
+    let first = (8 * MIB as u64 / cluster) as u32 + 2;
+    let gap = (4 * MIB as u64 / cluster) as u32;
+    let n = need(mp4.bytes.len());
+    let h = n / 2;
+    let runs: Vec<u32> = (first..first + h)
+        .chain(first + h + gap..first + gap + n)
+        .collect();
+    b.add_at(&format!("{DIR}/C0001.MP4"), &mp4.bytes, &runs);
+    let j36 = jpeg_smooth(1024, 768, 1);
+    let j37 = jpeg_smooth(1024, 768, 2);
+    let s = (16 * MIB as u64 / cluster) as u32 + 2;
+    let (n36, n37) = (need(j36.len()), need(j37.len()));
+    let h36 = n36 / 2;
+    assert!(h36 >= 1);
+    let c37: Vec<u32> = (s + h36..s + h36 + n37).collect();
+    let c36: Vec<u32> = (s..s + h36).chain(s + h36 + n37..s + n37 + n36).collect();
+    b.add_at(&format!("{DIR}/DSC01236.JPG"), &j36, &c36);
+    b.add_at(&format!("{DIR}/DSC01237.JPG"), &j37, &c37);
+    Live {
+        arw,
+        jpg,
+        mp4,
+        j36,
+        j37,
+    }
+}
+
+/// Every `Found` has an origin and each file of `live_files` comes out once, `Intact`, with its file-system pieces.
+fn check_live_files(b: &FsBuilder, live: &Live, ev: &[Event], cluster: u64) {
+    let all = founds(ev);
+    assert!(all.iter().all(|f| f.origin.is_some()), "{:#?}", summary(ev));
+    let files: [(&str, usize); 5] = [
+        ("DSC01234.ARW", live.arw.bytes.len()),
+        ("DSC01235.JPG", live.jpg.len()),
+        ("C0001.MP4", live.mp4.bytes.len()),
+        ("DSC01236.JPG", live.j36.len()),
+        ("DSC01237.JPG", live.j37.len()),
+    ];
+    assert_eq!(all.len(), files.len(), "{:#?}", summary(ev));
+    for (name, len) in files {
+        let path = format!("{DIR}/{name}");
+        let f = named(ev, &path);
+        assert_eq!(f.health, Health::Intact, "{path}: {f:?}");
+        assert_eq!(f.len, len as u64, "{path}");
+        let o = f.origin.as_ref().unwrap();
+        assert_eq!(o.state, FsState::Live);
+        assert_eq!(o.placement, Placement::Chain);
+        let pieces = pieces_of(b, &b.clusters(&path), len as u64, cluster);
+        assert_eq!(f.start, pieces[0].start, "{path}");
+        if pieces.len() == 1 {
+            assert!(f.fragments.is_empty(), "{path}");
+        } else {
+            assert_eq!(f.fragments, pieces, "{path}");
+        }
+    }
+    assert_eq!(named(ev, &format!("{DIR}/C0001.MP4")).fragments.len(), 2);
+    assert_eq!(named(ev, &format!("{DIR}/DSC01236.JPG")).fragments.len(), 2);
+}
+
+#[test]
+fn volume_event_comes_first() {
+    let mut b = card();
+    b.add(&format!("{DIR}/DSC01235.JPG"), &jpeg(64, 64, 11, 2000));
+    let ev = events(&placed(&b));
+    match &ev[0] {
+        Event::Volume {
+            volume,
+            listing_truncated,
+        } => {
+            assert_eq!(volume.fs, FsKind::Fat32);
+            assert_eq!(volume.offset, VOL);
+            assert_eq!(volume.index, 0);
+            assert!(!listing_truncated);
+        }
+        e => panic!("first event {e:?}"),
+    }
+    assert!(matches!(ev[1], Event::Progress { .. }), "{:?}", ev[1]);
+    assert_eq!(
+        ev.iter()
+            .filter(|e| matches!(e, Event::Volume { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn live_files_come_out_once_with_names() {
+    let mut b = card();
+    let live = live_files(&mut b, 512);
+    let ev = events(&placed(&b));
+    check_live_files(&b, &live, &ev, 512);
+    // The ARW's preview is inside an `Intact` finding: no finding of its own.
+    let arw = named(&ev, &format!("{DIR}/DSC01234.ARW"));
+    let preview = arw.start + live.arw.preview.clone().unwrap().start as u64;
+    assert!(founds(&ev).iter().all(|f| f.start != preview));
+    let o = arw.origin.as_ref().unwrap();
+    assert_eq!(o.name(), "DSC01234.ARW");
+    assert_eq!(o.folder(), Some(DIR));
+    assert_eq!(o.size, live.arw.bytes.len() as u64);
+    assert!(o.modified.is_some());
+}
+
+#[test]
+fn live_chain_beats_the_gap_search_limits() {
+    let mut b = card();
+    let j = jpeg_smooth(1024, 768, 1);
+    let n = j.len().div_ceil(512) as u32;
+    // An 8 KiB first piece at cluster 3000, the rest before it, from cluster 100 (ruling Q8).
+    let clusters: Vec<u32> = (3000..3016).chain(100..100 + n - 16).collect();
+    b.add_at(&format!("{DIR}/DSC00001.JPG"), &j, &clusters);
+    let ev = events(&placed(&b));
+    let f = named(&ev, &format!("{DIR}/DSC00001.JPG"));
+    assert_eq!(f.health, Health::Intact, "{f:?}");
+    assert_eq!(f.fragments, pieces_of(&b, &clusters, j.len() as u64, 512));
+    assert_eq!(f.fragments.len(), 2);
+}
+
+#[test]
+fn deleted_files_keep_their_name_and_health() {
+    let mut b = card();
+    sibling(&mut b);
+    let j = jpeg(64, 64, 11, 2000);
+    b.add(&format!("{DIR}/DSC01235.JPG"), &j);
+    b.delete(&format!("{DIR}/DSC01235.JPG"), DeleteStyle::Camera);
+    let ev = events(&placed(&b));
+    let f = named(&ev, &format!("{DIR}/DSC01235.JPG"));
+    let o = f.origin.as_ref().unwrap();
+    assert_eq!(o.state, FsState::Deleted);
+    assert_eq!(o.placement, Placement::Guessed);
+    assert_eq!(f.health, Health::Intact);
+    assert_eq!(f.len, j.len() as u64);
+    assert_eq!(founds(&ev).len(), 1, "{:#?}", summary(&ev));
+}
+
+#[test]
+fn photo_written_over_a_raw_preview_is_found() {
+    let mut b = card();
+    sibling(&mut b);
+    let arw = arw_with_preview();
+    let arw_path = format!("{DIR}/DSC01234.ARW");
+    let cl = b.add(&arw_path, &arw.bytes);
+    b.delete(&arw_path, DeleteStyle::Camera);
+    // The preview starts at a sector of the file, so at one of its 512-byte clusters.
+    let preview = arw.preview.clone().unwrap();
+    assert_eq!(preview.start % 512, 0);
+    let first = cl[preview.start / 512];
+    let j = jpeg(64, 64, 11, 2000);
+    let n = j.len().div_ceil(512) as u32;
+    let jc: Vec<u32> = (first..first + n).collect();
+    b.add_at(&format!("{DIR}/DSC09999.JPG"), &j, &jc);
+    let ev = events(&placed(&b));
+    let photo = named(&ev, &format!("{DIR}/DSC09999.JPG"));
+    assert_eq!(photo.origin.as_ref().unwrap().state, FsState::Live);
+    assert_eq!(photo.health, Health::Intact);
+    assert_eq!(photo.start, at(&b, first) as u64);
+    let raw = named(&ev, &arw_path);
+    assert_eq!(raw.origin.as_ref().unwrap().state, FsState::Deleted);
+    assert_ne!(raw.health, Health::Intact, "{raw:?}");
+}
+
+#[test]
+fn carved_file_over_live_clusters_is_not_intact() {
+    let mut b = card();
+    let j = jpeg(64, 64, 21, 0);
+    let first = 20_000u32;
+    let n = j.len().div_ceil(512) as u32;
+    let last = first + n - 1;
+    let tail = &j[(n as usize - 1) * 512..];
+    b.add_at("MISC/notes.txt", tail, &[last]);
+    let mut d = placed(&b);
+    let o = at(&b, first);
+    d[o..o + j.len()].copy_from_slice(&j);
+    let ev = events(&d);
+    let all = founds(&ev);
+    assert_eq!(all.len(), 1, "{:#?}", summary(&ev));
+    assert_eq!(all[0].start, o as u64);
+    assert_eq!(all[0].len, j.len() as u64);
+    assert!(all[0].origin.is_none());
+    assert_eq!(all[0].health, Health::Partial);
+}
+
+#[test]
+fn forged_live_file_does_not_hide_a_deleted_photo() {
+    let mut b = card();
+    let j = jpeg(64, 64, 22, 0);
+    // DATA.BIN's chain covers the photo, which starts at its 5th cluster.
+    let mut data = vec![0u8; 4 * 512];
+    data.extend_from_slice(&j);
+    data.resize(data.len().div_ceil(512) * 512 + 4096, 0);
+    let first = 20_000u32;
+    let n = (data.len() / 512) as u32;
+    let chain: Vec<u32> = (first..first + n).collect();
+    b.add_at("MISC/DATA.BIN", &data, &chain);
+    let ev = events(&placed(&b));
+    let all = founds(&ev);
+    assert_eq!(all.len(), 1, "{:#?}", summary(&ev));
+    assert_eq!(all[0].start, at(&b, first + 4) as u64);
+    assert!(all[0].origin.is_none());
+    assert_eq!(all[0].health, Health::Partial);
+}
+
+#[test]
+fn live_non_photo_file_consumes_only_its_head() {
+    let mut b = card();
+    let thumb = jpeg(16, 16, 3, 0);
+    let inner = jpeg(64, 64, 4, 0);
+    let mut data = thumb.clone();
+    data.resize(thumb.len().div_ceil(512) * 512, 0);
+    let inner_at = data.len();
+    data.extend_from_slice(&inner);
+    let cl = b.add(&format!("{DIR}/INFO.THM"), &data);
+    let ev = events(&placed(&b));
+    let all = founds(&ev);
+    assert_eq!(all.len(), 1, "{:#?}", summary(&ev));
+    assert_eq!(all[0].start, at(&b, cl[inner_at / 512]) as u64);
+    assert_eq!(all[0].len, inner.len() as u64);
+    assert!(all[0].origin.is_none());
+    assert_eq!(all[0].health, Health::Partial);
+}
+
+#[test]
+fn dedup_keeps_distinct_files() {
+    let mut b = card();
+    let mut extra = 1900;
+    let d = loop {
+        let d = jpeg(16, 16, 1, extra);
+        if d.len() > 5 * 512 && d.len() <= 6 * 512 {
+            break d;
+        }
+        extra = if d.len() <= 5 * 512 {
+            extra + 64
+        } else {
+            extra - 32
+        };
+    };
+    let x = jpeg(16, 16, 2, 0);
+    assert!(x.len() <= 4 * 512);
+    sibling(&mut b);
+    let path = format!("{DIR}/DSC00010.JPG");
+    let cl = b.add(&path, &d);
+    assert_eq!(cl.len(), 6);
+    b.delete(&path, DeleteStyle::Camera);
+    let mut img = placed(&b);
+    let xo = at(&b, cl[2]);
+    img[xo..xo + x.len()].copy_from_slice(&x);
+    let ev = events(&img);
+    let df = named(&ev, &path);
+    assert_eq!(df.start, at(&b, cl[0]) as u64);
+    assert_eq!(df.origin.as_ref().unwrap().state, FsState::Deleted);
+    assert_ne!(df.health, Health::Intact);
+    let xf: Vec<_> = founds(&ev)
+        .into_iter()
+        .filter(|f| f.start == xo as u64)
+        .collect();
+    assert_eq!(xf.len(), 1, "{:#?}", summary(&ev));
+    assert!(xf[0].origin.is_none());
+    assert_eq!(xf[0].health, Health::Intact);
+    assert_eq!(xf[0].len, x.len() as u64);
+}
+
+#[test]
+fn fs_size_mismatch_is_not_intact() {
+    let j = jpeg_smooth(1024, 768, 1);
+    let size = 2 * j.len();
+    let noise: Vec<u8> = (0..size as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let second = jpeg(64, 64, 5, 0);
+    let video = mp4(&Mp4Options {
+        mdat_len: 10_000,
+        moov_at_end: true,
+        mov: false,
+        mdat_64bit: false,
+    });
+    let tails: [(&str, Vec<u8>, Health); 4] = [
+        ("noise", noise[..j.len()].to_vec(), Health::Partial),
+        ("zeros", vec![0; j.len()], Health::Intact),
+        ("mpf", second.clone(), Health::Intact),
+        ("motion", video.clone(), Health::Intact),
+    ];
+    for (what, tail, want) in tails {
+        let mut data = j.clone();
+        data.extend_from_slice(&tail);
+        data.resize(size, 0);
+        let mut b = card();
+        b.add(&format!("{DIR}/DSC00001.JPG"), &data);
+        let ev = events(&placed(&b));
+        let f = named(&ev, &format!("{DIR}/DSC00001.JPG"));
+        assert_eq!(f.len, size as u64, "{what}");
+        assert_eq!(f.kind, FileKind::Jpeg, "{what}");
+        assert_eq!(f.health, want, "{what}: {f:?}");
+    }
+}
+
+#[test]
+fn corrupt_count_in_an_fs_file_is_bounded_by_its_size() {
+    let mut arw = tiff_raw(&TiffRawOptions {
+        variant: TiffVariant::Arw,
+        big_endian: false,
+        raw_len: 200_000,
+        seed: 9,
+        preview: None,
+        preview_sector_aligned: false,
+        exif: TestExif::default(),
+    });
+    // The raw strip's StripByteCounts entry (tag 279, LONG, count 1) holds the raw length.
+    let mut entry = vec![0x17, 0x01, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00];
+    entry.extend_from_slice(&(arw.raw.len() as u32).to_le_bytes());
+    let pos = arw
+        .bytes
+        .windows(12)
+        .position(|w| w == entry.as_slice())
+        .expect("StripByteCounts entry");
+    arw.bytes[pos + 8..pos + 12].copy_from_slice(&0x3000_0000u32.to_le_bytes());
+    let mut b = card();
+    b.add(&format!("{DIR}/DSC01234.ARW"), &arw.bytes);
+    let ev = events(&placed(&b));
+    let f = named(&ev, &format!("{DIR}/DSC01234.ARW"));
+    assert_eq!(f.len, arw.bytes.len() as u64);
+    assert_eq!(f.health, Health::Partial, "{f:?}");
+}
+
+#[test]
+fn carving_join_of_another_size_is_not_used() {
+    let a = jpeg_smooth(1024, 768, 1);
+    let c = (a.len() / 2).div_ceil(512) * 512;
+    let size = a.len() + 4096;
+    let mut data = a[..c].to_vec();
+    data.extend((0..(size - c) as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8));
+    let mut b = card();
+    sibling(&mut b);
+    let path = format!("{DIR}/DSC00002.JPG");
+    let cl = b.add(&path, &data);
+    b.delete(&path, DeleteStyle::Camera);
+    let mut img = placed(&b);
+    let tail_at = at(&b, cl[0]) + 2 * MIB;
+    img[tail_at..tail_at + a.len() - c].copy_from_slice(&a[c..]);
+    // Without the file system, the carving joins the photo `Intact` at the entry's start.
+    let carved = events_with(
+        &img,
+        &[],
+        &ScanOptions {
+            filesystems: false,
+            ..ScanOptions::default()
+        },
+    );
+    let joined = founds(&carved)
+        .into_iter()
+        .find(|f| f.start == at(&b, cl[0]) as u64)
+        .expect("carved");
+    assert_eq!(
+        (joined.health, joined.len),
+        (Health::Intact, a.len() as u64)
+    );
+    let ev = events(&img);
+    let f = named(&ev, &path);
+    let o = f.origin.as_ref().unwrap();
+    assert_eq!(
+        (o.state, o.placement),
+        (FsState::Deleted, Placement::Guessed)
+    );
+    assert_ne!(f.health, Health::Intact);
+    assert!(f.fragments.is_empty());
+    assert_eq!(f.len, size as u64);
+}
+
+#[test]
+fn deleted_guess_prefers_a_better_carving_of_the_same_size() {
+    let d = jpeg_smooth(1024, 768, 3);
+    let live = jpeg(64, 64, 9, 0);
+    let (nd, nl) = (
+        d.len().div_ceil(512) as u32,
+        live.len().div_ceil(512) as u32,
+    );
+    let (x, h) = (1000u32, 60u32);
+    let dc: Vec<u32> = (x..x + h).chain(x + h + nl..x + nl + nd).collect();
+    let lc: Vec<u32> = (x + h..x + h + nl).collect();
+    let mut b = card();
+    let path = format!("{DIR}/DSC00002.JPG");
+    b.add_at(&path, &d, &dc);
+    b.add_at(&format!("{DIR}/DSC00001.JPG"), &live, &lc);
+    b.delete(&path, DeleteStyle::Camera);
+    let ev = events(&placed(&b));
+    let f = named(&ev, &path);
+    assert_eq!(f.health, Health::Intact, "{f:?}");
+    assert_eq!(f.fragments, pieces_of(&b, &dc, d.len() as u64, 512));
+    let o = f.origin.as_ref().unwrap();
+    assert_eq!(
+        (o.state, o.placement),
+        (FsState::Deleted, Placement::Carved)
+    );
+    assert_eq!(
+        named(&ev, &format!("{DIR}/DSC00001.JPG")).health,
+        Health::Intact
+    );
+}
+
+#[test]
+fn fs_events_identical_across_threads_and_caches() {
+    let mut b = card();
+    let live = live_files(&mut b, 512);
+    let gone = jpeg(64, 64, 31, 0);
+    b.add(&format!("{DIR}/DSC00100.JPG"), &gone);
+    let raw = arw_with_preview();
+    b.add(&format!("{DIR}/DSC00101.ARW"), &raw.bytes);
+    b.delete(&format!("{DIR}/DSC00100.JPG"), DeleteStyle::Camera);
+    b.delete(&format!("{DIR}/DSC00101.ARW"), DeleteStyle::Camera);
+    let img = placed(&b);
+    let jpg = at(&b, b.clusters(&format!("{DIR}/DSC01235.JPG"))[0]) as u64 + 1024;
+    // A sector of the first FAT (FAT32: 32 reserved sectors).
+    let fat = VOL + 32 * 512 + 3 * 512;
+    let bad = [(jpg, jpg + 512), (fat, fat + 512)];
+    let opts = |threads, cache_bytes| ScanOptions {
+        threads,
+        cache_bytes,
+        ..ScanOptions::default()
+    };
+    let base = events_with(&img, &bad, &opts(1, 256 * MIB));
+    assert!(base.iter().any(|e| matches!(e, Event::Unreadable { .. })));
+    let j = named(&base, &format!("{DIR}/DSC01235.JPG"));
+    assert_eq!(j.health, Health::Partial);
+    assert_eq!(j.len, live.jpg.len() as u64);
+    named(&base, &format!("{DIR}/DSC00100.JPG"));
+    named(&base, &format!("{DIR}/DSC00101.ARW"));
+    for (threads, cache) in [
+        (2, 256 * MIB),
+        (8, 256 * MIB),
+        (16, 256 * MIB),
+        (8, MIB),
+        (1, MIB),
+        (8, 256 * MIB),
+        (8, 256 * MIB),
+    ] {
+        assert_eq!(
+            events_with(&img, &bad, &opts(threads, cache)),
+            base,
+            "threads {threads}, cache {cache}"
+        );
+    }
+}
+
+#[test]
+fn cancel_inside_the_first_volume_callback() {
+    let mut b = card();
+    b.add(&format!("{DIR}/DSC01235.JPG"), &jpeg(64, 64, 11, 2000));
+    let (_file, src) = source(&placed(&b), &[]);
+    let cancel = CancelToken::default();
+    let mut seen = Vec::new();
+    let r = scan(
+        &src,
+        &all_formats(),
+        &ScanOptions::default(),
+        &cancel,
+        &mut |e| {
+            if matches!(e, Event::Volume { .. }) {
+                cancel.cancel();
+            }
+            seen.push(e);
+        },
+    );
+    assert!(matches!(r, Err(EngineError::Cancelled)), "{r:?}");
+    assert_eq!(seen.len(), 1);
+    assert!(matches!(seen[0], Event::Volume { .. }));
+}
+
+#[test]
+fn filesystems_off_is_the_old_scan() {
+    let mut b = card();
+    live_files(&mut b, 512);
+    let img = placed(&b);
+    let off = events_with(
+        &img,
+        &[],
+        &ScanOptions {
+            filesystems: false,
+            ..ScanOptions::default()
+        },
+    );
+    assert!(!off.iter().any(|e| matches!(e, Event::Volume { .. })));
+    assert!(founds(&off).iter().all(|f| f.origin.is_none()));
+    // The same card with its partition table and boot sectors erased: no volume is found, so the scan is the
+    // carving alone.
+    let mut erased = img.clone();
+    erased[..512].fill(0);
+    erased[VOL as usize..VOL as usize + 32 * 512].fill(0);
+    let carving = events(&erased);
+    assert!(!carving.iter().any(|e| matches!(e, Event::Volume { .. })));
+    assert_eq!(off, carving);
+    assert!(!founds(&off).is_empty());
+}
+
+#[test]
+fn exfat_card_works_the_same() {
+    let cluster = 32 * 1024;
+    let mut b = FsBuilder::new(FsType::Exfat, 32 * MIB as u64, cluster as u32);
+    let live = live_files(&mut b, cluster);
+    let ev = events(&placed(&b));
+    match &ev[0] {
+        Event::Volume { volume, .. } => assert_eq!(volume.fs, FsKind::Exfat),
+        e => panic!("first event {e:?}"),
+    }
+    check_live_files(&b, &live, &ev, cluster);
+}
+
+#[test]
+fn moov_inside_a_live_file_is_no_orphan() {
+    // A video with no entry cut in two: its first piece in free clusters, the rest (with its `moov`) as the contents of a
+    // live MISC/DATA.BIN. The `moov` belongs to the live file, so the video is not paired with it.
+    let v = avc_video(&AvcOptions {
+        samples: 120,
+        seed: 3,
+        mov: false,
+        mdat_pad: 0,
+        small_nals: true,
+    });
+    let p = &v.mdat_payload;
+    let l1 = (p.start + p.len() * 2 / 5).div_ceil(512) * 512;
+    let mut b = card();
+    let rest = &v.bytes[l1..];
+    let n = rest.len().div_ceil(512) as u32;
+    let chain: Vec<u32> = (40_000..40_000 + n).collect();
+    b.add_at("MISC/DATA.BIN", rest, &chain);
+    let mut img = placed(&b);
+    let first = at(&b, 20_000);
+    img[first..first + l1].copy_from_slice(&v.bytes[..l1]);
+    let updated = |ev: &[Event]| ev.iter().filter(|e| matches!(e, Event::Updated(_))).count();
+    let off = events_with(
+        &img,
+        &[],
+        &ScanOptions {
+            filesystems: false,
+            ..ScanOptions::default()
+        },
+    );
+    assert_eq!(updated(&off), 1, "the carving alone pairs them");
+    let ev = events(&img);
+    assert_eq!(updated(&ev), 0);
+    let video = founds(&ev)
+        .into_iter()
+        .find(|f| f.start == first as u64)
+        .expect("the video's first piece");
+    assert_eq!(video.health, Health::Damaged);
+}

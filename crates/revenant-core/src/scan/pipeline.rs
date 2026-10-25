@@ -8,6 +8,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use super::fs::{FsJobResult, FsPlan, fs_job};
 use super::{CancelToken, HEAD_LEN};
 use crate::cache::{CachedSource, Runs};
 use crate::formats::{CancelScope, Format, MOOV_MAX_LEN, Measurement};
@@ -40,7 +41,10 @@ pub(super) fn measure(
 enum SlotState {
     Waiting,
     Done(Option<Measurement>),
-    /// Not measured: the scan was cancelled, the head lies in a committed skip range, or `measure` panicked.
+    /// A kept file-system file's job done.
+    DoneFs(Box<FsJobResult>),
+    /// Not measured: the scan was cancelled, the head lies in a committed skip range (never for a file-system file's
+    /// job), or `measure` panicked.
     Dropped,
 }
 
@@ -52,6 +56,8 @@ pub(super) struct Slot {
 /// A measured job's outcome, as the commit loop sees it.
 pub(super) enum Outcome {
     Measured(Option<Measurement>),
+    /// A kept file-system file's job.
+    MeasuredFs(Box<FsJobResult>),
     /// The worker did not measure it: the commit loop measures it itself.
     NotMeasured,
     Cancelled,
@@ -77,6 +83,7 @@ impl Slot {
             if !matches!(*st, SlotState::Waiting) {
                 return match std::mem::replace(&mut *st, SlotState::Dropped) {
                     SlotState::Done(m) => Outcome::Measured(m),
+                    SlotState::DoneFs(r) => Outcome::MeasuredFs(r),
                     _ => Outcome::NotMeasured,
                 };
             }
@@ -96,14 +103,19 @@ struct Job {
     at: u64,
     head: [u8; HEAD_LEN],
     head_len: usize,
+    /// The kept file-system file starting at `at` (index in [`FsPlan::kept`]): the job is its `fs_job`.
+    fs: Option<usize>,
     slot: Arc<Slot>,
 }
 
-/// A sector start some format recognizes.
+/// A sector start some format recognizes, or where a kept file-system file starts (recognized or not, inside a skip
+/// range or not, readable or not).
 pub(super) struct Head {
     pub(super) at: u64,
     pub(super) head: [u8; HEAD_LEN],
     pub(super) head_len: usize,
+    /// The kept file-system file starting here (index in [`FsPlan::kept`]).
+    pub(super) fs: Option<usize>,
     /// The queued job's result; `None` when there are no workers (the commit loop measures it).
     pub(super) slot: Option<Arc<Slot>>,
 }
@@ -223,6 +235,13 @@ pub(super) struct Shared<'s> {
     /// Sector-rounded ranges where no head is examined (the pieces of committed `Intact` findings); only grows, except
     /// that ranges behind the commit loop are pruned.
     pub(super) skips: Mutex<Runs>,
+    /// What the scan keeps of the file-system listing (empty without file systems).
+    pub(super) fs: FsPlan,
+    /// The `fs_job` reuse of the carving (always on outside tests).
+    pub(super) reuse: bool,
+    /// Tests: the workers hand every file-system job back unmeasured, so the commit loop runs it.
+    #[cfg(test)]
+    pub(super) drop_fs_jobs: bool,
     /// Jobs not yet taken, and whether the queue is closed.
     queue: Mutex<(VecDeque<Job>, bool)>,
     queued: Condvar,
@@ -253,6 +272,10 @@ impl<'s> Shared<'s> {
             sector,
             total,
             skips: Mutex::new(Runs::default()),
+            fs: FsPlan::default(),
+            reuse: true,
+            #[cfg(test)]
+            drop_fs_jobs: false,
             queue: Mutex::new((VecDeque::new(), false)),
             queued: Condvar::new(),
         }
@@ -284,30 +307,46 @@ impl<'s> Shared<'s> {
                     q = self.queued.wait(q).unwrap_or_else(PoisonError::into_inner);
                 }
             };
-            if self.cancel.is_cancelled() || self.skipped(job.at) {
+            // A file-system file's job is never dropped for a skip range: its finding does not depend on the carving.
+            if self.cancel.is_cancelled() || (job.fs.is_none() && self.skipped(job.at)) {
+                job.slot.fill(SlotState::Dropped);
+                continue;
+            }
+            #[cfg(test)]
+            if job.fs.is_some() && self.drop_fs_jobs {
                 job.slot.fill(SlotState::Dropped);
                 continue;
             }
             // A panicking detector must not leave the commit loop waiting: the job is handed back unmeasured, and the
             // commit loop measures it on the scan thread, where the panic surfaces as it would in a sequential scan.
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                measure(
+            let result = catch_unwind(AssertUnwindSafe(|| match job.fs {
+                Some(k) => SlotState::DoneFs(Box::new(self.fs_job(k, job.at))),
+                None => SlotState::Done(measure(
                     self.formats,
                     &self.cache,
                     job.at,
                     &job.head[..job.head_len],
                     self.cancel,
-                )
+                )),
             }));
-            job.slot.fill(match result {
-                Ok(m) => SlotState::Done(m),
-                Err(_) => SlotState::Dropped,
-            });
+            job.slot.fill(result.unwrap_or(SlotState::Dropped));
         }
     }
 
-    /// Reads the block `[pos, end)` (or defers it) and, with workers, queues a job for each head to examine. `finder`
-    /// searches the bytes read for orphan `moov` candidates.
+    /// The job of the kept file `k` starting at `at`.
+    pub(super) fn fs_job(&self, k: usize, at: u64) -> FsJobResult {
+        fs_job(
+            self.formats,
+            &self.cache,
+            &self.fs.kept[k],
+            at,
+            self.cancel,
+            self.reuse,
+        )
+    }
+
+    /// Reads the block `[pos, end)` (or defers it) and, with workers, queues a job for each head to examine and for each
+    /// kept file-system file starting in it. `finder` searches the bytes read for orphan `moov` candidates.
     pub(super) fn fill(&self, pos: u64, end: u64, workers: bool, finder: &mut MoovFinder) -> Block {
         let sector = self.sector;
         let sectors = (end - pos).div_ceil(sector) as usize;
@@ -359,12 +398,17 @@ impl<'s> Shared<'s> {
                         at,
                         head: h,
                         head_len,
+                        fs: None,
                         slot: None,
                     });
                 }
                 at = sector_end;
             }
         });
+        let kept = self.fs.kept_in(pos, end);
+        if !kept.is_empty() {
+            heads = with_kept(heads, kept.map(|k| (self.fs.starts[k], k)));
+        }
         if workers && !heads.is_empty() {
             let mut q = lock(&self.queue);
             for h in &mut heads {
@@ -374,6 +418,7 @@ impl<'s> Shared<'s> {
                     at: h.at,
                     head: h.head,
                     head_len: h.head_len,
+                    fs: h.fs,
                     slot,
                 });
             }
@@ -398,6 +443,33 @@ impl<'s> Shared<'s> {
         let n = self.cache.read_at(at, &mut head[..want]).ok()?;
         (n == want && self.formats.iter().any(|f| f.recognizes(&head[..n]))).then_some((head, n))
     }
+}
+
+/// `heads` (ascending) with a head for each kept file `(start, index)` (ascending): an existing head at that start
+/// becomes the file's, otherwise one is added.
+fn with_kept(heads: Vec<Head>, kept: impl Iterator<Item = (u64, usize)>) -> Vec<Head> {
+    let mut out = Vec::with_capacity(heads.len());
+    let mut heads = heads.into_iter().peekable();
+    for (at, k) in kept {
+        while let Some(h) = heads.next_if(|h| h.at < at) {
+            out.push(h);
+        }
+        match heads.next_if(|h| h.at == at) {
+            Some(mut h) => {
+                h.fs = Some(k);
+                out.push(h);
+            }
+            None => out.push(Head {
+                at,
+                head: [0; HEAD_LEN],
+                head_len: 0,
+                fs: Some(k),
+                slot: None,
+            }),
+        }
+    }
+    out.extend(heads);
+    out
 }
 
 #[cfg(test)]

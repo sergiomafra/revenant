@@ -16,7 +16,6 @@ use crate::cache::CachedSource;
 use crate::source::Source;
 use partitions::Candidate;
 
-#[allow(unused_imports)] // `read_with` is the scan's entry point (Task 7).
 pub(crate) use listing::read_with;
 pub use listing::{FsFile, FsOrigin, FsState, FsTime, Listing, Placement, read};
 
@@ -114,8 +113,7 @@ impl<'a, 'c> SourceProbe<'a, 'c> {
         }
     }
 
-    /// Reads `raw`, the source under `cache`, never a range `cache` knows to be unreadable (the scan's probe, Task 7).
-    #[allow(dead_code)] // The scan builds it (Task 7); the unit tests do now.
+    /// Reads `raw`, the source under `cache`, never a range `cache` knows to be unreadable (the scan's probe).
     pub(crate) fn beside(raw: &'a dyn Source, cache: &'a CachedSource<'c>) -> Self {
         SourceProbe {
             source: raw,

@@ -532,14 +532,15 @@ No read is larger than 128 KiB, and none is allocated before it is known to lie 
 volume `volumes` finds (exFAT: see [File systems: exFAT](#file-systems-exfat); a volume of more than 2^28 clusters is
 not walked). It never fails: a broken volume yields fewer files. Cancellation is checked before each directory; a cancelled
 read returns what was listed so far. Written from fatgen103 (FAT entries, directory entries, long names). The scan
-(Task 7) calls the crate-internal `read_with(meta, probe, cancel)`: metadata through its cache, the FAT32 high-word
+calls the crate-internal `read_with(meta, probe, cancel)`: metadata through its cache, the FAT32 high-word
 heads through a `Probe` over the raw source (see Deleted files); `read` uses the given source for both.
 
 - `Listing.files`: the photo/video files, those whose extension `FileKind::from_extension` knows (jpg jpeg jpe, mp4 m4v,
   mov, cr2, cr3, nef nrw, arw, dng, orf ori, rw2, raf, heic heif hif, tif tiff; any case). Each is an `FsFile`:
   - `origin`: `volume` (the volume's index), `folder` (components joined by `/`, from the root, no leading `/`, `""`
     for the root; `None` when dropped, see Bounds; one string shared by the files of a folder), `name`, `state` (`live`,
-    or `deleted`), `placement` (`chain` for a live file, `guessed` for a deleted one; exFAT adds `recorded`), `size` as
+    or `deleted`), `placement` (`chain` for a live file, `guessed` for a deleted one; exFAT adds `recorded`; a scan
+    finding's origin may say `carved`, see [Deduplication](#deduplication)), `size` as
     recorded, `created` and `modified` as `FsTime` (local time
     `YYYY-MM-DDTHH:MM:SS`, no offset on FAT, exFAT's UTC offset when recorded; `Display` appends `+HH:MM`/`-HH:MM`
     then; `None` when a field is out of range: month, day for that month and year,
@@ -823,7 +824,55 @@ kept only if it starts with `FF D8 FF`, its SOF parses and its whole range lies 
 scan keeps reading every block. After an `Intact` finding it examines no head inside the file (inside its pieces, for a
 file in pieces); after a `Partial` or `Damaged` finding it keeps examining heads, so files inside a broken one are still reported (one bad
 file never hides the rest of the disk; a damaged file may then overlap another finding). `measure` reads the whole source
-(not just the block), so files may cross block boundaries.
+(not just the block), so files may cross block boundaries. Before the first block the scan reads the source's file
+systems (below), so the files they list come out with their name, folder and dates, once each.
+
+### File systems in the scan
+
+With `ScanOptions::filesystems` (default `true`; `false` is the scan by signature alone: no `Volume` event, every
+`Finding::origin` `None`), the scan first lists the FAT/exFAT files (ruling D1; see [File systems: FAT](#file-systems-fat)
+and [File systems: exFAT](#file-systems-exfat)): the metadata through the scan's cache, the FAT32 high-word heads through
+a probe over the raw source that refuses, without reading it, any range the cache already knows to be unreadable. Then:
+
+- **Volumes.** One `Event::Volume { volume, listing_truncated }` per volume, in index order, before the first
+  `Progress`. `listing_truncated` is the listing's `truncated` flag (ruling R7; the same for every volume, and
+  `ScanSummary::listing_truncated`): a cap or budget of the listing dropped or degraded files, so some files found may
+  lack their name, folder or dates. A cancel from inside a `Volume` callback stops the scan there.
+- **Which files.** Every photo/video of `Listing.files` whose first piece starts at a multiple of `ScanOptions::sector`
+  (with a sector above 512 the others are dropped silently; the carving still finds them). When several share a
+  first-piece start (deleted entries over each other, a cross-link), one is kept: a live one before a deleted one, then
+  the latest `modified` (a missing time loses to a present one), then listing order; the others are not reported.
+- **Nothing is skipped because of the file system** (ruling R10): every head the signature rules examine is still
+  examined, and only an `Intact` finding skips its pieces, as before.
+- **A listed file's finding** is added at the sector holding its first piece, always (whether a format recognizes the
+  head there or not, inside a skip range or not, readable or not), before that sector's unreadable and skip checks; the
+  carving's head at that sector is consumed. The file is measured through a `source::Fragmented` view of its pieces
+  (the detectors at offset 0 of the view), and a deleted file is also measured where it starts, as the carving would
+  ("carved"; it counts only when that sector is readable and outside every committed skip range). The two are merged
+  (see [Deduplication](#deduplication)). The finding has `origin: Some(FsOrigin)` (volume, folder, name, state,
+  placement, recorded size, times); `len` is the sum of its pieces and `fragments` its pieces (empty for one piece),
+  unless the carving replaced them. Then the usual rules apply: `Intact` skips its pieces, an unreadable sector inside
+  makes it `Partial`, and it is emitted once the scan has read past its farthest piece.
+- **A live file of another kind** (`Listing.others`: `.THM`, `.XML`, ...): the head at its first cluster is consumed
+  without a finding; when the measurement there is `Intact`, its range is skipped. Heads inside the file are examined
+  as usual (ruling D18: they count as being inside a live file, below).
+- **Live clusters (ruling D7).** A finding whose origin is not a live file (found by its signature alone, or deleted)
+  and that overlaps `Listing.live` is at most `Partial`, and an orphan `moov` candidate inside `Listing.live` is dropped
+  (it belongs to a live file). A forged file system cannot hide a deleted photo: at worst the photo comes out `Partial`.
+- **One job, whoever runs it.** A listed file's measurement is queued to the measuring threads like a head's, and never
+  dropped for a skip range; when there is no worker result (one thread, a block not read again, a job handed back),
+  the commit loop runs the same function, so the events stay the same for any `threads` and `cache_bytes`. For a deleted
+  file in one piece whose carving is contiguous and no longer than the piece, the carving read the same bytes, so it
+  stands for the view measurement and only the tail check (D6) runs.
+
+Reading once, with the file systems: the metadata goes through the cache like every other read. The exceptions are the
+FAT32 high-word heads (at most 65,536 reads of 512 bytes, outside the cache; see Deleted files and folders), the later
+pieces of a fragmented file, which its view may read again when the cache no longer holds them, and the bytes between
+a file's structural end and its recorded size, which the tail check reads (from the cache when the file fits in it).
+And the listing runs before the first block, so the cache windows it loads (the boot sectors and probe offsets, the
+FATs, the directories) are read again by the scan when the cache no longer holds them once the scan reaches them:
+directories far into a large card, or, with a cache of a few MiB, the up to 5 windows the volume search loads on a
+source with no volume.
 
 Reading once: the scan and every `measure` read through one shared cache (`CachedSource`, crate-private) of
 `ScanOptions::cache_bytes` (default 256 MiB; values below 1 MiB are raised to it). "Read once" is about reading the
@@ -871,14 +920,21 @@ every scan in the process, plus the decoder's internal buffers), plus what each 
 `moov` of at most 16 MiB, or a JPEG gap search's DC values, about 3 × 13 MiB at 210 megapixels, plus 3 MiB), plus about
 200 B per recognized sector start in the read-ahead (at most
 lookahead × block / sector of them), plus the `moov` candidates (16 B each: at most 4096 per block read ahead, and
-4096 kept), the `Damaged` videos kept for pairing (at most 4096 findings) and the start of every finding (8 B each).
-After the scan, the pairing step holds one
+4096 kept), the `Damaged` videos kept for pairing (at most 4096 findings) and the start of every finding (8 B each),
+plus the file-system listing, kept for the whole scan: at most 262,144 photo/video files and 2^20 pieces, ≈ 355 MiB
+in the worst case at those caps (mostly names; see the Memory paragraph of [File systems: FAT](#file-systems-fat)),
+and while it is read before the first block, a peak of ≈ 640 MiB in the worst case (on exFAT, plus the allocation
+bitmap, ≤ 32 MiB, and the root entries waiting for it, ≤ 68 MiB), all of it a sum no real card reaches. Each running
+measurement of a listed file adds its view (16 B per piece, at most 4096 pieces) and a 64 KiB buffer for the tail
+check. After the scan, the pairing step holds one
 `moov` (at most 16 MiB) and its sample lists (at most 4,000,000 samples, about 32 B each, so up to about 128 MiB). With
 the defaults on a 16-thread machine: about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
 
 Events:
 
-- `Found(Finding)`: sequential `id` from 1, in start order. It is emitted once the scan has read past the file's end (the end of its
+- `Volume { volume, listing_truncated }`: a FAT/exFAT volume, before the first `Progress`, one per volume in index
+  order (see [File systems in the scan](#file-systems-in-the-scan)); none with `ScanOptions::filesystems` off.
+- `Found(Finding)`: sequential `id` from 1, in start order; `origin` is `Some` when the file system lists the file. It is emitted once the scan has read past the file's end (the end of its
   farthest piece), so unreadable sectors inside the file are known: they are reported as `Unreadable` events before the
   `Found`, and an `Intact` finding with any of them inside one of its pieces is downgraded to `Partial`. A file found inside a `Partial`/`Damaged` one is emitted right
   after it.
@@ -898,6 +954,34 @@ their remaining jobs, and `scan` returns `EngineError::Cancelled` after every th
 running is finished first, except a JPEG gap search, which gives up as soon as it sees the cancel, and a `zune-jpeg`
 validation decode, which is skipped when the cancel is seen before waiting for the decode budget or once the budget is
 granted); findings still pending are dropped.
+
+## Deduplication
+
+A file the file system lists and the carving also finds comes out once: at a listed file's start the finding is the
+merged one, and the carving's head there is consumed (see [File systems in the scan](#file-systems-in-the-scan)). The
+merge (rulings D3, D5, D6), from the measurement through the view of the file's pieces:
+
+1. Kind and health are the view measurement's; when no format measures the view, the extension's kind, `Damaged`.
+2. The health is at most `Partial` when the placement is not trusted (`FsFile::trusted`, ruling D3: a live chain that
+   is incomplete, loops or crosses another, a deleted file not in one run of free clusters), when the tail is not
+   coherent (D6, below) or when the view measurement is itself in pieces (a join inside the file's own pieces).
+3. The pieces are the file system's: `len` their sum, `fragments` them when there are two or more.
+4. A deleted file takes the carving at its start instead (its length, kind, health and pieces; `placement` `carved`)
+   when the carving is of the same kind, strictly healthier (`Intact` > `Partial` > `Damaged`) and exactly the
+   recorded size (D5): the guess was wrong and the signature found the file. A live file never does: its chain is
+   where its bytes are. A carving of another length (a join to the tail of another photo of a burst) is not used.
+
+The tail (D6): the structure measured over the view ends at `L`, and the view (the recorded size, as far as the clusters
+and the source hold it) has `S` bytes. `L == S` is coherent. Otherwise, at most 8 times: the bytes `[L, S)` are all
+`00` or `FF` (padding) → coherent; else a format recognizes the head at `L` and measures a contiguous file of `m` bytes,
+not `Damaged`, with `L + m ≤ S` (an MPF image, a motion photo's video) → `L += m` and again; else it is not coherent.
+So a corrupt count inside a listed file is bounded by its recorded size (the view ends there), and a file whose size
+does not match its contents is at most `Partial`. The file system is evidence of where a file is, never of its
+integrity: its facts only ever lower the health a detector gives.
+
+Not merged: a file found by its signature where no listed file starts (no entry, or a deleted entry whose first cluster
+was reused), and files inside another one (still found inside a `Partial` or `Damaged` finding, as before). Such a
+finding that overlaps a live file is at most `Partial` (D7).
 
 ## Performance
 

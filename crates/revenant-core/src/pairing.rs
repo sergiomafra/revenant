@@ -596,6 +596,7 @@ fn try_pair(
         kind: v.kind,
         health,
         fragments: pieces,
+        origin: v.finding.origin.clone(),
     })
 }
 
@@ -647,6 +648,7 @@ mod tests {
                 kind: FileKind::Mp4,
                 health: Health::Damaged,
                 fragments: Vec::new(),
+                origin: None,
             });
             moovs.push(((second + v.moov.start - l1) as u64, v.moov.len() as u64));
         }

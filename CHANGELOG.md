@@ -69,6 +69,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the few places it can be. exFAT keeps a deleted file's full name, and its recorded clusters are used when the file
   was written in one piece. Deleted files are never trusted more than the evidence allows: a guess that had to step
   over other files, or an exFAT file whose clusters were partly reused, is marked as not trusted.
+- The scan reads the card's FAT/exFAT file system first: photos and videos it lists, deleted ones included, come out
+  with their name, folder and dates, and a file found both by the file system and by its signature is listed once. A
+  live file is measured along its own clusters, so photos and videos written in pieces (around other files, or with
+  their second piece earlier on the card) come back whole and intact. The file system only tells where a file is,
+  never that it is intact: a file whose recorded size does not match what it holds (other than padding or attached
+  files such as a motion photo's video), whose placement is only a guess, or (for a file the file system does not list
+  as live) that overlaps a live file, is at most partial. A photo written over part of a deleted RAW is found. Each
+  volume found is reported at the start of the scan, with a flag when the listing hit one of its limits (some files may
+  then lack their names); the file-system step can be turned off.
 
 ### Changed
 

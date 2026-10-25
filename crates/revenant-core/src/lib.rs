@@ -14,6 +14,7 @@ pub(crate) mod tiff;
 
 pub use error::EngineError;
 pub use extract::extract;
+pub use filesystem::{FsOrigin, FsState, FsTime, Placement, Volume};
 pub use formats::Fragment;
 pub use inspect::{Inspection, Metadata, Preview, inspect};
 pub use scan::{CancelToken, Event, Finding, ScanOptions, ScanSummary, scan};

@@ -2,6 +2,7 @@
 //! are read ahead and candidate files measured on worker threads ([`pipeline`]); this module's commit loop takes the
 //! results in source order, so the events are those of a sequential scan.
 
+mod fs;
 mod pipeline;
 
 use std::collections::VecDeque;
@@ -10,9 +11,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::EngineError;
 use crate::cache::{CACHE_WINDOW, CachedSource, Runs};
+use crate::filesystem::{FsOrigin, FsState, SourceProbe, Volume};
 use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
 use crate::source::Source;
-use pipeline::{Block, CloseQueue, MoovFinder, Outcome, Shared};
+use fs::{FsJobResult, FsPlan, merge};
+use pipeline::{Block, CloseQueue, Head, MoovFinder, Outcome, Shared};
 
 /// Bytes of a sector start shown to `Format::recognizes`.
 const HEAD_LEN: usize = 16;
@@ -31,6 +34,9 @@ pub struct Finding {
     /// Empty for a contiguous file. Otherwise at least 2 pieces in file order: the first starts at `start`, the lengths
     /// sum to `len`, no two overlap.
     pub fragments: Vec<Fragment>,
+    /// Where the file system says this file is, when it does (name, folder, state, dates). `None` for a file found only
+    /// by its signature.
+    pub origin: Option<FsOrigin>,
 }
 
 impl Finding {
@@ -86,11 +92,15 @@ const MAX_THREADS: usize = 64;
 /// or a JPEG gap search's DC values, about 3 × 13 MiB at 210 megapixels, plus 3 MiB),
 /// plus about 200 B per recognized sector start in the read-ahead (at most lookahead × block / sector of them), plus the
 /// orphan `moov` candidates and `Damaged` videos kept for pairing (at most 4096 + 4096 per block read ahead, and 4096
-/// findings) and the start of every finding (8 B each), and, after the scan, the pairing step's one `moov` and its sample lists (up to about 128 MiB). So with
+/// findings) and the start of every finding (8 B each), plus the file-system listing: up to 262,144 files and 2^20
+/// pieces, ≈ 355 MiB kept for the whole scan in the worst case at those caps, with a peak of ≈ 640 MiB while it is read
+/// (on exFAT, plus the allocation bitmap, ≤ 32 MiB, and the root entries waiting for it, ≤ 68 MiB; core README), and,
+/// after the scan, the pairing step's one `moov` and its sample lists (up to about 128 MiB). So with
 /// the defaults on a 16-thread machine, about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
 pub struct ScanOptions {
     /// Granularity of candidate starts and of unreadable-region handling, in bytes. Above 512, the detectors see a sector that
-    /// failed only in part as wholly unreadable (health stays conservative).
+    /// failed only in part as wholly unreadable (health stays conservative), and a file-system file whose first piece is
+    /// not sector-aligned is silently dropped (it can still be carved).
     pub sector: u64,
     /// Bytes read per block (rounded down to a whole number of sectors, at least one).
     pub block: usize,
@@ -103,6 +113,15 @@ pub struct ScanOptions {
     /// Threads that measure candidate files: 0 (the default) means one per available core, at most 16; 1 measures on
     /// the scan thread itself; other values are capped at 64. The events are the same for any value.
     pub threads: usize,
+    /// Read the FAT/exFAT file systems first (the default): files they list come out with their [`Finding::origin`].
+    /// `false` scans by signature alone: no `Volume` events and every origin `None`.
+    pub filesystems: bool,
+    /// Tests: no `fs_job` reuse of the carving.
+    #[cfg(test)]
+    pub(crate) no_reuse: bool,
+    /// Tests: the workers hand every file-system job back unmeasured.
+    #[cfg(test)]
+    pub(crate) drop_fs_jobs: bool,
 }
 
 impl ScanOptions {
@@ -141,6 +160,11 @@ impl Default for ScanOptions {
             block: 4 * 1024 * 1024,
             cache_bytes: 256 * 1024 * 1024,
             threads: 0,
+            filesystems: true,
+            #[cfg(test)]
+            no_reuse: false,
+            #[cfg(test)]
+            drop_fs_jobs: false,
         }
     }
 }
@@ -161,6 +185,13 @@ impl CancelToken {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// A FAT/exFAT volume of the source, before the first `Progress`, one per volume in index order.
+    /// `listing_truncated`: a cap or budget of the file-system listing dropped or degraded some files (the same for
+    /// every volume of the scan): some files found may lack their name, folder or dates.
+    Volume {
+        volume: Volume,
+        listing_truncated: bool,
+    },
     Found(Finding),
     /// `read` bytes of `total` have been examined.
     Progress {
@@ -183,6 +214,8 @@ pub struct ScanSummary {
     pub unreadable_bytes: u64,
     /// `Updated` events emitted.
     pub updated: u64,
+    /// The file-system listing was truncated by one of its caps or budgets (see [`Event::Volume`]).
+    pub listing_truncated: bool,
 }
 
 /// Most orphan `moov` candidates kept per scan (the first ones, by offset).
@@ -222,6 +255,15 @@ struct Commit<'a, 's> {
     /// The start of every finding, ascending (one per finding): a file starting inside a paired video's pieces makes
     /// the pairing at most `Partial` (ruling Q13).
     starts: Vec<u64>,
+    /// The next kept file-system file the walk has not reached (index in `FsPlan::kept`).
+    next_kept: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// File-system jobs the commit loop ran itself on this thread (no worker result: `NotMeasured`, a deferred block,
+    /// `threads 1`), and those of them in a deferred block.
+    pub(crate) static COMMIT_FS_JOBS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 impl Commit<'_, '_> {
@@ -269,7 +311,10 @@ impl Commit<'_, '_> {
         let skips = pipeline::lock(&self.shared.skips);
         self.capped |= capped && !skips.covers(pos, end);
         for (q, size) in found {
-            if skips.overlaps(q, q + MOOV_HEAD) || self.own_moovs.overlaps(q, q + 1) {
+            if skips.overlaps(q, q + MOOV_HEAD)
+                || self.own_moovs.overlaps(q, q + 1)
+                || self.shared.fs.overlaps_live(q, q + 1)
+            {
                 continue;
             }
             if self.moovs.len() < MAX_MOOVS {
@@ -326,7 +371,28 @@ impl Commit<'_, '_> {
             }
             let idx = ((at - block.pos) / sector) as usize;
             let sector_end = (at + sector).min(block.end);
-            if block.bad.as_ref().is_some_and(|b| b[idx]) {
+            let bad = block.bad.as_ref().is_some_and(|b| b[idx]);
+            while heads.next_if(|h| h.at < at).is_some() {}
+            // A kept file-system file starting here is always reported, before the bad-sector and skip checks; the
+            // carving head here is consumed.
+            let kept = self.kept_at(at);
+            if let Some(k) = kept {
+                let head = heads.next_if(|h| h.at == at);
+                let r = self.fs_result(k, at, head, block.deferred)?;
+                // The carving counts only where the sequential carving would have examined the head.
+                let carved = (!bad && !self.shared.skipped(at))
+                    .then_some(r.carved.as_ref())
+                    .flatten();
+                let m = merge(&self.shared.fs.kept[k], &r.view, carved);
+                let measurement = Measurement {
+                    len: m.len,
+                    kind: m.kind,
+                    health: m.health,
+                    fragments: m.fragments,
+                };
+                self.add(at, measurement, Some(m.origin));
+            }
+            if bad {
                 match &mut self.run {
                     Some((s, l)) if *s + *l == at => *l += sector_end - at,
                     _ => {
@@ -347,8 +413,7 @@ impl Commit<'_, '_> {
                 continue;
             }
             self.flush_run()?;
-            while heads.next_if(|h| h.at < at).is_some() {}
-            if !self.shared.skipped(at) {
+            if kept.is_none() && !self.shared.skipped(at) {
                 let found = match heads.next_if(|h| h.at == at) {
                     Some(h) => {
                         let outcome = match &h.slot {
@@ -360,7 +425,9 @@ impl Commit<'_, '_> {
                             _ if self.shared.cancel.is_cancelled() => {
                                 return Err(EngineError::Cancelled);
                             }
-                            Outcome::NotMeasured => self.measure(at, &h.head[..h.head_len]),
+                            Outcome::NotMeasured | Outcome::MeasuredFs(_) => {
+                                self.measure(at, &h.head[..h.head_len])
+                            }
                             Outcome::Cancelled => return Err(EngineError::Cancelled),
                         }
                     }
@@ -370,13 +437,77 @@ impl Commit<'_, '_> {
                         .and_then(|(head, n)| self.measure(at, &head[..n])),
                     None => None,
                 };
-                if let Some(m) = found {
-                    self.add(at, m);
+                match found {
+                    // The head at the first cluster of a live file of another kind is consumed without a finding;
+                    // an `Intact` measurement there still skips its range (ruling R10).
+                    Some(m) if self.shared.fs.is_other(at) => {
+                        if m.health == Health::Intact
+                            && pieces_ok(at, m.len, &m.fragments, self.shared.total)
+                        {
+                            self.skip(&ranges(at, m.len, &m.fragments));
+                        }
+                    }
+                    Some(m) => self.add(at, m, None),
+                    None => {}
                 }
             }
             at = sector_end;
         }
         Ok(())
+    }
+
+    /// The index of the kept file-system file starting at `at`, if any (`at` only grows during a scan).
+    fn kept_at(&mut self, at: u64) -> Option<usize> {
+        let starts = &self.shared.fs.starts;
+        while self.next_kept < starts.len() && starts[self.next_kept] < at {
+            self.next_kept += 1;
+        }
+        (starts.get(self.next_kept) == Some(&at)).then_some(self.next_kept)
+    }
+
+    /// The job result of the kept file `k` at `at`: the worker's, else run here (the same function, so the result does
+    /// not depend on who ran it).
+    fn fs_result(
+        &self,
+        k: usize,
+        at: u64,
+        head: Option<Head>,
+        deferred: bool,
+    ) -> Result<FsJobResult, EngineError> {
+        let outcome = match head.and_then(|h| h.slot) {
+            Some(slot) => slot.wait(self.shared.cancel),
+            None => Outcome::NotMeasured,
+        };
+        match outcome {
+            Outcome::MeasuredFs(r) => Ok(*r),
+            Outcome::Cancelled => Err(EngineError::Cancelled),
+            _ if self.shared.cancel.is_cancelled() => Err(EngineError::Cancelled),
+            Outcome::NotMeasured | Outcome::Measured(_) => {
+                #[cfg(test)]
+                COMMIT_FS_JOBS.with(|c| {
+                    let (n, d) = c.get();
+                    c.set((n + 1, d + usize::from(deferred)));
+                });
+                let _ = deferred;
+                Ok(self.shared.fs_job(k, at))
+            }
+        }
+    }
+
+    /// Adds a skip range per range (rounded out to whole sectors).
+    fn skip(&self, ranges: &[Fragment]) {
+        let sector = self.shared.sector;
+        let mut skips = pipeline::lock(&self.shared.skips);
+        for r in ranges {
+            skips.add(
+                r.start / sector * sector,
+                r.start
+                    .saturating_add(r.len)
+                    .div_ceil(sector)
+                    .saturating_mul(sector),
+                usize::MAX,
+            );
+        }
     }
 
     fn measure(&self, at: u64, head: &[u8]) -> Option<Measurement> {
@@ -389,8 +520,9 @@ impl Commit<'_, '_> {
         )
     }
 
-    /// Turns the measurement at `at` into a pending finding; an `Intact` one adds a skip range per piece.
-    fn add(&mut self, at: u64, m: Measurement) {
+    /// Turns the measurement at `at` into a pending finding; an `Intact` one adds a skip range per piece. A finding whose
+    /// origin is not a live file and whose ranges overlap a live file is at most `Partial` (ruling D7).
+    fn add(&mut self, at: u64, mut m: Measurement, origin: Option<FsOrigin>) {
         if m.len == 0 {
             return;
         }
@@ -403,6 +535,16 @@ impl Commit<'_, '_> {
         let sector = self.shared.sector;
         let round_up = |x: u64| x.div_ceil(sector).saturating_mul(sector);
         let ranges = ranges(at, m.len, &m.fragments);
+        if m.health == Health::Intact
+            && origin.as_ref().is_none_or(|o| o.state != FsState::Live)
+            && ranges.iter().any(|r| {
+                self.shared
+                    .fs
+                    .overlaps_live(r.start, r.start.saturating_add(r.len))
+            })
+        {
+            m.health = Health::Partial;
+        }
         let end = ranges
             .iter()
             .map(|r| round_up(r.start.saturating_add(r.len)))
@@ -420,14 +562,7 @@ impl Commit<'_, '_> {
             }
         }
         if m.health == Health::Intact {
-            let mut skips = pipeline::lock(&self.shared.skips);
-            for r in &ranges {
-                skips.add(
-                    r.start / sector * sector,
-                    round_up(r.start.saturating_add(r.len)),
-                    usize::MAX,
-                );
-            }
+            self.skip(&ranges);
         }
         self.starts.push(at);
         let finding = Finding {
@@ -437,6 +572,7 @@ impl Commit<'_, '_> {
             kind: m.kind,
             health: m.health,
             fragments: m.fragments,
+            origin,
         };
         self.next_id += 1;
         self.pending.push_back(Pending {
@@ -479,6 +615,16 @@ impl Commit<'_, '_> {
 /// have all gone through the cache already (read by `measure`) is not read again: its unreadable sectors come from the
 /// cache's bad map.
 ///
+/// File systems (`opts.filesystems`, ruling D1): before the first block the FAT/exFAT listing is read (metadata through
+/// the cache; the FAT32 high-word heads through a probe over `source` that refuses ranges the cache knows to be bad),
+/// and one [`Event::Volume`] is emitted per volume. For each distinct first-piece start one listed photo/video is kept
+/// (live before deleted, then the latest `modified`, then listing order). At the sector holding it, before the
+/// unreadable and skip checks, its merged finding is added and the carving head there is consumed; its job (a view of
+/// its pieces measured, plus the carving at its start for a deleted file) is never dropped for a skip range, and every
+/// commit path without a worker result runs the same `fs_job`. Nothing is skipped because of the file system: a live
+/// file of another kind only consumes the head at its first cluster, and a finding that is not a live file's and
+/// overlaps a live file is at most `Partial` (ruling D7). See `fs` and the core README ("Deduplication").
+///
 /// `opts.sector` is raised to at least 16 (the head length) and `opts.block` rounded down to whole sectors, so a head
 /// never straddles two blocks. Cancellation is checked before each block examined or read ahead, before and after
 /// every event, while waiting for a measurement and during the pairing step: once it is seen no further event is
@@ -497,8 +643,28 @@ pub fn scan(
     let threads = opts.resolved_threads();
     let workers = if threads > 1 { threads } else { 0 };
     let cache = CachedSource::new(source, sector, opts.cache_bytes.max(CACHE_WINDOW));
-    let shared = Shared::new(cache, formats, cancel, sector);
+    let mut shared = Shared::new(cache, formats, cancel, sector);
     let total = shared.total;
+    // The file systems first (ruling D1): metadata through the cache, the high-word heads through a probe over the raw
+    // source that refuses what the cache knows to be unreadable. Nothing is skipped because of them (ruling R10).
+    let (volumes, listing_truncated) = if opts.filesystems {
+        let listing = crate::filesystem::read_with(
+            &shared.cache,
+            &SourceProbe::beside(source, &shared.cache),
+            cancel,
+        );
+        let out = (listing.volumes.clone(), listing.truncated);
+        shared.fs = FsPlan::new(listing, sector, total);
+        out
+    } else {
+        (Vec::new(), false)
+    };
+    #[cfg(test)]
+    {
+        shared.reuse = !opts.no_reuse;
+        shared.drop_fs_jobs = opts.drop_fs_jobs;
+    }
+    let shared = shared;
 
     std::thread::scope(|s| {
         let _close = CloseQueue(&shared);
@@ -517,7 +683,15 @@ pub fn scan(
             videos: Vec::new(),
             capped: false,
             starts: Vec::new(),
+            next_kept: 0,
         };
+        commit.summary.listing_truncated = listing_truncated;
+        for volume in volumes {
+            commit.emit(Event::Volume {
+                volume,
+                listing_truncated,
+            })?;
+        }
         let mut finder = MoovFinder::default();
         let mut ahead: VecDeque<Block> = VecDeque::with_capacity(lookahead);
         let mut fill_pos = 0u64;

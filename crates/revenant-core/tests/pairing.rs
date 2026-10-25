@@ -185,6 +185,7 @@ fn split_video_is_reassembled_intact() {
                 len: (v.bytes.len() - l1) as u64,
             },
         ],
+        origin: None,
     };
     assert_eq!(last, &Event::Updated(expected.clone()));
     assert_eq!(extracted(&src, &expected), v.bytes);

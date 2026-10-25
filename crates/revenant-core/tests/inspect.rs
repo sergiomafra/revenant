@@ -439,6 +439,7 @@ fn noise_never_panics_for_any_kind() {
                 kind,
                 health: Health::Partial,
                 fragments: Vec::new(),
+                origin: None,
             };
             let _ = inspect(&source, &f);
         }
@@ -547,6 +548,7 @@ fn fragmented_jpeg_inspects_like_the_whole_file() {
         kind: FileKind::Jpeg,
         health: Health::Intact,
         fragments: pieces.clone(),
+        origin: None,
     };
     let i = inspect(&source, &f);
     assert_eq!(i.metadata, whole.metadata);
@@ -603,6 +605,7 @@ fn a_preview_inside_one_piece_has_no_pieces() {
                 len: len - split,
             },
         ],
+        origin: None,
     };
     let i = inspect(&source, &f);
     assert_eq!(i.metadata, whole.metadata);

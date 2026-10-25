@@ -63,6 +63,7 @@ fn fixture(volume: Option<VolumeId>, bad: Option<(u64, u64)>, jpeg_len: usize) -
         kind: FileKind::Jpeg,
         health: Health::Intact,
         fragments: Vec::new(),
+        origin: None,
     };
     Fixture {
         _img: img,

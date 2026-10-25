@@ -380,6 +380,8 @@ fn run_scan(
                     cancel.cancel();
                 }
             }
+            // The scan lines do not show volumes yet.
+            Event::Volume { .. } => {}
             Event::Progress { read, total } => {
                 let pct = (read * 100).checked_div(total).unwrap_or(100);
                 if pct != last_pct {
@@ -453,6 +455,7 @@ mod tests {
             kind: FileKind::Jpeg,
             health: Health::Intact,
             fragments: Vec::new(),
+            origin: None,
         };
         let v = json(&contiguous);
         assert_eq!(v["event"], "found");
@@ -514,6 +517,7 @@ mod tests {
             kind: FileKind::Jpeg,
             health: Health::Intact,
             fragments: Vec::new(),
+            origin: None,
         };
         let p = Preview {
             start: 4096,

@@ -29,7 +29,8 @@ impl FsState {
 }
 
 /// How the pieces were placed: Chain = FAT chain or exFAT NoFatChain of a live file; Recorded = exFAT NoFatChain run
-/// of a deleted file; Guessed = deleted-file heuristic (D4); Carved = the scan's own measurement (D5, Task 10).
+/// of a deleted file; Guessed = deleted-file heuristic (D4); Carved = the scan's own measurement at the file's start
+/// replaced the guess (D5; set by the scan only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
     Chain,
@@ -129,7 +130,7 @@ pub struct Listing {
     /// (ruling R8), and a directory or file left out by the piece or photo cap.
     pub live: Vec<Fragment>,
     /// First piece of every live file that is not a photo/video (any other extension), sorted by start: the scan
-    /// consumes the head there without a finding (Task 7). There is no pre-skip list: nothing is skipped before the
+    /// consumes the head there without a finding. There is no pre-skip list: nothing is skipped before the
     /// search (R10).
     pub others: Vec<Fragment>,
     /// A cap or budget dropped or degraded something (ruling R7): a file left out by the piece or photo cap, a folder
