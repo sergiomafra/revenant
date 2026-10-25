@@ -6,10 +6,9 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 
 ## Onde o desenvolvimento está
 
-**20/10/2026.** Módulo 1 (motor): Parte 1.1 (fundação e escultura) mergeada (PR #1, CI verde nas 4 arquiteturas);
-Parte 1.2 (RAW e dados da foto) mergeada (PRs #2 e #3). Parte 1.3 (arquivos fragmentados e velocidade) concluída na
-branch `feat/m1-p3-fragments-speed`, aguardando PR/merge; decisões e pendências em
-`docs/superpowers/history/2026-10-20-m1-p3-pendencias.md`. Próxima: 1.4 (sistemas de arquivos). Roteiro até a 1.0:
+**25/10/2026.** Módulo 1 (motor): Partes 1.1 a 1.3 mergeadas (PRs #1 a #4). Parte 1.4 (sistemas de arquivos: FAT12/16/32 e
+exFAT, deduplicação, nomes e agrupamento) concluída na branch `feat/m1-p4-filesystems`, aguardando PR/merge; decisões e
+pendências em `docs/superpowers/history/2026-10-25-m1-p4-pendencias.md`. Próxima: 1.5 (disco de verdade). Roteiro até a 1.0:
 `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev` (`bench` mede a velocidade).
 Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.
 
@@ -26,8 +25,10 @@ Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.s
   GPL/AGPL/LGPL/MPL de terceiros e qualquer código copiado do PhotoRec/TestDisk. O Revenant é GPL-3.0-only.
 - Erros por código: todo erro do motor tem `code() -> &'static str` em `snake_case`; nenhum texto de UI no motor.
 - Rust edição 2024, `rust-version = "1.88"`. Sem `unsafe` fora de `source/windows.rs`, cada bloco com `// SAFETY:`.
-- Testes nunca tocam dados reais nem discos físicos: só imagens sintéticas em `tempfile`. Única exceção: o teste opcional
-  `real_samples`, que só lê as amostras CC0 baixadas para `samples/cache/`. Todo teste novo é visto falhando antes.
+- Testes nunca tocam dados reais nem discos físicos: só imagens sintéticas em `tempfile`. Duas exceções opcionais: `real_samples`, que só lê as
+  amostras CC0 baixadas para `samples/cache/`; e `os_filesystems`/`os_builders` (`REVENANT_OS_FS=1`, só macOS, rodar com
+  `--test-threads=1`), que usam o `hdiutil` para criar imagens FAT/exFAT numa pasta temporária e montá-las só leitura:
+  nunca tocam disco físico nem dados reais, só as imagens que o próprio teste criou. Todo teste novo é visto falhando antes.
 - Commits em Conventional Commits, com o trailer `Co-Authored-By`. Nunca `git add -A`.
 
 ## Ambiente

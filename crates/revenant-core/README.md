@@ -669,7 +669,10 @@ clusters; per listing at most 262,144 photo/video files and `MAX_PIECES` (2^20) 
 photo/video's pieces, an other file's ranges in `live`) and a directory's runs. A file that would pass either cap is not
 listed at all (not in `files`, `others` or `live`); a directory past the piece cap is still walked but its ranges are not
 in `live`. Once the entry cap is reached the walk of the volume stops: no further directory is read. Following chains
-examines each cluster of a volume at most once; the deleted-file guesses examine at most 2^26 clusters per volume, and
+examines each cluster of a volume at most once, except the clusters of a directory, which are followed twice (the
+chain is followed again through the FAT when the directory is read); if a flaky source changes between the two, the directory can
+keep the chain it claimed while losing its trust (never the other way round: trust is never given on a re-read). The
+deleted-file guesses examine at most 2^26 clusters per volume, and
 the high-word checks read at most 65,536 heads per listing.
 
 Paths (ruling R6): a photo/video whose path (folder, `/`, name) would pass `MAX_PATH_BYTES` (4096 bytes) keeps its name
@@ -691,7 +694,7 @@ consumed and its origin moved into the listing, never copied, so every name is h
   + 30 MiB.
 - **While a directory is read:** its entries are held at once, 48 B each plus the name. With long names that is at
   most 3,120 entries (21 slots each in 2 MiB): ≈ 2.5 MiB. With short names, 65,535 entries of ≤ 12-byte names:
-  ≈ 3.8 MiB. On top of that, one cluster (≤ 512 KiB) or the FAT12/16 root region (≤ 2 MiB) is read at a time.
+  ≈ 3.8 MiB, ≈ 4.9 MiB at the peak (a growing `Vec` briefly holds the old and the new buffer). On top of that, one cluster (≤ 512 KiB) or the FAT12/16 root region (≤ 2 MiB) is read at a time.
 - **The walk itself:**
   - each directory waiting on the stack keeps only its folder, depth and (first cluster, cluster count), 56 B, so
     65,536 of them take ≈ 3.5 MiB; its chain is followed again through the FAT when it is read;
@@ -1095,13 +1098,23 @@ are an upper bound for a card reader. "Before" is the start of part 1.3 (commit 
 reading on its own); "after" is the end of it (commit `718f1f1`), with the default threads (16 here) and with one.
 MB = 10^6 bytes.
 
-| Image        | Files | Before (MB/s) | After, 16 threads (MB/s) | After, 1 thread (MB/s) |
-| ------------ | ----: | ------------: | -----------------------: | ---------------------: |
-| `noise`      |     0 |         765.6 |                   2381.4 |                 2265.4 |
-| `dense-jpeg` |    95 |          21.8 |                    503.9 |                  102.8 |
-| `dense-raw`  |    37 |         158.1 |                   1576.9 |                  589.5 |
-| `video`      |     3 |         797.2 |                   2296.6 |                 2216.3 |
-| `cut-jpeg`   |    95 |          26.8 |                    419.3 |                   85.6 |
+| Image        | Files | Before (MB/s) | After 1.3, 16 threads (MB/s) | After 1.3, 1 thread (MB/s) | End of 1.4, 16 threads (MB/s) |
+| ------------ | ----: | ------------: | ---------------------------: | -------------------------: | ----------------------------: |
+| `noise`      |     0 |         765.6 |                       2381.4 |                     2265.4 |                        2207.5 |
+| `dense-jpeg` |    95 |          21.8 |                        503.9 |                      102.8 |                         539.8 |
+| `dense-raw`  |    37 |         158.1 |                       1576.9 |                      589.5 |                        1420.3 |
+| `video`      |     3 |         797.2 |                       2296.6 |                     2216.3 |                        2525.4 |
+| `cut-jpeg`   |    95 |          26.8 |                        419.3 |                       85.6 |                         439.0 |
+| `exfat-card` |    93 |             - |                            - |                          - |                         459.1 |
+
+The "end of 1.4" column is the head of part 1.4 (default threads, one run of `revenant-dev bench`, best of 3 scans);
+`exfat-card` (an exFAT volume holding the `dense-jpeg` photos, every 4th deleted, so the scan also reads the file system)
+is new in 1.4, so it has no earlier figure: at 459.1 MB/s it is 0.85 of `dense-jpeg` (539.8), above the 0.8 gate, and it
+finds all 93 placed files. The other lines did not move beyond the variation between runs of this machine, which throttles
+(`dense-raw` 1576.9 to 1420.3, `video` 2296.6 to 2525.4 in the same session). Against part 1.3's head (`main`,
+`b5ec340`) built side by side and interleaved, best of 3 scans, three rounds with a 60 s pause: `dense-jpeg` 581.4 /
+584.7 / 591.6 MB/s on `main` against 545.8 / 561.1 / 566.6 on the 1.4 head (4 to 6% slower; the cause was not isolated); `noise` swings the other way as often as not (2794.1 /
+2653.3 / 2523.6 on `main`, 2468.3 / 2397.0 / 2807.7 on the head), so it shows no difference.
 
 Every placed file is found in every run. What it means for a card: an SD card reader delivers at most about 100 MB/s
 (UHS-I) to about 300 MB/s (UHS-II), so with the default threads the scan keeps up with the reader on every image here,
