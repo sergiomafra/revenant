@@ -92,6 +92,20 @@ impl Destination {
         self.info.as_ref()
     }
 
+    /// [`create_named`] in the checked folder: a new file named after `name` (with `suffix` in place of its extension
+    /// when given), never overwriting. Refuses (`destination_on_source`) a folder no longer on the volume it was checked
+    /// on. For callers writing something other than a finding's bytes there (a preview), so every write goes through
+    /// the check.
+    pub fn create_named(
+        &self,
+        finding: &Finding,
+        name: &str,
+        suffix: Option<&str>,
+    ) -> Result<(PathBuf, File), EngineError> {
+        self.still_checked()?;
+        create_named(&self.dir, finding, name, suffix)
+    }
+
     /// Refuses (`destination_on_source`) a folder no longer on the volume it was checked on (it could have been
     /// replaced since).
     pub(crate) fn still_checked(&self) -> Result<(), EngineError> {

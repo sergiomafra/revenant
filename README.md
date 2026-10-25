@@ -27,10 +27,16 @@ comes next (reading cards directly), then a graphical app.
 ```sh
 cargo build --release -p revenant-dev
 target/release/revenant-dev scan card.img --extract ~/recovered
+target/release/revenant-dev disks                               # the connected disks
+sudo target/release/revenant-dev scan disk4 --extract ~/recovered   # a card read directly (macOS)
 ```
 
-This prints one JSON line per finding, with its photo details and preview. See
-[crates/revenant-dev](crates/revenant-dev/README.md) for the output format and how to make a read-only image of a card.
+This prints one JSON line per finding, with its photo details and preview. It reads a disk image file or a whole card
+directly, read-only (as root on macOS, from a terminal run as administrator on Windows: `revenant-dev scan
+PhysicalDrive2`); do not open the card in Finder or Explorer meanwhile. It can also copy a failing card into an image
+with a rescue map (`revenant-dev copy disk4 card.img`) and save a scan to resume it later (`--session`). See
+[crates/revenant-dev](crates/revenant-dev/README.md) for the output format, reading a card directly, copying a card and
+saved scans.
 
 ## License
 

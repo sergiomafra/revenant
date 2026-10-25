@@ -160,7 +160,8 @@ pub struct Session {
     dir: PathBuf,
     manifest: Manifest,
     point: Point,
-    /// The checked folder, for a session created in this process; a reopened one is checked when it is resumed.
+    /// The checked folder: the one it was created or reopened ([`Session::open_checked`]) with; `None` for a session
+    /// reopened with [`Session::open`].
     dest: Option<Destination>,
     /// What an interrupted session resumes from, when already read.
     resume: Option<Resume>,
@@ -276,6 +277,15 @@ impl Session {
             dest: None,
             resume,
         })
+    }
+
+    /// Reopens the session in `dest.dir()` like [`Session::open`], with its folder already checked by the caller
+    /// ([`Destination::check`] against the source it will be run on, with the caller's [`crate::device::DeviceOps`]):
+    /// the way to resume a device's session. Writes nothing.
+    pub fn open_checked(dest: &Destination) -> Result<Session, EngineError> {
+        let mut session = Session::open(dest.dir())?;
+        session.dest = Some(dest.clone());
+        Ok(session)
     }
 
     /// The session's folder.
@@ -557,9 +567,11 @@ impl<'a> Writer<'a> {
 /// win over `opts`; threads, cache size and rates come from `opts`. A finished session only replays: the source is not
 /// read and nothing is written.
 ///
-/// The session writes only into its checked folder: the [`Destination`] it was created with, or, for a reopened
-/// session, its folder checked now against `source` with the running system ([`SystemDevices`]; for an image source
-/// only the volume rule applies and the system is not asked).
+/// The session writes only into its checked folder: the [`Destination`] it was created or reopened
+/// ([`Session::open_checked`]) with. A session reopened with [`Session::open`] has none: for an image source its folder
+/// is checked now with the volume rule alone (no system asked); for a device source (`source.disk()` is `Some`) it is
+/// refused (`destination_unknown`) before anything is read or written, since only the caller's
+/// [`crate::device::DeviceOps`] can tell which disks the folder lives on.
 ///
 /// A checkpoint is saved at a block boundary once `sopts.checkpoint_bytes` were scanned or `sopts.checkpoint_every`
 /// passed since the last one, after the pairing step, and at the end. A cancel or a vanished source seen at a block
@@ -586,6 +598,8 @@ pub fn scan_session(
     let opts = session.options(opts)?;
     let dest = match &session.dest {
         Some(d) => d.clone(),
+        None if source.disk().is_some() => return Err(EngineError::DestinationUnknown),
+        // An image source: only the volume rule applies, and `Destination::check` never calls the ops.
         None => Destination::check(&SystemDevices, source, &session.dir)?,
     };
     let resume = session.take_resume()?;

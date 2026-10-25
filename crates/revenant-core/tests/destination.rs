@@ -207,3 +207,38 @@ fn fake_devices_serve_virtual_disks() {
     assert_eq!(&log[..2], ["list", "open disk7"]);
     assert!(log.contains(&"read disk7 3584".to_string()), "{log:?}");
 }
+
+#[test]
+fn files_are_created_in_the_checked_folder() {
+    // What `revenant-dev --previews` writes through: a new file in the resolved folder, never overwriting.
+    let source = SimSource::zeros(MIB);
+    let finding = Finding {
+        id: 1,
+        start: 4096,
+        len: 100,
+        kind: FileKind::Jpeg,
+        health: Health::Intact,
+        fragments: Vec::new(),
+        origin: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let checked = Destination::check(&FakeDevices::new(), &source, dir.path()).unwrap();
+    let resolved = std::fs::canonicalize(dir.path()).unwrap();
+    let (first, _) = checked
+        .create_named(&finding, "DSC01235.ARW", Some(".preview.jpg"))
+        .unwrap();
+    let (second, _) = checked
+        .create_named(&finding, "DSC01235.ARW", Some(".preview.jpg"))
+        .unwrap();
+    assert_eq!(first, resolved.join("DSC01235.preview.jpg"));
+    assert_eq!(second, resolved.join("DSC01235_2.preview.jpg"));
+    // An unsafe suffix creates nothing.
+    assert_eq!(
+        checked
+            .create_named(&finding, "a.jpg", Some("/../x"))
+            .unwrap_err()
+            .code(),
+        "write_failed"
+    );
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+}

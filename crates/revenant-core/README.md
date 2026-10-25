@@ -189,7 +189,9 @@ and later the copy and the session, write only into a `Destination`. The folder 
 
 The folder is resolved first (`std::fs::canonicalize`: symbolic links, and junctions on Windows, are followed), and the
 rules and every later write use the resolved folder, so a link pointing into the card is judged as the card;
-`extract_to` also refuses (`destination_on_source`) when the folder is no longer on the volume it was checked on. Known
+`extract_to` also refuses (`destination_on_source`) when the folder is no longer on the volume it was checked on. Anything
+else written there goes through `dest.create_named(&finding, name, suffix)` (the CLI's previews): the same check, then
+`extract::create_named` in the resolved folder (a new file, never overwriting). Known
 limit: a folder inside a mounted disk image (DMG, VHD) whose backing file lives on the card is not detected.
 
 An image source (`disk()` is `None`) only gets the volume rule; `ops` is not called. `dir()` is the folder and `info()`
@@ -1507,7 +1509,8 @@ let mut session = Session::create(&dest, identity.clone(), &opts)?; // the folde
 let summary = scan_session(&source, &identity, &formats, &opts, &mut session, &SessionOptions::default(), &cancel,
     &mut |event| { /* … */ })?;
 // Later, after a crash or a disconnect:
-let mut session = Session::open(folder)?;      // state(): Fresh, Interrupted { read, total } or Finished(summary)
+let dest = Destination::check(&ops, &source, folder)?;  // checked again, with the caller's ops
+let mut session = Session::open_checked(&dest)?; // state(): Fresh, Interrupted { read, total } or Finished(summary)
 scan_session(&source, &identity, &formats, &opts, &mut session, &sopts, &cancel, &mut on_event)?;
 ```
 
@@ -1515,9 +1518,12 @@ scan_session(&source, &identity, &formats, &opts, &mut session, &sopts, &cancel,
   with `Destination::check` (not on the card, through any of its volumes) that must be empty (`session_not_empty`). It
   records the source's identity (see [Source identity](#source-identity)) and the scan's `sector`, `block` and
   `filesystems`: a resume always scans with these, whatever the caller's `opts` say (threads, cache size and rates do
-  come from the caller). `Session::open(folder)` reopens one (`open_failed` when there is none there). Running a
-  reopened session checks its folder again against the source (`Destination::check` with the running system; for an
-  image only the volume rule applies, and the system is not asked).
+  come from the caller). `Session::open_checked(&dest)` reopens one in a folder the caller checked again with
+  `Destination::check` and its own `DeviceOps` (`open_failed` when there is no session there): the way to resume a
+  card's session. `Session::open(folder)` reopens one without a check, to read its results (`events()`) or to resume an
+  image's session (its folder is then checked with the volume rule alone, no system asked); resuming a device's session
+  opened that way is refused (`destination_unknown`, nothing read or written), since only the caller's `DeviceOps` can
+  tell which disks the folder lives on.
 - **One session per source.** `scan_session` refuses (`session_other_source`, before anything is read or written) an
   `identity` that is not `same_source` as the session's: for a card, size, model and the digest of its identity sectors
   (the serial number counts only when both sides have one), so the same card in another reader resumes and a reformatted
@@ -1712,7 +1718,7 @@ Ids inside a group go by (time, id), the undated last.
 U+FEFF, which can disguise an extension) and U+FFFD become `_`; leading and trailing `.` and spaces are trimmed (`..`
 gives `None`); a Windows reserved stem (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`, their superscript
 forms, `CONIN$`, `CONOUT$`; any case; the stem is what precedes the first `.`, so `CON.tar.gz` counts) gets a `_` in
-front; at most 200 bytes (before a `_N` suffix), cut on a char boundary, keeping an extension of up to 16 bytes. `extract::create_named(dir, &Finding, name, suffix)` is the one public way to create a file under a derived name (the CLI writes previews with it): it sanitizes `name`, replaces the extension by `suffix` when given (which must be empty or start with `.` and hold no unsafe char, else `write_failed`) and applies the `_N` rule. A total path over 260
+front; at most 200 bytes (before a `_N` suffix), cut on a char boundary, keeping an extension of up to 16 bytes. `extract::create_named(dir, &Finding, name, suffix)` is the one public way to create a file under a derived name (`Destination::create_named` calls it after the destination check; the CLI writes previews that way): it sanitizes `name`, replaces the extension by `suffix` when given (which must be empty or start with `.` and hold no unsafe char, else `write_failed`) and applies the `_N` rule. A total path over 260
 characters on Windows is a write error (`write_failed`) there, never an escape.
 
 ## Tested against real files

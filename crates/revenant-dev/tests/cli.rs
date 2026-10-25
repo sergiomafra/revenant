@@ -806,3 +806,330 @@ fn an_unknown_camera_label_has_no_camera_key() {
             .any(|g| g["label"]["kind"] == "undated_session")
     );
 }
+
+// ---- Part 1.5: copies, maps, digests and saved scans (image files only: no device is ever touched here). ----
+
+const MIB: usize = 1 << 20;
+
+fn dev() -> Command {
+    Command::cargo_bin("revenant-dev").unwrap()
+}
+
+/// `bytes` written to `dir/name`.
+fn file_in(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+/// A 16 MiB noise image with two photos in each 4 MiB block (the default scan block), so a scan emits two `found`
+/// lines, then a block boundary, and so on.
+fn photos_image() -> Vec<u8> {
+    let mut bytes = std::fs::read(DiskImage::noise(16 * MIB, 11).save().path()).unwrap();
+    for (i, at) in [MIB / 2, 5 * MIB / 2].iter().cycle().take(8).enumerate() {
+        let at = at + (i / 2) * 4 * MIB;
+        let photo = jpeg(64, 48, i as u64 + 1, 0);
+        bytes[at..at + photo.len()].copy_from_slice(&photo);
+    }
+    bytes
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// A rescue map of `size` bytes saved beside `image`: all rescued except `holes` (start, len), left untried.
+fn save_map(image: &std::path::Path, size: u64, holes: &[(u64, u64)]) {
+    use revenant_core::SourceIdentity;
+    use revenant_core::rescue::{RegionState, RescueMap, map_path};
+    let mut map = RescueMap::new(size, 512, SourceIdentity::Image { size, digest: 1 });
+    assert!(map.set(0, size, RegionState::Rescued));
+    for &(start, len) in holes {
+        assert!(map.set(start, len, RegionState::Untried));
+    }
+    map.save(&map_path(image)).unwrap();
+}
+
+fn without(mut v: serde_json::Value, keys: &[&str]) -> serde_json::Value {
+    for k in keys {
+        v.as_object_mut().unwrap().remove(*k);
+    }
+    v
+}
+
+#[test]
+fn copy_of_an_image_file_is_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = photos_image();
+    let img = file_in(dir.path(), "card.img", &bytes);
+    let out_dir = tempfile::tempdir().unwrap();
+    let out = out_dir.path().join("out.img");
+    let run = || {
+        let o = dev()
+            .arg("copy")
+            .arg(&img)
+            .arg(&out)
+            .arg("--allow-same-volume")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        lines(&o)
+    };
+    let events = run();
+    assert_eq!(std::fs::read(&out).unwrap(), bytes);
+    assert!(out_dir.path().join("out.img.rvmap").exists());
+    assert!(events.iter().any(|e| e["event"] == "copy_progress"));
+    let last = events.last().unwrap();
+    assert_eq!(last["event"], "copy_summary", "{last}");
+    assert_eq!(last["complete"], true);
+    assert_eq!(last["rescued"], bytes.len());
+    assert_eq!(last["untried"], 0);
+    // A second run resumes from the map: nothing left to copy, the image unchanged.
+    let again = run();
+    assert_eq!(again.last().unwrap()["complete"], true);
+    assert_eq!(std::fs::read(&out).unwrap(), bytes);
+    // Onto the image's own volume without the flag: refused before anything is created.
+    let fresh = dir.path().join("again.img");
+    dev()
+        .arg("copy")
+        .arg(&img)
+        .arg(&fresh)
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("error: destination_on_source"));
+    assert!(!fresh.exists());
+}
+
+#[test]
+fn scan_with_a_map_marks_holes_unreadable() {
+    // The image of `unrescued_zeros_are_never_intact` (core): a JPEG at 1 MiB whose all-padding APP1 payload holds a
+    // 127-sector run the copy never read (zeros on disk).
+    let dir = tempfile::tempdir().unwrap();
+    let size = 8 * MIB;
+    let at = MIB;
+    let photo = revenant_testkit::jpeg(640, 480, 21, 192 * 1024);
+    let seg2 = 2 + 4 + 65_533;
+    assert_eq!(photo[seg2..seg2 + 2], [0xFF, 0xE1]);
+    let payload = (at + seg2 + 4) as u64..(at + seg2 + 4 + 65_533) as u64;
+    let run_start = payload.start.next_multiple_of(512);
+    let run_end = payload.end / 512 * 512;
+    let mut bytes = std::fs::read(DiskImage::noise(size, 8).save().path()).unwrap();
+    bytes[at..at + photo.len()].copy_from_slice(&photo);
+    bytes[run_start as usize..run_end as usize].fill(0);
+    let img = file_in(dir.path(), "card.img", &bytes);
+    save_map(&img, size as u64, &[(run_start, run_end - run_start)]);
+    let scan = || {
+        lines(
+            &dev()
+                .arg("scan")
+                .arg(&img)
+                .assert()
+                .success()
+                .get_output()
+                .stdout,
+        )
+    };
+
+    let events = scan();
+    assert_eq!(events[0]["event"], "map", "{}", events[0]);
+    assert_eq!(events[0]["unrescued"], run_end - run_start);
+    assert_eq!(events[0]["rescued"], size as u64 - (run_end - run_start));
+    assert!(
+        events.iter().any(|e| e["event"] == "unreadable"
+            && e["start"] == run_start
+            && e["len"] == run_end - run_start),
+        "{events:?}"
+    );
+    let health = |events: &[serde_json::Value]| {
+        events
+            .iter()
+            .find(|e| e["event"] == "found" && e["start"] == at)
+            .expect("the photo")["health"]
+            .clone()
+    };
+    assert_ne!(health(&events), "intact");
+
+    // Without the map the zeros look like data: intact, no map line.
+    std::fs::remove_file(dir.path().join("card.img.rvmap")).unwrap();
+    let plain = scan();
+    assert_ne!(plain[0]["event"], "map");
+    assert_eq!(health(&plain), "intact");
+}
+
+#[test]
+fn scan_session_resumes_and_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = file_in(dir.path(), "card.img", &photos_image());
+    let full = lines(
+        &dev()
+            .arg("scan")
+            .arg(&img)
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    );
+    assert!(full.iter().filter(|e| e["event"] == "found").count() >= 8);
+    let session = dir.path().join("session");
+    let extracted = dir.path().join("out");
+    std::fs::create_dir(&extracted).unwrap();
+    // Run 1: a checkpoint every MiB, stopped after the 7th event (the first block boundary comes before it).
+    let first = dev()
+        .arg("scan")
+        .arg(&img)
+        .arg("--session")
+        .arg(&session)
+        .arg("--allow-same-volume")
+        .args(["--checkpoint-mib", "1", "--stop-after-events", "7"])
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+    assert!(session.join("session.rvs").exists());
+    let first = lines(&first);
+    assert!(first.iter().all(|e| e.get("replayed").is_none()));
+    // Run 2: resumed, extracting.
+    let second = lines(
+        &dev()
+            .arg("scan")
+            .arg(&img)
+            .arg("--session")
+            .arg(&session)
+            .arg("--extract")
+            .arg(&extracted)
+            .arg("--allow-same-volume")
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    );
+    let replayed = second.iter().filter(|e| e["replayed"] == true).count();
+    assert!(replayed > 0, "{second:?}");
+    assert!(
+        second[..replayed].iter().all(|e| e["replayed"] == true),
+        "the replayed lines come first"
+    );
+    assert!(
+        second[..replayed].iter().all(|e| e.get("file").is_none()),
+        "replayed lines are not extracted again"
+    );
+    let written = second[replayed..]
+        .iter()
+        .filter(|e| e.get("file").is_some())
+        .count();
+    assert!(written > 0);
+    assert_eq!(std::fs::read_dir(&extracted).unwrap().count(), written);
+    let stripped: Vec<_> = second
+        .into_iter()
+        .map(|e| without(e, &["replayed", "file"]))
+        .collect();
+    assert_eq!(stripped, full);
+}
+
+#[test]
+fn finished_session_scan_reads_nothing_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let img = file_in(dir.path(), "card.img", &photos_image());
+    let session = dir.path().join("session");
+    let run = || {
+        lines(
+            &dev()
+                .arg("scan")
+                .arg(&img)
+                .arg("--session")
+                .arg(&session)
+                .arg("--allow-same-volume")
+                .assert()
+                .success()
+                .get_output()
+                .stdout,
+        )
+    };
+    let first = run();
+    let second = run();
+    let (summary, rest) = second.split_last().unwrap();
+    assert_eq!(summary["event"], "summary");
+    assert_eq!(summary, first.last().unwrap());
+    assert!(!rest.is_empty());
+    assert!(rest.iter().all(|e| e["replayed"] == true), "{rest:?}");
+    let rest: Vec<_> = rest
+        .iter()
+        .map(|e| without(e.clone(), &["replayed"]))
+        .collect();
+    assert_eq!(rest, first[..first.len() - 1]);
+}
+
+#[test]
+fn preflight_needs_a_whole_disk() {
+    dev()
+        .args(["preflight", "disk4s1"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("error: not_whole_disk"));
+}
+
+#[test]
+fn digest_of_an_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = photos_image();
+    let img = file_in(dir.path(), "card.img", &bytes[..bytes.len() - 1000]);
+    let out = lines(
+        &dev()
+            .arg("digest")
+            .arg(&img)
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    );
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0]["event"], "digest");
+    assert_eq!(out[0]["bytes"], bytes.len() - 1000);
+    assert_eq!(
+        out[0]["fnv64"],
+        format!("{:016x}", fnv1a64(&bytes[..bytes.len() - 1000]))
+    );
+    assert_eq!(out[0]["unreadable_bytes"], 0);
+}
+
+#[test]
+fn disk_failing_line() {
+    // An image file has no bad sectors, so a map supplies them: 20 isolated sectors never rescued.
+    let dir = tempfile::tempdir().unwrap();
+    let size = 8 * MIB;
+    let img = file_in(
+        dir.path(),
+        "card.img",
+        &std::fs::read(DiskImage::noise(size, 5).save().path()).unwrap(),
+    );
+    let holes: Vec<(u64, u64)> = (0..20u64).map(|i| (i * 256 * 1024 + 4096, 512)).collect();
+    save_map(&img, size as u64, &holes);
+    let events = lines(
+        &dev()
+            .arg("scan")
+            .arg(&img)
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    );
+    let failing: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "disk_failing")
+        .collect();
+    assert_eq!(failing.len(), 1, "{events:?}");
+    assert!(
+        failing[0]["unreadable_runs"].as_u64().unwrap() >= 16,
+        "{}",
+        failing[0]
+    );
+    assert_eq!(
+        events.iter().filter(|e| e["event"] == "unreadable").count(),
+        20
+    );
+}

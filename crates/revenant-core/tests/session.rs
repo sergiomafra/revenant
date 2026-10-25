@@ -547,6 +547,92 @@ fn session_on_the_source_is_refused() {
 }
 
 #[test]
+fn reopened_session_folder_on_the_source_disk_is_refused() {
+    // A device session interrupted, then reopened: its folder is checked with the caller's `DeviceOps` (here the fake),
+    // never with the running system behind the caller's back.
+    let fake = FakeDevices::new();
+    fake.add(sdxc(Some("S1")), card_bytes());
+    let dir = tempfile::tempdir().unwrap();
+    fake.set_destination(dir.path(), Ok(dest_info(&["disk2"])));
+    let source = device(&fake);
+    let id = SourceIdentity::of_device(&sdxc(Some("S1")), &source).unwrap();
+    let o = opts(2);
+    let mut session = Session::create(
+        &Destination::check(&fake, &source, dir.path()).unwrap(),
+        id.clone(),
+        &o,
+    )
+    .unwrap();
+    let cancel = CancelToken::default();
+    let mut seen = 0;
+    let r = scan_session(
+        &source,
+        &id,
+        &all_formats(),
+        &o,
+        &mut session,
+        &sopts(),
+        &cancel,
+        &mut |e| {
+            if matches!(e, Event::Progress { .. }) {
+                seen += 1;
+                if seen == 3 {
+                    cancel.cancel();
+                }
+            }
+        },
+    );
+    assert_eq!(r.unwrap_err().code(), "cancelled");
+    let files = |d: &Path| {
+        let mut v: Vec<_> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), std::fs::read(e.path()).unwrap())
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let before = files(dir.path());
+    let run = |session: &mut Session| {
+        scan_session(
+            &source,
+            &id,
+            &all_formats(),
+            &o,
+            session,
+            &sopts(),
+            &CancelToken::default(),
+            &mut |_| {},
+        )
+    };
+
+    // Reopened with no checked folder, a device session cannot tell where its folder lives: refused, nothing written.
+    let mut bare = Session::open(dir.path()).unwrap();
+    assert_eq!(run(&mut bare).unwrap_err().code(), "destination_unknown");
+    assert_eq!(files(dir.path()), before);
+
+    // The folder now answers as the card itself (the caller's ops say so): it cannot be checked, so cannot be reopened.
+    fake.set_destination(dir.path(), Ok(dest_info(&["disk4"])));
+    assert_eq!(
+        Destination::check(&fake, &source, dir.path())
+            .unwrap_err()
+            .code(),
+        "destination_on_source"
+    );
+    assert_eq!(files(dir.path()), before);
+
+    // Checked against another disk, it resumes to the end.
+    fake.set_destination(dir.path(), Ok(dest_info(&["disk2"])));
+    let dest = Destination::check(&fake, &source, dir.path()).unwrap();
+    let mut checked = Session::open_checked(&dest).unwrap();
+    assert!(matches!(checked.state(), SessionState::Interrupted { .. }));
+    run(&mut checked).unwrap();
+    assert!(matches!(checked.state(), SessionState::Finished(_)));
+}
+
+#[test]
 fn options_come_from_the_session() {
     let card = cards::a();
     let (expected, summary) = reference(&card.source, &opts(4));

@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `revenant-dev` lists the connected disks, runs the pre-flight check, unmounts and remounts a card, copies a card into
+  an image with its rescue map (resumable, checked first: it stops before writing anything when the destination cannot
+  hold the card or is on it), prints a digest of a card or image, and scans a card directly, an image with its map (what
+  was never rescued is unreadable, never zeros), or a saved session (resumed after a crash or a pulled cable, waiting
+  for the card to be plugged back in, with the lines already found marked as replayed). With a card, `--extract`,
+  `--previews` and `--session` are checked once against the whole card and `--allow-same-volume` is refused, so nothing
+  is ever written to it.
+
 - A scan can be saved into a folder of its own and resumed after the card is disconnected, the program crashes or is
   closed, or the power goes, with the same results as an uninterrupted scan; a finished scan's results can be opened
   again without the card. A session refuses to resume on another card (or on a rescue copy whose image changed
