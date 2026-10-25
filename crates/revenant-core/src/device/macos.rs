@@ -159,10 +159,12 @@ pub(crate) fn destination(dir: &Path) -> Result<DestInfo, EngineError> {
 
 /// Unmounts every volume of `disk` without ejecting it (ruling D10): `diskutil unmountDisk` (never `force`; it also
 /// unmounts the volumes of an APFS container on the disk, and succeeds when nothing is mounted), then a listing to
-/// confirm. A disk no longer listed is `device_not_found`; the tool failing, or a volume of the disk still mounted, is
+/// confirm. A listing first refuses the system disk (`system_disk`, P29) and a disk not listed (`device_not_found`)
+/// before the tool runs. A disk no longer listed afterwards is `device_not_found`; the tool failing, or a volume of the disk still mounted, is
 /// `unmount_failed` with the volumes the listing shows mounted (an APFS container's volumes are not among them, so they
 /// may be empty).
 pub(crate) fn unmount(disk: &DiskId) -> Result<(), EngineError> {
+    super::unmountable(&list()?, disk)?;
     let ok = run(DISKUTIL, &["unmountDisk", disk.as_str()]).is_ok();
     let after = list()?;
     if !after.iter().any(|d| d.id == *disk) {

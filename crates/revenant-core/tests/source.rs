@@ -73,12 +73,16 @@ fn opening_missing_file_gives_code() {
 
 /// What would open something for writing. `GENERIC_WRITE` is allowed once, in `source/windows.rs`, inside
 /// `lock_volume_for_dismount` (the Windows volume lock exception, CLAUDE.md).
-const BANNED: [&str; 5] = [
+const BANNED: [&str; 9] = [
     "write(true)",
     ".append(",
     "create(true)",
     "create_new(",
     "GENERIC_WRITE",
+    "GENERIC_ALL",
+    "FILE_ALL_ACCESS",
+    "FILE_WRITE_DATA",
+    "FILE_APPEND_DATA",
 ];
 const EXCEPTION_FN: &str = "fn lock_volume_for_dismount(";
 const EXCEPTION_MARK: &str = "WRITE-ACCESS EXCEPTION (CLAUDE.md)";
@@ -101,12 +105,12 @@ fn write_paths(text: &str, exception: bool) -> Vec<String> {
             .iter()
             .position(|l| l.contains(EXCEPTION_FN))
             .is_some_and(|f| {
-                let top_level = |l: &&str| l.starts_with("fn ") || l.starts_with("pub");
-                let next = lines[f + 1..]
+                // The function ends at its own closing brace: the first line that is just `}`.
+                let end = lines[f + 1..]
                     .iter()
-                    .position(top_level)
-                    .map_or(lines.len(), |n| f + 1 + n);
-                f > 0 && lines[f - 1].contains(EXCEPTION_MARK) && (f..next).contains(&writes[0])
+                    .position(|l| *l == "}")
+                    .map_or(f, |n| f + 1 + n);
+                f > 0 && lines[f - 1].contains(EXCEPTION_MARK) && (f..end).contains(&writes[0])
             });
     if !writes.is_empty() && !allowed {
         found.push(format!("GENERIC_WRITE on lines {writes:?}"));
@@ -172,6 +176,27 @@ fn write_path_check_finds_misplaced_write_access() {
     // Twice in the function, even on one line.
     let twice = good.replace("open(GENERIC_WRITE)", "open(GENERIC_WRITE | GENERIC_WRITE)");
     assert!(!write_paths(&twice, true).is_empty());
+    // Right after the function's closing brace, before the next `fn`: outside it.
+    let after = good
+        .replace("    open(GENERIC_WRITE);", "    open(0);")
+        .replace(
+            "}\n\nfn other",
+            "}\nconst W: u32 = GENERIC_WRITE;\n\nfn other",
+        );
+    assert!(!write_paths(&after, true).is_empty());
+    // Other access rights that write are banned everywhere.
+    for right in [
+        "GENERIC_ALL",
+        "FILE_ALL_ACCESS",
+        "FILE_WRITE_DATA",
+        "FILE_APPEND_DATA",
+    ] {
+        let other = good.replace(
+            "open(GENERIC_WRITE)",
+            &format!("open(GENERIC_WRITE | {right})"),
+        );
+        assert_eq!(write_paths(&other, true), [right]);
+    }
     // The other banned strings are never excepted.
     let create = good.replace("open(GENERIC_WRITE)", "open(GENERIC_WRITE).create(true)");
     assert_eq!(write_paths(&create, true), ["create(true)"]);

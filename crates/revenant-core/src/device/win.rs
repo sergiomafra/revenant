@@ -5,7 +5,8 @@ use std::io;
 use std::os::windows::io::OwnedHandle;
 use std::path::Path;
 
-use super::{DestInfo, DiskInfo, win_parse};
+use super::win_parse::{self, WinVolumeRaw};
+use super::{DestInfo, DiskInfo};
 use crate::EngineError;
 use crate::source::DiskId;
 use crate::source::windows as platform;
@@ -17,6 +18,11 @@ const MAX_DRIVE: u32 = 63;
 /// extents, and the volume of the Windows folder (`GetSystemWindowsDirectoryW`) for the system disk. Fails (`open_failed`)
 /// when the system volume or its disks cannot be told: a listing never silently shows no system disk.
 pub(crate) fn list() -> Result<Vec<DiskInfo>, EngineError> {
+    snapshot().map(|(disks, _)| disks)
+}
+
+/// The listing and the raw volumes it was assembled from.
+fn snapshot() -> Result<(Vec<DiskInfo>, Vec<WinVolumeRaw>), EngineError> {
     let disks: Vec<_> = (0..=MAX_DRIVE).filter_map(platform::disk_raw).collect();
     let volumes = platform::volumes_raw();
     let windows =
@@ -24,9 +30,10 @@ pub(crate) fn list() -> Result<Vec<DiskInfo>, EngineError> {
     let system = platform::volume_name_of(&windows).ok_or_else(|| EngineError::Open {
         cause: io::Error::other("the system volume cannot be told"),
     })?;
-    win_parse::disks(&disks, &volumes, &system).ok_or_else(|| EngineError::Open {
+    let listed = win_parse::disks(&disks, &volumes, &system).ok_or_else(|| EngineError::Open {
         cause: io::Error::other("the system volume has no disk extents"),
-    })
+    })?;
+    Ok((listed, volumes))
 }
 
 /// Where `dir` lives (ruling D12): its volume's extents, file system and free space. A folder without disk extents (a
@@ -38,24 +45,30 @@ pub(crate) fn destination(dir: &Path) -> Result<DestInfo, EngineError> {
     })
 }
 
-/// The volume GUID paths of the volumes on `disk` (`PhysicalDriveN`); `device_not_found` for a disk Windows does not
-/// list.
-fn volumes_of(disk: &DiskId) -> Result<Vec<String>, EngineError> {
-    let number = disk
-        .as_str()
+/// The number N of `PhysicalDriveN`.
+fn number_of(disk: &DiskId) -> Result<u32, EngineError> {
+    disk.as_str()
         .strip_prefix("PhysicalDrive")
         .and_then(|n| n.parse::<u32>().ok())
-        .ok_or(EngineError::NotWholeDisk)?;
-    platform::disk_raw(number).ok_or(EngineError::DeviceNotFound)?;
-    Ok(win_parse::volumes_on(&platform::volumes_raw(), number))
+        .ok_or(EngineError::NotWholeDisk)
 }
 
-/// Locks and dismounts every volume on `disk` (ruling D10) and returns the locks, to be held for the session. When one
-/// fails, the others are released (dropped) and the error names those that stayed mounted: `unmount_failed`.
+/// Locks and dismounts every volume on `disk` (ruling D10) and returns the locks, to be held for the session. The system
+/// disk is refused (`system_disk`, P29) and a disk not listed is `device_not_found`, before anything is locked. While a
+/// local volume's disks are unknown (its extents query failed) nothing is locked and the call fails closed with
+/// `unmount_failed` naming it: it could lie on `disk`. When a lock fails, the others are released (dropped) and the
+/// error names those that stayed mounted.
 pub(crate) fn unmount(disk: &DiskId) -> Result<Vec<OwnedHandle>, EngineError> {
+    let (listed, volumes) = snapshot()?;
+    super::unmountable(&listed, disk)?;
+    let number = number_of(disk)?;
+    let unknown = win_parse::unknown_volumes(&volumes);
+    if !unknown.is_empty() {
+        return Err(EngineError::UnmountFailed { volumes: unknown });
+    }
     let mut locks = Vec::new();
     let mut results = Vec::new();
-    for volume in volumes_of(disk)? {
+    for volume in win_parse::volumes_on(&volumes, number) {
         let result = match platform::lock_volume_for_dismount(&volume) {
             Ok(lock) => {
                 locks.push(lock);
@@ -73,7 +86,8 @@ pub(crate) fn unmount(disk: &DiskId) -> Result<Vec<OwnedHandle>, EngineError> {
 /// After the locks are released: queries each volume on `disk`, which makes Windows mount it. A volume that does not
 /// answer is `remount_failed`.
 pub(crate) fn remount(disk: &DiskId) -> Result<(), EngineError> {
-    let volumes = volumes_of(disk).map_err(|_| EngineError::RemountFailed)?;
+    let number = number_of(disk).map_err(|_| EngineError::RemountFailed)?;
+    let volumes = win_parse::volumes_on(&platform::volumes_raw(), number);
     if volumes.iter().all(|v| platform::volume_answers(v)) {
         Ok(())
     } else {

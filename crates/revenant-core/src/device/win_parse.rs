@@ -51,7 +51,10 @@ pub(crate) struct WinVolumeRaw {
     pub(crate) fs: Option<String>,
     pub(crate) label: Option<String>,
     pub(crate) mount_point: Option<PathBuf>,
+    /// Empty when the volume has none (a CD, a network volume) or its query failed (`extents_failed`).
     pub(crate) extents: Vec<WinExtent>,
+    /// The extents query of a local volume failed: the disks it lies on are unknown.
+    pub(crate) extents_failed: bool,
 }
 
 /// A destination folder's volume as queried.
@@ -213,6 +216,16 @@ pub(crate) fn volumes_on(volumes: &[WinVolumeRaw], number: u32) -> Vec<String> {
         .collect()
 }
 
+/// The volumes whose disks are unknown (their extents query failed): one of them may lie on the disk being unmounted,
+/// so an unmount fails closed while any is there, naming them.
+pub(crate) fn unknown_volumes(volumes: &[WinVolumeRaw]) -> Vec<String> {
+    volumes
+        .iter()
+        .filter(|v| v.extents_failed)
+        .map(|v| v.name.clone())
+        .collect()
+}
+
 /// Which volumes stayed mounted or unlocked (ruling D10): each volume's lock-and-dismount result (`Err` holds the
 /// Windows error code). `Err` with the names of those that failed, in order.
 pub(crate) fn unmount_outcome(results: &[(String, Result<(), i32>)]) -> Result<(), Vec<String>> {
@@ -266,6 +279,7 @@ mod tests {
             label: None,
             mount_point: mount.map(PathBuf::from),
             extents,
+            extents_failed: false,
         }
     }
 
@@ -466,5 +480,18 @@ mod tests {
         );
         assert_eq!(volumes_on(&volumes, 0), [r"\\?\Volume{sys}\"]);
         assert!(volumes_on(&volumes, 9).is_empty());
+        // A CD or a network volume has no extents and is known; a local volume whose query failed is unknown.
+        assert!(unknown_volumes(&volumes).is_empty());
+        let mut failed = volumes.to_vec();
+        failed.push(WinVolumeRaw {
+            extents_failed: true,
+            ..volume("lost", "FAT32", Some(r"H:\"), Vec::new())
+        });
+        assert_eq!(unknown_volumes(&failed), [r"\\?\Volume{lost}\"]);
+        assert_eq!(
+            volumes_on(&failed, 1).len(),
+            3,
+            "unknown volumes are never guessed onto a disk"
+        );
     }
 }

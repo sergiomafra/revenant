@@ -5,13 +5,14 @@ mod support;
 
 use std::path::PathBuf;
 
+use revenant_core::device::DeviceOps;
 use revenant_core::formats::{Fragment, all_formats};
 use revenant_core::source::{
     DeviceSource, DiskId, FileSource, Fragmented, Geometry, RawDevice, Source,
 };
 use revenant_core::{CancelToken, EngineError, Event, FsState, ScanOptions, scan};
 use revenant_testkit as testkit;
-use support::MemDevice;
+use support::{FakeDevices, MemDevice, disk_info};
 use testkit::DiskImage;
 use testkit::fs::{DeleteStyle, FsBuilder, FsType, Partitioning, disk};
 
@@ -246,4 +247,44 @@ fn disk_ids_parse() {
         let err = DiskId::parse(s).unwrap_err();
         assert_eq!(err.code(), "not_whole_disk", "{s:?}");
     }
+}
+
+#[test]
+fn unmount_refuses_the_system_disk_and_names_busy_volumes() {
+    let fake = FakeDevices::new();
+    let mut system = disk_info("disk0", 1 << 20);
+    system.system = true;
+    fake.add_virtual(system, Vec::new());
+    fake.add_virtual(disk_info("disk4", 1 << 20), Vec::new());
+    fake.add_virtual(disk_info("disk5", 1 << 20), Vec::new());
+    fake.fail_unmount("disk5", &["disk5s1"]);
+
+    let err = fake.unmount(&id("disk0")).unwrap_err();
+    assert_eq!(err.code(), "system_disk");
+    assert!(fake.mounted("disk0"));
+    match fake.unmount(&id("disk5")) {
+        Err(EngineError::UnmountFailed { volumes }) => assert_eq!(volumes, ["disk5s1"]),
+        other => panic!("expected unmount_failed, got {other:?}"),
+    }
+    assert!(fake.mounted("disk5"));
+    assert_eq!(
+        fake.unmount(&id("disk9")).unwrap_err().code(),
+        "device_not_found"
+    );
+
+    let guard = fake.unmount(&id("disk4")).unwrap();
+    assert_eq!(guard.held(), 0);
+    assert!(!fake.mounted("disk4"));
+    fake.remount(&id("disk4"), Some(guard)).unwrap();
+    assert!(fake.mounted("disk4"));
+    assert_eq!(
+        fake.log(),
+        [
+            "unmount disk0",
+            "unmount disk5",
+            "unmount disk9",
+            "unmount disk4",
+            "remount disk4"
+        ]
+    );
 }

@@ -110,6 +110,7 @@ pub trait DeviceOps: Send + Sync {
     fn destination(&self, dir: &Path) -> Result<DestInfo, EngineError>;
     /// Unmounts every volume of `disk` without ejecting (D10). Nothing mounted → Ok(empty guard).
     /// Failure → Err(EngineError::UnmountFailed { volumes }) with the volumes still mounted, code "unmount_failed".
+    /// The system disk is never unmounted: Err(EngineError::SystemDisk), code "system_disk", before anything runs.
     fn unmount(&self, disk: &DiskId) -> Result<UnmountGuard, EngineError>;
     /// macOS `diskutil mountDisk`; Windows: drops `guard` and queries each volume. Err code "remount_failed".
     fn remount(&self, disk: &DiskId, guard: Option<UnmountGuard>) -> Result<(), EngineError>;
@@ -139,9 +140,11 @@ impl DeviceOps for SystemDevices {
         os_destination(dir)
     }
 
-    /// macOS: `diskutil unmountDisk` (never `force`, never eject) when a volume is mounted, then a listing to confirm;
-    /// Windows: `FSCTL_LOCK_VOLUME` + `FSCTL_DISMOUNT_VOLUME` on every volume with an extent on the disk, the locks kept
-    /// in the guard. Errors: `unmount_failed`, `device_not_found`, `system_tool_failed` (macOS), `unsupported_platform`.
+    /// The system disk is refused first (`system_disk`). macOS: `diskutil unmountDisk` (never `force`, never eject),
+    /// always run (an APFS container's volumes are not in the listing), then a listing to confirm; Windows:
+    /// `FSCTL_LOCK_VOLUME` + `FSCTL_DISMOUNT_VOLUME` on every volume with an extent on the disk, the locks kept in the
+    /// guard. Errors: `system_disk`, `unmount_failed`, `device_not_found`, `system_tool_failed` (macOS), `open_failed`
+    /// (Windows listing), `unsupported_platform`.
     fn unmount(&self, disk: &DiskId) -> Result<UnmountGuard, EngineError> {
         os_unmount(disk)
     }
@@ -229,5 +232,65 @@ pub(crate) fn sort_disks(disks: &mut [DiskInfo]) {
 fn push_unique(disks: &mut Vec<DiskId>, id: DiskId) {
     if !disks.contains(&id) {
         disks.push(id);
+    }
+}
+
+/// The listed disk `disk`, when it may be unmounted (ruling P29): `device_not_found` when it is not listed, `system_disk`
+/// when it holds the running system (never unmounted, whatever the caller asks).
+#[cfg(any(target_os = "macos", windows, test))]
+pub(crate) fn unmountable<'a>(
+    listed: &'a [DiskInfo],
+    disk: &DiskId,
+) -> Result<&'a DiskInfo, EngineError> {
+    let info = listed
+        .iter()
+        .find(|d| d.id == *disk)
+        .ok_or(EngineError::DeviceNotFound)?;
+    if info.system {
+        return Err(EngineError::SystemDisk);
+    }
+    Ok(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(id: &str, system: bool) -> DiskInfo {
+        DiskInfo {
+            id: DiskId::parse(id).unwrap(),
+            geometry: Geometry {
+                size: 1 << 30,
+                logical_sector: 512,
+                physical_sector: 512,
+            },
+            vendor: None,
+            model: None,
+            serial: None,
+            removable: !system,
+            internal: system,
+            system,
+            virtual_disk: false,
+            solid_state: None,
+            volumes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn system_disk_is_never_unmounted() {
+        let listed = [
+            info("disk0", true),
+            info("disk4", false),
+            info("PhysicalDrive0", true),
+        ];
+        let code = |d: &str| {
+            unmountable(&listed, &DiskId::parse(d).unwrap())
+                .map(|i| i.id.as_str().to_string())
+                .map_err(|e| e.code())
+        };
+        assert_eq!(code("disk0"), Err("system_disk"));
+        assert_eq!(code("PhysicalDrive0"), Err("system_disk"));
+        assert_eq!(code("disk4"), Ok("disk4".to_string()));
+        assert_eq!(code("disk9"), Err("device_not_found"));
     }
 }

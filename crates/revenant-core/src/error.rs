@@ -51,6 +51,9 @@ pub enum EngineError {
     /// The system refused to mount a disk's volumes again.
     #[error("remount_failed")]
     RemountFailed,
+    /// The disk holds the running system: the engine never unmounts it.
+    #[error("system_disk")]
+    SystemDisk,
 }
 
 impl EngineError {
@@ -71,6 +74,7 @@ impl EngineError {
             Self::DestinationUnknown => "destination_unknown",
             Self::UnmountFailed { .. } => "unmount_failed",
             Self::RemountFailed => "remount_failed",
+            Self::SystemDisk => "system_disk",
         }
     }
 }
@@ -110,6 +114,7 @@ mod tests {
             "unmount_failed"
         );
         assert_eq!(EngineError::RemountFailed.code(), "remount_failed");
+        assert_eq!(EngineError::SystemDisk.code(), "system_disk");
         let io = || std::io::Error::other("x");
         assert_eq!(
             EngineError::Read {

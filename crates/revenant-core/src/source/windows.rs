@@ -13,7 +13,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
+    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW, GetDriveTypeW,
     GetFileInformationByHandle, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
     GetVolumePathNameW, GetVolumePathNamesForVolumeNameW, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
 };
@@ -286,22 +286,33 @@ fn volume_information(root: &OsStr) -> (Option<String>, Option<String>) {
     (non_empty(until_nul(&label)), non_empty(until_nul(&fs)))
 }
 
+/// `GetDriveTypeW` answers for a network volume (`DRIVE_REMOTE`; the constant lives in a `windows-sys` feature not
+/// enabled).
+const DRIVE_REMOTE: u32 = 4;
+/// `GetDriveTypeW` answers for a CD or DVD (`DRIVE_CDROM`).
+const DRIVE_CDROM: u32 = 5;
+
 /// The disk extents of the volume `\\?\Volume{…}\` (`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS` on the volume opened for
-/// queries only, without the trailing backslash); empty when it has none (a CD, a network volume) or does not answer.
+/// queries only, without the trailing backslash): `Some` and empty when it has none (a CD or a network volume, by
+/// `GetDriveTypeW`, or the IOCTL answering zero extents), `None` when the query failed (the disks are then unknown).
 /// With more extents than [`MAX_EXTENTS`] (`ERROR_MORE_DATA`), the first ones when `partial` is allowed (a listing), else
-/// none (a destination check fails closed rather than miss a disk).
-fn volume_extents(name: &str, partial: bool) -> Vec<WinExtent> {
-    let Ok(file) = open_query(Path::new(name.trim_end_matches('\\'))) else {
-        return Vec::new();
-    };
+/// `None` (a destination check fails closed rather than miss a disk).
+fn volume_extents(name: &str, partial: bool) -> Option<Vec<WinExtent>> {
+    let root = wide(OsStr::new(name));
+    // SAFETY: `root` is a NUL-terminated UTF-16 string that outlives the call.
+    let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
+    if kind == DRIVE_REMOTE || kind == DRIVE_CDROM {
+        return Some(Vec::new());
+    }
+    let file = open_query(Path::new(name.trim_end_matches('\\'))).ok()?;
     let mut buf = [0u8; 8 + 24 * MAX_EXTENTS];
     match ioctl::<(), _>(&file, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, None, &mut buf) {
-        Ok(_) => win_parse::extents(&buf),
+        Ok(_) => Some(win_parse::extents(&buf)),
         // More extents than the buffer holds: the first ones are there.
         Err(e) if partial && e.raw_os_error() == Some(ERROR_MORE_DATA as i32) => {
-            win_parse::extents(&buf)
+            Some(win_parse::extents(&buf))
         }
-        Err(_) => Vec::new(),
+        Err(_) => None,
     }
 }
 
@@ -339,11 +350,13 @@ pub(crate) fn volumes_raw() -> Vec<WinVolumeRaw> {
         let name = until_nul(&buf);
         if !name.is_empty() {
             let (label, fs) = volume_information(OsStr::new(&name));
+            let extents = volume_extents(&name, true);
             out.push(WinVolumeRaw {
                 fs,
                 label,
                 mount_point: mount_point(&name),
-                extents: volume_extents(&name, true),
+                extents_failed: extents.is_none(),
+                extents: extents.unwrap_or_default(),
                 name,
             });
         }
@@ -383,7 +396,8 @@ pub(crate) fn dest_raw(dir: &Path) -> io::Result<WinDestRaw> {
     Ok(WinDestRaw {
         fs,
         free_bytes: free,
-        extents: volume_extents(&name, false),
+        // No extents (a network volume) or a failed query: the destination check fails closed on an empty list.
+        extents: volume_extents(&name, false).unwrap_or_default(),
     })
 }
 
@@ -401,7 +415,9 @@ pub(crate) fn lock_volume_for_dismount(volume: &str) -> io::Result<OwnedHandle> 
     let locked = match lock_and_dismount(&read_only) {
         Ok(()) => read_only,
         Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
-            // Closed before the second open: a lock taken on it (lock accepted, dismount refused) would refuse that open.
+            // FSCTL_LOCK_VOLUME also answers ERROR_ACCESS_DENIED for a volume in use: the reopen then happens too and fails
+            // the same way. Closed before the second open: a lock taken on it (lock accepted, dismount refused) would
+            // refuse that open.
             drop(read_only);
             // The exception (CLAUDE.md): write access on a VOLUME handle, only because the system demands it for the lock
             // and dismount requests. This handle is passed to nothing but `lock_and_dismount`: no ReadFile, no WriteFile.

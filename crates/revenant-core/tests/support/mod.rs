@@ -341,6 +341,7 @@ pub fn error_of(code: &str) -> EngineError {
             volumes: Vec::new(),
         },
         "remount_failed" => EngineError::RemountFailed,
+        "system_disk" => EngineError::SystemDisk,
         _ => EngineError::Open {
             cause: std::io::Error::other(code.to_string()),
         },
@@ -495,6 +496,9 @@ impl DeviceOps for FakeDevices {
         self.note(format!("unmount {}", disk.as_str()));
         let mut st = self.lock();
         let d = st.disks.get_mut(disk).ok_or(EngineError::DeviceNotFound)?;
+        if d.info.system {
+            return Err(EngineError::SystemDisk);
+        }
         if let Some(volumes) = &d.fail_unmount {
             return Err(EngineError::UnmountFailed {
                 volumes: volumes.clone(),

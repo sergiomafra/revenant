@@ -114,6 +114,8 @@ Windows; elsewhere every call is `unsupported_platform`). `destination` needs no
 `unmount(&disk)` unmounts every volume of a disk **without ejecting it**, so the system stops writing to the card while
 it is read, and returns an `UnmountGuard`; `remount(&disk, Some(guard))` mounts the volumes again. The engine never
 remounts by itself: remounting gives the system back the chance to write to the card, so it happens only when asked.
+The system disk is never unmounted: `unmount` refuses it with `system_disk` before running anything, and a disk not
+listed is `device_not_found`.
 
 - macOS: `diskutil unmountDisk diskN` (never `force`; it also unmounts the volumes of an APFS container on the disk and
   succeeds when nothing is mounted), then a listing confirms it. The tool failing or a volume of the disk still mounted is
@@ -123,7 +125,9 @@ remounts by itself: remounting gives the system back the chance to write to the 
 - Windows: every volume with an extent on the disk is locked and dismounted (`FSCTL_LOCK_VOLUME`, then
   `FSCTL_DISMOUNT_VOLUME`), and the guard keeps the locks for the session so Windows does not mount the volumes again;
   dropping the guard releases them, after which Windows mounts a volume on its next access. A volume that cannot be
-  locked (in use) makes the call fail with `unmount_failed` naming it, and the others are released. Each volume is
+  locked (in use) makes the call fail with `unmount_failed` naming it, and the volumes that did lock are released, so
+Windows may mount them again. While any local volume's disks cannot be told (its extents query failed), nothing is
+locked and the call fails closed with `unmount_failed` naming that volume, since it could lie on the card. Each volume is
   opened read-only first; only when Windows refuses the lock or the dismount on that handle (`ERROR_ACCESS_DENIED`) is
   it opened again with write access, solely to repeat the two requests. That handle never reads or writes data (the
   engine's single exception to opening anything for writing, recorded in the project rules and checked by the
