@@ -6,6 +6,7 @@ pub mod error;
 pub mod extract;
 pub mod filesystem;
 pub mod formats;
+pub mod group;
 pub mod inspect;
 pub mod naming;
 pub(crate) mod pairing;

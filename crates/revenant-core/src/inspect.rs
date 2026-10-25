@@ -469,9 +469,73 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 
+/// Seconds since 1970-01-01 of a "YYYY-MM-DDTHH:MM:SS" string read as if it were UTC (a naive clock difference is all
+/// grouping needs). `None` unless the string is exactly that shape and a real date and time.
+pub(crate) fn seconds(local: &str) -> Option<i64> {
+    let b = local.as_bytes();
+    if b.len() != 19
+        || [(4, b'-'), (7, b'-'), (10, b'T'), (13, b':'), (16, b':')]
+            .iter()
+            .any(|&(i, c)| b[i] != c)
+    {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<u32> {
+        let digits = &b[from..to];
+        digits.iter().all(u8::is_ascii_digit).then(|| {
+            digits
+                .iter()
+                .fold(0, |acc, &d| acc * 10 + u32::from(d - b'0'))
+        })
+    };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, s) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !((1..=12).contains(&mo)
+        && (1..=days_in_month(y, mo)).contains(&d)
+        && h < 24
+        && mi < 60
+        && s < 60)
+    {
+        return None;
+    }
+    Some(days_from_civil(i64::from(y), mo, d) * 86_400 + i64::from(h * 3600 + mi * 60 + s))
+}
+
+/// Days from 1970-01-01 to the given proleptic Gregorian date (the inverse of [`civil_from_days`]).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = y - i64::from(m <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = i64::from(if m > 2 { m - 3 } else { m + 9 });
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn seconds_matches_known_instants() {
+        assert_eq!(seconds("1970-01-01T00:00:00"), Some(0));
+        assert_eq!(seconds("2000-03-01T00:00:01"), Some(951_868_801));
+        assert_eq!(seconds("2025-12-14T08:30:00"), Some(1_765_701_000));
+        assert_eq!(
+            seconds("2025-12-14T08:30:00").unwrap() - seconds("2025-12-14T08:00:00").unwrap(),
+            1800
+        );
+        for bad in [
+            "2025-02-30T00:00:00",
+            "2025-12-14 08:30:00",
+            "2025-12-14T24:00:00",
+            "2025-12-14T08:30",
+            "",
+            "2025-1x-14T08:30:00",
+        ] {
+            assert_eq!(seconds(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn civil_from_days_known_dates() {

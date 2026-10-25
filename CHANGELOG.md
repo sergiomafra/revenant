@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Recovered files can be grouped by shooting session (a pause of more than 2 hours starts a new one), by day, by
+  camera and by folder, for the results screen; "by folder" is offered only when the folder structure survived.
+  `revenant-dev scan --group` prints the groups.
 - Recovered files keep their original name, or get a readable one from the date and camera
   (`2025-12-14_07-12-05_ILCE-7M4.JPG`); names are made safe, so extraction never leaves the destination folder, and a
   name already taken gets `_2`, `_3`… (also on case-insensitive disks). `revenant-dev --previews` names a preview after its file.

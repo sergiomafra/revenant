@@ -13,7 +13,7 @@ cargo build --release -p revenant-dev
 ## Usage
 
 ```sh
-revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-volume] [--threads N]
+revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-volume] [--threads N] [--group session|day|camera|folder]
 ```
 
 - `<IMAGE>`: a disk image file (scanning devices directly comes in a later part).
@@ -32,6 +32,12 @@ revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-vol
   same temporary directory.
 - `--threads N`: threads that measure candidate files (default 0 = one per core, at most 16; 1 = measure on the scan
   thread; capped at 64). The output is identical for any value.
+- `--group session|day|camera|folder`: after the last `found`/`updated` line and before `summary`, prints one line per
+  group of the results (see "Grouping" in the core README), using each file's latest finding and details:
+  `{"event":"group","by":"session","label":{"kind":"session","camera":{"make":"Sony","model":"ILCE-7M4","serial":"111"},"first":"2025-12-14T08:00:00","last":"2025-12-14T08:30:00"},"ids":[1,2]}`.
+  `label.kind` is the variant name in snake_case (`session`, `undated_session`, `day`, `undated`, `camera`,
+  `unknown_camera`, `folder`, `no_folder`) with its fields (`camera` is left out when unknown). `--group folder` on a
+  scan where no file has a folder prints one line, `{"event":"group","by":"folder","available":false}`.
 
 ### Output
 

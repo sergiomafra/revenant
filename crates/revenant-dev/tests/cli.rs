@@ -1,7 +1,8 @@
 use assert_cmd::Command;
 use revenant_testkit::fs::{FsBuilder, FsStamp, FsType, Partitioning, disk};
 use revenant_testkit::{
-    DiskImage, Mp4Options, TestExif, TiffRaw, TiffRawOptions, TiffVariant, jpeg, mp4, tiff_raw,
+    DiskImage, Mp4Options, TestExif, TiffRaw, TiffRawOptions, TiffVariant, jpeg, jpeg_with_exif,
+    mp4, tiff_raw,
 };
 
 fn image() -> (tempfile::NamedTempFile, Vec<u8>, Vec<u8>) {
@@ -676,4 +677,73 @@ fn extract_uses_original_and_readable_names() {
         previews.iter().any(|f| f == "DSC01235.preview.jpg"),
         "{previews:?}"
     );
+}
+
+#[test]
+fn group_lines_come_before_the_summary() {
+    let at = |date: &str| TestExif {
+        date: Some(date.into()),
+        ..exif()
+    };
+    let mut img = DiskImage::noise(256 * 1024, 7);
+    img.put(8192, &jpeg_with_exif(64, 48, 1, &at("2025:12:14 08:00:00")))
+        .put(
+            96 * 1024,
+            &jpeg_with_exif(64, 48, 2, &at("2025:12:14 11:00:00")),
+        );
+    let img = img.save();
+    let run = |by: &str| {
+        let out = Command::cargo_bin("revenant-dev")
+            .unwrap()
+            .args(["scan", "--group", by])
+            .arg(img.path())
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        lines(&out)
+    };
+    let events = run("session");
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["found", "found", "group", "group", "summary"],
+        "{events:?}"
+    );
+    assert_eq!(events[2]["by"], "session");
+    assert_eq!(
+        events[2]["label"],
+        serde_json::json!({
+            "kind": "session",
+            "camera": {"make": "Acme", "model": "Model X", "serial": "SN12345"},
+            "first": "2025-12-14T08:00:00",
+            "last": "2025-12-14T08:00:00",
+        })
+    );
+    assert_eq!(events[2]["ids"], serde_json::json!([1]));
+    assert_eq!(events[3]["label"]["first"], "2025-12-14T11:00:00");
+    assert_eq!(events[3]["ids"], serde_json::json!([2]));
+
+    let days = run("day");
+    assert_eq!(days.len(), 4, "{days:?}");
+    assert_eq!(
+        days[2]["label"],
+        serde_json::json!({"kind": "day", "day": "2025-12-14"})
+    );
+    assert_eq!(days[2]["ids"], serde_json::json!([1, 2]));
+    let cams = run("camera");
+    assert_eq!(cams[2]["label"]["kind"], "camera");
+
+    // Files found only by their signature have no folder: the grouping is not available.
+    let folders = run("folder");
+    assert_eq!(folders.len(), 4, "{folders:?}");
+    assert_eq!(
+        folders[2],
+        serde_json::json!({"event": "group", "by": "folder", "available": false})
+    );
+    assert_eq!(folders[3]["event"], "summary");
 }

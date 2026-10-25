@@ -1131,6 +1131,29 @@ nothing is ever overwritten, on case-sensitive and case-insensitive volumes alik
   partial file comes out instead of none. Each piece stops at the source's end, even if its length runs past it.
 - A write error returns `write_failed` and removes the incomplete file.
 
+## Grouping
+
+`group` (pure functions, no I/O) arranges recovered files for the results screen. Each file becomes a `GroupInput`
+(`GroupInput::new(&Finding, Option<&Metadata>)`: id, time, camera, folder) and `by_session`, `by_day`, `by_camera` and
+`by_folder` return `Vec<Group>` (a `GroupLabel` and the ids). The result never depends on the order of the input.
+
+- **Time** (photos): the capture time, else the origin's modified time, else its created time. **Videos** (MP4/MOV):
+  the origin's modified time, else created, else the capture time (the file system keeps local time, the `mvhd` date is
+  UTC). The first candidate that is a real date wins; a file with none is "undated".
+- **Camera**: make and model (trimmed, case-insensitive) plus serial; `None` when make and model are both unknown. A file
+  without a serial joins the one body of its model when the files have exactly one serial for it; with two or more
+  serials it stays apart. The label shows the strings of the file with the smallest id.
+- **By session**: per camera, files sorted by (time, id); a pause of more than `SESSION_GAP_SECS` (2 hours; exactly 2 hours
+  stays in the session) starts a new one. Sessions are ordered by (first time, camera, first id); each camera's undated
+  files form an `UndatedSession` after them. A session label carries the first and last time.
+- **By day**: `Day("YYYY-MM-DD")` ascending, `Undated` last. **By camera**: ordered by camera, `UnknownCamera` last.
+- **By folder**: the origin's folder, whatever its state: a card after a quick format still has its old folders
+  (`?/100MSDCF`) and that counts. A file in the root is `Folder("")`; a file with no origin, or whose folder the listing
+  dropped (too long, or past its path budget), is in `NoFolder`, last. `None` when no file has a folder at all (the
+  structure did not survive: the screen offers no "by folder").
+
+Ids inside a group go by (time, id), the undated last.
+
 ## Names
 
 `naming::file_name(&Finding, Option<&Metadata>)` gives the name a recovered file is written under:
