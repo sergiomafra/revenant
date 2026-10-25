@@ -12,7 +12,10 @@
 use std::collections::HashSet;
 
 use super::jpeg::{OwnJpegs, preview_health};
-use super::{FileKind, Format, HEAD_LEN, Health, Measurement, Reader, SECTOR, builtin};
+use super::{
+    FileKind, Format, Fragment, HEAD_LEN, Health, MAX_OWN_FILES, Measurement, Reader, SECTOR,
+    builtin,
+};
 use crate::source::Source;
 use crate::tiff::{TIFF_MAX_LEN, TiffInfo, type_size, walk};
 
@@ -151,6 +154,36 @@ impl Format for TiffRaw {
             health,
             fragments: Vec::new(),
         })
+    }
+
+    fn own_files(&self, source: &dyn Source, start: u64) -> Vec<Fragment> {
+        Self::own(source, start)
+    }
+}
+
+impl TiffRaw {
+    /// The previews and JPEG-coded strips/tiles the walk of the TIFF at `start` records, absolute, previews first, at
+    /// most [`MAX_OWN_FILES`].
+    fn own(source: &dyn Source, start: u64) -> Vec<Fragment> {
+        if !TiffRaw.confirms(source, start) {
+            return Vec::new();
+        }
+        let mut r = Reader::new(source);
+        let available = source.len().saturating_sub(start);
+        let Some(info) = walk(&mut r, start, available.min(TIFF_MAX_LEN)) else {
+            return Vec::new();
+        };
+        let starts: HashSet<u64> = info.jpeg_data_starts.iter().copied().collect();
+        let coded = info.data.iter().filter(|(o, _)| starts.contains(o));
+        info.jpegs
+            .iter()
+            .chain(coded)
+            .take(MAX_OWN_FILES)
+            .map(|&(o, len)| Fragment {
+                start: start + o,
+                len,
+            })
+            .collect()
     }
 }
 

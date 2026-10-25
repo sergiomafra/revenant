@@ -15,8 +15,12 @@ on the card and a camera video whose index (`moov`) ended up away from its frame
 retries a known unreadable sector, and checks the files it finds on every core: on an 8-core / 16-thread Intel Core
 i9-9980HK, with the default threads, it scans a photo-dense 1 GiB image at about 500 MB/s (JPEG) to 1,600 MB/s (RAW)
 from the page cache, against 22 and 158 MB/s before, faster than an SD card reader delivers (details in
-[crates/revenant-core](crates/revenant-core/README.md#performance)). It is tested against real camera files as well as
-synthetic ones. More engine work comes next (file systems, reading cards directly), then a graphical app.
+[crates/revenant-core](crates/revenant-core/README.md#performance)). It reads FAT12/16/32 and exFAT file systems (on MBR and GPT
+disks, and after a quick format through the old folders) to bring back deleted photos and videos with their original names, folders
+and dates, tells a file the file system lists apart from the same photo found by its signature (each photo comes out
+once), gives files without a name a readable one (`2025-12-14_07-12-05_ILCE-7M4.JPG`), and groups the results by
+session, day, camera and folder. It is tested against real camera files as well as synthetic ones. More engine work
+comes next (reading cards directly), then a graphical app.
 
 ## Trying the engine (developers)
 

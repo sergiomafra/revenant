@@ -1,6 +1,6 @@
 # Revenant — roteiro até a versão 1.0
 
-Atualizado em 20/10/2026. Cada parte segue o mesmo caminho: spec, depois telas (quando houver tela), depois plano, execução por
+Atualizado em 25/10/2026. Cada parte segue o mesmo caminho: spec, depois telas (quando houver tela), depois plano, execução por
 subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizada em toda parte.
 
 ## Marcos
@@ -23,17 +23,22 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
   - Lê os dados da foto (câmera, lente, número de série, ISO, data da foto) e a maior prévia JPEG embutida.
   - Pendências da 1.1.
   - Amostras reais de câmera nos testes.
-- **1.3, arquivos fragmentados e velocidade, concluída** (aguardando merge):
+- **1.3, arquivos fragmentados e velocidade, concluída** (PR #4):
   - Remonta o JPEG partido em dois pedaços e o vídeo de câmera cujo `moov` ficou longe do `mdat` (dois pedaços).
   - Busca no ritmo do leitor de cartão: cada setor lido uma vez pela busca e pelos detectores (a busca de lacuna de um
     JPEG pode reler a sua janela de 64 MiB), conferência em paralelo e mapa de setores ruins (de 21,8 para 503,9 MB/s
     em JPEG denso; números em `crates/revenant-core/README.md`).
   - Não cobre: arquivos em 3 ou mais pedaços e fragmentação de RAW (foram para a 1.6).
-- **1.4, sistemas de arquivos:**
-  - exFAT e FAT32: arquivos apagados com o nome e a pasta originais, cartão formatado rápido.
-  - Deduplicação entre a busca por estrutura e a busca por assinatura.
-  - Agrupamento por sessão e por câmera.
-  - Arquivo recuperado sem nome ganha um nome por data e câmera.
+- **1.4, sistemas de arquivos, concluída** (aguardando PR/merge):
+  - FAT12/16/32 e exFAT, em MBR e GPT: arquivos vivos e apagados com o nome, a pasta e as datas originais, até com o
+    arquivo fragmentado (cadeia viva) e a FAT com setor ruim.
+  - Cartão formatado rápido: os nomes e as pastas voltam pelas pastas antigas que sobraram.
+  - Deduplicação: a mesma foto achada pelo sistema de arquivos e pela escultura sai uma vez; JPEGs próprios de um RAW
+    `Partial` não são mais relatados à parte; o vídeo pareia na grade de clusters.
+  - Agrupamento por sessão, dia, câmera e pasta.
+  - Arquivo recuperado sem nome ganha um nome por data e câmera; a extração sanea os nomes.
+  - Não cobre: arquivo apagado e fragmentado (sai `Partial`, vai para a 1.6); NTFS, APFS e HFS+ (a escultura segue
+    cobrindo). Pendências e decisões em `docs/superpowers/history/2026-10-25-m1-p4-pendencias.md`.
 - **1.5, disco de verdade:**
   - Lê o cartão ou HD direto pelo aparelho no Mac e no Windows, desmontando sem ejetar e sempre só leitura.
   - Cópia do cartão tolerante a setores ruins.

@@ -1,5 +1,8 @@
 //! Synthetic test data for Revenant: deterministic JPEGs and disk images. Nothing here touches real data.
 
+pub mod fs;
+pub mod os_fs;
+
 use std::io::Write;
 
 use image::ExtendedColorType;
@@ -1535,15 +1538,19 @@ pub enum BenchImage {
     Video,
     /// Like `DenseJpeg`, but the second half of every file is replaced by noise.
     CutJpeg,
+    /// An exFAT volume in an MBR disk (first LBA 8192) filling the image, holding the `DenseJpeg` files as live files
+    /// in `DCIM/100TEST`, every 4th one deleted.
+    ExfatCard,
 }
 
 impl BenchImage {
-    pub const ALL: [BenchImage; 5] = [
+    pub const ALL: [BenchImage; 6] = [
         BenchImage::Noise,
         BenchImage::DenseJpeg,
         BenchImage::DenseRaw,
         BenchImage::Video,
         BenchImage::CutJpeg,
+        BenchImage::ExfatCard,
     ];
 
     pub fn name(self) -> &'static str {
@@ -1553,6 +1560,7 @@ impl BenchImage {
             BenchImage::DenseRaw => "dense-raw",
             BenchImage::Video => "video",
             BenchImage::CutJpeg => "cut-jpeg",
+            BenchImage::ExfatCard => "exfat-card",
         }
     }
 
@@ -1580,9 +1588,13 @@ fn write_noise(rng: &mut SplitMix64, mut n: u64, out: &mut dyn Write) -> std::io
 /// `DenseJpeg`/`CutJpeg` cycle 8 distinct JPEGs (3000×2000, else 320×240); `DenseRaw` cycles 4 RAWs (Arw, Nef, Cr2, Dng;
 /// 24 MiB / 1 MiB of raw data, preview 1616×1080 / 160×120); `Video` writes MP4s with `mdat` of 256 MiB / 8 MiB.
 pub fn write_bench_image(kind: BenchImage, len: u64, out: &mut dyn Write) -> std::io::Result<u64> {
+    if kind == BenchImage::ExfatCard {
+        return write_exfat_card(len, out);
+    }
     let big = len >= BENCH_BIG;
     let files: Vec<Vec<u8>> = match kind {
         BenchImage::Noise => Vec::new(),
+        BenchImage::ExfatCard => unreachable!("handled above"),
         BenchImage::DenseJpeg | BenchImage::CutJpeg => {
             let (w, h) = if big { (3000, 2000) } else { (320, 240) };
             (0..8).map(|s| jpeg(w, h, 100 + s, 30_000)).collect()
@@ -1642,6 +1654,49 @@ pub fn write_bench_image(kind: BenchImage, len: u64, out: &mut dyn Write) -> std
     }
     write_noise(&mut rng, len - pos, out)?;
     Ok(placed)
+}
+
+/// First LBA of the `ExfatCard` volume (4 MiB, where cameras and macOS put it).
+const CARD_FIRST_LBA: u32 = 8192;
+/// Cluster size of the `ExfatCard` volume.
+const CARD_CLUSTER: u32 = 4096;
+
+/// The `ExfatCard` image: the volume is built in memory (peak memory about twice `len`: the builder keeps a copy of every file and `build()` allocates the image), then written after its MBR head.
+fn write_exfat_card(len: u64, out: &mut dyn Write) -> std::io::Result<u64> {
+    use fs::{DeleteStyle, FsBuilder, FsType, mbr_head};
+    let head_len = u64::from(CARD_FIRST_LBA) * 512;
+    assert!(
+        len > head_len && len.is_multiple_of(512),
+        "the exfat-card image needs a multiple of 512 bytes past 4 MiB"
+    );
+    let big = len >= BENCH_BIG;
+    let (w, h) = if big { (3000, 2000) } else { (320, 240) };
+    let photos: Vec<Vec<u8>> = (0..8).map(|s| jpeg(w, h, 100 + s, 30_000)).collect();
+    let mut b = FsBuilder::new(FsType::Exfat, len - head_len, CARD_CLUSTER);
+    b.mkdir("DCIM/100TEST");
+    // Leave 2% of the clusters (and at least 64) for the bitmap, the folder entries and the rounding of each file.
+    let cluster = u64::from(CARD_CLUSTER);
+    let mut room = u64::from(b.cluster_count());
+    room -= (room / 50).max(64);
+    let mut names = Vec::new();
+    while let Some(photo) = photos.get(names.len() % photos.len()) {
+        let need = (photo.len() as u64).div_ceil(cluster);
+        if need > room {
+            break;
+        }
+        room -= need;
+        let name = format!("DCIM/100TEST/IMG_{:05}.JPG", names.len());
+        b.add(&name, photo);
+        names.push(name);
+    }
+    for name in names.iter().skip(3).step_by(4) {
+        b.delete(name, DeleteStyle::Camera);
+    }
+    let mut volume = b.build();
+    drop(b);
+    out.write_all(&mbr_head(&mut volume, CARD_FIRST_LBA))?;
+    out.write_all(&volume)?;
+    Ok(names.len() as u64)
 }
 
 #[cfg(test)]

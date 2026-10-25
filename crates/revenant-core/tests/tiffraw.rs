@@ -533,30 +533,21 @@ fn panasonic_rw2_ignores_the_placeholder_strip() {
 /// to the 0x4000-byte block. 280 x 200 = 56,000 pixels -> 112,000 -> 114,688.
 const RW2_UNKNOWN_BOUND: u64 = 114_688;
 
-/// Scan result of an RW2 with an unknown packing: the RW2 itself, claimed up to the upper bound (ruling P16), and its own
-/// JpgFromRaw. The scan keeps examining heads inside a `Partial` finding (one broken file must not hide others), so the
-/// preview, which starts on a sector, is also reported on its own.
+/// Scan result of an RW2 with an unknown packing: the RW2 itself, claimed up to the upper bound (ruling P16), alone.
+/// The scan keeps examining heads inside a `Partial` finding (one broken file must not hide others), but the preview,
+/// which starts on a sector, is the RW2's own JpgFromRaw and is not reported on its own (ruling D12).
 fn assert_unknown_packing_keeps_the_raw_data(
     f: &testkit::TiffRaw,
     found: &[(u64, u64, FileKind, Health)],
 ) {
-    let p = f.preview.clone().unwrap();
     assert_eq!(
         found,
-        [
-            (
-                8192,
-                f.raw.start as u64 + RW2_UNKNOWN_BOUND,
-                FileKind::Rw2,
-                Health::Partial
-            ),
-            (
-                8192 + p.start as u64,
-                p.len() as u64,
-                FileKind::Jpeg,
-                Health::Intact
-            ),
-        ]
+        [(
+            8192,
+            f.raw.start as u64 + RW2_UNKNOWN_BOUND,
+            FileKind::Rw2,
+            Health::Partial
+        )]
     );
 }
 

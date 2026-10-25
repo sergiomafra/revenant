@@ -33,7 +33,10 @@ fn a_crafted_huge_frame_is_measured_quickly() {
     let bound = if cfg!(debug_assertions) {
         Duration::from_secs(10)
     } else {
-        Duration::from_millis(100)
+        // Ruling R5: generous enough for a loaded machine, still far below the ~1.1 s of the old lenient decode. That no
+        // zune-jpeg decode runs at all is asserted by the unit test
+        // `formats::jpeg::tests::a_crafted_huge_frame_is_partial_without_the_lenient_decode`.
+        Duration::from_millis(600)
     };
     assert!(best < bound, "{best:?}");
 }

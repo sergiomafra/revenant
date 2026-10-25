@@ -185,7 +185,9 @@ whole 512-byte sector of one repeated byte value is treated as cut there (ruling
 this, but a large flat area coded with optimized Huffman tables could (all `00`); such a photo is `Partial` and is not
 put back together.
 
-Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`).
+Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`); its
+`fs` module builds FAT12/16/32 and exFAT volumes (with deleted files, raw entries and quick formats) inside MBR or GPT
+disks, written from the Microsoft and UEFI specifications.
 
 ## Formats: MP4/MOV
 
@@ -246,7 +248,9 @@ start `q` is a candidate when its 16 bytes are a size in `[24, MOOV_MAX_LEN + 8]
 finding that was `Intact` when added (rounded to whole sectors: those blocks may never be read, so keeping candidates
 there would depend on timing) or when it lies inside a non-`Damaged` MP4/MOV/CR3/HEIC finding (its own index). At most
 4096 candidates per block are looked at and 4096 per scan are kept (the first ones). The videos are the `Damaged`
-MP4/MOV findings (at most 4096, the first ones).
+MP4/MOV findings (at most 4096, the first ones), except those of a live file (its chain is where its bytes are, so it
+is not split elsewhere); a deleted file's video keeps its `origin`, with placement `Carved`, when it is put back
+together.
 
 Pairing a video at `s` (the `Found` start) with a candidate at `q`:
 
@@ -272,7 +276,11 @@ Pairing a video at `s` (the `Found` start) with a candidate at `q`:
 6. Break points `L1`: sector boundaries (relative to `s`) from the start of sample `k − 1` (not its end: a sample cut
    inside its last NAL unit's payload still passes `A`) to the start of sample `k + 1` (or `P`), at least `payload`,
    at most 4096 tried; samples `k − 1` and `k` must pass read across `L1` (bytes before it at `s`, after it at the second
-   piece). The pieces are `[s, s + L1)` and `[q − P + L1, … + (P − L1) + moov size)`, inside the source, not
+   piece). On a FAT/exFAT card (ruling D13), when `s` is a cluster start of a volume the scan found (cluster at least
+   4096 bytes, `s` inside its heap), the break points tried first are only those on that volume's cluster grid
+   (`(s + L1 − heap) % cluster == 0`) whose second piece `q − P + L1` starts on a cluster of it too, and uniqueness is
+   judged among them; when none passes, every sector boundary is tried as above (a card reformatted with another
+   cluster size pairs as before). The pieces are `[s, s + L1)` and `[q − P + L1, … + (P − L1) + moov size)`, inside the source, not
    overlapping. The first piece ends by the `Found` video's own end (the scan cut the video where another file starts,
    ruling Q13), unless that end is one of the video's own Motion-JPEG frames, and no other finding may start inside it:
    otherwise the video is not paired.
@@ -289,8 +297,9 @@ points, the sample budget or the step budget below): an unchecked candidate migh
 candidate cap does not count in a block wholly inside committed skip ranges (such a block may or may not be read, and
 all its candidates are dropped anyway), so the result does not depend on timing. Otherwise `Intact`. The checks validate
 lengths and header bytes, never the payload, so a break point inside one NAL unit's payload cannot be told from one a
-sector away: real H.264/HEVC with large slices (tens of KiB per NAL unit) will usually pair as `Partial` until 1.4
-(the file system's cluster size will narrow `L1`). So will most real videos with sound: audio samples interleaved
+sector away: real H.264/HEVC with large slices (tens of KiB per NAL unit) will usually pair as `Partial`, unless the
+video lies on the cluster grid of a FAT/exFAT volume (step 6), which leaves one candidate every cluster instead of every
+sector. So will most real videos with sound: audio samples interleaved
 between video samples `k − 1` and `k` are not checked, so every sector boundary inside them passes too. The kind comes
 from the `ftyp`.
 
@@ -340,6 +349,9 @@ brand is never HEIC.
   exactly at a CR3 chunk or HEIC extent start is indistinguishable from the file's own data and does not cut it. The
   checks need the index to be readable: if `moov`/`meta` is missing or unusable, a head inside `mdat` cuts the file as
   before.
+- Own files (`Format::own_files`, ruling D12): a `Partial` CR3's `PRVW` JPEG and full-size JPEG; a JPEG the scan finds
+  at one of their starts, wholly inside the CR3, is not reported (see [Scan](#scan)). MP4/MOV (Motion-JPEG frames
+  included) and HEIC have none: the frames of a `Partial` Motion-JPEG video are still reported.
 
 ## Formats: Fujifilm RAF
 
@@ -356,7 +368,8 @@ a file.
   the end of the source; either makes the file `Partial`. The file also ends at the first 512-aligned sector inside it
   where another file starts (`Partial`), except at the starts of its own blocks and inside its embedded JPEG (the EXIF
   thumbnail) while that JPEG still decodes strictly (ruling P13, as for TIFF RAWs); a file written over part of the JPEG
-  breaks its decode, so it cuts the RAF and is reported on its own.
+  breaks its decode, so it cuts the RAF and is reported on its own. A `Partial` RAF's own file (`Format::own_files`) is
+  its embedded JPEG: found at its start inside the RAF, it is not reported (ruling D12, see [Scan](#scan)).
 - Health: like a TIFF RAW, only the embedded JPEG can be verified. `Intact` needs a complete file, no unreadable sector
   and a strict decode of the JPEG; no JPEG, or one that decodes leniently or not at all, is `Partial`.
 
@@ -406,7 +419,10 @@ and
   or not at all (the raw data may still be fine). If the size of any preview cannot be measured (no SOF, zero size, over
   the decode cap) no smaller one may vouch for the file, so it is `Partial`. `Intact` only when the largest preview
   decodes strictly. There is no RAW decoder, so the raw data itself is never verified.
-- Inside an `Intact` RAW the scan suppresses heads, so its embedded previews are not reported separately.
+- Inside an `Intact` RAW the scan suppresses heads, so its embedded previews are not reported separately. A `Partial`
+  RAW hides its own JPEGs too (`Format::own_files`: its previews and JPEG-coded strips/tiles, at most 64; ruling D12):
+  a JPEG the scan finds at one of their starts, lying wholly inside the RAW, is not reported. A `Damaged` RAW hides
+  nothing. See [Scan](#scan).
 
 ## TIFF reader (internal)
 
@@ -458,6 +474,409 @@ pieces for a photo it puts back together (see "Fragmented JPEG"); the scan copie
 finding. After an `Intact` finding in pieces, the scan skips heads only inside
 its pieces (each rounded out to whole sectors), so files in the gaps between them are still found.
 
+## File systems: volumes
+
+`filesystem::volumes(source)` lists every FAT12, FAT16, FAT32 and exFAT volume of a source, in offset order (at most 16,
+the lowest offsets), as `Volume { index, fs, offset, len, sector_size, cluster_size, heap_offset, cluster_count, label,
+serial, from_backup, scheme }`. Offsets are absolute; `len` is what the boot sector says and may run past the source's end;
+`cluster_offset(c)` is the absolute offset of cluster `c`, `None` outside `2 ..= cluster_count + 1`. `FsKind::as_str()`
+gives `"fat12"`, `"fat16"`, `"fat32"`, `"exfat"`; `Scheme::as_str()` gives `"none"`, `"mbr"`, `"gpt"`. It only reads, and
+a broken table or boot sector is never an error: it yields fewer volumes. Written from the public specifications (MBR/EBR
+conventions, the UEFI GPT chapter, fatgen103, the Microsoft exFAT specification).
+
+Layouts, tried from sector 0:
+
+- **Superfloppy:** sector 0 is itself a valid boot sector (scheme `none`).
+- **GPT:** an MBR entry of type `0xEE`. The header at LBA 1 (512-byte blocks, else at byte 4096 for 4096-byte blocks)
+  must have the signature, its own LBA, a header CRC32 that holds, at most 128 entries of 128..=1024 bytes (a multiple of
+  128) and an entry-array CRC32 that holds; otherwise the backup header at the primary's AlternateLBA, then at the last
+  LBA, is checked the same way. Every entry with a non-zero type GUID and first LBA ≤ last LBA is a candidate. When no
+  header checks out (both damaged) and the MBR is a hybrid one, its other (non-`0xEE`) entries are read as an MBR.
+- **MBR:** each of the 4 entries with a non-zero type, start and size; an extended entry (`0x05`, `0x0F`, `0x85`) is
+  followed through its EBR chain (logical partitions relative to their EBR, links relative to the extended start). A link
+  already seen, outside the source, unreadable or without `55 AA` ends a chain; at most 64 EBRs are read in all. LBAs are
+  read as 512-byte sectors, and again as 4096-byte sectors (a 4Kn disk; ruling R3): a partition found that second way
+  (also through its EBRs) is kept only when its boot sector declares 4096-byte sectors, and an offset found both ways is
+  read the first way.
+- **Probe:** when no candidate gave a volume (table destroyed, or no table), the sectors 0, 63, 128, 2048, 8192, 32768 and
+  65536 are tried (scheme `none`). A probe can land on a volume's backup: sector 6 of a FAT32 (a FAT32 partition at 2042)
+  or the backup region at 12 of an exFAT, both valid boot sectors of the same geometry. So when the primary at a probe
+  is FAT32 or exFAT and the volume that many sectors earlier (6 or 12, in its own sector size) has the same boot sector
+  (its primary, or this one as its backup), the earlier volume is reported if its primary is there, or if its first FAT
+  starts where its boot sector says (FAT entry 0 = the media byte then `FF FF`) and the probed one's does not.
+
+The partition's own record of where the volume sits (FAT `BPB_HiddSec`, exFAT `PartitionOffset`) is never used for
+placement: a volume is where its table entry (or probe) points.
+
+A FAT boot sector is valid with `55 AA` at 510, a jump (`EB ?? 90` or `E9`), BytsPerSec 512/1024/2048/4096, SecPerClus a
+power of two ≤ 128, RsvdSecCnt ≥ 1, NumFATs 1 or 2, a data region starting before the end, and at least one cluster. It
+is FAT32 by its BPB (FATSz16 = 0, RootEntCnt = 0, FATSz32 > 0, RootClus ≥ 2, and RootClus inside the heap); otherwise it
+needs FATSz16 ≠ 0 and RootEntCnt ≠ 0 (fatgen103: a FAT12/16 BPB has both, so a FAT32 with a corrupt RootClus is refused,
+not read as FAT16, and its backup is used) and is FAT12 below 4085 clusters, FAT16 below 65525, and refused above. An exFAT boot sector is valid with `"EXFAT   "` at 3,
+bytes 11..64 zero, `55 AA`, BytesPerSectorShift 9..=12, SectorsPerClusterShift ≤ 25 − that, NumberOfFats 1 or 2,
+FatOffset ≥ 24, ClusterHeapOffset ≥ FatOffset + FatLength × NumberOfFats, ClusterCount 1..=2^32 − 11, the heap ending
+within VolumeLength, and the root cluster inside the heap.
+
+Backups: when the primary boot sector is not valid, the exFAT backup boot sector (sector 12) and the FAT32 one (sector 6)
+are tried, for 512- and then 4096-byte sectors, each only with its own sector size (`from_backup: true`); an exFAT
+backup whose boot checksum (sector 23) holds is preferred. An exFAT primary whose fields are valid but whose boot
+checksum (sector 11) does not hold is replaced by an exFAT backup whose checksum holds, and kept when there is none.
+
+Label: FAT, the volume-label entry among the root's first 16 entries, else the BPB label (only with the extended boot
+signature `0x29`, which also gives the serial); printable ASCII is kept, any other byte becomes `_`, trailing spaces are
+dropped. exFAT, the `0x83` entry among the first 4 KiB of the root's first cluster (up to the end-of-directory entry).
+An empty label or `"NO NAME"` is `None`.
+
+Bounds: at most 16 volumes, 64 EBRs, 128 GPT entries. One call makes at most 1,362 reads of at most 16,588,800 bytes in
+all (a test counts them on every hostile case):
+
+- tables: sector 0, at most 6 GPT headers each with its entry array (≤ 128 KiB), 64 EBRs: 77 reads, 833,536 bytes;
+- at most 128 candidate offsets from a table (72 from an MBR), each at most 9 reads and 111,104 bytes: the primary, its
+  exFAT checksum region (12 sectors of ≤ 4 KiB), 4 backup boot sectors and 2 backup checksum regions, then one label read
+  (≤ 4 KiB). An offset that is not a volume costs five 512-byte reads (only a valid exFAT field set costs a checksum
+  region), and one refused for its sector size skips the label read;
+- when probing, 7 offsets, each at most 19 reads and 219,136 bytes (the offset and the one 6 or 12 sectors earlier, the
+  two FAT entry-0 sectors, a label).
+
+No read is larger than 128 KiB, and none is allocated before it is known to lie inside the source.
+
+## File systems: FAT
+
+`filesystem::read(source, cancel)` returns a `Listing` of the live and deleted files of every FAT12/16/32 and exFAT
+volume `volumes` finds (exFAT: see [File systems: exFAT](#file-systems-exfat); a volume of more than 2^28 clusters is
+not walked). It never fails: a broken volume yields fewer files. Cancellation is checked before each directory; a cancelled
+read returns what was listed so far. Written from fatgen103 (FAT entries, directory entries, long names). The scan
+calls the crate-internal `read_with(meta, probe, cancel)`: metadata through its cache, the FAT32 high-word
+heads through a `Probe` over the raw source (see Deleted files); `read` uses the given source for both.
+
+- `Listing.files`: the photo/video files, those whose extension `FileKind::from_extension` knows (jpg jpeg jpe, mp4 m4v,
+  mov, cr2, cr3, nef nrw, arw, dng, orf ori, rw2, raf, heic heif hif, tif tiff; any case). Each is an `FsFile`:
+  - `origin`: `volume` (the volume's index), `folder` (components joined by `/`, from the root, no leading `/`, `""`
+    for the root; `None` when dropped, see Bounds; one string shared by the files of a folder), `name`, `state` (`live`,
+    or `deleted`), `placement` (`chain` for a live file, `guessed` for a deleted one; exFAT adds `recorded`; a scan
+    finding's origin may say `carved`, see [Deduplication](#deduplication)), `size` as
+    recorded, `created` and `modified` as `FsTime` (local time
+    `YYYY-MM-DDTHH:MM:SS`, no offset on FAT, exFAT's UTC offset when recorded; `Display` appends `+HH:MM`/`-HH:MM`
+    then; `None` when a field is out of range: month, day for that month and year,
+    hour, minute, seconds, or a creation 10 ms count above 199). The creation time adds its 10 ms count, floored to the
+    second. `name()`, `folder()` (an `Option`) and `path()` (`folder/name`, or the name alone) read them.
+  - `pieces`: absolute byte ranges in file order, consecutive clusters joined, holding the first `size` bytes; a piece
+    past the end of the source is cut or dropped, and a file with no piece left is not listed.
+  - `trusted` (ruling D3): a live file's chain is complete (exactly `ceil(size / cluster)` clusters, the last one
+    end-of-chain), with no cycle and no cluster another chain holds, in at most 4096 runs; a deleted file's guess is
+    one run of free clusters, as many as its size needs. Either way it says where the bytes probably are, never that
+    they are intact: health comes from the detectors (an untrusted file is at most partial, D3).
+
+  Sorted by (first piece start, volume, path). Several entries, live or deleted, may share a first cluster: all are
+  listed (the scan picks one).
+- `Listing.others`: the first piece of every other live file (any other extension, or none), sorted by start. Such a
+  file keeps no name or path. A deleted file of another kind is not listed anywhere.
+- `Listing.live`: the merged ranges of every live file (its pieces) and every trusted live directory (its clusters);
+  never a deleted file or directory.
+  The fixed FAT12/16 root region is not in it, nor is a directory that is not trusted (ruling R8), nor a file or
+  directory left out by the piece or photo cap.
+- `Listing.truncated` (ruling R7): a cap or budget dropped or degraded something: a file left out by the piece or photo
+  cap, a folder dropped by the path cap or budget, a volume whose contested set overflowed, a directory not entered for
+  the directory or depth cap, entries not read for the entry cap or a directory chain running past 2 MiB, a volume
+  too large to walk, deleted files not listed because the volume's guess steps or the listing's high-word probes ran
+  out, or deleted folders not walked because 65,536 were already waiting.
+
+The walk:
+
+- **Names.** A long name is used only when its parts come right before the short entry, ordinals counting down to 1 from
+  the part marked last (`0x40`), every part carrying the short name's checksum; its text is the UTF-16 up to the first
+  `0x0000`, decoded lossily. Otherwise the 8.3 name: base and extension trimmed, joined by `.` when the extension is not
+  empty, lower-cased as the NT bits of byte 12 say (`0x08` base, `0x10` extension), a first byte `0x05` read as `0xE5`,
+  any byte outside printable ASCII read as `_`. In every component `/` and NUL become `_`, and an empty one is `_`, so
+  `name()`/`folder()` never split one wrongly. Deleted entries (`0xE5`) are read as described under Deleted files;
+  the volume label, `.` and `..` are skipped; `0x00` ends a directory. An entry is a long-name part when its attribute byte masked with `0x3F` is `0x0F`
+  (fatgen103's mask).
+- **Chains.** The first cluster is `hi << 16 | lo` on FAT32, `lo` otherwise. FAT12 entries are packed 12 bits, FAT16 16,
+  FAT32 the low 28 bits; end-of-chain is ≥ `0xFF8`/`0xFFF8`/`0x0FFFFFF8`, bad is `0xFF7`/`0xFFF7`/`0x0FFFFFF7`, and a
+  value outside the heap is invalid. A chain is followed until end-of-chain, a free, bad or invalid entry, a cluster
+  outside the heap or already claimed, `ceil(size / cluster)` clusters, or 4096 runs. A sector of the first FAT that
+  cannot be read is read from the next copy; one no copy gives stops the chain there. The FAT32 `ExtFlags` field is not
+  honored: with mirroring disabled and an active FAT other than 0, the first FAT is still read first, and the others
+  only stand in for its unreadable sectors.
+- **Claims.** Every live directory and file claims the clusters of its chain, in walk order (depth first, entries in
+  on-disk order). A chain that reaches a cluster another chain claimed stops there and the cluster becomes contested;
+  once the walk of the volume ends, every file and directory holding a contested cluster is untrusted. Reaching a
+  cluster of its own chain is a cycle: the chain is incomplete, nothing is contested. When more than 65,536 clusters
+  would be contested, every live file and directory of that volume is untrusted (ruling C11).
+- **Directories.** The root is the fixed region (FAT12/16) or the `RootClus` chain (FAT32). A directory entry whose first
+  cluster is outside the heap or already claimed (a loop back to an ancestor, itself, or a second link) is not entered.
+  A directory is trusted when its chain ends in end-of-chain within 2 MiB, with no cycle and no contested cluster (ruling
+  C10); one that is not trusted is still walked, as far as its chain goes. An unreadable cluster or sector of a
+  directory is skipped.
+
+### Deleted files and folders
+
+A deleted entry (byte 0 `0xE5`) keeps its size, times and first cluster; its chain was freed. Only deleted
+photos/videos (by extension) of size > 0 are listed, with `state` `deleted` and `placement` `guessed`; they claim
+nothing and never enter `live` or `others`.
+
+They are placed only once the volume's live walk is done (ruling R10): every live chain has claimed its clusters by
+then, and a claimed cluster is in use for the guesses whatever its FAT entry says (a live chain broken or cross-linked
+there). And the live files take the listing's caps first (photo slots, pieces): a deleted file is listed only with
+what they left, so deleted entries never push a live file out of `files` or `live`. While the live tree is walked,
+the deleted photos/videos wait, never more than the photo slots left (a later live photo drops the last one waiting).
+
+- **First letter (ruling D9).** Byte 0 of the short name is lost. The deleted long-name parts right before the short
+  entry (attribute `0x0F`, byte 0 also `0xE5`, so their ordinals are lost too) that carry the nearest part's checksum
+  are taken nearest first, at most 20, and read up to the first `0x0000`; when their first character, upper-cased
+  (ASCII), as byte 0 makes the short name's checksum match theirs, that byte is restored and the long name is the
+  file's name. Otherwise byte 0 is the most common first byte among the short names with the same bytes 1, 2 and 3 —
+  live ones, or deleted ones already restored — first in the same directory, then in the whole volume (ties: the
+  lowest byte), formatted like the rest of the 8.3 name; otherwise it is `_`. The volume-wide count is taken once the
+  live tree is walked (so a later folder's names count), and the names still unknown are settled then, in walk order.
+  A long name whose first character is not the short name's byte 0 (a name starting with `.`, `+`, a space or an
+  accented letter, all of which the 8.3 name replaces or drops) fails the checksum, so its text is not used: the
+  file gets its 8.3 name, first letter from the sibling rule.
+- **Placement (ruling D4).** `need = ceil(size / cluster)`. Nothing is listed when the first cluster is outside the
+  heap or allocated today (overwritten). From it, clusters free today are taken in order, allocated (or unreadable)
+  ones stepped over, until `need` were taken, the heap ends, `2 × need + 1024` clusters were examined, or 4096 runs.
+  Fewer than `need` (short): the pieces hold what was found. Stepping over a cluster, or more than one run, makes the
+  file untrusted.
+- **FAT32 high word (ruling D10, C2, C3).** Windows zeroes a deleted FAT32 entry's high cluster word. On a FAT32
+  volume with clusters past `0xFFFF`, a deleted file whose recorded high word is 0 has as candidates `lo` and every
+  `h << 16 | lo` (`h ≥ 1`) inside the heap (at most `last >> 16`, ≤ 4096); a candidate counts when it is free today and
+  the format of the extension's kind (JPEG; ISO BMFF for mp4/mov/cr3/heic; TIFF RAW for cr2/nef/arw/dng/orf/rw2/tif;
+  RAF) recognizes the first 16 bytes of its head. Exactly one candidate: it is the first cluster. None or several:
+  the file is not listed. Files with the same `lo` and format share one answer (ruling R10). The checks run by high
+  word, every open question in one round, so a round looks at one 256 KiB stretch of the FAT and the FAT is read
+  once, in order; each candidate looked up costs a step of the volume's budget (below), paid before the round, and
+  cancel is checked before each round and every 1024 lookups. Every head check is one read of 512 bytes through the `Probe` (outside the scan's cache);
+  the probe refuses, without reading, a range the cache already knows to be unreadable, and a refused or failed read
+  recognizes nothing. At most 65,536 checks per listing (32 MiB); once spent, no more candidates are tried and a file
+  whose candidates were not all checked is not listed. Cost (D10): a camera-deleted file whose head was overwritten
+  by noise may take the name of another photo that sits at its only recognized candidate.
+- **Deleted folders.** A deleted directory met in the live tree waits (at most 65,536 per volume) until the live walk
+  ends; then each is walked depth first, in the order met. Its clusters are the D4 guess for 2 MiB (read as needed,
+  up to its end-of-directory entry), and it is read only when its first cluster starts with its own `.` entry (for a
+  FAT32 directory whose recorded high word is 0 only `lo` is tried, so a folder Windows deleted on FAT32 past cluster
+  65,535 is lost, with the files in it; the scan still finds them without names). Every entry in it is deleted, whatever its byte
+  0 says; deleted directories inside it are walked too (never twice the same first cluster). It never claims and never
+  enters `live`. The directory, depth and entry caps apply as for live ones; a waiting directory counts against the
+  directory cap once it is walked, so deleted folders never take room from the live tree.
+- **Step budget (ruling C7, R10).** Every cluster examined by the guesses of a volume (deleted folders, then the
+  high-word candidates, then the files) costs one step of 2^26; once spent, the volume's remaining deleted files are
+  not listed and no further deleted folder is read (in that order, each in walk order). The allocation is read a FAT
+  block at a time, so 2^26 steps of guessing take well under a second; FAT32 high-word lookups are dearer per step,
+  and a hostile volume that spends the whole budget on them takes about 10 s on the development Mac (a real card asks
+  a few of them per deleted file).
+
+Bounds (each lowerable in unit tests): per volume at most 65,536 directories, 4,000,000 directory entries (every
+32-byte slot read counts, the end marker included), depth 32 (the root is 0), 2 MiB per directory, 65,536 contested
+clusters; per listing at most 262,144 photo/video files and `MAX_PIECES` (2^20) pieces, counting a file's runs (a
+photo/video's pieces, an other file's ranges in `live`) and a directory's runs. A file that would pass either cap is not
+listed at all (not in `files`, `others` or `live`); a directory past the piece cap is still walked but its ranges are not
+in `live`. Once the entry cap is reached the walk of the volume stops: no further directory is read. Following chains
+examines each cluster of a volume at most once, except the clusters of a directory, which are followed twice (the
+chain is followed again through the FAT when the directory is read); if a flaky source changes between the two, the directory can
+keep the chain it claimed while losing its trust (never the other way round: trust is never given on a re-read). The
+deleted-file guesses examine at most 2^26 clusters per volume, and
+the high-word checks read at most 65,536 heads per listing.
+
+Paths (ruling R6): a photo/video whose path (folder, `/`, name) would pass `MAX_PATH_BYTES` (4096 bytes) keeps its name
+and loses its folder, and so do the files under a directory whose own path would pass it. Folder strings are held once
+per directory and shared by its files; the listing pays for each from a 64 MiB budget, and once that runs out new
+directories get no folder (their files are listed without one).
+
+Memory (64-bit sizes, allocator overhead not counted). A name is at most 20 long-name parts of 13 UTF-16 units, each
+decoded to at most 3 UTF-8 bytes: 780 bytes, allocated exactly. When a volume's walk ends, each pending file is
+consumed and its origin moved into the listing, never copied, so every name is held once.
+
+- **Retained, per listed photo/video:** the `FsFile` (152 B) plus its name (≤ 780 B), two time strings (19 B each)
+  and 16 B per piece. At the 262,144-file cap: ≤ 780 B × 262,144 ≈ 195 MiB of names, ≈ 242.5 MiB in all.
+- **Retained, per other file:** 16 B in `others` plus its ranges in `live`; it keeps no name or path.
+- **Per piece:** the 2^20 piece budget bounds the pieces and `others` together (≤ 16 MiB) and `live` (≤ 16 MiB).
+- **Folders:** ≤ 64 MiB, plus a 16 B shared-string header per folder (≤ 16 MiB).
+- **While a volume is walked, per pending file:** 48 B, plus 8 B per run (Vec capacity, so up to 16 B). A photo/video
+  also has a boxed origin of 120 B that holds its (retained) name. With at most 2^20 pending entries: ≤ 48 MiB + 16 MiB
+  + 30 MiB.
+- **While a directory is read:** its entries are held at once, 48 B each plus the name. With long names that is at
+  most 3,120 entries (21 slots each in 2 MiB): ≈ 2.5 MiB. With short names, 65,535 entries of ≤ 12-byte names:
+  ≈ 3.8 MiB, ≈ 4.9 MiB at the peak (a growing `Vec` briefly holds the old and the new buffer). On top of that, one cluster (≤ 512 KiB) or the FAT12/16 root region (≤ 2 MiB) is read at a time.
+- **The walk itself:**
+  - each directory waiting on the stack keeps only its folder, depth and (first cluster, cluster count), 56 B, so
+    65,536 of them take ≈ 3.5 MiB; its chain is followed again through the FAT when it is read;
+  - the claims bitmap: ≤ 32 MiB at 2^28 clusters;
+  - the contested set: ≤ 65,536 clusters, ≈ 1.5 MiB;
+  - the FAT cache: ≤ 8 MiB;
+  - deleted entries (all freed before `finish`, never at the same time as the listing being built):
+    - the first-letter count (D9): while the live tree is walked, 4 B per known short name (≤ 16 MiB at
+      4,000,000 entries, ≤ 32 MiB of capacity), then 8 B per distinct (bytes 1–3, byte 0) pair (≤ 32 MiB), the
+      first freed once the second is built; names counted inside deleted folders, ≈ 16 B each. The entry cap is
+      shared, so the whole count is ≤ ≈ 64 MiB;
+    - the deleted photos/videos waiting to be placed: 72 B each besides their names, ≤ 262,144 of them with the
+      live photos (≤ 18 MiB; their names count among the 262,144 names above, not on top);
+    - the high-word questions: ≤ ≈ 100 B per deleted file whose high word reads 0 (≤ 25 MiB);
+    - the deleted folders waiting (≤ 65,536 × 56 B ≈ 3.5 MiB) and those walked (≤ 65,536 first clusters); the
+      names still to settle (16 B each); one directory's count (≤ 65,536 × 8 B); one guess (≤ 4096 runs, 64 KiB).
+
+    Measured with a counting allocator (peak heap growth during `read`, release build, a throwaway probe binary):
+    4,000,000 live short names with distinct bytes 1–3: 47.5 MiB; 4,000,000 entries inside 62 deleted folders:
+    65.4 MiB; 190,000 deleted JPEGs with 255-character long names, high word 0 (probe cap reached): 77.9 MiB; the
+    same deleted by a camera, 174,805 listed: 110.2 MiB peak, 92.4 MiB retained.
+
+Combined worst case at the default caps: ≈ 355 MiB retained (deleted files share the photo and piece caps, so they
+add nothing). The peak, which adds every transient above at once (including the brief overlap of the old and new
+buffers while `files` grows, ≈ 19 MiB, and while `live` is merged, ≈ 16 MiB, and the deleted-entry tables,
+≤ 64 + 18 + 25 ≈ 107 MiB), is ≈ 640 MiB. It is a sum no card reaches: the deleted-entry tables are freed before
+`finish` builds the listing, and the entry cap keeps the first-letter count and 262,144 long names from coexisting. Before origins were moved, the names alone were held twice at the end of each volume
+(+195 MiB).
+
+Reads: metadata, through the given source: the boot sector again (to locate the FATs and the root), the FATs in
+32 KiB blocks cached up to 8 MiB (a block whose read fails is read again sector by sector, from each copy in turn; a
+block may be read again after the cache is emptied), each directory cluster once (at most 512 KiB per read; a deleted
+folder's clusters too), and the FAT12/16 root region once (at most 2 MiB). Besides: up to 65,536 reads of 512 bytes
+(32 MiB) for the FAT32 high-word checks, through the `Probe` (the scan's raw source, outside the cache, never a range
+the cache knows to be unreadable); the only exception to reading each byte once.
+
+## File systems: exFAT
+
+exFAT volumes go into the same `Listing` as FAT ones, with the same fields, caps, path rules, truncation flag and
+sorting (see [File systems: FAT](#file-systems-fat)); what differs is below. Written from Microsoft's exFAT
+specification (FAT §4.1, allocation bitmap §7.1, up-case table §7.2, entry sets §6.3, File §7.4, Stream Extension §7.6
+and File Name §7.7 entries).
+
+- **Root and bitmap.** The root is the FAT chain from `FirstClusterOfRootDirectory` (at most 256 MiB; trusted, and in
+  `live`, when it ends there with no cycle or cross-link, as a FAT directory). Its first allocation-bitmap entry
+  (`0x81`, BitmapFlags bit 0 clear) is read as soon as it is met: FirstCluster (byte 20) inside the heap, DataLength
+  (byte 24) at least `ceil(ClusterCount / 8)` and at most that rounded up to whole clusters, its FAT chain holding
+  those bytes, every byte readable. Otherwise there is no bitmap (below). The bitmap's and the up-case table's
+  (`0x82`) clusters are claimed like a live chain. The live photos/videos and directories of the root met before the
+  bitmap entry (their trust needs it) wait for it, at most as many photos/videos as the listing has photo slots left
+  and 65,536 directories (past either they are dropped and the listing is truncated); any other live file there is
+  handled at once.
+- **Entry sets.** A File entry (`0x85`; `0x05` deleted) with SecondaryCount (byte 1) in 2..=18, then a Stream
+  Extension (`0xC0`/`0x40`), then `ceil(NameLength / 15)` File Name entries (`0xC1`/`0x41`), then any other secondary
+  entries the count holds (skipped). NameLength (stream byte 3) is 1..=255 and `1 + ceil(NameLength / 15)` must fit
+  in SecondaryCount. The SetChecksum (bytes 2–3 of the File entry) is computed over all `SecondaryCount + 1` entries,
+  bytes 2–3 skipped, with every type byte's InUse bit (`0x80`) set first, so a deleted set keeps the checksum of its
+  live form; a set that breaks any of these rules is skipped (an entry that breaks a set is read again as the
+  possible start of the next one). `0x00` ends a directory; an unreadable stretch of a directory is skipped, and a
+  set across it is lost. Names are the UTF-16 units decoded lossily, `/` and NUL becoming `_`.
+- **Fields.** File entry: FileAttributes (byte 4, `0x10` directory); created and modified timestamps (bytes 8 and 12:
+  the DOS date in the high 16 bits, the time in the low 16), their 10 ms counts (bytes 20 and 21, added and floored to
+  the second; above 199 the time is `None`), their UTC offsets (bytes 22 and 23: bit 7 valid, bits 0–6 signed
+  15-minute units, `utc_offset_minutes`). Stream: GeneralSecondaryFlags (byte 1: bit 0 AllocationPossible, bit 1
+  NoFatChain), ValidDataLength (byte 8), FirstCluster (byte 20), DataLength (byte 24, the `size`). An entry without
+  AllocationPossible or with DataLength 0 has no clusters and is not listed.
+- **Live files and folders.** NoFatChain: one run of `ceil(DataLength / cluster)` clusters from FirstCluster, claimed;
+  otherwise the FAT chain is followed for that many clusters (as on FAT32, but the whole 32-bit entry:
+  `0xFFFFFFF7` bad, `0xFFFFFFF8` and above end). Claims, cross-links and the contested set work as on FAT (a run that
+  reaches a claimed cluster stops there). A live file is trusted when its run or chain is complete with no conflict,
+  every cluster of a NoFatChain run is in use in the bitmap, and ValidDataLength equals DataLength. A directory's
+  DataLength is its size, at most 256 MiB (past it only 256 MiB are read, the directory is not trusted and the listing
+  is truncated); it is trusted when every cluster that size needs is claimed with no conflict (a FAT chain ending
+  there, or a NoFatChain run the bitmap shows in use). A directory whose first cluster is outside the heap or already
+  claimed is not entered.
+- **Deleted files and folders.** A set is deleted when its File entry's InUse bit is clear, or a folder above it is
+  deleted. Deleted photos/videos wait, and are placed only once the live walk is done, against the live claims (a
+  claimed cluster is in use whatever the bitmap says; ruling R10), with what the live files left of the caps:
+  - NoFatChain: the run as recorded (`placement` `recorded`, cut at the heap's end); trusted only when every cluster
+    of it is free in the bitmap today;
+  - FAT-chained: its old FAT chain (exFAT frees clusters in the bitmap only) when it has exactly
+    `ceil(DataLength / cluster)` clusters, all free today, the last one's entry end-of-chain (`guessed`, trusted only
+    when it is one run); otherwise the FAT rule D4 guess (`guessed`, trusted only when one run and not short);
+  - a first cluster outside the heap or in use today: not listed (overwritten);
+  - ValidDataLength short of (or past) DataLength: not trusted.
+
+  Deleted folders met in the live tree wait, and are walked once it is done, depth first, never twice the same first
+  cluster: placed the same way (at most 256 MiB), a recorded run read only as far as its clusters are free today.
+  The old chains, the bitmap checks and the guesses spend the volume's budget of 2^26 cluster examinations (one per
+  cluster looked at; a bitmap check stops at the first cluster in use); once spent, the remaining deleted files are
+  not listed and no further deleted folder is read, and the listing is truncated. Cancel is checked before each
+  directory and every 1024 placements.
+- **No bitmap** (missing, unreadable, or out of bounds): every cluster no live chain claims reads free, so the
+  placements see the live claims only, and every deleted file is untrusted. Live files skip the bitmap check.
+
+Bounds: as on FAT (65,536 directories and 4,000,000 entries per volume, depth 32, the listing's caps), with 256 MiB per
+directory instead of 2 MiB. The work is linear in what is read: each cluster is claimed at most once, the bitmap is
+counted 64 clusters at a time, and every deleted placement is paid from the step budget.
+
+Memory (on top of FAT's figures, which hold for the listing itself). The bitmap: one bit per cluster, ≤ 32 MiB at 2^28
+clusters, freed with the walk. A directory is read 128 KiB at a time and parsed entry by entry, holding one entry set
+(≤ 608 B) besides the chunk, so a 256 MiB directory never sits in memory. The root's entries waiting for its bitmap
+entry (formatters write it first, so normally none) take 64 B each plus the name: at most 262,144 photos/videos
+(16 MiB; their names are the ones the listing keeps, not extra) and 65,536 directories (4 MiB plus names of
+≤ 765 B, ≤ 48 MiB), so ≤ 68 MiB in the worst case, freed once the bitmap entry is met or the root ends. A name is
+at most 255 UTF-16 units, ≤ 765 bytes of UTF-8. Deleted photos/videos waiting to be placed: ≈ 100 B each besides
+their names, ≤ 262,144 of them with the live photos; deleted folders waiting: ≤ 65,536 × 64 B.
+
+Reads: the boot sector again, the FAT in 32 KiB blocks cached up to 8 MiB (sectors no FAT copy gives stop a chain),
+the bitmap once (≤ 128 KiB per read), each directory cluster once (≤ 128 KiB per read; a deleted folder's clusters
+too), all through the given source. exFAT has no high-word check: no read goes through the `Probe`.
+
+## File systems: after a quick format
+
+A quick format writes a new boot region, new FATs (exFAT: a new bitmap and up-case table) and an empty root, and leaves
+everything else as it was: the old folders' clusters still hold their entries, with each file's name, size, times and
+first cluster. The old root is gone, so the top folders' names are lost. The scan (`scan::scan`, with
+`ScanOptions::filesystems`) uses those old folders to give the photos and videos it finds by their signature their old
+names back (ruling D11). They only ever name findings; they never place data, so a file whose head no format
+recognizes does not come back through them.
+
+- **Which clusters.** While reading its blocks, the scan looks at every cluster start of every volume found (on the
+  volume's grid as it is today: a quick format with the same geometry keeps the old grid). An old FAT folder starts
+  with its `.` entry (11 bytes `".          "`, the directory attribute) then its `..` entry (`"..         "`, the
+  directory attribute), whose cluster names its parent (0 for the root); an old exFAT folder starts with an entry set:
+  a File entry (`0x85`, or `0x05`) with SecondaryCount 2..=18 whose whole set, within the cluster's first 608 bytes,
+  holds together with a valid SetChecksum (the InUse bits forced, as for deleted sets). Not counted: a cluster start
+  inside the listing's live ranges or inside any directory the listing walked (live or deleted, trusted or not), and,
+  as for orphan `moov` candidates, one whose head (64 bytes on FAT, up to 608 on exFAT) overlaps a committed skip range
+  (those blocks may not be read at all). At most 8192 per block (counted only for a block skip ranges do not wholly
+  cover) and 65,536 per scan (the first ones in commit order), 16 B each.
+- **A folder longer than a cluster (exFAT).** A later cluster of an old exFAT folder whose first bytes happen to
+  start a whole entry set is a candidate of its own: the first cluster's reading stops there, and the files listed
+  from it on come out under a folder no entry names, as `?/<name>` (FAT continuation clusters never start with `.`, so
+  they are never candidates).
+- **Which findings.** Every finding emitted without origin that starts on a cluster start of a volume is kept (its id,
+  start, length, kind, health and pieces, ≈ 64 B; at most 262,144).
+- **After the search and the pairing,** each old folder is read, in offset order, through the scan's cache: its first
+  cluster, then the next ones while they lie in the heap, are no other old folder's start, are neither live nor walked,
+  can be read and still read as directory entries (FAT: up to the first free entry, long-name parts with a cluster
+  word 0 and short entries with printable name bytes, no reserved attribute bit and no `.`; exFAT: known entry types),
+  at most 2 MiB. Entries are parsed with the live walk's rules (long names with their checksum, exFAT entry sets with
+  their SetChecksum, `/` and NUL in a name become `_`); erased FAT entries and deleted exFAT sets are left out (their
+  names are not whole, and their clusters may have been reused). The volume's entry cap (4,000,000) counts these
+  entries too.
+- **Folder names.** A folder entry gives an old folder its name when its first cluster is that folder's (FAT: and the
+  folder's `..` names the folder holding the entry; exFAT has no `..`): the first such entry in offset order. A folder
+  no entry names is `?`, so a photo of `DCIM/100MSDCF` whose root entry for `DCIM` is gone comes out as
+  `?/100MSDCF/DSC01234.JPG`. At most 32 levels are followed up (and a loop stops): past them the top is `?`. Paths obey
+  the listing's caps (ruling R6): a folder string longer than 4096 bytes, or one past the 64 MiB folder budget, is
+  dropped (the file keeps its name, `folder()` is `None`), and so is a folder whose path with the file's name would
+  pass 4096 bytes.
+- **Which name.** A file entry with a photo/video extension and a size names the finding without origin that starts
+  at its first cluster with the same kind (MP4 and MOV count as one). When several entries name one finding (a file
+  copied to two folders, a cross-link), the latest `modified` wins (a missing one loses), then the lowest folder
+  offset.
+- **The update.** The finding gets `origin: Some(FsOrigin { state: Orphaned, placement: Carved, .. })` with the entry's
+  volume, folder, name, recorded size and times, and comes out again as an `Event::Updated` with the same id. An
+  `Intact` finding named by an entry of another size is at most `Partial` when the finding is longer than the size, or
+  when the bytes from its end (the end of its last piece) up to that size, contiguous and inside the source, are not
+  coherent (the tail check of ruling D6: padding, or up to 8 whole files then padding). Health is otherwise unchanged:
+  the old folder is evidence of a name, never of integrity. A finding the pairing also put back together comes out
+  once, merged (its two pieces and its origin). All `Updated` events, of the pairing and of the old folders, come out
+  one per id, in id order.
+- **Truncation.** When a cap drops old folders (per block or per scan) or kept findings, when the entry cap stops the
+  old folders' parsing, or when the path cap or budget drops a folder, `ScanSummary::listing_truncated` is set (ruling
+  R7; the `Volume` events, emitted before the search, cannot carry it).
+
+Reads: each old folder's clusters once, through the cache, after the search (so read again from the source when the
+cache no longer holds them); a folder's clusters stop at the next old folder of any volume, so within a volume no
+cluster is read for two folders. The tail check reads, through the cache, the bytes between a named finding's end and
+its recorded size.
+
+Memory: the listing's `walked` ranges (merged runs of the directory clusters the walks read, at most 2^20 runs of
+16 B per volume before merging, so ≤ 16 MiB per volume; a directory read in one run costs one), the candidates (16 B
+each, ≤ 65,536 kept, ≤ 131,072 per block read ahead before the block cap) and the kept
+findings (≈ 64 B each plus their pieces, ≤ 262,144) during the search; afterwards, per old folder its name and the
+folder string (each folder held once, ≤ 64 MiB of folder strings), one 2 MiB read at a time, and one best entry per
+kept finding (≈ 150 B plus its name).
+
 ## Inspect
 
 `inspect(source, &Finding) -> Inspection` reads what a found file says about itself: `Metadata` (make, model, lens, serial,
@@ -492,7 +911,76 @@ kept only if it starts with `FF D8 FF`, its SOF parses and its whole range lies 
 scan keeps reading every block. After an `Intact` finding it examines no head inside the file (inside its pieces, for a
 file in pieces); after a `Partial` or `Damaged` finding it keeps examining heads, so files inside a broken one are still reported (one bad
 file never hides the rest of the disk; a damaged file may then overlap another finding). `measure` reads the whole source
-(not just the block), so files may cross block boundaries.
+(not just the block), so files may cross block boundaries. Before the first block the scan reads the source's file
+systems (below), so the files they list come out with their name, folder and dates, once each.
+
+A `Partial` RAW's own JPEGs (rulings D12, R24): for every measurement that is not `Damaged`, the format that measured it
+also lists the embedded files it references in its own data (`Format::own_files`: a TIFF RAW's previews and JPEG-coded
+strips/tiles, a RAF's embedded JPEG, a CR3's `PRVW` and full-size JPEG; at most 64), in the same measuring step on every
+path (a measuring thread, the scan thread, a listed file's job, whose view offsets are mapped back through its pieces),
+so the events do not depend on who measured. An `Intact` measurement needs them too: the finding may still come out
+`Partial` (a listed file whose placement is not trusted, whose tail is not coherent or whose view joined pieces; a
+carved file over live clusters, ruling D7). For a listed file the own files are those of the measurement its finding
+took (the view's, or the carving's when it replaced the view). When the finding is `Partial`, the scan keeps their
+distinct sector-aligned starts after the RAW's start, each with the RAW's ranges (at most 65,536 at once, in an ordered
+map, dropped once the walk is past them). A file found by its signature alone at one of those starts whose ranges lie
+wholly inside that RAW's is not reported (it gets no id); when its own measurement is `Intact` it still skips its range
+(ruling R10), so a thumbnail inside a hidden preview is not reported either. A listed file is always reported, a
+`Damaged` finding hides nothing, and a foreign file elsewhere in the RAW (which cuts it), or one at an own start that
+runs past the RAW's end, is found as before.
+
+### File systems in the scan
+
+With `ScanOptions::filesystems` (default `true`; `false` is the scan by signature alone: no `Volume` event, every
+`Finding::origin` `None`), the scan first lists the FAT/exFAT files (ruling D1; see [File systems: FAT](#file-systems-fat)
+and [File systems: exFAT](#file-systems-exfat)): the metadata through the scan's cache, the FAT32 high-word heads through
+a probe over the raw source that refuses, without reading it, any range the cache already knows to be unreadable. Then:
+
+- **Volumes.** One `Event::Volume { volume, listing_truncated }` per volume, in index order, before the first
+  `Progress`. `listing_truncated` is the listing's `truncated` flag (ruling R7; the same for every volume, and
+  `ScanSummary::listing_truncated`): a cap or budget of the listing dropped or degraded files, so some files found may
+  lack their name, folder or dates. A cancel from inside a `Volume` callback stops the scan there.
+- **Which files.** Every photo/video of `Listing.files` whose first piece starts at a multiple of `ScanOptions::sector`
+  (with a sector above 512 the others are dropped silently; the carving still finds them). When several share a
+  first-piece start (deleted entries over each other, a cross-link), one is kept: a live one before a deleted one, then
+  the latest `modified` (a missing time loses to a present one), then listing order; the others are not reported.
+- **Nothing is skipped because of the file system** (ruling R10): every head the signature rules examine is still
+  examined, and only an `Intact` finding skips its pieces, as before.
+- **A listed file's finding** is added at the sector holding its first piece, always (whether a format recognizes the
+  head there or not, inside a skip range or not, readable or not), before that sector's unreadable and skip checks; the
+  carving's head at that sector is consumed. The file is measured through a `source::Fragmented` view of its pieces
+  (the detectors at offset 0 of the view), and a deleted file is also measured where it starts, as the carving would
+  ("carved"; it counts only when that sector is readable and outside every committed skip range). The two are merged
+  (see [Deduplication](#deduplication)). The finding has `origin: Some(FsOrigin)` (volume, folder, name, state,
+  placement, recorded size, times); `len` is the sum of its pieces and `fragments` its pieces (empty for one piece),
+  unless the carving replaced them. Then the usual rules apply: `Intact` skips its pieces, an unreadable sector inside
+  makes it `Partial`, and it is emitted once the scan has read past its farthest piece. A piece that lies before the
+  file's start (a FAT allocator that wrapped around on a reused card) was passed before the finding existed, so when the
+  finding is added an `Intact` one is lowered to `Partial` if the cache's bad-sector map knows an unreadable sector in
+  any of its pieces below that start (everything below it has been read, so this is the same for any `threads` and
+  `cache_bytes`), even when the detector never read those bytes.
+- **A live file of another kind** (`Listing.others`: `.THM`, `.XML`, ...): the head at its first cluster is consumed
+  without a finding; when the measurement there is `Intact`, its range is skipped. Heads inside the file are examined
+  as usual (ruling D18: they count as being inside a live file, below).
+- **Live clusters (ruling D7).** A finding whose origin is not a live file (found by its signature alone, or deleted)
+  and that overlaps `Listing.live` is at most `Partial`, and an orphan `moov` candidate inside `Listing.live` is dropped
+  (it belongs to a live file). A forged file system cannot hide a deleted photo: at worst the photo comes out `Partial`.
+- **One job, whoever runs it.** A listed file's measurement is queued to the measuring threads like a head's, and never
+  dropped for a skip range; when there is no worker result (one thread, a block not read again, a job handed back),
+  the commit loop runs the same function, so the events stay the same for any `threads` and `cache_bytes`. For a deleted
+  file in one piece whose carving is contiguous and no longer than the piece, the carving read the same bytes, so it
+  stands for the view measurement and only the tail check (D6) runs.
+
+Reading once, with the file systems: the metadata goes through the cache like every other read. The exceptions are the
+FAT32 high-word heads (at most 65,536 reads of 512 bytes, outside the cache; see Deleted files and folders), the later
+pieces of a fragmented file, which its view may read again when the cache no longer holds them, the bytes between
+a file's structural end and its recorded size, which the tail check reads (from the cache when the file fits in it),
+and the old folders of a quick-formatted card, read after the search (see
+[File systems: after a quick format](#file-systems-after-a-quick-format)).
+And the listing runs before the first block, so the cache windows it loads (the boot sectors and probe offsets, the
+FATs, the directories) are read again by the scan when the cache no longer holds them once the scan reaches them:
+directories far into a large card, or, with a cache of a few MiB, the up to 5 windows the volume search loads on a
+source with no volume.
 
 Reading once: the scan and every `measure` read through one shared cache (`CachedSource`, crate-private) of
 `ScanOptions::cache_bytes` (default 256 MiB; values below 1 MiB are raised to it). "Read once" is about reading the
@@ -540,16 +1028,27 @@ every scan in the process, plus the decoder's internal buffers), plus what each 
 `moov` of at most 16 MiB, or a JPEG gap search's DC values, about 3 × 13 MiB at 210 megapixels, plus 3 MiB), plus about
 200 B per recognized sector start in the read-ahead (at most
 lookahead × block / sector of them), plus the `moov` candidates (16 B each: at most 4096 per block read ahead, and
-4096 kept), the `Damaged` videos kept for pairing (at most 4096 findings) and the start of every finding (8 B each).
-After the scan, the pairing step holds one
+4096 kept), the `Damaged` videos kept for pairing (at most 4096 findings), the start of every finding (8 B each) and
+the own-file starts of `Partial` RAWs (at most 65,536 at once, about 70 to 90 B each: an ordered-map entry, its `Vec`
+and a shared pointer to the RAW's ranges, so at most about 6 MiB, plus each RAW's ranges), the old-directory candidates and the findings they may name (see
+[File systems: after a quick format](#file-systems-after-a-quick-format)),
+plus the file-system listing, kept for the whole scan: at most 262,144 photo/video files and 2^20 pieces, ≈ 355 MiB
+in the worst case at those caps (mostly names; see the Memory paragraph of [File systems: FAT](#file-systems-fat)),
+and while it is read before the first block, a peak of ≈ 640 MiB in the worst case (on exFAT, plus the allocation
+bitmap, ≤ 32 MiB, and the root entries waiting for it, ≤ 68 MiB), all of it a sum no real card reaches. Each running
+measurement of a listed file adds its view (16 B per piece, at most 4096 pieces) and a 64 KiB buffer for the tail
+check. After the scan, the pairing step holds one
 `moov` (at most 16 MiB) and its sample lists (at most 4,000,000 samples, about 32 B each, so up to about 128 MiB). With
 the defaults on a 16-thread machine: about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
 
 Events:
 
-- `Found(Finding)`: sequential `id` from 1, in start order. It is emitted once the scan has read past the file's end (the end of its
+- `Volume { volume, listing_truncated }`: a FAT/exFAT volume, before the first `Progress`, one per volume in index
+  order (see [File systems in the scan](#file-systems-in-the-scan)); none with `ScanOptions::filesystems` off.
+- `Found(Finding)`: sequential `id` from 1, in start order; `origin` is `Some` when the file system lists the file. It is emitted once the scan has read past the file's end (the end of its
   farthest piece), so unreadable sectors inside the file are known: they are reported as `Unreadable` events before the
-  `Found`, and an `Intact` finding with any of them inside one of its pieces is downgraded to `Partial`. A file found inside a `Partial`/`Damaged` one is emitted right
+  `Found`, and an `Intact` finding with any of them inside one of its pieces is downgraded to `Partial` (also one in a
+  piece below the file's start, met before the finding existed: from the bad-sector map). A file found inside a `Partial`/`Damaged` one is emitted right
   after it.
 - `Progress { read, total }`: once per block, plus one for an empty source; the last has `read == total`.
 - `Unreadable { start, len }`: when a block cannot be read it is re-read sector by sector; each run of consecutive failed
@@ -558,7 +1057,8 @@ Events:
 - `Updated(Finding)`: a better version of a finding already reported, which replaces the earlier `Found` with the same
   `id`. Emitted after every `Found` (and the last `Progress`), before `scan` returns, in id order; counted in
   `ScanSummary::updated`. Today: a video put back together with its separated `moov` (see "Video with a separated
-  index").
+  index"), and a finding an old folder of a quick-formatted card names (see
+  [File systems: after a quick format](#file-systems-after-a-quick-format)); one event per id, both merged.
 
 `CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block
 examined and each block read ahead, before and after every event and while waiting for a measurement. Once it is seen no
@@ -567,6 +1067,34 @@ their remaining jobs, and `scan` returns `EngineError::Cancelled` after every th
 running is finished first, except a JPEG gap search, which gives up as soon as it sees the cancel, and a `zune-jpeg`
 validation decode, which is skipped when the cancel is seen before waiting for the decode budget or once the budget is
 granted); findings still pending are dropped.
+
+## Deduplication
+
+A file the file system lists and the carving also finds comes out once: at a listed file's start the finding is the
+merged one, and the carving's head there is consumed (see [File systems in the scan](#file-systems-in-the-scan)). The
+merge (rulings D3, D5, D6), from the measurement through the view of the file's pieces:
+
+1. Kind and health are the view measurement's; when no format measures the view, the extension's kind, `Damaged`.
+2. The health is at most `Partial` when the placement is not trusted (`FsFile::trusted`, ruling D3: a live chain that
+   is incomplete, loops or crosses another, a deleted file not in one run of free clusters), when the tail is not
+   coherent (D6, below) or when the view measurement is itself in pieces (a join inside the file's own pieces).
+3. The pieces are the file system's: `len` their sum, `fragments` them when there are two or more.
+4. A deleted file takes the carving at its start instead (its length, kind, health and pieces; `placement` `carved`)
+   when the carving is of the same kind, strictly healthier (`Intact` > `Partial` > `Damaged`) and exactly the
+   recorded size (D5): the guess was wrong and the signature found the file. A live file never does: its chain is
+   where its bytes are. A carving of another length (a join to the tail of another photo of a burst) is not used.
+
+The tail (D6): the structure measured over the view ends at `L`, and the view (the recorded size, as far as the clusters
+and the source hold it) has `S` bytes. `L == S` is coherent. Otherwise, at most 8 times: the bytes `[L, S)` are all
+`00` or `FF` (padding) → coherent; else a format recognizes the head at `L` and measures a contiguous file of `m` bytes,
+not `Damaged`, with `L + m ≤ S` (an MPF image, a motion photo's video) → `L += m` and again; else it is not coherent.
+So a corrupt count inside a listed file is bounded by its recorded size (the view ends there), and a file whose size
+does not match its contents is at most `Partial`. The file system is evidence of where a file is, never of its
+integrity: its facts only ever lower the health a detector gives.
+
+Not merged: a file found by its signature where no listed file starts (no entry, or a deleted entry whose first cluster
+was reused), and files inside another one (still found inside a `Partial` or `Damaged` finding, as before). Such a
+finding that overlaps a live file is at most `Partial` (D7).
 
 ## Performance
 
@@ -577,13 +1105,28 @@ are an upper bound for a card reader. "Before" is the start of part 1.3 (commit 
 reading on its own); "after" is the end of it (commit `718f1f1`), with the default threads (16 here) and with one.
 MB = 10^6 bytes.
 
-| Image        | Files | Before (MB/s) | After, 16 threads (MB/s) | After, 1 thread (MB/s) |
-| ------------ | ----: | ------------: | -----------------------: | ---------------------: |
-| `noise`      |     0 |         765.6 |                   2381.4 |                 2265.4 |
-| `dense-jpeg` |    95 |          21.8 |                    503.9 |                  102.8 |
-| `dense-raw`  |    37 |         158.1 |                   1576.9 |                  589.5 |
-| `video`      |     3 |         797.2 |                   2296.6 |                 2216.3 |
-| `cut-jpeg`   |    95 |          26.8 |                    419.3 |                   85.6 |
+| Image        | Files | Before (MB/s) | After 1.3, 16 threads (MB/s) | After 1.3, 1 thread (MB/s) | End of 1.4, 16 threads (MB/s) |
+| ------------ | ----: | ------------: | ---------------------------: | -------------------------: | ----------------------------: |
+| `noise`      |     0 |         765.6 |                       2381.4 |                     2265.4 |                        2207.5 |
+| `dense-jpeg` |    95 |          21.8 |                        503.9 |                      102.8 |                         539.8 |
+| `dense-raw`  |    37 |         158.1 |                       1576.9 |                      589.5 |                        1420.3 |
+| `video`      |     3 |         797.2 |                       2296.6 |                     2216.3 |                        2525.4 |
+| `cut-jpeg`   |    95 |          26.8 |                        419.3 |                       85.6 |                         439.0 |
+| `exfat-card` |    93 |             - |                            - |                          - |                         459.1 |
+
+The "end of 1.4" column is the head of part 1.4 (default threads, one run of `revenant-dev bench`, best of 3 scans);
+`exfat-card` (an exFAT volume holding the `dense-jpeg` photos, every 4th deleted, so the scan also reads the file system)
+is new in 1.4, so it has no earlier figure: at 459.1 MB/s it is 0.85 of `dense-jpeg` (539.8), above the 0.8 gate, and it
+finds all 93 placed files. The other lines were not compared side by side with part 1.3 (only `dense-jpeg` and `noise`
+were, below); between runs on this machine, which throttles, they move by up to about 10% (`dense-raw` 1576.9 to
+1420.3, `video` 2296.6 to 2525.4). Against part 1.3's head (`main`, `b5ec340`) built side by side and interleaved, best
+of 3 scans, three rounds with a 60 s pause: `dense-jpeg` 581.4 / 584.7 / 591.6 MB/s on `main` against 545.8 / 561.1 /
+566.6 on the 1.4 head (4 to 6% slower); `noise` swings the other way as often as not (2794.1 / 2653.3 / 2523.6 on
+`main`, 2468.3 / 2397.0 / 2807.7 on the head), so it shows no difference. The `dense-jpeg` gap is not file-system work:
+on that image (no volume) the listing step costs about 1.1 ms and the old-folder finder is never created, and a control
+rebuild of the head (a one-line change) scanned `dense-jpeg` in 2.11 s with file systems on and 2.14 s off, against
+2.13 s on `main`, while the head as first built took 2.26 s. The gap is the code layout of that one build. On this Mac
+an A/B needs such a control rebuild to resolve a difference of about 6%.
 
 Every placed file is found in every run. What it means for a card: an SD card reader delivers at most about 100 MB/s
 (UHS-I) to about 300 MB/s (UHS-II), so with the default threads the scan keeps up with the reader on every image here,
@@ -597,17 +1140,64 @@ photo), a heavy case; the real camera samples (below) all still come out as one 
 ## Extract
 
 `extract(source, &Finding, dest_dir) -> Result<PathBuf, EngineError>` copies a finding's bytes (in 1 MiB chunks) into `dest_dir`
-as `revenant_<start as 12 hex digits>.<ext>`; if that exists, `_2`, `_3`… are tried (files are created with `create_new`, so
-nothing is ever overwritten; after 10,000 attempts it fails with `write_failed`).
+under `naming::file_name(finding, None)`: the original name of a finding the file system listed, else
+`revenant_<start as 12 hex digits>.<ext>`. `extract_as(source, &Finding, dest_dir, name)` does the same under a name you
+choose: `sanitize(name)`, or `revenant_<start>.<ext>` when nothing is left of it. If the name exists, `<stem>_2.<ext>`,
+`<stem>_3.<ext>`… are tried. Files are created with `create_new` (O_EXCL), so the volume itself decides what is taken:
+nothing is ever overwritten, on case-sensitive and case-insensitive volumes alike and for NFC/NFD forms of one name
+(`DSC00001.JPG` and `dsc00001.jpg` give two files; after 10,000 attempts it fails with `write_failed`).
 
 - Refuses with `destination_on_source` when the destination is on the source's volume (writing to a damaged card could destroy
   what is still recoverable). If the source's volume is unknown (`None`) extraction is allowed. If the destination's volume
   cannot be determined (e.g. the directory does not exist) it returns `open_failed` and writes nothing.
 - A finding in pieces is written as its pieces (`Finding::ranges()`) one after another, in file order; the file is still
-  named after `start` (the first piece's start).
+  named after the original name or, without one, after `start` (the first piece's start).
 - A chunk that cannot be read is re-read sector by sector (512 bytes); only the unreadable sectors are written as zeros, so a
   partial file comes out instead of none. Each piece stops at the source's end, even if its length runs past it.
 - A write error returns `write_failed` and removes the incomplete file.
+
+## Grouping
+
+`group` (pure functions, no I/O) arranges recovered files for the results screen. Each file becomes a `GroupInput`
+(`GroupInput::new(&Finding, Option<&Metadata>)`: id, time, camera, folder) and `by_session`, `by_day`, `by_camera` and
+`by_folder` return `Vec<Group>` (a `GroupLabel` and the ids). The result never depends on the order of the input.
+
+- **Time** (photos): the capture time, else the origin's modified time, else its created time. **Videos** (MP4/MOV):
+  the origin's modified time, else created, else the capture time (the file system keeps local time, the `mvhd` date is
+  UTC). The first candidate that is a real date wins; a file with none is "undated".
+- **Camera**: make and model (trimmed, case-insensitive) plus serial; `None` when make and model are both unknown. A file
+  without a serial joins the one body of its model when the files have exactly one serial for it; with two or more
+  serials it stays apart. The label shows the strings of the file with the smallest id.
+- **By session**: per camera, files sorted by (time, id); a pause of more than `SESSION_GAP_SECS` (2 hours; exactly 2 hours
+  stays in the session) starts a new one. Sessions are ordered by (first time, camera, first id); each camera's undated
+  files form an `UndatedSession` after them. A session label carries the first and last time.
+- **By day**: `Day("YYYY-MM-DD")` ascending, `Undated` last. **By camera**: ordered by camera, `UnknownCamera` last.
+- **By folder**: the origin's folder, whatever its state: a card after a quick format still has its old folders
+  (`?/100MSDCF`) and that counts. A file in the root is `Folder("")`; a file with no origin, or whose folder the listing
+  dropped (too long, or past its path budget), is in `NoFolder`, last. `None` when no file has a folder at all (the
+  structure did not survive: the screen offers no "by folder").
+
+Ids inside a group go by (time, id), the undated last.
+
+## Names
+
+`naming::file_name(&Finding, Option<&Metadata>)` gives the name a recovered file is written under:
+
+1. The original name from the file system (`origin.name()` alone, never the folder), sanitized. A deleted file keeps the
+   name the entry still holds (`_SC01235.JPG`).
+2. Else `YYYY-MM-DD_HH-MM-SS[_<camera>].<EXT>` from the capture time (`Metadata::captured_at`; else the origin's modified
+   time), `EXT` being the kind's extension in upper case. The camera part is the model without the make's first word,
+   only ASCII letters, digits and `-`, at most 24 chars: make `Canon`, model `Canon EOS R5` gives
+   `2025-12-14_07-12-05_EOSR5.CR3`.
+3. Else `revenant_<start as 12 hex digits>.<ext>` (what 1.3 wrote).
+
+`naming::sanitize(name) -> Option<String>` makes one safe component, so extraction never leaves the destination folder:
+`/ \ : * ? " < > |`, control characters (below 0x20, 0x7F and the C1 range U+0080–U+009F), U+2028/U+2029, format controls (U+200B–200F, U+202A–202E, U+2066–2069,
+U+FEFF, which can disguise an extension) and U+FFFD become `_`; leading and trailing `.` and spaces are trimmed (`..`
+gives `None`); a Windows reserved stem (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`, their superscript
+forms, `CONIN$`, `CONOUT$`; any case; the stem is what precedes the first `.`, so `CON.tar.gz` counts) gets a `_` in
+front; at most 200 bytes (before a `_N` suffix), cut on a char boundary, keeping an extension of up to 16 bytes. `extract::create_named(dir, &Finding, name, suffix)` is the one public way to create a file under a derived name (the CLI writes previews with it): it sanitizes `name`, replaces the extension by `suffix` when given (which must be empty or start with `.` and hold no unsafe char, else `write_failed`) and applies the `_N` rule. A total path over 260
+characters on Windows is a write error (`write_failed`) there, never an escape.
 
 ## Tested against real files
 

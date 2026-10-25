@@ -1033,9 +1033,11 @@ fn big_intact_video_is_read_once() {
             Health::Intact
         )]
     );
-    // The read-ahead (2 blocks here) fits in the cache, so at most it and the block being examined are read twice.
+    // The read-ahead (2 blocks here) fits in the cache, so at most it and the block being examined are read twice. The
+    // file-system step before the scan looks for a volume at sector 0 and the 7 probe offsets, loading their cache
+    // windows (5 distinct ones: 0, 1, 4, 16 and 32 MiB), which a 4 MiB cache may evict before the scan reaches them.
     let read = source.bytes();
-    let bound = (48 + (opts.lookahead_blocks() as u64 + 1)) * MIB as u64;
+    let bound = (48 + (opts.lookahead_blocks() as u64 + 1) + 5) * MIB as u64;
     eprintln!("inner bytes read: {read} (bound {bound})");
     assert!(read <= bound, "inner bytes read: {read}");
 }
@@ -1178,6 +1180,7 @@ fn block_not_read_again_still_reports_its_unreadable_sectors() {
                 kind: FileKind::Jpeg,
                 health: Health::Partial,
                 fragments: Vec::new(),
+                origin: None,
             }),
         ]
     );
@@ -1547,6 +1550,7 @@ fn fragmented_measurements_skip_only_their_pieces() {
                     len: 1024,
                 },
             ],
+            origin: None,
         })
     };
     let gap = |len: usize| {
@@ -1557,6 +1561,7 @@ fn fragmented_measurements_skip_only_their_pieces() {
             kind: FileKind::Jpeg,
             health: Health::Intact,
             fragments: Vec::new(),
+            origin: None,
         })
     };
     let (events, gap_jpeg) = scan_two_pieces(1024, Vec::new());
@@ -1745,5 +1750,139 @@ fn cancel_stops_a_jpeg_gap_search() {
         returned - at < Duration::from_millis(700),
         "{:?}",
         returned - at
+    );
+}
+
+/// A Panasonic RW2 whose packing (raw format 5 at 12 bits) the detector does not check: `Partial`, its raw data claimed
+/// up to an upper bound. Its JpgFromRaw (the preview) starts at offset 512, a sector start.
+fn unchecked_rw2() -> testkit::TiffRaw {
+    testkit::panasonic_rw2(&testkit::Rw2Options {
+        width: 280,
+        height: 200,
+        raw_format: 5,
+        bits: 12,
+        raw_len: 98_304,
+        strip_len: 0,
+        seed: 3,
+        exif: TestExif::default(),
+    })
+}
+
+fn scan_found(img: &DiskImage) -> Vec<(u64, FileKind, Health)> {
+    let file = img.save();
+    let (r, events) = run(
+        &FileSource::open(file.path()).unwrap(),
+        &ScanOptions::default(),
+    );
+    r.unwrap();
+    found(&events)
+}
+
+/// A `Partial` RAW hides the JPEGs it references itself (ruling D12): its preview is no separate photo, and the preview,
+/// measuring `Intact`, still skips its range, so the thumbnail inside it is none either (ruling R10). A foreign photo
+/// inside the RAW's raw data is still found.
+#[test]
+fn partial_raw_hides_its_own_jpegs_only() {
+    let f = unchecked_rw2();
+    let p = f.preview.clone().unwrap();
+    assert_eq!(p.start % 512, 0);
+    let mut img = DiskImage::noise(8192 + f.bytes.len() + 32_768, 21);
+    img.put(8192, &f.bytes);
+    assert_eq!(
+        scan_found(&img),
+        vec![(8192, FileKind::Rw2, Health::Partial)]
+    );
+
+    let foreign = testkit::jpeg(32, 32, 5, 0);
+    let at = 8192 + (f.raw.start + 8192).next_multiple_of(512);
+    img.put(at, &foreign);
+    assert_eq!(
+        scan_found(&img),
+        vec![
+            (8192, FileKind::Rw2, Health::Partial),
+            (at as u64, FileKind::Jpeg, Health::Intact)
+        ]
+    );
+}
+
+/// Overwrites the value of tag `tag` of the little-endian IFD at `ifd` with `value` (its type kept).
+fn patch_le_entry(bytes: &mut [u8], ifd: usize, tag: u16, value: u32) {
+    let n = u16::from_le_bytes([bytes[ifd], bytes[ifd + 1]]) as usize;
+    let e = (0..n)
+        .map(|i| ifd + 2 + 12 * i)
+        .find(|&e| u16::from_le_bytes([bytes[e], bytes[e + 1]]) == tag)
+        .expect("tag present");
+    bytes[e + 8..e + 12].copy_from_slice(&value.to_le_bytes());
+}
+
+/// A `Damaged` RAW hides nothing (ruling D12): its sector-aligned preview is still a finding.
+#[test]
+fn damaged_raw_keeps_its_preview_as_a_finding() {
+    let raw = testkit::tiff_raw(&TiffRawOptions {
+        variant: TiffVariant::Arw,
+        big_endian: false,
+        raw_len: 120_000,
+        seed: 7,
+        preview: Some((160, 120)),
+        preview_sector_aligned: true,
+        exif: TestExif::default(),
+    });
+    let mut bytes = raw.bytes.clone();
+    // The SubIFD pointer now points past the 1 GiB TIFF cap (`1 << 30`): a structural error.
+    patch_le_entry(&mut bytes, 8, 0x014A, (1 << 30) + 0x1000);
+    let p = raw.preview.clone().unwrap();
+    assert_eq!(p.start % 512, 0);
+    let mut img = DiskImage::noise(8192 + bytes.len() + 8192, 21);
+    img.put(8192, &bytes);
+    let found = scan_found(&img);
+    assert_eq!(
+        found[0],
+        (8192, FileKind::Arw, Health::Damaged),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&((8192 + p.start) as u64, FileKind::Jpeg, Health::Intact)),
+        "{found:?}"
+    );
+}
+
+/// A CR3 whose `PRVW` is broken is `Partial`; its full-size JPEG, at a sector start in `mdat`, is its own (ruling D12).
+#[test]
+fn partial_cr3_hides_its_own_jpegs() {
+    let mut v = testkit::cr3(7, &TestExif::default());
+    let find = |needle: &[u8]| v.windows(needle.len()).position(|w| w == needle).unwrap();
+    let prvw = find(b"PRVW");
+    let full = find(b"mdat") + 4;
+    assert_eq!(full % 512, 0);
+    assert_eq!(&v[full..full + 3], &[0xFF, 0xD8, 0xFF]);
+    let size = u32::from_be_bytes(v[prvw + 16..prvw + 20].try_into().unwrap()) as usize;
+    let mid = prvw + 20 + size / 2;
+    v[mid..mid + 64].copy_from_slice(&[0xFF, 0xC4].repeat(32));
+    let mut img = DiskImage::noise(8192 + v.len() + 8192, 21);
+    img.put(8192, &v);
+    assert_eq!(
+        scan_found(&img),
+        vec![(8192, FileKind::Cr3, Health::Partial)]
+    );
+}
+
+/// A foreign JPEG written at the start of a `Partial` RAW's own JpgFromRaw that runs past the RAW's end is not inside
+/// the RAW: it is found (ruling D12 needs the file wholly inside its owner).
+#[test]
+fn foreign_jpeg_at_an_own_start_running_past_the_raw_is_found() {
+    let f = unchecked_rw2();
+    let p = f.preview.clone().unwrap();
+    let foreign = testkit::jpeg(1024, 768, 9, 0);
+    let mut img = DiskImage::noise(8192 + p.start + foreign.len() + 65_536, 21);
+    img.put(8192, &f.bytes).put(8192 + p.start, &foreign);
+    let found = scan_found(&img);
+    assert_eq!(
+        found[0],
+        (8192, FileKind::Rw2, Health::Partial),
+        "{found:?}"
+    );
+    assert!(
+        found.contains(&((8192 + p.start) as u64, FileKind::Jpeg, Health::Intact)),
+        "{found:?}"
     );
 }

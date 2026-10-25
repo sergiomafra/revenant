@@ -68,6 +68,28 @@ impl FileKind {
         }
     }
 
+    /// The kind a file name's extension (without the dot) stands for, case-insensitively: jpg jpeg jpe → Jpeg;
+    /// mp4 m4v → Mp4; mov → Mov; cr2; cr3; nef nrw → Nef; arw; dng; orf ori → Orf; rw2; raf; heic heif hif → Heic;
+    /// tif tiff → Tiff; anything else `None`.
+    pub fn from_extension(ext: &str) -> Option<FileKind> {
+        Some(match ext.to_ascii_lowercase().as_str() {
+            "jpg" | "jpeg" | "jpe" => FileKind::Jpeg,
+            "mp4" | "m4v" => FileKind::Mp4,
+            "mov" => FileKind::Mov,
+            "cr2" => FileKind::Cr2,
+            "cr3" => FileKind::Cr3,
+            "nef" | "nrw" => FileKind::Nef,
+            "arw" => FileKind::Arw,
+            "dng" => FileKind::Dng,
+            "orf" | "ori" => FileKind::Orf,
+            "rw2" => FileKind::Rw2,
+            "raf" => FileKind::Raf,
+            "heic" | "heif" | "hif" => FileKind::Heic,
+            "tif" | "tiff" => FileKind::Tiff,
+            _ => return None,
+        })
+    }
+
     /// Conventional file extension, without the dot.
     pub fn extension(self) -> &'static str {
         match self {
@@ -134,7 +156,19 @@ pub trait Format: Send + Sync {
     /// Measures the file starting at `start`. `None` means "not a file of this format", never "could not read": an
     /// unreadable sector inside a file lowers its health instead (see [`Health`]).
     fn measure(&self, source: &dyn Source, start: u64) -> Option<Measurement>;
+
+    /// Embedded files the file at `start` holds in its own data (JPEG previews, thumbnails, JPEG-compressed strips or
+    /// tiles, a CR3's PRVW and full-size JPEG), absolute, at most [`MAX_OWN_FILES`]. The scan asks for every measurement
+    /// that is not `Damaged` and uses them once the finding is `Partial` (it may lower an `Intact` measurement; rulings
+    /// D12, R24): a file found there is the file's own, not another photo. The default holds none.
+    fn own_files(&self, source: &dyn Source, start: u64) -> Vec<Fragment> {
+        let _ = (source, start);
+        Vec::new()
+    }
 }
+
+/// Most embedded files [`Format::own_files`] returns.
+pub const MAX_OWN_FILES: usize = 64;
 
 /// Every supported format.
 pub fn all_formats() -> Vec<Box<dyn Format>> {
@@ -385,6 +419,50 @@ pub(crate) mod tests {
     use super::*;
     use crate::error::EngineError;
     use crate::source::VolumeId;
+
+    #[test]
+    fn kinds_from_extensions() {
+        use FileKind::*;
+        let table = [
+            ("jpg", Jpeg),
+            ("JPEG", Jpeg),
+            ("Jpe", Jpeg),
+            ("mp4", Mp4),
+            ("M4V", Mp4),
+            ("mov", Mov),
+            ("CR2", Cr2),
+            ("cr3", Cr3),
+            ("nef", Nef),
+            ("NRW", Nef),
+            ("arw", Arw),
+            ("dng", Dng),
+            ("orf", Orf),
+            ("ORI", Orf),
+            ("rw2", Rw2),
+            ("raf", Raf),
+            ("heic", Heic),
+            ("HEIF", Heic),
+            ("hif", Heic),
+            ("tif", Tiff),
+            ("TIFF", Tiff),
+        ];
+        for (ext, kind) in table {
+            assert_eq!(FileKind::from_extension(ext), Some(kind), "{ext}");
+        }
+        for ext in [
+            "",
+            "txt",
+            "thm",
+            "xml",
+            "lrv",
+            "jpgx",
+            "jp",
+            "j.pg",
+            "ｊｐｇ",
+        ] {
+            assert_eq!(FileKind::from_extension(ext), None, "{ext}");
+        }
+    }
 
     pub(crate) struct Mem(pub Vec<u8>);
 

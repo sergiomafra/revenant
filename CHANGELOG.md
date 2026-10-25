@@ -7,6 +7,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Recovered files can be grouped by shooting session (a pause of more than 2 hours starts a new one), by day, by
+  camera and by folder, for the results screen; "by folder" is offered only when the folder structure survived.
+  `revenant-dev scan --group` prints the groups.
+- Recovered files keep their original name, or get a readable one from the date and camera
+  (`2025-12-14_07-12-05_ILCE-7M4.JPG`); names are made safe, so extraction never leaves the destination folder, and a
+  name already taken gets `_2`, `_3`… (also on case-insensitive disks). `revenant-dev --previews` names a preview after its file.
+- After a quick format, photos and videos get their old names and folders back when the old folders survive: each one
+  found by its signature that an old folder lists comes out again (`updated`) with its name, the folder path (`?` for a
+  folder whose own name was in the lost root, as in `?/100MSDCF/DSC01234.JPG`) and its dates; a file whose recorded
+  size does not match what was found is at most partial.
+- `revenant-dev` prints the volumes (`volume` lines) and, for each file the file system lists, its name, folder, state
+  and dates; `bench` gains an `exfat-card` image.
 - JPEG photo detection: exact length from the marker structure (an embedded EXIF thumbnail does not end the file), health
   from a real decode.
 - MP4/MOV video detection: exact length from the box structure, health from the `moov` chunk and sample tables; a video
@@ -54,9 +66,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (at most 4096 candidates, 1 GiB of indexes loaded, 256 pairs checked) and stops when the scan is cancelled.
 - Real camera samples: an opt-in test (and CI job) runs the engine over real CR2, CR3, NEF, ARW, RAF, DNG, ORF and RW2
   files (CC0, from raw.pixls.us), downloaded on demand by `scripts/fetch-samples.sh` and checked by SHA-256.
+- FAT and exFAT volumes are found on MBR (including logical partitions and disks with 4096-byte sectors), GPT and
+  unpartitioned media, also with a damaged boot sector (the backup boot sector is used) or a lost partition table (the
+  usual partition starts are probed).
+- The live files of FAT12/16/32 and exFAT volumes are listed with their original folders and names (long names
+  included), their creation and modification times (on exFAT with the time zone the camera recorded) and where their
+  pieces are on the disk, even when a file is fragmented or a FAT sector is unreadable (the FAT's second copy is used).
+  A damaged or forged volume (directory loops, chains that loop or cross each other, broken exFAT entries) is read in
+  bounded time, and the files it touches are marked as not trusted.
+- Deleted photos and videos on FAT12/16/32 and exFAT volumes are listed with their folders and names, including the
+  contents of deleted folders: on FAT the lost first letter comes back from the long name, or from similar names
+  nearby, and where the file probably lies is guessed from the clusters that are free today (never from clusters
+  another file now uses); on FAT32 cards where Windows deleted the file, its real starting point is found by checking
+  the few places it can be. exFAT keeps a deleted file's full name, and its recorded clusters are used when the file
+  was written in one piece. Deleted files are never trusted more than the evidence allows: a guess that had to step
+  over other files, or an exFAT file whose clusters were partly reused, is marked as not trusted.
+- The scan reads the card's FAT/exFAT file system first: photos and videos it lists, deleted ones included, come out
+  with their name, folder and dates, and a file found both by the file system and by its signature is listed once. A
+  live file is measured along its own clusters, so photos and videos written in pieces (around other files, or with
+  their second piece earlier on the card) come back whole and intact. The file system only tells where a file is,
+  never that it is intact: a file whose recorded size does not match what it holds (other than padding or attached
+  files such as a motion photo's video), whose placement is only a guess, or (for a file the file system does not list
+  as live) that overlaps a live file, is at most partial; so is a file with an unreadable sector in a piece that lies
+  earlier on the card than its start, even when the check of its contents never reads that sector. A photo written over part of a deleted RAW is found. Each
+  volume found is reported at the start of the scan, with a flag when the listing hit one of its limits (some files may
+  then lack their names); the file-system step can be turned off.
 
 ### Changed
 
+- A partial RAW (TIFF-based RAW, RAF, CR3) no longer lists its own preview (or full-size JPEG) as a separate photo; a
+  damaged RAW still does, and a photo written elsewhere inside a RAW is still found.
+- Videos on a FAT/exFAT card are put back together on cluster boundaries, so more come out intact; a video the file
+  system lists as a live file is no longer split, and a deleted one keeps its name when put back together.
 - A JPEG cut before its first row of pixels (for example right after its header, when another file was written over the
   rest or the rest of the card was erased) is damaged, not partial: nothing of the photo would show; so is one whose data
   breaks within its first row before an end-of-image marker. A JPEG cut or broken later is partial: the rows before the

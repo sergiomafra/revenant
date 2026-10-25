@@ -185,6 +185,7 @@ fn split_video_is_reassembled_intact() {
                 len: (v.bytes.len() - l1) as u64,
             },
         ],
+        origin: None,
     };
     assert_eq!(last, &Event::Updated(expected.clone()));
     assert_eq!(extracted(&src, &expected), v.bytes);
@@ -819,4 +820,128 @@ fn hostile_moov_candidates_are_bounded() {
         "inner bytes read: {read}"
     );
     assert!(elapsed.as_secs() < 10, "{elapsed:?}");
+}
+
+/// Where the test volumes start (MBR entry at LBA 8192).
+const VOL: usize = 8192 * 512;
+
+/// Fills `[from, to)` of `img` with seeded noise.
+fn noise_over(img: &mut [u8], from: usize, to: usize, seed: u64) {
+    let mut x = seed | 1;
+    for b in &mut img[from..to] {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *b = x as u8;
+    }
+}
+
+/// The `ambiguous_break_point_is_partial` video, split on a cluster boundary of a 32 KiB-cluster exFAT volume (both
+/// pieces at cluster starts, `l1` a multiple of 32 KiB), the free clusters around them noise, and no entry for the
+/// video, paired: the updated finding, the first piece's start and the second's.
+fn pair_on_grid(second_shift: usize) -> (Finding, u64, u64, Vec<u8>, Src, tempfile::NamedTempFile) {
+    use revenant_testkit::fs::{FsBuilder, FsType, Partitioning, disk};
+    const CLUSTER: usize = 32 * 1024;
+    let v = video(1, false, 0);
+    let p = &v.mdat_payload;
+    let l1 = (p.start + p.len() * 2 / 5).div_ceil(CLUSTER) * CLUSTER;
+    let b = FsBuilder::new(FsType::Exfat, 64 * MIB as u64, CLUSTER as u32);
+    let vol = b.build();
+    let mut img = disk(
+        Partitioning::Mbr { first_lba: 8192 },
+        &vol,
+        VOL + vol.len() + MIB,
+    );
+    let at = |c: u32| VOL + b.cluster_offset(c) as usize;
+    noise_over(&mut img, at(100), VOL + vol.len(), 7);
+    let (first, second) = (at(200), at(1200) + second_shift);
+    img[first..first + l1].copy_from_slice(&v.bytes[..l1]);
+    img[second..second + v.bytes.len() - l1].copy_from_slice(&v.bytes[l1..]);
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut file, &img).unwrap();
+    let src = Src::new(&file);
+    let (_, events) = run(&src);
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Volume { .. })),
+        "{events:?}"
+    );
+    let u = updated(&events);
+    assert_eq!(u.len(), 1, "{:?}", found(&events));
+    assert_eq!(u[0].fragments[0].start, first as u64);
+    // The second piece starts where the moov's place says, for the break point chosen.
+    assert_eq!(
+        u[0].fragments[1].start + l1 as u64,
+        second as u64 + u[0].fragments[0].len
+    );
+    assert!(u[0].origin.is_none());
+    (u[0].clone(), first as u64, l1 as u64, v.bytes, src, file)
+}
+
+/// The grid leaves one break point (ruling D13): `Intact`, where the search over 512-byte steps alone is ambiguous
+/// (`ambiguous_break_point_is_partial`). A second piece off the grid falls back to that search: `Partial` again.
+#[test]
+fn cluster_grid_makes_the_break_point_unique() {
+    let (u, _, l1, bytes, src, _file) = pair_on_grid(0);
+    assert_eq!((u.health, u.fragments[0].len), (Health::Intact, l1));
+    assert_eq!(extracted(&src, &u), bytes);
+    let (u, _, l1, ..) = pair_on_grid(512);
+    assert_eq!(u.health, Health::Partial);
+    assert!(u.fragments[0].len <= l1, "{u:?}");
+}
+
+/// A live file's chain is where its bytes are: a live MP4 whose chain lacks the `moov` is not paired with an orphan
+/// `moov` elsewhere. The same video deleted is, and keeps its origin with placement `Carved`.
+#[test]
+fn live_fs_videos_are_not_paired() {
+    use revenant_core::{FsState, Placement};
+    use revenant_testkit::fs::{DeleteStyle, FsBuilder, FsType, Partitioning, disk};
+    let v = video(1, true, 0);
+    let l1 = cut(&v, 2);
+    let run_card = |deleted: bool| {
+        let mut b = FsBuilder::new(FsType::Fat32, 48 * MIB as u64, 512);
+        let path = "DCIM/100MSDCF/C0001.MP4";
+        let n = v.bytes.len().div_ceil(512) as u32;
+        let clusters: Vec<u32> = (20_000..20_000 + n).collect();
+        if deleted {
+            b.add_at(path, &v.bytes, &clusters);
+            b.delete(path, DeleteStyle::Camera);
+        } else {
+            b.add_at(path, &v.bytes[..l1], &clusters[..l1 / 512]);
+        }
+        let vol = b.build();
+        let mut img = disk(
+            Partitioning::Mbr { first_lba: 8192 },
+            &vol,
+            vol.len() + 8 * MIB,
+        );
+        let at = |c: u32| VOL + b.cluster_offset(c) as usize;
+        let first = at(20_000);
+        img[first..first + v.bytes.len()].copy_from_slice(&v.bytes);
+        // The rest of the video lies 8 MiB further, over free clusters; noise where it was.
+        noise_over(&mut img, first + l1, first + v.bytes.len(), 9);
+        let second = at(20_000 + 16_384);
+        img[second..second + v.bytes.len() - l1].copy_from_slice(&v.bytes[l1..]);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, &img).unwrap();
+        let src = Src::new(&file);
+        let (_, events) = run(&src);
+        let video = found(&events)
+            .into_iter()
+            .find(|f| f.start == first as u64)
+            .expect("the video");
+        assert_eq!(video.health, Health::Damaged, "{video:?}");
+        let state = video.origin.as_ref().expect("listed").state;
+        assert_eq!(state == FsState::Deleted, deleted);
+        (updated(&events), second as u64)
+    };
+    assert_eq!(run_card(false).0, vec![]);
+    let (u, second) = run_card(true);
+    assert_eq!(u.len(), 1, "{u:?}");
+    assert_eq!(u[0].fragments[1].start, second);
+    let origin = u[0].origin.as_ref().expect("origin kept");
+    // A deleted short name with no long name and no sibling loses its first letter (ruling D9).
+    assert_eq!(
+        (origin.name(), origin.state, origin.placement),
+        ("_0001.MP4", FsState::Deleted, Placement::Carved)
+    );
 }

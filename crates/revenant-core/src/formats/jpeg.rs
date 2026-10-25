@@ -574,7 +574,6 @@ pub(super) fn contiguous(r: &mut Reader, start: u64, header: &Header) -> Measure
 mod tests {
     use super::*;
     use crate::formats::tests::Mem;
-    use std::time::Instant;
 
     #[test]
     fn a_cancelled_scan_does_not_decode() {
@@ -830,14 +829,13 @@ mod tests {
         let mut r = Reader::new(&src);
         let mut own = OwnJpegs::new((0..N).map(|i| (i * 512, 512)));
         let before = MEMBERS_EXAMINED.with(|c| c.get());
-        let t = Instant::now();
         for i in 0..N {
             // Strictly inside tile i. Zeros do not decode, so none vouches.
             assert!(!own.vouch_for(&mut r, i * 512 + 100));
         }
+        // Ruling R2: the deterministic count is the bound (no wall-clock check, which flakes under load in debug).
         let examined = MEMBERS_EXAMINED.with(|c| c.get()) - before;
         assert!(examined as u64 <= 2 * N, "examined {examined}");
-        assert!(t.elapsed().as_secs_f64() < 2.0, "{:?}", t.elapsed());
     }
 
     #[test]

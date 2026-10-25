@@ -1,18 +1,21 @@
 //! `revenant-dev`: developer command line for the Revenant engine. Not the end-user app.
 
-use std::fs::OpenOptions;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod bench;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use revenant_core::extract::create_named;
 use revenant_core::formats::all_formats;
+use revenant_core::group::{self, Camera, Group, GroupInput, GroupLabel};
+use revenant_core::naming::file_name;
 use revenant_core::source::{FileSource, Source, VolumeId, volume_of};
 use revenant_core::{
-    CancelToken, EngineError, Event, Finding, Fragment, Inspection, Preview, ScanOptions, extract,
-    inspect, scan,
+    CancelToken, EngineError, Event, Finding, Fragment, Inspection, Metadata, Preview, ScanOptions,
+    Volume, extract_as, inspect, scan,
 };
 use revenant_testkit::BenchImage;
 use serde::Serialize;
@@ -46,6 +49,10 @@ enum Command {
         /// Threads measuring candidate files (0 = one per core, at most 16). The output is the same for any value.
         #[arg(long, value_name = "N", default_value_t = 0)]
         threads: usize,
+        /// After the last found/updated line, print the results grouped by session, day, camera or folder (one
+        /// `group` line per group, before the summary).
+        #[arg(long, value_enum, value_name = "BY")]
+        group: Option<GroupBy>,
     },
     /// Measure scan throughput on synthetic images written to a temp dir (page-cache speed, not a card reader's).
     Bench {
@@ -55,12 +62,12 @@ enum Command {
         /// Scans per image; the best run is reported.
         #[arg(long, value_name = "N", default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
         runs: u32,
-        /// Images to measure: noise, dense-jpeg, dense-raw, video, cut-jpeg.
+        /// Images to measure: noise, dense-jpeg, dense-raw, video, cut-jpeg, exfat-card.
         #[arg(
             long,
             value_delimiter = ',',
             value_parser = parse_bench_image,
-            default_values = ["noise", "dense-jpeg", "dense-raw", "video", "cut-jpeg"]
+            default_values = ["noise", "dense-jpeg", "dense-raw", "video", "cut-jpeg", "exfat-card"]
         )]
         images: Vec<BenchImage>,
         /// Folder for the temporary images (default: the system temp dir).
@@ -72,6 +79,14 @@ enum Command {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum GroupBy {
+    Session,
+    Day,
+    Camera,
+    Folder,
+}
+
 fn parse_bench_image(s: &str) -> Result<BenchImage, String> {
     BenchImage::parse(s).ok_or_else(|| format!("unknown image '{s}'"))
 }
@@ -79,6 +94,8 @@ fn parse_bench_image(s: &str) -> Result<BenchImage, String> {
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "lowercase")]
 enum Line {
+    /// A FAT/exFAT volume of the source, before every other line.
+    Volume(Box<VolumeLine>),
     Found(Box<FoundLine>),
     Unreadable {
         start: u64,
@@ -86,11 +103,165 @@ enum Line {
     },
     /// A better version of an earlier `found` line with the same `id` (same fields).
     Updated(Box<FoundLine>),
+    /// One group of the results (`scan --group`), or `available: false` for a grouping the scan cannot offer.
+    Group {
+        by: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        label: Option<LabelLine>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ids: Option<Vec<u64>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        available: Option<bool>,
+    },
     Summary {
         found: u64,
         unreadable_bytes: u64,
         updated: u64,
+        listing_truncated: bool,
     },
+}
+
+#[derive(Serialize)]
+struct CameraLine {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    make: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serial: Option<String>,
+}
+
+impl From<Camera> for CameraLine {
+    fn from(c: Camera) -> Self {
+        CameraLine {
+            make: c.make,
+            model: c.model,
+            serial: c.serial,
+        }
+    }
+}
+
+/// A group's label: `kind` is the variant name in snake_case, the other keys are its fields (`camera` is omitted when
+/// the group's camera is unknown).
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum LabelLine {
+    Session {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        camera: Option<CameraLine>,
+        first: String,
+        last: String,
+    },
+    UndatedSession {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        camera: Option<CameraLine>,
+    },
+    Day {
+        day: String,
+    },
+    Undated,
+    Camera {
+        camera: CameraLine,
+    },
+    UnknownCamera,
+    Folder {
+        folder: String,
+    },
+    NoFolder,
+}
+
+impl From<GroupLabel> for LabelLine {
+    fn from(l: GroupLabel) -> Self {
+        match l {
+            GroupLabel::Session {
+                camera,
+                first,
+                last,
+            } => LabelLine::Session {
+                camera: camera.map(Into::into),
+                first,
+                last,
+            },
+            GroupLabel::UndatedSession { camera } => LabelLine::UndatedSession {
+                camera: camera.map(Into::into),
+            },
+            GroupLabel::Day(day) => LabelLine::Day { day },
+            GroupLabel::Undated => LabelLine::Undated,
+            GroupLabel::Camera(camera) => LabelLine::Camera {
+                camera: camera.into(),
+            },
+            GroupLabel::UnknownCamera => LabelLine::UnknownCamera,
+            GroupLabel::Folder(folder) => LabelLine::Folder { folder },
+            GroupLabel::NoFolder => LabelLine::NoFolder,
+        }
+    }
+}
+
+/// The `group` lines of the results: each id with its latest finding and metadata.
+fn group_lines(by: GroupBy, latest: &BTreeMap<u64, (Finding, Metadata)>) -> Vec<Line> {
+    let items: Vec<GroupInput> = latest
+        .values()
+        .map(|(f, m)| GroupInput::new(f, Some(m)))
+        .collect();
+    let (name, groups): (&'static str, Option<Vec<Group>>) = match by {
+        GroupBy::Session => ("session", Some(group::by_session(&items))),
+        GroupBy::Day => ("day", Some(group::by_day(&items))),
+        GroupBy::Camera => ("camera", Some(group::by_camera(&items))),
+        GroupBy::Folder => ("folder", group::by_folder(&items)),
+    };
+    match groups {
+        Some(groups) => groups
+            .into_iter()
+            .map(|g| Line::Group {
+                by: name,
+                label: Some(g.label.into()),
+                ids: Some(g.ids),
+                available: None,
+            })
+            .collect(),
+        None => vec![Line::Group {
+            by: name,
+            label: None,
+            ids: None,
+            available: Some(false),
+        }],
+    }
+}
+
+#[derive(Serialize)]
+struct VolumeLine {
+    index: u32,
+    fs: &'static str,
+    scheme: &'static str,
+    offset: u64,
+    len: u64,
+    sector_size: u32,
+    cluster_size: u64,
+    heap_offset: u64,
+    cluster_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    serial: u32,
+    from_backup: bool,
+    listing_truncated: bool,
+}
+
+fn volume_line(v: &Volume, listing_truncated: bool) -> Line {
+    Line::Volume(Box::new(VolumeLine {
+        index: v.index,
+        fs: v.fs.as_str(),
+        scheme: v.scheme.as_str(),
+        offset: v.offset,
+        len: v.len,
+        sector_size: v.sector_size,
+        cluster_size: v.cluster_size,
+        heap_offset: v.heap_offset,
+        cluster_count: v.cluster_count,
+        label: v.label.clone(),
+        serial: v.serial,
+        from_backup: v.from_backup,
+        listing_truncated,
+    }))
 }
 
 #[derive(Serialize)]
@@ -141,6 +312,22 @@ struct FoundLine {
     health: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     fragments: Option<Vec<FragmentLine>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placement: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fs_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     make: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,6 +395,20 @@ fn finding_fields(f: &Finding, details: Inspection, out: Outputs) -> Box<FoundLi
             revenant_core::formats::Health::Damaged => "damaged",
         },
         fragments: fragment_lines(&f.fragments),
+        name: f.origin.as_ref().map(|o| o.name().to_string()),
+        path: f.origin.as_ref().map(|o| o.path()),
+        state: f.origin.as_ref().map(|o| o.state.as_str()),
+        placement: f.origin.as_ref().map(|o| o.placement.as_str()),
+        volume: f.origin.as_ref().map(|o| o.volume),
+        fs_size: f.origin.as_ref().map(|o| o.size),
+        created: f
+            .origin
+            .as_ref()
+            .and_then(|o| o.created.as_ref().map(ToString::to_string)),
+        modified: f
+            .origin
+            .as_ref()
+            .and_then(|o| o.modified.as_ref().map(ToString::to_string)),
         make: m.make,
         model: m.model,
         lens: m.lens,
@@ -230,17 +431,15 @@ fn finding_fields(f: &Finding, details: Inspection, out: Outputs) -> Box<FoundLi
     })
 }
 
-/// How many `_N` suffixes are tried for a preview's file name (as `extract` does).
-const MAX_NAME_ATTEMPTS: u32 = 10_000;
-
-/// Writes the preview's bytes (all its pieces, in order) to `<dir>/revenant_<finding start as 12 hex digits>.preview.jpg` (`_2`, `_3`… if it
-/// exists; never overwrites), the same naming as `extract` with a `.preview.jpg` suffix. A read or write error removes
-/// the incomplete file.
+/// Writes the preview's bytes (all its pieces, in order) to `<dir>/<stem of the file's name>.preview.jpg` (`_2`, `_3`…
+/// if it exists; never overwrites), so a file and its preview sit side by side. A read or write error removes the
+/// incomplete file.
 fn write_preview(
     source: &dyn Source,
     f: &Finding,
     p: &Preview,
     dir: &Path,
+    file_name: &str,
 ) -> Result<PathBuf, EngineError> {
     // The engine bounds a preview's length (JPEG_MAX_LEN), so it fits in memory; its pieces are written in order.
     let mut data = Vec::with_capacity(p.len as usize);
@@ -255,31 +454,15 @@ fn write_preview(
         }
         data.extend_from_slice(&piece);
     }
-    for n in 1..=MAX_NAME_ATTEMPTS {
-        let name = if n == 1 {
-            format!("revenant_{:012x}.preview.jpg", f.start)
-        } else {
-            format!("revenant_{:012x}_{n}.preview.jpg", f.start)
-        };
-        let path = dir.join(name);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                return match file.write_all(&data).and_then(|()| file.flush()) {
-                    Ok(()) => Ok(path),
-                    Err(cause) => {
-                        drop(file);
-                        let _ = std::fs::remove_file(&path);
-                        Err(EngineError::Write { cause })
-                    }
-                };
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(cause) => return Err(EngineError::Write { cause }),
+    let (path, mut file) = create_named(dir, f, file_name, Some(".preview.jpg"))?;
+    match file.write_all(&data).and_then(|()| file.flush()) {
+        Ok(()) => Ok(path),
+        Err(cause) => {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            Err(EngineError::Write { cause })
         }
     }
-    Err(EngineError::Write {
-        cause: std::io::Error::other("no free file name"),
-    })
 }
 
 /// The extraction folder must exist and be a directory; checked once, before scanning.
@@ -302,16 +485,17 @@ fn finding_line(
     previews: Option<&Path>,
 ) -> Result<(Inspection, Outputs), EngineError> {
     let mut out = Outputs::default();
+    let details = inspect(source, f);
+    let name = file_name(f, Some(&details.metadata));
     if let Some(dest) = dest {
-        match extract(source, f, dest) {
+        match extract_as(source, f, dest, &name) {
             Ok(p) => out.file = Some(p.display().to_string()),
             Err(EngineError::DestinationOnSource) => return Err(EngineError::DestinationOnSource),
             Err(e) => out.error = Some(e.code()),
         }
     }
-    let details = inspect(source, f);
     if let (Some(dir), Some(p)) = (previews, &details.preview) {
-        match write_preview(source, f, p, dir) {
+        match write_preview(source, f, p, dir, &name) {
             Ok(path) => out.preview_file = Some(path.display().to_string()),
             Err(e) => out.preview_error = Some(e.code()),
         }
@@ -325,6 +509,7 @@ fn run_scan(
     previews: Option<&Path>,
     allow_same_volume: bool,
     threads: usize,
+    group: Option<GroupBy>,
 ) -> Result<(), EngineError> {
     let file = FileSource::open(image)?;
     let wrapped = UnknownVolume(&file);
@@ -343,6 +528,8 @@ fn run_scan(
     let cancel = CancelToken::default();
     let mut fatal: Option<EngineError> = None;
     let mut last_pct = u64::MAX;
+    // With `--group`: each id's latest finding and metadata (an `updated` replaces its `found`).
+    let mut latest: BTreeMap<u64, (Finding, Metadata)> = BTreeMap::new();
     let result = scan(
         source,
         &all_formats(),
@@ -354,6 +541,9 @@ fn run_scan(
         &mut |event| match event {
             Event::Found(f) => match finding_line(source, &f, dest, previews) {
                 Ok((details, out)) => {
+                    if group.is_some() {
+                        latest.insert(f.id, (f.clone(), details.metadata.clone()));
+                    }
                     if !emit(&found_line(&f, details, out)) {
                         cancel.cancel();
                     }
@@ -366,6 +556,9 @@ fn run_scan(
             // An updated finding is written again (`extract` and the previews pick a new `_N` name).
             Event::Updated(f) => match finding_line(source, &f, dest, previews) {
                 Ok((details, out)) => {
+                    if group.is_some() {
+                        latest.insert(f.id, (f.clone(), details.metadata.clone()));
+                    }
                     if !emit(&Line::Updated(finding_fields(&f, details, out))) {
                         cancel.cancel();
                     }
@@ -377,6 +570,14 @@ fn run_scan(
             },
             Event::Unreadable { start, len } => {
                 if !emit(&Line::Unreadable { start, len }) {
+                    cancel.cancel();
+                }
+            }
+            Event::Volume {
+                volume,
+                listing_truncated,
+            } => {
+                if !emit(&volume_line(&volume, listing_truncated)) {
                     cancel.cancel();
                 }
             }
@@ -393,10 +594,18 @@ fn run_scan(
         return Err(e);
     }
     let summary = result?;
+    if let Some(by) = group {
+        for line in group_lines(by, &latest) {
+            if !emit(&line) {
+                return Ok(());
+            }
+        }
+    }
     emit(&Line::Summary {
         found: summary.found,
         unreadable_bytes: summary.unreadable_bytes,
         updated: summary.updated,
+        listing_truncated: summary.listing_truncated,
     });
     Ok(())
 }
@@ -417,12 +626,14 @@ fn main() -> ExitCode {
             previews,
             allow_same_volume,
             threads,
+            group,
         } => run_scan(
             &image,
             extract.as_deref(),
             previews.as_deref(),
             allow_same_volume,
             threads,
+            group,
         ),
     };
     match result {
@@ -453,6 +664,7 @@ mod tests {
             kind: FileKind::Jpeg,
             health: Health::Intact,
             fragments: Vec::new(),
+            origin: None,
         };
         let v = json(&contiguous);
         assert_eq!(v["event"], "found");
@@ -514,6 +726,7 @@ mod tests {
             kind: FileKind::Jpeg,
             health: Health::Intact,
             fragments: Vec::new(),
+            origin: None,
         };
         let p = Preview {
             start: 4096,
@@ -532,7 +745,7 @@ mod tests {
             ],
         };
         let out = tempfile::tempdir().unwrap();
-        let path = write_preview(&source, &f, &p, out.path()).unwrap();
+        let path = write_preview(&source, &f, &p, out.path(), "revenant_000000001000.jpg").unwrap();
         let mut expected = bytes[4096..5096].to_vec();
         expected.extend_from_slice(&bytes[512..1012]);
         assert_eq!(std::fs::read(path).unwrap(), expected);

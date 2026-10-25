@@ -13,15 +13,17 @@ cargo build --release -p revenant-dev
 ## Usage
 
 ```sh
-revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-volume] [--threads N]
+revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-volume] [--threads N] [--group session|day|camera|folder]
 ```
 
 - `<IMAGE>`: a disk image file (scanning devices directly comes in a later part).
-- `--extract <DIR>`: copies each finding into `<DIR>` as soon as it is found. `<DIR>` must already exist and be a folder;
+- `--extract <DIR>`: copies each finding into `<DIR>` as soon as it is found, under its original name when the file
+  system listed one, else `YYYY-MM-DD_HH-MM-SS[_<camera>].<EXT>` from its details, else `revenant_<start as 12 hex digits>.<ext>`
+  (`_2`, `_3`… if the name exists; see "Names" in the core README). `<DIR>` must already exist and be a folder;
   otherwise the command stops before scanning with `error: open_failed` (exit 1). The engine refuses to extract onto the
   source's own volume (error `destination_on_source`, exit 1), so use a folder on another disk.
 - `--previews <DIR>`: writes each finding's embedded preview JPEG (the one in the `preview` field) into `<DIR>` as
-  `revenant_<start as 12 hex digits>.preview.jpg` (`_2`, `_3`… if the name exists; never overwrites), the same naming as
+  `<stem of the file's name>.preview.jpg` (`DSC01235.ARW` gives `DSC01235.preview.jpg`; `_2`, `_3`… if the name exists; never overwrites), the same naming as
   `--extract`, so a file and its preview sit side by side. Same folder rules as `--extract`: `<DIR>` must exist
   (`open_failed` otherwise) and must not be on the source's volume (`destination_on_source`, exit 1, checked before
   scanning).
@@ -30,6 +32,14 @@ revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-vol
   same temporary directory.
 - `--threads N`: threads that measure candidate files (default 0 = one per core, at most 16; 1 = measure on the scan
   thread; capped at 64). The output is identical for any value.
+- `--group session|day|camera|folder`: after the last `found`/`updated` line and before `summary`, prints one line per
+  group of the results (see "Grouping" in the core README), using each file's latest finding and details:
+  `{"event":"group","by":"session","label":{"kind":"session","camera":{"make":"Sony","model":"ILCE-7M4","serial":"111"},"first":"2025-12-14T08:00:00","last":"2025-12-14T08:30:00"},"ids":[1,2]}`.
+  `label.kind` is the variant name in snake_case (`session`, `undated_session`, `day`, `undated`, `camera`,
+  `unknown_camera`, `folder`, `no_folder`) with its fields: `session` has `camera`, `first`, `last`; `undated_session`
+  has `camera`; `day` has `day` (`YYYY-MM-DD`); `camera` has `camera`; `folder` has `folder`. A `camera` object has `make`,
+  `model`, `serial` (each left out when unknown), and the `camera` key itself is left out when the camera is unknown. `--group folder` on a
+  scan where no file has a folder prints one line, `{"event":"group","by":"folder","available":false}`.
 
 ### Output
 
@@ -39,9 +49,32 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
 {"event":"found","id":1,"start":0,"len":12345,"kind":"jpeg","health":"intact","width":64,"height":48,"preview":{"start":0,"len":12345,"width":64,"height":48}}
 {"event":"unreadable","start":1044480,"len":4096}
 {"event":"found","id":2,"start":1049088,"len":13507425,"kind":"nef","health":"intact","make":"NIKON CORPORATION","model":"NIKON Z 6","lens":"NIKKOR Z 24-70mm f/4 S","iso":100,"captured_at":"2019-11-29T17:15:20","width":4548,"height":3030,"preview":{"start":3215360,"len":432488,"width":3024,"height":2016}}
-{"event":"summary","found":2,"unreadable_bytes":4096,"updated":0}
+{"event":"summary","found":2,"unreadable_bytes":4096,"updated":0,"listing_truncated":false}
 ```
 
+- When the image holds FAT12/16/32 or exFAT volumes, a `volume` line per volume comes first (before any other line), in
+  offset order; images with no volume print none:
+
+  ```json
+  {"event":"volume","index":0,"fs":"fat32","scheme":"mbr","offset":4194304,"len":50331648,"sector_size":512,"cluster_size":512,"heap_offset":4290048,"cluster_count":98000,"label":"REVENANT","serial":305419896,"from_backup":false,"listing_truncated":false}
+  ```
+
+  `fs`: `fat12`, `fat16`, `fat32` or `exfat`; `scheme`: `none`, `mbr` or `gpt`; `offset`, `len` and `heap_offset` are
+  absolute bytes in the image; `label` is omitted when the volume has none; `from_backup` is true when the backup boot
+  sector had to be used. `listing_truncated` is true when a limit of the file-system listing dropped or degraded some
+  files (some may lack their name, folder or dates); it is the same on every `volume` line and in the summary.
+- A `found` (or `updated`) line for a file the file system lists also carries where it came from: `name`, `path`
+  (`folder/name`, root-relative, `/`-separated; the name alone when the folder is unknown), `state` (`live`, `deleted` or
+  `orphaned`), `placement` (`chain`, `recorded`, `guessed` or `carved`: how its clusters were found), `volume` (the
+  `index` of its `volume` line), `fs_size` (the size the directory entry records) and, when the entry has them,
+  `created` and `modified` (`YYYY-MM-DDTHH:MM:SS` as recorded, with `+HH:MM`/`-HH:MM` when the volume stores the UTC
+  offset):
+
+  ```json
+  {"event":"found","id":1,"start":4296192,"len":2612,"kind":"jpeg","health":"intact","name":"DSC01234.JPG","path":"DCIM/100MSDCF/DSC01234.JPG","state":"live","placement":"chain","volume":0,"fs_size":2612,"modified":"2025-12-14T07:12:06","width":64,"height":48}
+  ```
+
+  Files found by the byte scan alone carry none of these keys, and lines without them are exactly as before.
 - `kind`: `jpeg`, `mp4`, `mov`, `cr2`, `nef`, `arw`, `dng`, `orf`, `rw2`, `raf`, `cr3`, `heic` or `tiff`.
   `health`: `intact`, `partial` or `damaged`.
 - `health` follows the engine: a file containing unreadable sectors is never `intact`. Files inside a `partial` or
@@ -60,9 +93,11 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   {"event":"found","id":2,"start":101888,"len":8250,"kind":"jpeg","health":"intact","width":64,"height":64,"preview":{"start":101888,"len":8250,"width":64,"height":64}}
   ```
 - `updated`: a better version of an earlier `found` line with the same `id`, with the same fields; it replaces that
-  line. These lines come after every `found` line, just before the summary, whose `updated` counts them. Today: a
+  line. These lines come after every `found` line, just before the summary, whose `updated` counts them, one per `id`
+  in `id` order. Today: a file found by its signature on a quick-formatted card that an old folder names (the same line
+  with its `name`, `path` such as `?/100MSDCF/DSC01234.JPG`, `state` `orphaned` and `placement` `carved`), and a
   camera video whose index (`moov`) ended up elsewhere on the card, found `damaged` and then put back together from its
-  two pieces:
+  two pieces (both in one line when both apply):
 
   ```json
   {"event":"found","id":1,"start":1048576,"len":55090,"kind":"mp4","health":"damaged"}
@@ -94,6 +129,11 @@ Images (files go back to back, each at the next 512-byte boundary, the rest is s
 - `dense-jpeg`: 8 distinct camera-like JPEGs cycled (3000x2000 from 512 MiB up, else 320x240).
 - `dense-raw`: 4 TIFF-based RAWs (ARW, NEF, CR2, DNG) with a JPEG preview, cycled.
 - `video`: MP4 files with `moov` at the end (256 MiB `mdat` from 512 MiB up, else 8 MiB).
+- `exfat-card`: an exFAT volume (4 KiB clusters) on an MBR disk (first sector 8192) that fills the image, holding the
+  `dense-jpeg` photos as files in `DCIM/100TEST`, every 4th one deleted; `placed` counts them all and `found` should
+  equal it. It measures the scan with the file-system listing. It is built in memory, so its peak memory is about
+  twice the image size (about 2 GiB at the default `--size-mib`): the builder keeps a copy of every file and `build()`
+  allocates the image.
 - `cut-jpeg`: like `dense-jpeg` but the second half of every file is noise. It has no speed target (each cut JPEG starts
   a gap search that may re-read its 64 MiB window); it is only measured and reported.
 
@@ -140,6 +180,38 @@ Then:
 ```sh
 revenant-dev scan card.img --extract ~/recovered --allow-same-volume   # only if ~/recovered is on the same disk as card.img
 ```
+
+## Checking against real file systems (macOS, opt-in)
+
+The synthetic FAT12/16/32 and exFAT volumes in `revenant-testkit` are checked against the real macOS drivers, so the
+builders cannot drift from what cameras and operating systems write:
+
+```sh
+REVENANT_OS_FS=1 cargo test -p revenant-testkit --test os_builders -- --ignored
+```
+
+For each file system the test builds a volume with a `DCIM/100TEST` folder (a plain name, a long name, a fragmented file,
+a deleted file, a stamped modification time), places it on an MBR disk image in a temp directory, attaches it
+read-only with `hdiutil`, and compares the names, the file bytes and the modification time as the OS reads them. It also
+runs `fsck_msdos -n` / `fsck_exfat -n` on the attached partition. A second test formats an image with the OS itself
+(`hdiutil create`) to check the helper. Without `REVENANT_OS_FS=1`, off macOS, or without `/usr/bin/hdiutil`, the tests
+print `skipped: <reason>` and pass.
+
+It only ever attaches image files it created in a temp directory (`-nobrowse -noverify -noautofsck`, read-only except
+for the helper's own OS-formatted image), detaches only the device `hdiutil attach` printed for them (also on panic),
+and never calls `diskutil`, `sudo` or any real disk, so the "no real disks" rule still holds.
+
+Another opt-in test, in the engine, formats images with the OS (FAT32 and exFAT on MBR, exFAT on GPT, FAT16 without a
+table), writes photos, a RAW, a video and a few bigger files through the mount (deleting some), and scans the result end
+to end:
+
+```sh
+REVENANT_OS_FS=1 cargo test -p revenant-core --test os_filesystems -- --ignored --test-threads=1
+```
+
+It checks that every live file is found once with its path, `Intact` and extracting to the bytes written, and that each
+deleted photo whose clusters were not reused is found `Deleted` and `Intact`. Run it with `--test-threads=1`: every image's
+volume is named `RVT`, so two mounted at once would clash.
 
 ## Real camera samples
 

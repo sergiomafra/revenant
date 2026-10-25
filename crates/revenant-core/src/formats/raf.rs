@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use super::jpeg::{OwnJpegs, preview_health};
-use super::{FileKind, Format, Health, Measurement, Reader, SECTOR, builtin};
+use super::{FileKind, Format, Fragment, Health, Measurement, Reader, SECTOR, builtin};
 use crate::source::Source;
 use crate::tiff::TIFF_MAX_LEN;
 
@@ -117,5 +117,17 @@ impl Format for Raf {
             health,
             fragments: Vec::new(),
         })
+    }
+
+    /// The embedded JPEG.
+    fn own_files(&self, source: &dyn Source, start: u64) -> Vec<Fragment> {
+        let mut r = Reader::new(source);
+        embedded_jpeg(&mut r, start)
+            .map(|(o, len)| Fragment {
+                start: start + o,
+                len,
+            })
+            .into_iter()
+            .collect()
     }
 }

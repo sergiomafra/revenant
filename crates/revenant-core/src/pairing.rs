@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 
 use crate::cache::{CACHE_WINDOW, CachedSource};
+use crate::filesystem::{FsState, Placement};
 use crate::formats::isobmff::{
     Check, MOOV_MAX_LEN, child, index_health, index_tracks, moovless_layout,
 };
@@ -40,6 +41,11 @@ const MAX_NAL_UNITS: usize = 512;
 const MAX_STEPS: u64 = 1 << 24;
 /// Bytes per load of the sample readers (they read a few bytes per NAL unit).
 const READ_WINDOW: usize = 64 * 1024;
+/// Smallest cluster whose grid narrows the break points (ruling D13).
+const MIN_GRID_CLUSTER: u64 = 4096;
+
+/// A volume's cluster grid: `(heap offset, cluster size, heap end)`, absolute.
+pub(crate) type Grid = (u64, u64, u64);
 
 /// A `Damaged` video without `moov`.
 struct Video<'f> {
@@ -132,7 +138,8 @@ struct Budget {
 }
 
 /// Damaged moov-less videos × orphan `moov` boxes (start, declared size, as the scan saw them) → the reassembled findings (same ids, in the order of `videos`),
-/// each with 2 pieces. Takes the [`CachedSource`]: `bad_runs` over both pieces is the only complete record of the
+/// each with 2 pieces. A video with a live origin is no candidate (its chain is where its bytes are); a deleted one keeps
+/// its origin, with placement `Carved`. `grids` are the volumes' cluster grids (ruling D13, see `try_pair`). Takes the [`CachedSource`]: `bad_runs` over both pieces is the only complete record of the
 /// unreadable sectors the scan met (so a piece's health agrees with the `Unreadable` events).
 ///
 /// `starts` holds the start of every finding of the scan, ascending (ruling Q13). The first piece ends by the video
@@ -151,9 +158,10 @@ pub(crate) fn pair_videos(
     videos: &[Finding],
     moovs: &[(u64, u64)],
     starts: &[u64],
+    grids: &[Grid],
     cancel: &CancelToken,
 ) -> Vec<Finding> {
-    pair_with(source, videos, moovs, starts, cancel, LIMITS).0
+    pair_with(source, videos, moovs, starts, grids, cancel, LIMITS).0
 }
 
 /// [`pair_videos`] under `limits`; also returns the sample-check steps used.
@@ -162,12 +170,14 @@ fn pair_with(
     videos: &[Finding],
     moovs: &[(u64, u64)],
     starts: &[u64],
+    grids: &[Grid],
     cancel: &CancelToken,
     limits: Limits,
 ) -> (Vec<Finding>, u64) {
     let mut r = Reader::new(source);
     let vids: Vec<Video> = videos
         .iter()
+        .filter(|f| f.origin.as_ref().is_none_or(|o| o.state != FsState::Live))
         .filter_map(|f| {
             let l = moovless_layout(&mut r, f.start)?;
             let rel = l.mdat_at.checked_sub(f.start)?;
@@ -214,9 +224,16 @@ fn pair_with(
             if cancel.is_cancelled() {
                 return (Vec::new(), steps.used);
             }
-            if let Some(finding) =
-                try_pair(source, v, &m, starts, &mut steps, limits.max_breaks, cancel)
-            {
+            if let Some(finding) = try_pair(
+                source,
+                v,
+                &m,
+                starts,
+                grids,
+                &mut steps,
+                limits.max_breaks,
+                cancel,
+            ) {
                 passed.push(Pass {
                     video: vi,
                     moov: mi,
@@ -472,12 +489,63 @@ fn foreign_starts<'a>(
         .filter(move |&x| !own_frame(m, x - from + off))
 }
 
+/// The cluster grid `(heap, cluster)` that video start `s` sits on: the first of `grids` with a cluster of at least
+/// [`MIN_GRID_CLUSTER`] whose heap holds `s` at a cluster start.
+fn grid_of(grids: &[Grid], s: u64) -> Option<(u64, u64, u64)> {
+    grids.iter().copied().find(|&(heap, cluster, end)| {
+        cluster >= MIN_GRID_CLUSTER && heap <= s && s < end && (s - heap).is_multiple_of(cluster)
+    })
+}
+
+/// The passing break points among `first, first + step, …, last` (at most `max_breaks` tried, at most 2 kept: the
+/// smallest, and whether there is another) that `on_grid` accepts, and whether some were left untried. `None` when the
+/// run is cancelled or its step budget spent.
+#[allow(clippy::too_many_arguments)]
+fn passing_breaks(
+    at: &mut Places,
+    items: &[Item],
+    k: usize,
+    (first, last, step): (u64, u64, u64),
+    on_grid: impl Fn(u64) -> bool,
+    steps: &mut Steps,
+    max_breaks: u64,
+    cancel: &CancelToken,
+) -> Option<(Vec<u64>, bool)> {
+    let n = items.len();
+    let count = (last - first) / step + 1;
+    let mut passing = Vec::new();
+    for j in 0..count.min(max_breaks) {
+        if cancel.is_cancelled() || steps.spent() {
+            return None;
+        }
+        let l1 = first + j * step;
+        if !on_grid(l1) {
+            continue;
+        }
+        let split = Side::Split(l1);
+        let ok = (k.saturating_sub(1)..(k + 1).min(n)).all(|i| at.passes(split, &items[i], steps));
+        if ok {
+            passing.push(l1);
+            if passing.len() == 2 {
+                break; // ambiguous: the smallest is kept
+            }
+        }
+    }
+    Some((passing, count > max_breaks))
+}
+
 /// Checks video `v` against `moov` `m` (the arithmetic filter already passed) and returns the reassembled finding.
+///
+/// Ruling D13: when `v` starts at a cluster start of a grid in `grids` (cluster ≥ [`MIN_GRID_CLUSTER`]), the break
+/// points tried first are only those on the grid (`(s + L1 − heap) % cluster == 0`) whose second piece starts on it too
+/// (ambiguity is counted among them); when none passes, every sector boundary is tried, as without a grid.
+#[allow(clippy::too_many_arguments)]
 fn try_pair(
     source: &CachedSource,
     v: &Video,
     m: &Moov,
     starts: &[u64],
+    grids: &[Grid],
     steps: &mut Steps,
     max_breaks: u64,
     cancel: &CancelToken,
@@ -525,29 +593,56 @@ fn try_pair(
         None => v.payload,
     };
     let hi = items.get(k + 1).map_or(v.p, |next| next.offset.min(v.p));
-    let first = lo.div_ceil(SECTOR).checked_mul(SECTOR)?;
-    let last = hi / SECTOR * SECTOR;
-    if first > last || first == 0 {
-        return None;
-    }
-    let count = (last - first) / SECTOR + 1;
-    let mut passing = Vec::new();
-    for j in 0..count.min(max_breaks) {
-        if cancel.is_cancelled() || steps.spent() {
-            return None;
+    // Ruling D13: on a cluster grid, first only the break points on it (relative to `s`, which is on it, multiples of
+    // the cluster) whose second piece `q − P + L1` starts on it too.
+    let on_grid = grid_of(grids, s).and_then(|(heap, cluster, end)| {
+        let first = lo.div_ceil(cluster).checked_mul(cluster)?;
+        let last = hi / cluster * cluster;
+        let second_on_grid = move |l1: u64| {
+            m.q.checked_add(l1)
+                .and_then(|x| x.checked_sub(v.p))
+                .is_some_and(|g| heap <= g && g < end && (g - heap).is_multiple_of(cluster))
+        };
+        (first > 0 && first <= last).then_some(((first, last, cluster), second_on_grid))
+    });
+    let mut found = None;
+    if let Some((span, second_on_grid)) = on_grid {
+        let (passing, capped) = passing_breaks(
+            &mut at,
+            items,
+            k,
+            span,
+            second_on_grid,
+            steps,
+            max_breaks,
+            cancel,
+        )?;
+        if !passing.is_empty() {
+            found = Some((passing, capped));
         }
-        let l1 = first + j * SECTOR;
-        let split = Side::Split(l1);
-        let ok = (k.saturating_sub(1)..(k + 1).min(n)).all(|i| at.passes(split, &items[i], steps));
-        if ok {
-            passing.push(l1);
-            if passing.len() == 2 {
-                break; // ambiguous: the smallest is kept
+    }
+    let (passing, capped) = match found {
+        Some(f) => f,
+        None => {
+            let first = lo.div_ceil(SECTOR).checked_mul(SECTOR)?;
+            let last = hi / SECTOR * SECTOR;
+            if first > last || first == 0 {
+                return None;
             }
+            passing_breaks(
+                &mut at,
+                items,
+                k,
+                (first, last, SECTOR),
+                |_| true,
+                steps,
+                max_breaks,
+                cancel,
+            )?
         }
-    }
+    };
     let &l1 = passing.first()?;
-    let ambiguous = passing.len() > 1 || count > max_breaks;
+    let ambiguous = passing.len() > 1 || capped;
     // Q13: the first piece ends where the scan cut the video (another file starts there), and by the first other file
     // inside it; the video's own Motion-JPEG frames are neither.
     let flen = v.finding.len;
@@ -589,6 +684,11 @@ fn try_pair(
         }
         h => h,
     };
+    // A deleted file's origin is kept, but the pieces are the pairing's, not the file system's.
+    let origin = v.finding.origin.clone().map(|mut o| {
+        o.placement = Placement::Carved;
+        o
+    });
     Some(Finding {
         id: v.finding.id,
         start: s,
@@ -596,6 +696,7 @@ fn try_pair(
         kind: v.kind,
         health,
         fragments: pieces,
+        origin,
     })
 }
 
@@ -647,6 +748,7 @@ mod tests {
                 kind: FileKind::Mp4,
                 health: Health::Damaged,
                 fragments: Vec::new(),
+                origin: None,
             });
             moovs.push(((second + v.moov.start - l1) as u64, v.moov.len() as u64));
         }
@@ -679,6 +781,7 @@ mod tests {
             &findings,
             &all[..moovs],
             &starts,
+            &[],
             &CancelToken::default(),
             limits,
         );
