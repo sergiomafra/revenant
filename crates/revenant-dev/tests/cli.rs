@@ -1133,3 +1133,94 @@ fn disk_failing_line() {
         20
     );
 }
+
+// ---- Only whole disks and regular files are sources: a partition or any other node could be the card itself. ----
+
+#[test]
+fn a_device_node_that_is_not_a_whole_disk_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("s");
+    dev()
+        .args(["scan", "/dev/null", "--session"])
+        .arg(&session)
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("error: not_whole_disk"));
+    assert!(!session.exists());
+    for extra in [&[][..], &["--allow-same-volume"][..]] {
+        dev()
+            .args(["copy", "/dev/null"])
+            .arg(dir.path().join("x.img"))
+            .args(extra)
+            .assert()
+            .code(1)
+            .stderr(predicates::str::contains("error: not_whole_disk"));
+    }
+    dev()
+        .args(["digest", "/dev/null"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("error: not_whole_disk"));
+    // A partition's node, whether or not it exists here.
+    for partition in [
+        "/dev/disk4s1",
+        "/dev/rdisk0s1",
+        r"\\.\E:",
+        r"\\?\Volume{0}\",
+    ] {
+        dev()
+            .args(["scan", partition])
+            .assert()
+            .code(1)
+            .stderr(predicates::str::contains("error: not_whole_disk"));
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_source_that_is_not_a_regular_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let link = dir.path().join("link.img");
+    std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+    for (source, code) in [(&fifo, "open_failed"), (&link, "not_whole_disk")] {
+        let session = out.path().join("s");
+        dev()
+            .arg("scan")
+            .arg(source)
+            .arg("--session")
+            .arg(&session)
+            .arg("--allow-same-volume")
+            .assert()
+            .code(1)
+            .stderr(predicates::str::contains(format!("error: {code}")));
+        dev()
+            .arg("copy")
+            .arg(source)
+            .arg(out.path().join("x.img"))
+            .arg("--allow-same-volume")
+            .assert()
+            .code(1)
+            .stderr(predicates::str::contains(format!("error: {code}")));
+        dev()
+            .arg("digest")
+            .arg(source)
+            .assert()
+            .code(1)
+            .stderr(predicates::str::contains(format!("error: {code}")));
+        assert_eq!(
+            std::fs::read_dir(out.path()).unwrap().count(),
+            0,
+            "{source:?}"
+        );
+    }
+}

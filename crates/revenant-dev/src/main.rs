@@ -501,6 +501,25 @@ mod tests {
             assert_eq!(run_copy(ops, &args).unwrap(), Exit::Issues);
             assert_eq!(entries(dest.path()), 0, "nothing created");
         }
+        // An image folder on the card: refused before the card is unmounted or read, nothing created.
+        let on_card = CopyArgs {
+            source: "disk4".into(),
+            image: card.path().join("card.img"),
+            ..CopyArgs::default()
+        };
+        let ops = StubDevices::new(card.path());
+        assert_eq!(
+            run_copy(&ops, &on_card).unwrap_err().code(),
+            "destination_on_source"
+        );
+        assert!(
+            !ops.log()
+                .iter()
+                .any(|l| l.starts_with("unmount") || l.starts_with("open")),
+            "{:?}",
+            ops.log()
+        );
+        assert_eq!(entries(card.path()), 0);
         // With room, the copy runs and the image is the card.
         let roomy = StubDevices::new(card.path());
         assert_eq!(run_copy(&roomy, &args).unwrap(), Exit::Done);

@@ -18,7 +18,7 @@ use revenant_core::{
 };
 use serde::Serialize;
 
-use crate::devices::{device_name, open_device, remount_hint, report_unmount};
+use crate::devices::{check_regular_file, device_name, open_device, remount_hint, report_unmount};
 use crate::output::{
     Line, Outputs, emit, emit_json, emit_marked, finding_fields, found_line, group_lines,
     volume_line,
@@ -99,6 +99,7 @@ enum Input {
 impl Input {
     /// A file: through its map when `<file>.rvmap` exists.
     fn open_file(path: &Path) -> Result<Input, EngineError> {
+        check_regular_file(path)?;
         if map_path(path).exists() {
             Ok(Input::Mapped(MappedSource::open(path)?))
         } else {

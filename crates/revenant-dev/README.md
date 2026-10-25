@@ -28,8 +28,12 @@ and exits with 1; `preflight` and `copy` exit with 2 when the pre-flight check f
 
 - `<SOURCE>`: a disk image file, or a whole disk: `disk4` (also `/dev/disk4`, `/dev/rdisk4`) on macOS, `PhysicalDrive2`
   (also `\\.\PhysicalDrive2`) on Windows (see [Reading a card directly](#reading-a-card-directly)). A whole-disk name
-  always means the disk (write `./disk4` for a file of that name); a partition (`disk4s1`) is refused with
-  `not_whole_disk`. An image file with its rescue map beside it (`<SOURCE>.rvmap`, written by `copy`) is read through
+  always means the disk (write `./disk4` for a file of that name). A partition or any other device node
+  (`disk4s1`, `/dev/disk4s1`, `/dev/null`, `\\.\E:`, `\\?\Volume{…}`) is refused with `not_whole_disk`, even when it
+  exists: read as a file it would not be known as part of the card, so nothing would keep the extraction, the copy or
+  the session off the card. Name the whole disk instead. A file SOURCE must be a regular file (links followed): a link
+  into `/dev` is `not_whole_disk`, a FIFO, socket or folder `open_failed`. The same rules hold for `copy` and
+  `digest`. An image file with its rescue map beside it (`<SOURCE>.rvmap`, written by `copy`) is read through
   the map (see [Copying a card](#copying-a-card)).
 - `--extract <DIR>`: copies each finding into `<DIR>` as soon as it is found, under its original name when the file
   system listed one, else `YYYY-MM-DD_HH-MM-SS[_<camera>].<EXT>` from its details, else `revenant_<start as 12 hex digits>.<ext>`
@@ -250,8 +254,8 @@ On Windows, open a terminal with "Run as administrator", then `revenant-dev disk
 - If the card is disconnected (a loose cable, the computer sleeping) during a scan with `--session`, stderr asks to plug
   it back in; the scan waits (checking every half second), finds the same card again even under another disk name
   (another card is never taken for it), unmounts it again and goes on in the same session. The system may write to the
-  card in the short window between plugging it in and that unmount. Without `--session` the scan stops with
-  `error: device_gone`.
+  card in the short window between plugging it in and that unmount. The card found again is always unmounted, even
+  with `--no-unmount` (the safer direction). Without `--session` the scan stops with `error: device_gone`.
 
 ## Copying a card
 
@@ -266,7 +270,9 @@ revenant-dev scan /Volumes/Backup/card.img --extract ~/recovered          # read
 revenant-dev remount disk4                                                # when done with the card
 ```
 
-- `copy` with a disk runs the pre-flight check first (unmounting unless `--no-unmount`) and, if it finds any issue (no
+- `copy` with a disk first checks the image's folder against the whole card (`destination_on_source` or
+  `destination_unknown`, exit 1, with the card still mounted and untouched), then runs the pre-flight check (unmounting
+  unless `--no-unmount`) and, if it finds any issue (no
   permission, a card that does not answer, a destination on the card, without room for the whole card, or on FAT32 for
   a card over 4 GiB), prints the `preflight` line and exits with 2 before writing anything.
 - Interrupted (a crash, Ctrl-C, the card pulled out), the same command resumes from the map; pulling the card out never

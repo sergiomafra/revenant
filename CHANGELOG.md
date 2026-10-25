@@ -13,7 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   was never rescued is unreadable, never zeros), or a saved session (resumed after a crash or a pulled cable, waiting
   for the card to be plugged back in, with the lines already found marked as replayed). With a card, `--extract`,
   `--previews` and `--session` are checked once against the whole card and `--allow-same-volume` is refused, so nothing
-  is ever written to it.
+  is ever written to it; a partition or any other device node is refused (name the whole disk).
 
 - A scan can be saved into a folder of its own and resumed after the card is disconnected, the program crashes or is
   closed, or the power goes, with the same results as an uninterrupted scan; a finished scan's results can be opened

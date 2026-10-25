@@ -13,8 +13,10 @@ use crate::Exit;
 use crate::output::emit_json;
 
 /// What a SOURCE argument names: `Some(disk)` for a whole disk ("disk4", "/dev/rdisk4", "PhysicalDrive2",
-/// r"\\.\PhysicalDrive2"), `None` for a file. A name that looks like a disk but is not a whole one ("disk4s1",
-/// "/dev/disk4s1") and is not an existing file is `not_whole_disk`.
+/// r"\\.\PhysicalDrive2"), `None` for a file. Any other device path (under `/dev/`, or starting with `\\.\` or `\\?\`:
+/// a partition such as "/dev/disk4s1" or `\\.\E:`) is `not_whole_disk` whether it exists or not: read as a file it
+/// would carry no disk, and nothing would keep the scan, the copy or the session off the card it belongs to. A bare
+/// name that looks like a disk ("disk4s1") and is not an existing file is `not_whole_disk` too.
 pub(crate) fn device_name(source: &Path) -> Result<Option<DiskId>, EngineError> {
     let Some(s) = source.to_str() else {
         return Ok(None);
@@ -23,16 +25,38 @@ pub(crate) fn device_name(source: &Path) -> Result<Option<DiskId>, EngineError> 
         Ok(disk) => Ok(Some(disk)),
         Err(e) => {
             let lower = s.to_ascii_lowercase();
-            let looks_like_disk = lower.starts_with("disk")
-                || lower.starts_with("/dev/")
-                || lower.starts_with(r"\\.\")
-                || lower.starts_with("physicaldrive");
-            if looks_like_disk && !source.exists() {
+            if is_device_path(&lower)
+                || ((lower.starts_with("disk") || lower.starts_with("physicaldrive"))
+                    && !source.exists())
+            {
                 Err(e)
             } else {
                 Ok(None)
             }
         }
+    }
+}
+
+/// A device namespace path: `/dev/…`, `\\.\…` or `\\?\…` (any case).
+fn is_device_path(lower: &str) -> bool {
+    lower.starts_with("/dev/") || lower.starts_with(r"\\.\") || lower.starts_with(r"\\?\")
+}
+
+/// A file SOURCE must be a regular file (links followed), checked before it is opened (a FIFO would block the open):
+/// a link resolving into a device namespace is `not_whole_disk`, any other non-regular file (a FIFO, a socket, a
+/// folder, a device elsewhere) `open_failed`.
+pub(crate) fn check_regular_file(path: &Path) -> Result<(), EngineError> {
+    if let Ok(resolved) = std::fs::canonicalize(path)
+        && is_device_path(&resolved.to_string_lossy().to_ascii_lowercase())
+    {
+        return Err(EngineError::NotWholeDisk);
+    }
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => Ok(()),
+        Ok(_) => Err(EngineError::Open {
+            cause: std::io::Error::other("not a regular file"),
+        }),
+        Err(cause) => Err(EngineError::Open { cause }),
     }
 }
 

@@ -8,7 +8,7 @@ use revenant_core::source::{DeviceSource, FileSource, Source};
 use serde::Serialize;
 
 use crate::Exit;
-use crate::devices::device_name;
+use crate::devices::{check_regular_file, device_name};
 use crate::output::emit_json;
 
 /// Bytes read at once.
@@ -96,7 +96,10 @@ pub(crate) fn run_digest(ops: &dyn DeviceOps, source: &Path) -> Result<Exit, Eng
             let sector = u64::from(device.scan_sector());
             digest(&device, sector)?
         }
-        None => digest(&FileSource::open(source)?, 512)?,
+        None => {
+            check_regular_file(source)?;
+            digest(&FileSource::open(source)?, 512)?
+        }
     };
     emit_json(&DigestLine {
         event: "digest",
