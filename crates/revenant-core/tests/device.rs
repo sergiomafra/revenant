@@ -193,6 +193,11 @@ fn gone_device_reports_device_gone() {
     }
     let err = source.read_at(5 * 4096 + 7, &mut buf).unwrap_err();
     assert_eq!(err.code(), "device_gone");
+    // The device reports the aligned read's offset (5 * 4096); the source never points before what was asked.
+    assert!(
+        matches!(err, EngineError::DeviceGone { offset } if offset == 5 * 4096 + 7),
+        "{err:?}"
+    );
 }
 
 #[test]

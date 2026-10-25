@@ -4,7 +4,7 @@
 <!-- Captured on the dev Mac with `ioreg -a -r -c IOBlockStorageDevice -l` while an hdiutil-attached raw
      image (disk2, standing in for an SD card) was attached. Trimmed: below each whole-disk IOMedia only its
      BSD client is kept (partitions and volumes cut); serials are TESTSERIAL, UUIDs zeroed, the image path
-     anonymized. -->
+     anonymized; statistics and busy times zeroed, firmware and image versions replaced. -->
 <array>
 	<dict>
 		<key>Device Characteristics</key>
@@ -62,7 +62,7 @@
 				<key>IOServiceBusyState</key>
 				<integer>0</integer>
 				<key>IOServiceBusyTime</key>
-				<integer>36389</integer>
+				<integer>0</integer>
 				<key>IOServiceState</key>
 				<integer>30</integer>
 				<key>Statistics</key>
@@ -101,7 +101,7 @@
 		<key>IOServiceBusyState</key>
 		<integer>0</integer>
 		<key>IOServiceBusyTime</key>
-		<integer>223784</integer>
+		<integer>0</integer>
 		<key>IOServiceState</key>
 		<integer>30</integer>
 		<key>Protocol Characteristics</key>
@@ -178,7 +178,7 @@
 				<key>IOServiceBusyState</key>
 				<integer>0</integer>
 				<key>IOServiceBusyTime</key>
-				<integer>32673</integer>
+				<integer>0</integer>
 				<key>IOServiceState</key>
 				<integer>30</integer>
 				<key>Statistics</key>
@@ -217,7 +217,7 @@
 		<key>IOServiceBusyState</key>
 		<integer>0</integer>
 		<key>IOServiceBusyTime</key>
-		<integer>219919</integer>
+		<integer>0</integer>
 		<key>IOServiceState</key>
 		<integer>30</integer>
 		<key>Protocol Characteristics</key>
@@ -246,7 +246,7 @@
 			<key>Product Name</key>
 			<string>APPLE SSD AP1024N</string>
 			<key>Product Revision Level</key>
-			<string>1310</string>
+			<string>TESTREV</string>
 			<key>Serial Number</key>
 			<string>TESTSERIAL</string>
 			<key>Vendor Name</key>
@@ -358,7 +358,7 @@
 								<key>IOServiceBusyState</key>
 								<integer>0</integer>
 								<key>IOServiceBusyTime</key>
-								<integer>31005</integer>
+								<integer>0</integer>
 								<key>IOServiceState</key>
 								<integer>30</integer>
 							</dict>
@@ -370,7 +370,7 @@
 						<key>IOServiceBusyState</key>
 						<integer>0</integer>
 						<key>IOServiceBusyTime</key>
-						<integer>193436625</integer>
+						<integer>0</integer>
 						<key>IOServiceState</key>
 						<integer>30</integer>
 						<key>Leaf</key>
@@ -396,15 +396,15 @@
 				<key>IOServiceBusyState</key>
 				<integer>0</integer>
 				<key>IOServiceBusyTime</key>
-				<integer>193957175</integer>
+				<integer>0</integer>
 				<key>IOServiceState</key>
 				<integer>30</integer>
 				<key>Statistics</key>
 				<dict>
 					<key>Bytes (Read)</key>
-					<integer>93694177280</integer>
+					<integer>0</integer>
 					<key>Bytes (Write)</key>
-					<integer>974237605888</integer>
+					<integer>0</integer>
 					<key>Errors (Read)</key>
 					<integer>0</integer>
 					<key>Errors (Write)</key>
@@ -414,17 +414,17 @@
 					<key>Latency Time (Write)</key>
 					<integer>0</integer>
 					<key>Operations (Read)</key>
-					<integer>3950430</integer>
+					<integer>0</integer>
 					<key>Operations (Write)</key>
-					<integer>8371595</integer>
+					<integer>0</integer>
 					<key>Retries (Read)</key>
 					<integer>0</integer>
 					<key>Retries (Write)</key>
 					<integer>0</integer>
 					<key>Total Time (Read)</key>
-					<integer>2117499689225</integer>
+					<integer>0</integer>
 					<key>Total Time (Write)</key>
-					<integer>8005443952385</integer>
+					<integer>0</integer>
 				</dict>
 			</dict>
 		</array>
@@ -515,7 +515,7 @@
 		<key>IOServiceBusyState</key>
 		<integer>0</integer>
 		<key>IOServiceBusyTime</key>
-		<integer>194149823</integer>
+		<integer>0</integer>
 		<key>IOServiceState</key>
 		<integer>30</integer>
 		<key>IOStorageFeatures</key>
@@ -557,7 +557,7 @@
 			<key>Product Name</key>
 			<string>Disk Image</string>
 			<key>Product Revision Level</key>
-			<string>683.160.3.701.2</string>
+			<string>TESTVERSION</string>
 			<key>Vendor Name</key>
 			<string>Apple</string>
 		</dict>
@@ -664,7 +664,7 @@
 								<key>IOServiceBusyState</key>
 								<integer>0</integer>
 								<key>IOServiceBusyTime</key>
-								<integer>1042934</integer>
+								<integer>0</integer>
 								<key>IOServiceState</key>
 								<integer>30</integer>
 							</dict>
@@ -676,7 +676,7 @@
 						<key>IOServiceBusyState</key>
 						<integer>0</integer>
 						<key>IOServiceBusyTime</key>
-						<integer>26480427</integer>
+						<integer>0</integer>
 						<key>IOServiceState</key>
 						<integer>30</integer>
 						<key>Leaf</key>
@@ -702,13 +702,13 @@
 				<key>IOServiceBusyState</key>
 				<integer>0</integer>
 				<key>IOServiceBusyTime</key>
-				<integer>26486410</integer>
+				<integer>0</integer>
 				<key>IOServiceState</key>
 				<integer>30</integer>
 				<key>Statistics</key>
 				<dict>
 					<key>Bytes (Read)</key>
-					<integer>24576</integer>
+					<integer>0</integer>
 					<key>Bytes (Write)</key>
 					<integer>0</integer>
 					<key>Errors (Read)</key>
@@ -720,7 +720,7 @@
 					<key>Latency Time (Write)</key>
 					<integer>0</integer>
 					<key>Operations (Read)</key>
-					<integer>24</integer>
+					<integer>0</integer>
 					<key>Operations (Write)</key>
 					<integer>0</integer>
 					<key>Retries (Read)</key>
@@ -728,7 +728,7 @@
 					<key>Retries (Write)</key>
 					<integer>0</integer>
 					<key>Total Time (Read)</key>
-					<integer>24638669</integer>
+					<integer>0</integer>
 					<key>Total Time (Write)</key>
 					<integer>0</integer>
 				</dict>
@@ -741,7 +741,7 @@
 		<key>IOServiceBusyState</key>
 		<integer>0</integer>
 		<key>IOServiceBusyTime</key>
-		<integer>26851081</integer>
+		<integer>0</integer>
 		<key>IOServiceState</key>
 		<integer>30</integer>
 		<key>Protocol Characteristics</key>
