@@ -73,6 +73,8 @@ pub(super) fn walk(
         resolved: false,
         upcase: false,
         early: Vec::new(),
+        early_photos: 0,
+        early_dirs: 0,
         waiting: Vec::new(),
         later: Vec::new(),
         seen: BTreeSet::new(),
@@ -108,8 +110,11 @@ struct Walk<'a, 'b> {
     resolved: bool,
     /// The up-case table's clusters were claimed.
     upcase: bool,
-    /// Live entries of the root met before the bitmap entry.
+    /// Live photos/videos and directories of the root met before the bitmap entry (their trust needs it): at most the
+    /// photo slots left and [`Limits::dirs`] directories.
     early: Vec<Child>,
+    early_photos: usize,
+    early_dirs: usize,
     /// Deleted directories met in live directories, in walk order.
     waiting: Vec<Dir>,
     /// Deleted photos/videos, in walk order, placed by [`Walk::place`] once the live walk is done.
@@ -409,6 +414,8 @@ impl<'a> Walk<'a, '_> {
     /// The bitmap is settled: the root's live entries met before it are handled now.
     fn resolve(&mut self, d: &Dir, subdirs: &mut Vec<Dir>) {
         self.resolved = true;
+        self.early_photos = 0;
+        self.early_dirs = 0;
         for ch in std::mem::take(&mut self.early) {
             self.child(ch, d, true, subdirs);
         }
@@ -460,12 +467,35 @@ impl<'a> Walk<'a, '_> {
         } else if ch.deleted {
             self.deleted_child(ch, d, None);
         } else if root && !self.resolved {
-            self.early.push(ch);
+            self.wait_for_bitmap(ch, d);
         } else if ch.dir {
             self.live_dir(ch, d, subdirs);
         } else {
             self.live_file(ch, d);
         }
+    }
+
+    /// A live entry of the root met before the bitmap entry. A photo/video or a directory, whose trust depends on the
+    /// bitmap, waits for it (past the photo slots left or the directory cap it is dropped and the listing truncated);
+    /// any other file carries no trust and is handled at once.
+    fn wait_for_bitmap(&mut self, ch: Child, d: &Dir) {
+        let (count, cap) = if ch.dir {
+            (&mut self.early_dirs, self.limits.dirs)
+        } else if extension(&ch.name)
+            .and_then(FileKind::from_extension)
+            .is_some()
+        {
+            (&mut self.early_photos, self.budget.files_left())
+        } else {
+            self.live_file(ch, d);
+            return;
+        };
+        if *count >= cap {
+            self.budget.truncated = true;
+            return;
+        }
+        *count += 1;
+        self.early.push(ch);
     }
 
     /// A live directory: claims its clusters (its DataLength's worth, at most 256 MiB) and waits to be read. Not
@@ -1022,7 +1052,7 @@ mod tests {
     #[test]
     fn waiting_entries_are_small() {
         assert!(size_of::<Later>() <= 100, "{}", size_of::<Later>());
-        assert!(size_of::<Child>() <= 100, "{}", size_of::<Child>());
+        assert!(size_of::<Child>() <= 64, "{}", size_of::<Child>());
         assert!(size_of::<Dir>() <= 64, "{}", size_of::<Dir>());
         assert_eq!(size_of::<[[u8; 32]; MAX_SECONDARY + 1]>(), 608);
     }

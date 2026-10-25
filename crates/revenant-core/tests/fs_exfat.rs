@@ -418,6 +418,40 @@ fn deleted_folders_read_only_free_clusters_and_never_loop() {
 }
 
 #[test]
+fn deleted_old_chains_are_kept_only_when_whole() {
+    let eoc = 0xFFFF_FFFF;
+    // R: a deleted FAT-chained file of one run, 170..=172, whose cluster 171 is now a live file's: the old chain is not
+    // kept (171 is in use), so it is guessed around it and not trusted.
+    let mut b = card();
+    let data = bytes(3 * CLUSTER as usize - 10, 1);
+    b.add_at("DCIM/R.JPG", &data, &[170, 171, 172]);
+    b.set_fat(170, 171).set_fat(171, 172).set_fat(172, eoc);
+    // E: a deleted 2-run file 150..=152, 160..=161 whose last FAT entry reads free instead of end-of-chain: the old
+    // chain is not kept either; the guess takes the free clusters from 150 on.
+    let two = bytes(5 * CLUSTER as usize - 10, 2);
+    b.add_at("DCIM/E.JPG", &two, &[150, 151, 152, 160, 161]);
+    b.set_fat(161, 0);
+    b.delete("DCIM/R.JPG", DeleteStyle::Camera);
+    b.delete("DCIM/E.JPG", DeleteStyle::Camera);
+    b.add_at("DCIM/L.JPG", &bytes(1000, 3), &[171]);
+    let l = listing(&placed_with(&b, |v| {
+        // R as written by a driver that chains even a contiguous file: AllocationPossible only.
+        patch_set(v, &b, "DCIM", "R.JPG", |s| s[1][1] = 0x01);
+    }));
+    let r = file(&l, "DCIM/R.JPG");
+    assert_eq!(r.origin.state, FsState::Deleted);
+    assert_eq!(r.origin.placement, Placement::Guessed);
+    assert_eq!(r.pieces, pieces_of(&b, &[170, 172, 173], data.len() as u64));
+    assert!(!r.trusted);
+    let e = file(&l, "DCIM/E.JPG");
+    assert_eq!(e.origin.placement, Placement::Guessed);
+    assert_eq!(
+        e.pieces,
+        pieces_of(&b, &[150, 151, 152, 153, 154], two.len() as u64)
+    );
+}
+
+#[test]
 fn reused_clusters_make_a_deleted_file_partial() {
     let mut b = card();
     let data = bytes(4 * CLUSTER as usize - 100, 1);
@@ -529,6 +563,7 @@ fn root_files_before_the_bitmap_entry_wait_for_it() {
     // bitmap. R is listed, and checked against the bitmap even though its set came first.
     let mut b = card();
     let r = b.add("R.JPG", &bytes(1000, 1));
+    let n = b.add("N.TXT", &bytes(1000, 3));
     b.add("DCIM/A.JPG", &bytes(1000, 2));
     let l = listing(&placed_with(&b, |v| {
         let root = b.cluster_offset(b.clusters("")[0]) as usize;
@@ -536,8 +571,9 @@ fn root_files_before_the_bitmap_entry_wait_for_it() {
         let bitmap: [u8; 32] = v[at(1)..at(2)].try_into().unwrap();
         assert_eq!(bitmap[0], 0x81);
         assert_eq!(set_name(v, at(3)).as_deref(), Some("R.JPG"));
-        v.copy_within(at(2)..at(6), at(1));
-        v[at(5)..at(6)].copy_from_slice(&bitmap);
+        assert_eq!(set_name(v, at(6)).as_deref(), Some("N.TXT"));
+        v.copy_within(at(2)..at(9), at(1));
+        v[at(8)..at(9)].copy_from_slice(&bitmap);
         let map = b.cluster_offset(2) as usize;
         let k = (r[0] - 2) as usize;
         v[map + k / 8] &= !(1 << (k % 8));
@@ -546,6 +582,10 @@ fn root_files_before_the_bitmap_entry_wait_for_it() {
     assert_eq!(f.origin.state, FsState::Live);
     assert!(!f.trusted);
     assert!(file(&l, "DCIM/A.JPG").trusted);
+    // A file of another kind before the bitmap entry is handled at once (it carries no trust).
+    assert_eq!(l.others.len(), 1);
+    assert_eq!(l.others[0].start, VOL + b.cluster_offset(n[0]));
+    assert!(!l.truncated);
 }
 
 fn timed(bytes: &[u8]) -> Listing {

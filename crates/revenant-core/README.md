@@ -725,7 +725,10 @@ and File Name §7.7 entries).
   (`0x81`, BitmapFlags bit 0 clear) is read as soon as it is met: FirstCluster (byte 20) inside the heap, DataLength
   (byte 24) at least `ceil(ClusterCount / 8)` and at most that rounded up to whole clusters, its FAT chain holding
   those bytes, every byte readable. Otherwise there is no bitmap (below). The bitmap's and the up-case table's
-  (`0x82`) clusters are claimed like a live chain. Live entries of the root met before the bitmap entry wait for it.
+  (`0x82`) clusters are claimed like a live chain. The live photos/videos and directories of the root met before the
+  bitmap entry (their trust needs it) wait for it, at most as many photos/videos as the listing has photo slots left
+  and 65,536 directories (past either they are dropped and the listing is truncated); any other live file there is
+  handled at once.
 - **Entry sets.** A File entry (`0x85`; `0x05` deleted) with SecondaryCount (byte 1) in 2..=18, then a Stream
   Extension (`0xC0`/`0x40`), then `ceil(NameLength / 15)` File Name entries (`0xC1`/`0x41`), then any other secondary
   entries the count holds (skipped). NameLength (stream byte 3) is 1..=255 and `1 + ceil(NameLength / 15)` must fit
@@ -775,8 +778,10 @@ counted 64 clusters at a time, and every deleted placement is paid from the step
 
 Memory (on top of FAT's figures, which hold for the listing itself). The bitmap: one bit per cluster, ≤ 32 MiB at 2^28
 clusters, freed with the walk. A directory is read 128 KiB at a time and parsed entry by entry, holding one entry set
-(≤ 608 B) besides the chunk, so a 256 MiB directory never sits in memory; the entries of the root met before its
-bitmap entry are held until it (each ≈ 100 B plus a name ≤ 765 B; formatters write the bitmap entry first). A name is
+(≤ 608 B) besides the chunk, so a 256 MiB directory never sits in memory. The root's entries waiting for its bitmap
+entry (formatters write it first, so normally none) take 64 B each plus the name: at most 262,144 photos/videos
+(16 MiB; their names are the ones the listing keeps, not extra) and 65,536 directories (4 MiB plus names of
+≤ 765 B, ≤ 48 MiB), so ≤ 68 MiB in the worst case, freed once the bitmap entry is met or the root ends. A name is
 at most 255 UTF-16 units, ≤ 765 bytes of UTF-8. Deleted photos/videos waiting to be placed: ≈ 100 B each besides
 their names, ≤ 262,144 of them with the live photos; deleted folders waiting: ≤ 65,536 × 64 B.
 
