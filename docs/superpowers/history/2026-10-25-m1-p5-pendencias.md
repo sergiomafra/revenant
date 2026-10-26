@@ -108,7 +108,7 @@ O roteiro para o Sérgio conferir com hardware de verdade está em
 
 ## Decisões tomadas durante a execução (Claude, pelo Sérgio)
 
-Rulings P1 a P55 do controlador durante a execução (a numeração reinicia a do pre-flight: aqui `Ruling P…` do ledger).
+Rulings P1 a P57 do controlador durante a execução (a numeração reinicia a do pre-flight: aqui `Ruling P…` do ledger).
 Cada uma com o custo se estiver errada.
 
 - **P1 (exec):** os overrides `cfg(test)` de limites são invisíveis para `tests/*.rs`: esses testes viram testes de
@@ -229,6 +229,12 @@ Cada uma com o custo se estiver errada.
   volume (uma entrada só não consegue cair no próprio backup). Custo: nenhum.
 - **P55:** a troca D28 de um apagado por um vivo numa listagem cheia não devolve os pedaços do apagado ao orçamento de
   pedaços (limitado, documentado). Custo: truncamento um pouco mais cedo em listagens hostis enormes.
+- **P56:** a triagem da revisão final foi adotada como veio; o TOCTOU do `FileSource` e a frase do `CLAUDE.md` ficam
+  fechados (já corrigidos antes); os itens que podem esperar mantêm seus donos no apêndice. Custo: nenhum.
+- **P57:** identidade fraca num cartão morrendo (setores de identidade ilegíveis: dois cartões do mesmo modelo parecem
+  iguais) → pode esperar → Módulo 2: calcular e expor um `IdentityStrength`/marca de identidade fraca só se for trivial;
+  o comportamento da retomada não muda agora (retomar no cartão errado mistura resultados, mas nunca grava num cartão).
+  Custo: com dois cartões do mesmo modelo morrendo e sem número de série, uma retomada poderia seguir no cartão errado.
 
 ### Notas carregadas para este arquivo
 
@@ -338,22 +344,50 @@ Windows (CI, VHD): 113 contra 373. Ler o aparelho cru custa um pouco, não um m�
 
 **Depois:** copiar e buscar ao mesmo tempo (D19).
 
+## Onda final de correções (revisão final)
+
+A revisão final achou 3 importantes e 6 menores; todos corrigidos numa onda só:
+
+- **Link duro (importante):** a imagem retomada da cópia e o `events.rvs` da sessão exigem um único nome em todos os
+  sistemas (`source::single_link`: `nlink` no Unix; no Windows `link_count` via `GetFileInformationByHandle`/
+  `nNumberOfLinks` em `source/windows.rs`, com `// SAFETY:`, mantendo `FILE_FLAG_OPEN_REPARSE_POINT`). Teste Unix
+  `a_hard_linked_image_is_refused` (visto falhando: a vítima era sobrescrita). O Windows só a CI compila.
+- **Tetos da sessão (importante):** listagem e cada checkpoint lidos até 256 MiB (eram 1 GiB); os mesmos tetos valem
+  na gravação (`store::replace` recusa com `write_failed`), então sessão que grava sempre relê. A derivação mostrou que
+  os tetos da caminhada NÃO limitam a listagem codificada a 256 MiB (até ~1 GiB num cartão forjado: pastas de 4 KiB
+  repetidas por arquivo), nem o checkpoint (8 B por achado, sem teto); o limite é então escolhido e documentado, não
+  derivado. O README diz o limite verdadeiro. Teste `saved_files_are_capped_both_ways`.
+- **`create_named`** livre virou `pub(crate)`; o teste público passou a usar `Destination::create_named`.
+- **`RescueMap::load`** usa o `source::open_regular` compartilhado (olha sem seguir link, abre sem bloquear em FIFO e,
+  no macOS, com `O_NOFOLLOW`; no Windows com `FILE_FLAG_OPEN_REPARSE_POINT`; confere a alça): link ou FIFO no lugar do
+  mapa é `map_corrupt`, sem travar. A sessão usa o mesmo auxiliar. Teste `load_reads_only_a_regular_file`.
+- **CI do VHD:** sem `REVENANT_OS_DEV` na CI o teste falha (`panic!`), em vez de passar como "skipped".
+- **`revenant-dev`:** nome de disco solto (`disk4`, `PhysicalDrive2`) com algo desse nome na pasta atual é ambíguo
+  (`open_failed` com dica); leitura curta de prévia é `device_gone` e, como na extração, para a busca (a sessão espera a
+  reconexão).
+- **Manifesto:** `sector` potência de dois de 512 B a 64 KiB e `block` múltiplo do setor até 1 GiB, conferidos na
+  decodificação (`session_corrupt`) e no `Session::create` (`write_failed`, nada gravado).
+
 ## Apêndice: pendências menores para a revisão final
 
-Itens que a onda final de revisão trata (não corrigidos na Tarefa 14). Os `must-fix` primeiro.
+Itens que a onda final de revisão trata (não corrigidos na Tarefa 14). Os `must-fix` primeiro. **Todos os must-fix
+abaixo ficaram fechados na onda final** (seção acima); os menores adiados seguem com seus donos, como triados (P56).
 
-**Must-fix da onda final:**
+**Must-fix da onda final (fechados):**
 - Imagem retomada aceita por um LINK DURO a um arquivo do mesmo tamanho (uma sonda do revisor sobrescreveu a vítima): exigir
   `nlink() == 1` no Unix antes de gravar; no Windows, `GetFileInformationByHandle` com `nNumberOfLinks == 1` (Tarefa 6).
+  **Fechado** (onda final).
 - Verificação de `nlink` no Windows também para `events.rvs` e para a imagem da cópia retomada; tetos de 1 GiB dos arquivos
-  da sessão contra o texto do README "nunca uma alocação enorme" (apertar os tetos ou o texto) (Tarefa 10).
+  da sessão contra o texto do README "nunca uma alocação enorme" (apertar os tetos ou o texto) (Tarefa 10). **Fechado**
+  (onda final: os dois; tetos de 256 MiB e texto verdadeiro).
 - `FileSource` aberto por caminho depois de checar arquivo regular (troca por nó de dispositivo entre a checagem e a
   abertura): conferir `fstat` `is_file` depois de abrir. A Tarefa 11 (rodada 2) já fechou isso com `FileSource::open`
-  conferindo a alça; a onda final só confirma.
+  conferindo a alça; a onda final só confirma. **Fechado** (P56).
 - `CLAUDE.md` "Duas exceções opcionais" contra "terceira exceção": **corrigido nesta tarefa** (agora "Três exceções opcionais").
+  **Fechado** (P56).
 - O job "real devices (Windows VHD)" verde precisa provar que o teste rodou (falhar na CI sem `REVENANT_OS_DEV`, ou
   procurar "attached as PhysicalDrive" na saída) (Tarefa 12). A saída da execução 40243332458 mostra a linha, mas o job não
-  falha se faltar.
+  falha se faltar. **Fechado** (onda final: a CI sem a variável falha).
 
 **Menores adiados:**
 - Tarefa 1: cancelamento entre trechos de um recarregamento dividido por trecho ruim (`cache.rs`); comentário de doc do
