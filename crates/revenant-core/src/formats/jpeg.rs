@@ -34,7 +34,7 @@ fn is_segment_marker(m: u8) -> bool {
 }
 
 /// SOF markers (T.81 Table B.1).
-pub(crate) fn is_sof(m: u8) -> bool {
+pub(super) fn is_sof(m: u8) -> bool {
     matches!(m, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF)
 }
 

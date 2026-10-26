@@ -1011,7 +1011,8 @@ impl<'c, S: Seams> Ctx<'c, S> {
         resume.extend(w.resume);
         // Q33, Q36: no candidate starts in a unit of the solution itself. Its later units, decoded out of step, could
         // look evident and take the whole budget. This hides true paths that reuse or rejoin the solution's own pieces
-        // (a burst neighbour's data spliced into the middle of a photo): the burst-sibling cap of the JPEG covers those.
+        // (a burst neighbour's data spliced into the middle of a photo): the JPEG does not rely on uniqueness for those, a
+        // content-only JPEG in two or more pieces is at most Partial (Q37, `jpeg::jpeg_health_cap`).
         self.excluded = sol.clone();
         'ranks: for rank in 0..self.limits.break_points {
             for (i, list) in lists.iter().enumerate() {
