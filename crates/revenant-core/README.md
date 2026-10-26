@@ -850,7 +850,9 @@ A unit is free when it is inside the heap, no live file of the volume's listing 
 `Intact` reassembly) claimed it, it is not already a piece of the file, and no other finding starts in it. A run of free
 units stops at the first unit that is not free; a claimed range wholly covered by the file's own embedded files at their
 exact places (a RAW's preview found as its own `Intact` JPEG) does not stop it (coverage, not equality, since touching
-claimed ranges are merged). Taken ranges are stepped over range by range, never cluster by cluster.
+claimed ranges are merged). Taken ranges are stepped over range by range, never cluster by cluster. The window bounds
+only the distance to a candidate, never a piece's length: a piece runs as far as its units are free, until its walk
+breaks, the known length ends or the read budget does.
 
 **The order of candidates.** After a piece ending at absolute `end`: the free unit starts from `end` up to
 `end + 256 MiB` in ascending order ("next free"), then, on a grid, from the heap start (at most 256 MiB of it) up to
@@ -861,11 +863,14 @@ it); a look-alike continuation beyond it could leave a seam falsely unique, and 
 that (accepted risk). When the format gives an anchor, the start it implies comes first.
 
 **Break points.** When a walk breaks, the piece may end at any unit boundary between the last resume point at or before
-the checked evidence and the break, nearest to the break first, at most 64; more means not exhausted.
+the checked evidence and the break, nearest to the break first, at most 64; more means not exhausted. When the walk
+reaches the file's end, the last piece may still have ended earlier with the rest elsewhere (a look-alike tail right
+after it): its earlier unit boundaries, nearest to the end first, at most 64, are tried too, and any other complete
+solution makes the result not unique.
 
 **Candidates with and without evidence.** A candidate passes when its walk completes or checks content past the seam;
-it is blind when its walk neither breaks nor checks anything before its run ends (a one-cluster run shorter than one
-unit of evidence, data the format cannot check). Evident candidates are descended into first, then blind ones, in
+it is blind when its walk checks nothing past the seam yet does not break right at it (a cluster the format cannot
+check, then foreign data or the end of its run); only a candidate broken right at the seam is dropped. Evident candidates are descended into first, then blind ones, in
 order; both count toward uniqueness, so a blind true continuation next to an evident look-alike makes the result not
 unique. A solution through a blind seam is at most `Unproven`.
 
@@ -889,8 +894,9 @@ file) must match the sum of the pieces exactly; when both are known and disagree
 | Claimed runs              | 2^18 per scan                     |
 
 A file's budget is its own limits within what the scan has left; the prefilter's reads are charged to it (each
-prefilter call reads through its own one-sector reader, and a (start, seam) pair asked again is answered from memory).
-A budget hit stops the file's search, which is then not exhaustive. The search looks at the scan's cancel flag before
+prefilter call reads through its own one-sector reader, and a (start, seam) pair asked again is answered from memory),
+and so is the listing: every 64 candidate units listed cost one walk. Reads past the file's byte budget are refused,
+so one long walk cannot overrun it. A budget hit stops the file's search, which is then not exhaustive. The search looks at the scan's cancel flag before
 every walk and every prefilter read, and gives nothing when cancelled.
 
 **Reading.** The search reads through the scan's read cache, so a sector known to be unreadable is never read again;

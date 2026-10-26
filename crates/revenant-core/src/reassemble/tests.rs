@@ -78,6 +78,12 @@ struct Toy {
     prefilter_reads: bool,
     /// `prove` ignores blind units (only the search's own rule can lower the proof).
     trusting: bool,
+    /// The prefilter rejects every candidate.
+    reject_all: bool,
+    /// Prefilter calls so far.
+    prefilter_calls: u64,
+    /// A failed read counts as a good unit (a careless format: only the search's read limit flags it).
+    ignore_errors: bool,
 }
 
 fn toy(n: u32) -> Toy {
@@ -117,7 +123,10 @@ impl Seams for Toy {
             }
             if !self.blind.contains(&i) {
                 let mut h = [0u8; 12];
-                if view.read_at(s, &mut h).ok() != Some(12) {
+                let got = view.read_at(s, &mut h);
+                if got.is_err() && self.ignore_errors {
+                    h = header(ID, i, self.n);
+                } else if got.ok() != Some(12) {
                     return Walked {
                         end: WalkEnd::Stopped,
                         checked,
@@ -164,17 +173,18 @@ impl Seams for Toy {
 
     fn prefilter(&mut self, r: &mut Reader, g: u64, seam: u64) -> bool {
         let _ = seam;
+        self.prefilter_calls += 1;
         if self.prefilter_reads {
             let mut b = [0u8; 16];
             r.read(g, &mut b);
         }
-        true
+        !self.reject_all
     }
 }
 
 /// Searches the toy file starting at `start` on the 1 MiB-heap grid, `live` taken, nothing claimed.
 fn search_on(
-    src: &Mem,
+    src: &dyn Source,
     toy: &mut Toy,
     start: u64,
     live: &[Fragment],
@@ -252,8 +262,9 @@ fn space_lists_free_cluster_starts_in_prior_order() {
     assert_eq!(space.unit(), U);
     assert_eq!(space.max_pieces(), 16);
 
+    // The unit right at the end is the contiguous case, never a candidate.
     let (c, capped) = space.candidates(4 * MIB, &[], 8, &mut |_| true);
-    assert_eq!(c, (0..8).map(|k| 4 * MIB + k * U).collect::<Vec<_>>());
+    assert_eq!(c, (1..9).map(|k| 4 * MIB + k * U).collect::<Vec<_>>());
     assert!(capped);
 
     // The claimed range is stepped over.
@@ -261,10 +272,10 @@ fn space_lists_free_cluster_starts_in_prior_order() {
     assert_eq!(
         c,
         [
-            5 * MIB - 2 * U,
             5 * MIB - U,
             5 * MIB + 2 * U,
-            5 * MIB + 3 * U
+            5 * MIB + 3 * U,
+            5 * MIB + 4 * U
         ]
     );
 
@@ -274,12 +285,12 @@ fn space_lists_free_cluster_starts_in_prior_order() {
         len: 2 * U,
     }];
     let (c, _) = space.candidates(4 * MIB, &used, 3, &mut |_| true);
-    assert_eq!(c, [4 * MIB, 4 * MIB + 3 * U, 4 * MIB + 4 * U]);
+    assert_eq!(c, [4 * MIB + 3 * U, 4 * MIB + 4 * U, 4 * MIB + 5 * U]);
 
     // Next free forward, then the first hole from the heap start, skipping the live file.
     let end = IMG - 2 * U;
-    let (c, capped) = space.candidates(end, &[], 2 + 256 + 5, &mut |_| true);
-    let mut want = vec![IMG - 2 * U, IMG - U];
+    let (c, capped) = space.candidates(end, &[], 1 + 256 + 5, &mut |_| true);
+    let mut want = vec![IMG - U];
     want.extend((0..256).map(|k| MIB + k * U));
     want.extend((0..5).map(|k| 3 * MIB + k * U));
     assert_eq!(c, want);
@@ -311,7 +322,7 @@ fn space_without_grid_is_forward_only_on_sectors() {
         assert_eq!(space.unit(), 512);
         assert_eq!(space.max_pieces(), 4);
         let (c, capped) = space.candidates(2 * MIB, &[], 100, &mut |_| true);
-        assert_eq!(c, (0..16).map(|k| 2 * MIB + k * 512).collect::<Vec<_>>());
+        assert_eq!(c, (1..16).map(|k| 2 * MIB + k * 512).collect::<Vec<_>>());
         assert!(!capped);
     }
 }
@@ -608,14 +619,15 @@ fn entry_size_must_match_when_known() {
 fn anchor_fixes_the_last_piece() {
     let mut card = Card::new();
     runs_at(&mut card, 40, &FIVE);
-    card.put(7 * MIB, ID, 32..40, 40, 1);
-    card.noise(7 * MIB + units(8), 4);
+    // A copy of unit 32 alone, next free: [.., 7 MiB (unit 32), 4 MiB + 1 unit (33..40)] is a second solution.
+    card.put(7 * MIB, ID, 32..33, 40, 1);
+    card.noise(7 * MIB + units(1), 4);
     let src = card.mem();
     // Without the anchor the copy next free comes first and the seam is ambiguous.
     let s = search_on(&src, &mut toy(40), MIB, &[], &Limits::DEFAULT, None)
         .0
         .unwrap();
-    assert_eq!(s.pieces.last().unwrap().start, 7 * MIB);
+    assert!(s.pieces.iter().any(|p| p.start == 7 * MIB));
     assert!(!s.unique);
     let mut t = Toy {
         anchor: Some((units(32), 4 * MIB)),
@@ -652,20 +664,29 @@ fn blind_seam_is_placed_in_prior_order_and_unproven() {
     assert_eq!(s.proof, Proof::Unproven);
 }
 
-/// Q2's card: A = units 0..8, T = unit 8 alone (blind) on one free cluster, R = units 9..40, and (when `look_alike`)
-/// L = units 8..40 with correct headers but other bytes. Everything else is taken.
+/// Q2's card, start at 4 MiB: A = units 0..8, T = unit 8 alone (blind) on one free cluster, R = units 9..40 two
+/// clusters after T, and (when `look_alike`) L = units 8..40 with correct headers but other bytes, in the first hole at
+/// the heap start. Everything else is taken. With [`q2_limits`] (a 16-unit window) L's own earlier breaks (Q26) cannot
+/// reach R, so only the blind descent through T can make L non-unique.
 fn q2_card(look_alike: bool) -> (Mem, Vec<Fragment>, [Fragment; 4]) {
     let mut card = Card::new();
-    let a = card.put(MIB, ID, 0..8, 40, 1);
-    let t = card.put(MIB + units(9), ID, 8..9, 40, 1);
-    let l = card.put(2 * MIB, ID, 8..40, 40, 99);
-    let r = card.put(3 * MIB, ID, 9..40, 40, 1);
+    let a = card.put(4 * MIB, ID, 0..8, 40, 1);
+    let t = card.put(4 * MIB + units(9), ID, 8..9, 40, 1);
+    let r = card.put(4 * MIB + units(11), ID, 9..40, 40, 1);
+    let l = card.put(MIB, ID, 8..40, 40, 99);
     let free: Vec<Fragment> = if look_alike {
         vec![a, t, l, r]
     } else {
         vec![a, t, r]
     };
     (card.mem(), complement(&free), [a, t, l, r])
+}
+
+fn q2_limits() -> Limits {
+    Limits {
+        seam_window: units(16),
+        ..Limits::DEFAULT
+    }
 }
 
 #[test]
@@ -675,7 +696,7 @@ fn blind_true_continuation_next_to_an_evident_look_alike_is_not_unique() {
         blind: 8..9,
         ..toy(40)
     };
-    let s = search_on(&src, &mut t, MIB, &live, &Limits::DEFAULT, None)
+    let s = search_on(&src, &mut t, 4 * MIB, &live, &q2_limits(), None)
         .0
         .unwrap();
     assert!(s.complete);
@@ -692,7 +713,7 @@ fn blind_true_continuation_next_to_an_evident_look_alike_is_not_unique() {
             trusting,
             ..toy(40)
         };
-        let s = search_on(&src, &mut t, MIB, &live, &Limits::DEFAULT, None)
+        let s = search_on(&src, &mut t, 4 * MIB, &live, &q2_limits(), None)
             .0
             .unwrap();
         assert!(s.complete);
@@ -710,21 +731,234 @@ fn budget_cut_inside_a_blind_descent_is_not_exhaustive() {
         blind: 8..9,
         ..toy(40)
     };
-    let limits = Limits::DEFAULT;
-    let (s, budget) = search_on(&src, &mut t, MIB, &live, &limits, None);
+    let limits = q2_limits();
+    let (s, budget) = search_on(&src, &mut t, 4 * MIB, &live, &limits, None);
     assert!(s.unwrap().exhaustive);
     let tries = Budget::new(&limits).tries_left() - budget.tries_left();
     // The last try is inside the blind descent (evidence first): one fewer cuts it.
     let limits = Limits {
         file_tries: tries - 1,
-        ..Limits::DEFAULT
+        ..q2_limits()
     };
-    let s = search_on(&src, &mut t, MIB, &live, &limits, None)
+    let s = search_on(&src, &mut t, 4 * MIB, &live, &limits, None)
         .0
         .unwrap();
     assert!(s.complete);
     assert_eq!(s.pieces, [a, l]);
     assert!(!s.exhaustive);
+}
+
+/// The reviewer's probe: A = units 0..8 at 1 MiB, one taken cluster, T = unit 8 (blind) followed by free noise, R =
+/// units 9..40 at 1 MiB + 60 units. With `look_alike` the unit before R is noise too, so (noise) + R is an evident
+/// continuation; without it that cluster is taken.
+fn probe_card(look_alike: bool) -> (Mem, Vec<Fragment>) {
+    let mut card = Card::new();
+    card.put(MIB, ID, 0..8, 40, 1);
+    card.put(MIB + units(9), ID, 8..9, 40, 1);
+    card.noise(MIB + units(10), 50);
+    card.put(MIB + units(60), ID, 9..40, 40, 1);
+    let mut live = vec![Fragment {
+        start: MIB + units(8),
+        len: U,
+    }];
+    if !look_alike {
+        live.push(Fragment {
+            start: MIB + units(59),
+            len: U,
+        });
+    }
+    (card.mem(), live)
+}
+
+#[test]
+fn blind_continuation_broken_later_in_its_run_is_descended() {
+    let limits = Limits {
+        seam_window: units(64),
+        ..Limits::DEFAULT
+    };
+    for look_alike in [true, false] {
+        let (src, live) = probe_card(look_alike);
+        let mut t = Toy {
+            blind: 8..9,
+            ..toy(40)
+        };
+        let s = search_on(&src, &mut t, MIB, &live, &limits, None)
+            .0
+            .unwrap();
+        assert!(s.complete, "look-alike {look_alike}");
+        assert!(
+            !s.unique,
+            "look-alike {look_alike}: T then R is another solution"
+        );
+        assert!(!(s.unique && s.proof == Proof::Proven));
+    }
+}
+
+#[test]
+fn window_bounds_the_distance_not_the_piece() {
+    // Q25: a contiguous file longer than the window is one piece.
+    let limits = Limits {
+        seam_window: units(16),
+        ..Limits::DEFAULT
+    };
+    let mut card = Card::new();
+    let f = card.put(4 * MIB, ID, 0..40, 40, 1);
+    card.noise(4 * MIB + units(40), 4);
+    let src = card.mem();
+    let s = search_on(&src, &mut toy(40), 4 * MIB, &[], &limits, None)
+        .0
+        .unwrap();
+    assert_eq!(s.pieces, [f]);
+    assert!(s.complete);
+    assert!(s.unique);
+    assert!(s.exhaustive);
+    assert_eq!(s.proof, Proof::Proven);
+
+    // A look-alike of its tail in the first hole is another solution (Q26).
+    let mut card = Card::new();
+    card.put(4 * MIB, ID, 0..40, 40, 1);
+    card.noise(4 * MIB + units(40), 4);
+    card.put(MIB, ID, 16..40, 40, 99);
+    let src = card.mem();
+    let s = search_on(&src, &mut toy(40), 4 * MIB, &[], &limits, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(!s.unique);
+}
+
+#[test]
+fn complete_walk_tries_earlier_breaks_of_the_last_piece() {
+    // Q26: T = units 8..16 followed contiguously by a look-alike tail (same headers, other bytes); the true tail R is
+    // free elsewhere. T + tail completes, and so does T cut at unit 16 then R: not unique.
+    let mut card = Card::new();
+    card.put(MIB, ID, 0..8, 40, 1);
+    card.noise(MIB + units(8), 4);
+    card.put(2 * MIB, ID, 8..16, 40, 1);
+    card.put(2 * MIB + units(8), ID, 16..40, 40, 99);
+    card.noise(2 * MIB + units(32), 4);
+    card.put(3 * MIB, ID, 16..40, 40, 1);
+    card.noise(3 * MIB + units(24), 4);
+    let src = card.mem();
+    let s = search_on(&src, &mut toy(40), MIB, &[], &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(!s.unique);
+    assert!(!(s.unique && s.proof == Proof::Proven));
+}
+
+#[test]
+fn seam_candidate_cap_hit_is_not_exhaustive() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = card.mem();
+    let limits = Limits {
+        seam_candidates: 1,
+        ..Limits::DEFAULT
+    };
+    let s = search_on(&src, &mut toy(40), MIB, &[], &limits, None)
+        .0
+        .unwrap();
+    assert!(!s.exhaustive);
+}
+
+#[test]
+fn break_point_cap_hit_is_not_exhaustive() {
+    // The contiguous-continuation card has two valid breaks (7 and 8 units) and is otherwise exhaustive.
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..8, 40, 1);
+    let r = card.put(3 * MIB, ID, 8..40, 40, 1);
+    let src = card.mem();
+    let live = complement(&[a, r]);
+    let limits = Limits {
+        break_points: 1,
+        ..Limits::DEFAULT
+    };
+    let mut t = Toy {
+        blind: 7..8,
+        ..toy(40)
+    };
+    let s = search_on(&src, &mut t, MIB, &live, &limits, None)
+        .0
+        .unwrap();
+    assert!(!s.exhaustive);
+}
+
+/// A source whose reads fail inside `bad`.
+struct Holes(Mem, Range<u64>);
+
+impl Source for Holes {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        if offset < self.1.end && offset + buf.len() as u64 > self.1.start {
+            return Err(EngineError::Read {
+                offset,
+                cause: std::io::Error::other("bad"),
+            });
+        }
+        self.0.read_at(offset, buf)
+    }
+    fn volume(&self) -> Option<VolumeId> {
+        None
+    }
+}
+
+#[test]
+fn stopped_candidate_walk_is_not_exhaustive() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = Holes(card.mem(), 6 * MIB..6 * MIB + U);
+    let s = search_on(&src, &mut toy(40), MIB, &[], &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(!s.exhaustive);
+}
+
+#[test]
+fn prefilter_read_budget_hit_is_not_exhaustive() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = card.mem();
+    let limits = Limits {
+        file_read: 8 * K,
+        ..Limits::DEFAULT
+    };
+    let mut t = Toy {
+        prefilter_reads: true,
+        ..toy(40)
+    };
+    let s = search_on(&src, &mut t, MIB, &[], &limits, None).0.unwrap();
+    assert!(!s.exhaustive);
+}
+
+#[test]
+fn listing_work_is_charged_to_the_try_budget() {
+    // Blind units then noise: 7 break points, each listing ~3800 free units that the prefilter rejects.
+    let mut card = Card::new();
+    card.put(MIB, ID, 0..8, 40, 1);
+    card.noise(MIB + units(8), 4);
+    let src = card.mem();
+    let limits = Limits {
+        file_tries: 50,
+        ..Limits::DEFAULT
+    };
+    let mut t = Toy {
+        blind: 1..8,
+        reject_all: true,
+        ..toy(40)
+    };
+    let (s, budget) = search_on(&src, &mut t, MIB, &[], &limits, None);
+    assert!(!s.unwrap().exhaustive);
+    assert!(Budget::new(&limits).tries_left() - budget.tries_left() <= 50);
+    assert!(
+        t.prefilter_calls <= 50 * LISTED_PER_TRY,
+        "{} prefilter calls",
+        t.prefilter_calls
+    );
 }
 
 #[test]
@@ -791,4 +1025,24 @@ fn contiguous_continuation_is_not_a_seam() {
     assert!(s.exhaustive);
     assert!(s.unique);
     assert_eq!(s.pieces, [a, r]);
+}
+
+#[test]
+fn a_walk_cut_by_the_read_limit_is_not_exhaustive() {
+    // One piece allowed, so no later try notices the budget: only the refused read does.
+    let mut card = Card::new();
+    card.put(MIB, ID, 0..8, 8, 1);
+    let src = card.mem();
+    let limits = Limits {
+        pieces: 1,
+        file_read: 24,
+        ..Limits::DEFAULT
+    };
+    let mut t = Toy {
+        ignore_errors: true,
+        ..toy(8)
+    };
+    let s = search_on(&src, &mut t, MIB, &[], &limits, None).0.unwrap();
+    assert!(s.complete);
+    assert!(!s.exhaustive);
 }

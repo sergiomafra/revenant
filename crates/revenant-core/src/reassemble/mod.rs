@@ -5,7 +5,9 @@
 //! first) and, for each, the free unit starts where the next piece could begin ([`Space::candidates`]: next free
 //! forward within the window, then, on a cluster grid, the first hole from the heap start). A candidate passes when the
 //! walk over it shows content evidence past the seam; a candidate with no evidence either way (blind) is tried too, after
-//! the evident ones, and its complete solutions count toward uniqueness (ruling Q2). The search is bounded by
+//! the evident ones, and its complete solutions count toward uniqueness (ruling Q2). A walk that completes also tries
+//! the earlier break points of its last piece (Q26). The window bounds the distance to a candidate, not a piece's
+//! length (Q25). The search is bounded by
 //! [`Limits`] and a [`Budget`]; any cap or budget hit makes it not exhaustive, and the file can then be at most
 //! `Partial`.
 //!
@@ -15,7 +17,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::EngineError;
 use crate::cache::Runs;
@@ -49,6 +51,8 @@ pub(crate) const SCAN_READ: u64 = 16 << 30;
 pub(crate) const MAX_CANDIDATES: usize = 4096;
 /// Runs of bytes claimed by `Intact` findings kept per scan.
 pub(crate) const MAX_CLAIMED_RUNS: usize = 1 << 18;
+/// Candidate units listed (prefilter calls, answered from memory or not) per try charged to the file's budget.
+const LISTED_PER_TRY: u64 = 64;
 /// Prefilter answers remembered per file (past it they are asked again, and charged again).
 const PREFILTER_MEMO: usize = 1 << 16;
 
@@ -291,7 +295,8 @@ impl<'a> Space<'a> {
         (stop - g).min(max)
     }
 
-    /// Candidate starts after a piece ending at `end` (D4): free unit starts ascending from `end` up to `end + window`,
+    /// Candidate starts after a piece ending at `end` (D4): free unit starts ascending after `end` (never the unit right
+    /// at `end`: that is no seam) up to `end + window`,
     /// then (grid only) from the heap start up to `end` (at most `window` from the heap start); never inside `used`, a
     /// taken range, or a unit holding a finding start. `keep` (the seam's prefilter, which [`search`] wraps so that its
     /// reads are charged to the file's read budget and memoized per file by (absolute start, logical seam)) is applied
@@ -306,7 +311,13 @@ impl<'a> Space<'a> {
     ) -> (Vec<u64>, bool) {
         let mut out = Vec::new();
         let forward_to = end.saturating_add(self.window).min(self.end);
-        if self.list(self.ceil(end), forward_to, used, cap, keep, &mut out) {
+        // The unit right at `end` would continue the piece contiguously: no seam, never a candidate.
+        let from = if self.is_unit_start(end) {
+            end.saturating_add(self.unit)
+        } else {
+            self.ceil(end)
+        };
+        if self.list(from, forward_to, used, cap, keep, &mut out) {
             return (out, true);
         }
         if self.grid {
@@ -493,10 +504,13 @@ impl Budget {
     }
 }
 
-/// A source that counts the bytes read from it.
+/// A source that counts the bytes read from it and refuses reads once `limit` bytes were read (so one walk cannot run
+/// past the file's read budget; the search is then not exhaustive).
 struct Counted<'a> {
     inner: &'a dyn Source,
     read: AtomicU64,
+    limit: AtomicU64,
+    over: AtomicBool,
 }
 
 impl<'a> Counted<'a> {
@@ -504,11 +518,22 @@ impl<'a> Counted<'a> {
         Counted {
             inner,
             read: AtomicU64::new(0),
+            limit: AtomicU64::new(u64::MAX),
+            over: AtomicBool::new(false),
         }
     }
 
     fn read(&self) -> u64 {
         self.read.load(Ordering::Relaxed)
+    }
+
+    fn set_limit(&self, limit: u64) {
+        self.limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// Whether a read was refused for the limit.
+    fn over(&self) -> bool {
+        self.over.load(Ordering::Relaxed)
     }
 }
 
@@ -518,6 +543,10 @@ impl Source for Counted<'_> {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        if self.read() >= self.limit.load(Ordering::Relaxed) {
+            self.over.store(true, Ordering::Relaxed);
+            return Err(EngineError::Cancelled);
+        }
         let n = self.inner.read_at(offset, buf)?;
         self.read.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
@@ -559,6 +588,8 @@ struct Ctx<'c, S: Seams> {
     tries: u64,
     max_tries: u64,
     max_read: u64,
+    /// Candidate units listed so far (each [`LISTED_PER_TRY`] cost a try).
+    listed: u64,
     memo: HashMap<(u64, u64), bool>,
     solutions: Vec<Solution>,
     /// The partial path that checked the most logical bytes: (bytes, pieces).
@@ -590,6 +621,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
             anchor,
             own,
             tries: 0,
+            listed: 0,
             max_tries,
             max_read,
             memo: HashMap::new(),
@@ -623,8 +655,13 @@ impl<'c, S: Seams> Ctx<'c, S> {
     }
 
     /// The seam's prefilter for candidate `g` at logical `seam`, memoized per (absolute start, logical seam), its reads
-    /// charged to the file's read budget (Q1).
+    /// charged to the file's read budget (Q1). Listing itself is charged too: every [`LISTED_PER_TRY`] calls, answered
+    /// from memory or not, cost one try, so the listing work of a file is bounded by its try budget.
     fn keep(&mut self, g: u64, seam: u64) -> bool {
+        self.listed += 1;
+        if self.listed.is_multiple_of(LISTED_PER_TRY) && !self.charge() {
+            return false;
+        }
         if let Some(&v) = self.memo.get(&(g, seam)) {
             return v;
         }
@@ -650,12 +687,13 @@ impl<'c, S: Seams> Ctx<'c, S> {
         v
     }
 
-    /// Longest piece that may start at logical `l`: what is left of the known length, else the window.
+    /// Longest piece that may start at logical `l`: what is left of the known length, else unbounded (Q25: the window
+    /// bounds the distance to a candidate, not a piece; a piece runs until its walk breaks or the read budget ends).
     fn max_len(&self, l: u64) -> Option<u64> {
         match self.known {
             Some(k) if k <= l => None,
             Some(k) => Some(k - l),
-            None => Some(self.space.window),
+            None => Some(u64::MAX),
         }
     }
 
@@ -753,6 +791,11 @@ impl<'c, S: Seams> Ctx<'c, S> {
             WalkEnd::Complete { len } => {
                 if len > l && len <= l + run {
                     self.solution(pieces, g, len - l, blind);
+                    // Q26: the last piece may also end earlier, the rest elsewhere (a look-alike tail right after it).
+                    if pieces.len() + 1 < self.space.max_pieces() {
+                        let breaks = self.breaks(g, l, l + 1, len - 1, false);
+                        self.try_breaks(pieces, from, g, l, &w, breaks, blind);
+                    }
                 }
             }
             WalkEnd::Stopped => self.exhaustive = false,
@@ -787,19 +830,42 @@ impl<'c, S: Seams> Ctx<'c, S> {
             .max()
             .unwrap_or(l)
             .max(l);
-        // Unit boundaries in [floor, at] inside the piece, nearest to the break first.
-        let top = at.min(l + run);
-        let lowest = g + (floor - l);
-        let mut abs = self.space.floor(g + (top - l));
-        let mut breaks = Vec::new();
+        let breaks = self.breaks(g, l, floor, at.min(l + run), true);
+        self.try_breaks(pieces, from, g, l, w, breaks, blind);
+    }
+
+    /// Logical unit boundaries `b` in `[low, top]` of the piece starting at absolute `g`, logical `l` (`b > l`), nearest
+    /// to `top` first, at most `break_points`; past that, when `counts`, the search is not exhaustive.
+    fn breaks(&mut self, g: u64, l: u64, low: u64, top: u64, counts: bool) -> Vec<u64> {
+        let lowest = g + (low.max(l) - l);
+        let mut abs = self.space.floor(g + (top.max(l) - l));
+        let mut out = Vec::new();
         while abs > g && abs >= lowest {
-            if breaks.len() == self.limits.break_points {
-                self.exhaustive = false;
+            if out.len() == self.limits.break_points {
+                if counts {
+                    self.exhaustive = false;
+                }
                 break;
             }
-            breaks.push(l + (abs - g));
+            out.push(l + (abs - g));
             abs -= self.space.unit();
         }
+        out
+    }
+
+    /// For each break point `b` of the piece `[g, ..)` at logical `l` walked as `w`: the piece cut at `b`, then the next
+    /// piece's candidates, evident ones first, then blind ones (Q2).
+    #[allow(clippy::too_many_arguments)]
+    fn try_breaks(
+        &mut self,
+        pieces: &mut Vec<Fragment>,
+        from: &(u64, S::State),
+        g: u64,
+        l: u64,
+        w: &Walked<S::State>,
+        breaks: Vec<u64>,
+        blind: bool,
+    ) {
         for b in breaks {
             if self.stop.is_some() {
                 return;
@@ -854,11 +920,8 @@ impl<'c, S: Seams> Ctx<'c, S> {
             self.exhaustive = false;
         }
         let first = cands.first().copied();
-        cands.extend(
-            listed
-                .into_iter()
-                .filter(|&g2| g2 != end && Some(g2) != first),
-        );
+        // The listing never holds the unit at `end` (no seam), nor does the anchored start.
+        cands.extend(listed.into_iter().filter(|&g2| Some(g2) != first));
         let mut evident = Vec::new();
         let mut blinds = Vec::new();
         for g2 in cands {
@@ -878,7 +941,9 @@ impl<'c, S: Seams> Ctx<'c, S> {
             match w2.end {
                 WalkEnd::Complete { .. } => evident.push((g2, w2.checked <= b)),
                 WalkEnd::Broken { .. } if w2.checked > b => evident.push((g2, false)),
-                WalkEnd::Broken { at } if at >= b + run2 => blinds.push(g2),
+                // No evidence either way at the seam, broken only further on (even inside its own run: a blind
+                // cluster then foreign data): blind, descended. Only a candidate broken right at the seam is dropped.
+                WalkEnd::Broken { at } if at > b => blinds.push(g2),
                 WalkEnd::Broken { .. } => {}
                 WalkEnd::Stopped => self.exhaustive = false,
             }
@@ -926,6 +991,7 @@ pub(crate) fn search<S: Seams>(
         (a, b) => (a.or(b), false),
     };
     let caps = budget.for_file(limits);
+    counted.set_limit(caps.1);
     let mut ctx = Ctx::new(seams, &counted, space, limits, cancel, known, caps);
     let root = (0, ctx.seams.begin());
     ctx.dfs(&mut Vec::new(), &root, start, 0, false);
@@ -939,6 +1005,8 @@ pub(crate) fn search<S: Seams>(
         stop,
         ..
     } = ctx;
+    let exhaustive = exhaustive && !counted.over();
+    counted.set_limit(u64::MAX);
     let found = if stop == Some(Stop::Cancelled) {
         None
     } else if let Some((sol, blind)) = solutions.first() {
