@@ -636,8 +636,8 @@ struct Ctx<'c, S: Seams> {
     best: Option<(u64, Vec<Fragment>)>,
     exhaustive: bool,
     stop: Option<Stop>,
-    /// Ranges no candidate may start in besides the path's pieces: during the re-check, the rest of the piece being cut
-    /// (Q33, Q34).
+    /// Ranges no candidate may start in besides the path's pieces: during the re-check, the found solution's units (Q33,
+    /// Q36).
     excluded: Vec<Fragment>,
     /// Set by [`Ctx::cut_short`]: the re-check's top-hinted cut was not walked to the end when it is set during it.
     short: bool,
@@ -1009,6 +1009,10 @@ impl<'c, S: Seams> Ctx<'c, S> {
         };
         let mut resume = vec![root];
         resume.extend(w.resume);
+        // Q33, Q36: no candidate starts in a unit of the solution itself. Its later units, decoded out of step, could
+        // look evident and take the whole budget. This hides true paths that reuse or rejoin the solution's own pieces
+        // (a burst neighbour's data spliced into the middle of a photo): the burst-sibling cap of the JPEG covers those.
+        self.excluded = sol.clone();
         'ranks: for rank in 0..self.limits.break_points {
             for (i, list) in lists.iter().enumerate() {
                 let Some(&b) = list.get(rank) else {
@@ -1034,13 +1038,6 @@ impl<'c, S: Seams> Ctx<'c, S> {
                     start: p.start,
                     len: b - starts[i],
                 });
-                // Q33/Q34: no candidate starts in the rest of the piece being cut (its later units, decoded out of step,
-                // could look evident and take the whole budget, and the alternative is to leave them out); the
-                // solution's other pieces stay candidates (another path may reuse them).
-                self.excluded = vec![Fragment {
-                    start: p.start + (b - starts[i]),
-                    len: p.len - (b - starts[i]),
-                }];
                 // Q29: here only an alternative with content evidence past the new seam counts; a blind one (units the
                 // format cannot check, filled from any free run) is not descended into.
                 let is_top = rank == 0 && top[i] == Some(b);

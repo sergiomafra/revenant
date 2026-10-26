@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use crate::formats::jpeg::{JPEG_MAX_LEN, data_end, walk_header};
+use crate::formats::jpeg::{JPEG_MAX_LEN, data_end, is_sof, walk_header};
 use crate::formats::jpeg_entropy::{self, Cursor, End, Frame, RESUME_POINTS};
 use crate::formats::jpeg_join::{
     Dc, base_bound, blocks_per_mcu, boundary_mean, first_failing, on_seams, seam_mean, seams_ok,
@@ -732,6 +732,111 @@ impl Lead {
     }
 }
 
+/// Mean `|ΔDC|` (in the photos' quantized units) between the first MCU rows of two photos above which they are not burst
+/// siblings (Q36). Measured on the testkit's photos (seeds 5, 7, 11): burst neighbours (one scene shifted a pixel) are
+/// 0.45–1.19 apart at 1024×768 and 0.94–2.48 at 512×384, other scenes with the same tables 120–174; 8 leaves room for a
+/// few pixels of camera movement between shots and stays far below another scene.
+pub(crate) const SIBLING_MAD: f64 = 8.0;
+
+/// What the burst-sibling test compares of a JPEG: the bytes of its frame and table segments (SOF, DQT, DHT, in their
+/// order) and the luma DC values of its first MCU row.
+pub(crate) struct JpegPrint {
+    tables: Vec<u8>,
+    dc: Vec<i32>,
+}
+
+/// The print of the JPEG at `start`; `None` when its header does not parse, its frame is not one the decoder covers or
+/// its first MCU row does not decode.
+pub(crate) fn jpeg_print(source: &dyn Source, start: u64) -> Option<JpegPrint> {
+    let mut r = Reader::new(source);
+    let header = walk_header(&mut r, start, JPEG_MAX_LEN)?;
+    let (mut sof, mut dqt, mut dht) = (Vec::new(), Vec::new(), Vec::new());
+    let mut pos = start + 2;
+    while pos + 4 <= header.scan_start {
+        if r.byte(pos)? == 0xFF && r.byte(pos + 1)? == 0xFF {
+            pos += 1; // fill byte
+            continue;
+        }
+        let marker = r.byte(pos + 1)?;
+        let len = u64::from(r.u16(pos + 2)?);
+        let into = match marker {
+            0xDB => Some(&mut dqt),
+            0xC4 => Some(&mut dht),
+            m if is_sof(m) => Some(&mut sof),
+            _ => None,
+        };
+        if let Some(into) = into {
+            let mut seg = vec![0u8; 2 + len as usize];
+            if r.read(pos, &mut seg) < seg.len() {
+                return None;
+            }
+            into.extend_from_slice(&seg);
+        }
+        pos += 2 + len;
+    }
+    let frame = jpeg_entropy::frame(&mut r, start, header.scan_start)?;
+    let row = u64::from(frame.mcus_x);
+    let run = jpeg_entropy::decode_until(
+        &mut r,
+        &frame,
+        frame.start(header.scan_start),
+        source.len(),
+        true,
+        row,
+    );
+    if run.mcus < row {
+        return None;
+    }
+    let mut tables = sof;
+    tables.extend(dqt);
+    tables.extend(dht);
+    Some(JpegPrint { tables, dc: run.dc })
+}
+
+/// Mean `|ΔDC|` between the first MCU rows of two prints of the same geometry.
+fn first_row_mad(a: &JpegPrint, b: &JpegPrint) -> Option<f64> {
+    (a.dc.len() == b.dc.len() && !a.dc.is_empty()).then(|| {
+        let sum: u64 =
+            a.dc.iter()
+                .zip(&b.dc)
+                .map(|(x, y)| u64::from(x.abs_diff(*y)))
+                .sum();
+        sum as f64 / a.dc.len() as f64
+    })
+}
+
+/// Burst siblings (Q36): the same frame and tables byte for byte (SOF, DQT, DHT) and first MCU rows at most
+/// [`SIBLING_MAD`] apart: two photos of one scene from one camera, whose data the DC seam test cannot tell apart.
+pub(crate) fn is_burst_sibling(a: &JpegPrint, b: &JpegPrint) -> bool {
+    a.tables == b.tables && first_row_mad(a, b).is_some_and(|mad| mad <= SIBLING_MAD)
+}
+
+/// Whether the JPEG at `start` has a burst sibling among `heads` (the starts of the JPEG findings of the scan, fed by the
+/// reassembly step) whose data is not accounted for: a head inside a range claimed by an `Intact` finding (the sibling
+/// found whole, or nested in an `Intact` file) is not counted.
+pub(crate) fn has_burst_sibling(
+    source: &dyn Source,
+    start: u64,
+    heads: &[u64],
+    taken: &super::Taken,
+) -> bool {
+    let Some(me) = jpeg_print(source, start) else {
+        return false;
+    };
+    heads
+        .iter()
+        .copied()
+        .filter(|&h| h != start && taken.overlapping(h, h + 1).is_empty())
+        .any(|h| jpeg_print(source, h).is_some_and(|p| is_burst_sibling(&me, &p)))
+}
+
+/// The burst-sibling cap (Q36): a JPEG put together from content alone in two or more pieces is at most `Partial` when
+/// it has a burst sibling (the data of one could stand in the other's middle, and no search bound can rule that out).
+/// One run keeps the 1.3 rule.
+pub(crate) fn sibling_capped(found: &super::Search, has_sibling: bool) -> bool {
+    has_sibling && found.pieces.len() >= 2
+}
+
 /// Whether a candidate's first sector (absolute `g`) may be entropy-coded data, by the 1.3 window rule: no marker but
 /// `00` (stuffing), `D0`–`D7` (restart), `D9` (EOI) or `FF` (fill) after an `FF`, not one repeated byte value, readable.
 fn may_be_data(r: &mut Reader, g: u64) -> bool {
@@ -1432,24 +1537,30 @@ mod tests {
         }
     }
 
-    #[test]
-    #[cfg_attr(
-        debug_assertions,
-        ignore = "about 30-50 s in debug: runs in the release suite"
-    )]
-    fn a_later_piece_of_the_solution_reused_by_the_true_path_is_not_unique() {
-        // Q34. The solution is [P, A3]: P is one run holding a's data with MCUs x..y from its burst neighbour b (spliced
-        // where both photos are byte-aligned, x and y chosen so that P's data after y is a's shifted by whole clusters),
-        // and A3 is a's rest. The true path is [a[..c1], A2, A3]: it cuts P before x, goes on in A2 = a[c1..c2] (free,
-        // elsewhere) and reuses the solution's own last piece. The re-check must still list A3 as a candidate.
-        let burst = testkit::jpeg_burst(2048, 1536, 5, 2);
+    /// Whether a search result would be `Intact` under the health rule this part builds (Task 4 adds the scan's own
+    /// checks): one complete, unique, exhaustive, proven solution, not capped by a burst sibling (Q36).
+    fn intact(found: &Search, has_sibling: bool) -> bool {
+        found.complete
+            && found.unique
+            && found.exhaustive
+            && found.proof == Proof::Proven
+            && !sibling_capped(found, has_sibling)
+    }
+
+    /// The reviewers' probes (Q33, Q34, Q36). `a` with MCUs x..y from its burst neighbour `b` spliced in (x < y where both
+    /// photos are byte-aligned and part by whole 4 KiB clusters, so that past y the data is `a`'s shifted by whole
+    /// clusters), stored as one run P up to a's `c2`, then A3 = a[c2..]: the solution [P, A3]. The true path cuts P before
+    /// x and goes on in A2 = a[c1..]: with `rejoin`, A2 ends a cluster past y and the path rejoins P there (P holds a's
+    /// data again), then A3; without, A2 runs to c2 and the path reuses A3. `b`'s first clusters lie on the card (its head:
+    /// a burst sibling the scan found, not `Intact`).
+    fn spliced_middle(seed: u64, rejoin: bool) -> (Search, bool) {
+        let burst = testkit::jpeg_burst(2048, 1536, seed, 2);
         let (a, b) = (&burst[0], &burst[1]);
         let cluster = 4096u64;
         let (ca, _) = cursors(a);
         let (cb, _) = cursors(b);
         let mcus_x = u64::from(frame_of(a).0.mcus_x) as usize;
         let total = ca.len();
-        // MCUs byte-aligned in both photos, from the middle of the photo on: (MCU, byte in a, byte in b).
         let aligned: Vec<(usize, u64, u64)> = (total / 2..total * 9 / 10)
             .filter_map(|m| Some((m, ca[m].byte_aligned()?, cb[m].byte_aligned()?)))
             .collect();
@@ -1482,25 +1593,107 @@ mod tests {
                 }
             )
         );
-        // Past y, `s` is `a` shifted by `d` (a multiple of the cluster).
         let d = (xa + (yb - xb)) as i64 - ya as i64;
         assert_eq!(d.rem_euclid(cluster as i64), 0);
         let c1 = xa / cluster * cluster;
-        let c2 = (ya / cluster + 2) * cluster;
+        let c2 = (ya / cluster + 3) * cluster;
         let e = (c2 as i64 + d) as u64;
         assert_eq!(s[e as usize..], a[c2 as usize..]);
-        let mut card = noise_card(450, cluster);
+        let mut card = noise_card(500, cluster);
         let p = put(&mut card, at(cluster, 10), &s[..e as usize]);
-        let a2 = put(&mut card, at(cluster, 200), &a[c1 as usize..c2 as usize]);
-        let a3 = put(&mut card, at(cluster, 350), &a[c2 as usize..]);
+        let a2_end = if rejoin {
+            (ya / cluster + 1) * cluster
+        } else {
+            c2
+        };
+        if rejoin {
+            let back = (a2_end as i64 + d) as u64;
+            assert_eq!(
+                s[back as usize..e as usize],
+                a[a2_end as usize..c2 as usize],
+                "P holds a's data again"
+            );
+        }
+        put(
+            &mut card,
+            at(cluster, 200),
+            &a[c1 as usize..a2_end as usize],
+        );
+        put(&mut card, at(cluster, 350), &a[c2 as usize..]);
+        let sibling = put(&mut card, at(cluster, 470), &b[..2 * cluster as usize]);
         let g = grid(&card, cluster);
         let src = Mem(card);
-        let found = find(&src, &[g], p.start, &[p.start], &[], &Limits::DEFAULT).expect("found");
+        let heads = [p.start, sibling.start];
+        let found = find(&src, &[g], p.start, &heads, &[], &Limits::DEFAULT).expect("found");
         assert!(found.complete, "{found:?}");
-        assert!(
-            !found.unique,
-            "the true path [a[..c1], {a2:?}, {a3:?}] was not seen: {found:?}"
-        );
+        let none = Taken::new(&[], &Runs::default());
+        let has = has_burst_sibling(&src, p.start, &heads, &none);
+        (found, has)
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "about 30-50 s in debug: runs in the release suite"
+    )]
+    fn a_neighbour_spliced_into_the_middle_is_never_intact() {
+        // Q36: the true path reuses the solution's last piece, or rejoins its first one after the cut; the re-check does
+        // not list the solution's own units, so it may not see it: the burst sibling caps the result.
+        let mut wrong = Vec::new();
+        for seed in [5, 7, 11] {
+            for rejoin in [false, true] {
+                let (found, has) = spliced_middle(seed, rejoin);
+                if intact(&found, has) {
+                    wrong.push((seed, rejoin, found));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "Intact: {wrong:?}");
+    }
+
+    /// `jpeg_smooth(2048, 1536, seed)` in 3 runs of 16 KiB clusters on a noise card, and optionally the first cluster of
+    /// another photo with the same tables (`neighbour`: the same scene a pixel to the side, or another scene). With
+    /// 4 KiB clusters the main search's read budget goes to the runs' own later clusters (read out of step behind a
+    /// seam in the upper half, see "Fragmented JPEG"), which is not what this test is about.
+    fn three_pieces(seed: u64, neighbour: Option<&[u8]>) -> bool {
+        let a = testkit::jpeg_smooth(2048, 1536, seed);
+        let cluster = 16u64 << 10;
+        let mut card = noise_card(160, cluster);
+        let runs = put_runs(&mut card, &a, cluster, &[40, 90, 61]);
+        let mut heads = vec![runs[0].start];
+        if let Some(n) = neighbour {
+            heads.push(put(&mut card, at(cluster, 140), &n[..cluster as usize]).start);
+        }
+        let g = grid(&card, cluster);
+        let src = Mem(card);
+        let found = find(&src, &[g], runs[0].start, &heads, &[], &Limits::DEFAULT).expect("found");
+        assert_eq!(found.pieces, runs, "seed {seed}");
+        let none = Taken::new(&[], &Runs::default());
+        intact(
+            &found,
+            has_burst_sibling(&src, runs[0].start, &heads, &none),
+        )
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "about 30-50 s in debug: runs in the release suite"
+    )]
+    fn a_clean_photo_in_three_pieces_is_intact_unless_it_has_a_sibling() {
+        for seed in [5, 7, 11] {
+            assert!(three_pieces(seed, None), "no neighbour, seed {seed}");
+            let other = testkit::jpeg_smooth(2048, 1536, seed + 100);
+            assert!(
+                three_pieces(seed, Some(&other)),
+                "another scene, seed {seed}"
+            );
+            let burst = testkit::jpeg_burst(2048, 1536, seed, 2);
+            assert!(
+                !three_pieces(seed, Some(&burst[1])),
+                "a burst sibling, seed {seed}"
+            );
+        }
     }
 
     #[test]
@@ -1534,6 +1727,77 @@ mod tests {
         assert_eq!(s.pieces, runs);
         assert!(s.complete && s.unique && s.exhaustive, "{s:?}");
         assert_eq!(s.proof, Proof::Proven);
+    }
+
+    /// A card holding `photos` one after the other, every one starting on a sector.
+    fn photos_card(photos: &[&[u8]]) -> (Mem, Vec<u64>) {
+        let mut bytes = Vec::new();
+        let mut starts = Vec::new();
+        for p in photos {
+            starts.push(bytes.len() as u64);
+            bytes.extend_from_slice(p);
+            bytes.resize(bytes.len().next_multiple_of(SECTOR as usize), 0);
+        }
+        (Mem(bytes), starts)
+    }
+
+    #[test]
+    fn a_burst_neighbour_is_a_sibling_and_another_scene_is_not() {
+        for seed in [5, 7, 11] {
+            let burst = testkit::jpeg_burst(512, 384, seed, 2);
+            let other = testkit::jpeg_smooth(512, 384, seed + 100);
+            let (src, starts) = photos_card(&[&burst[0], &burst[1], &other]);
+            let print = |s: u64| jpeg_print(&src, s).expect("a print");
+            let (a, b, c) = (print(starts[0]), print(starts[1]), print(starts[2]));
+            assert_eq!(a.tables, c.tables, "same camera tables (seed {seed})");
+            assert!(is_burst_sibling(&a, &b), "seed {seed}");
+            assert!(!is_burst_sibling(&a, &c), "seed {seed}");
+            let none = Taken::new(&[], &Runs::default());
+            assert!(has_burst_sibling(&src, starts[0], &starts, &none));
+            assert!(!has_burst_sibling(
+                &src,
+                starts[0],
+                &[starts[0], starts[2]],
+                &none
+            ));
+            // The sibling whole and claimed by an Intact finding: its data is accounted for.
+            let mut claimed = Taken::new(&[], &Runs::default());
+            claimed.claim(&[Fragment {
+                start: starts[1],
+                len: burst[1].len() as u64,
+            }]);
+            assert!(!has_burst_sibling(&src, starts[0], &starts, &claimed));
+        }
+        // Other tables (another size): never a sibling.
+        let small = testkit::jpeg_burst(256, 192, 5, 1);
+        let big = testkit::jpeg_burst(512, 384, 5, 1);
+        let (src, starts) = photos_card(&[&big[0], &small[0]]);
+        let (a, b) = (
+            jpeg_print(&src, starts[0]).unwrap(),
+            jpeg_print(&src, starts[1]).unwrap(),
+        );
+        assert!(!is_burst_sibling(&a, &b));
+    }
+
+    #[test]
+    fn the_sibling_cap_takes_two_pieces_and_a_sibling() {
+        let found = |pieces: usize| Search {
+            pieces: (0..pieces as u64)
+                .map(|k| Fragment {
+                    start: k * 8192,
+                    len: 4096,
+                })
+                .collect(),
+            len: pieces as u64 * 4096,
+            complete: true,
+            unique: true,
+            exhaustive: true,
+            proof: Proof::Proven,
+        };
+        assert!(sibling_capped(&found(2), true));
+        assert!(sibling_capped(&found(3), true));
+        assert!(!sibling_capped(&found(1), true), "one run: the 1.3 rule");
+        assert!(!sibling_capped(&found(2), false));
     }
 
     /// [`JpegSeams`] without its hint to the uniqueness re-check.

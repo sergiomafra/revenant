@@ -560,6 +560,23 @@ same-camera data the search can run out of budget: the photo is then at most `Pa
 1.3 stays (Q16): a photo reassembled from two or more pieces is at most `Partial` (the reassembly step's health rule
 applies it; `JpegSeams::restart_interval` reports the interval).
 
+**Burst siblings** (ruling Q36, `reassemble::jpeg::{jpeg_print, is_burst_sibling, has_burst_sibling,
+sibling_capped}`). A burst sibling of a JPEG is another JPEG head found on the card that has:
+
+- the same frame and tables, byte for byte (its SOF, DQT and DHT segments in their order);
+- a first MCU row whose luma DC values are at most 8 apart on average (`SIBLING_MAD`). On the testkit's photos, burst
+  neighbours (one scene shifted a pixel) are 0.45–2.48 apart and other scenes with the same tables 120–174;
+- data not accounted for: a head inside a range an `Intact` finding claims (the sibling found whole, or nested in an
+  `Intact` file) does not count.
+
+The data of one such photo can stand in the middle of the other: it decodes in step and passes the DC seam test. No
+search bound rules that out, since the true path may reuse or rejoin the found solution's own pieces, which the
+re-check does not list. So a JPEG put together from content alone that has two or more pieces is at most `Partial` when
+it has a burst sibling. The cost: on a card with deleted bursts, fragmented JPEGs of those bursts come out `Partial`.
+Placements a file system proves (a live or surviving chain) are not affected, nor are photos found in one run (the 1.3
+rule). The reassembly step (part 1.6, task 4) feeds the starts of the scan's JPEG findings to `has_burst_sibling` and
+applies `sibling_capped` in its health rule.
+
 For the uniqueness re-check (`Seams::suspicious_breaks`) the JPEG orders the cut positions by how much the DC grid jumps
 at each MCU. At each block of the seam line the MCU would make, it takes how far the vertical DC step across the line is
 from the mean of the steps just above and below it. A smooth photo's steps change slowly, and another photo of the same
@@ -903,9 +920,10 @@ points: first the unit boundaries at or before the positions the format marks as
 most suspicious first; positions in one unit count once), then the nearest to the piece's end, at most 64 per piece, taken round robin over the pieces; from each it lists the next
 piece's candidates and searches on from those with content evidence past the new seam (a blind candidate is not
 followed there: filling units the format cannot check from any free run is no evidence of another file). No candidate
-starts in the rest of the piece being cut, the units after the cut (rulings Q33, Q34: leaving them out is the
-alternative, and read out of step they can look like a continuation and take the whole budget); the solution's other
-pieces stay candidates, since another path may reuse them. Any other complete solution makes the result not unique. The re-check has its own
+starts in a unit of the found solution itself (rulings Q33, Q36): read out of step, the solution's own later units can
+look like a continuation and take the whole budget. This hides the true paths that reuse or rejoin the solution's own
+pieces, as when a burst neighbour's data stands in the middle of a photo; for the JPEG the burst-sibling cap (see
+"Fragmented JPEG") covers those. Any other complete solution makes the result not unique. The re-check has its own
 budget (2^14 walks per file); running out of it, or of break points, does not make the search non-exhaustive, with
 one exception (Q33): when the format gives hints, every candidate at each piece's most suspicious cut must be walked to
 the end (no candidate or break-point cap, budget or cancel cutting it short), else the result is not exhaustive. Hitting
@@ -919,12 +937,14 @@ check, then foreign data or the end of its run); only a candidate broken right a
 order; both count toward uniqueness, so a blind true continuation next to an evident look-alike makes the result not
 unique. A solution through a blind seam is at most `Unproven`.
 
-**Residual risk, stated plainly.** Uniqueness is decided within bounds: candidates only inside the window, and
-look-alikes inside a piece only at the break points the re-check tries within its budget. A look-alike continuation
-beyond the window, a swap point inside a long piece past the tried break points, or a look-alike whose data right after
-the swap point is blind to the format (the re-check follows only evident candidates), can leave a result unique that is
-not. The format's own proof is the guard: formats with positional proof (a video's sample table, a RAW's tile offsets)
-do not depend on the engine's uniqueness; for the others the format orders the re-check so its weakest seams come first.
+**What uniqueness covers, and what is best effort.** Uniqueness is decided within bounds: candidates only inside the
+window; look-alikes inside a piece only at the break points the re-check tries within its budget, never through the
+solution's own units; and the re-check follows only evident candidates. A look-alike beyond those bounds can leave a
+result unique that is not. Formats with positional proof (a video's sample table, a RAW's tile offsets) do not depend
+on the engine's uniqueness. The JPEG, whose only proof is the DC grid, does not rely on it either for the case that
+matters (a burst of one scene, whose data the DC test cannot tell apart): a JPEG put together in two or more pieces
+from content alone is at most `Partial` when the card holds a burst sibling of it (Q36, "Fragmented JPEG"). For a JPEG
+found in one run, the re-check is best effort and the 1.3 rule stands.
 
 **The rule for `Intact`.** The search reports the first complete solution in that order (else the path that checked the
 most bytes), whether it is the only complete solution, whether nothing was cut by a cap or budget, and the proof. A file
