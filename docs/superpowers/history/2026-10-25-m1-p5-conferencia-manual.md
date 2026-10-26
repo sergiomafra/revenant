@@ -11,8 +11,10 @@ o PR da 1.5: os resultados vão para o fim deste arquivo (passo 6) e decidem se 
    `system: false` na linha do cartão. Se o id que você ia usar mostra `"system":true` ou `"internal":true`, **pare**.
 2. **Nunca use o disco do sistema como origem** (o `disk0`/`disk1` do Mac, o `PhysicalDrive0` do Windows). O motor recusa
    (`system_disk`), mas o roteiro não deve nem tentar.
-3. O `revenant-dev` só lê o cartão. Os únicos comandos que mexem em algo do cartão são `unmount` e `remount` (desmontar e
-   montar o volume, como o "ejetar" do Finder sem soltar o aparelho): não apagam nem gravam dados do cartão.
+3. O `revenant-dev` só lê o cartão e nunca grava dados nele. Mas `unmount`, `preflight`, `scan` e `copy` sobre um disco
+   **também o desmontam** (como o "ejetar" do Finder, sem soltar o aparelho; passe `--no-unmount` para não desmontar), e só
+   `remount` o monta de volta. Montar e desmontar não apagam nem gravam dados do cartão (o macOS pode gravar
+   `.fseventsd` ao montar).
 4. Use um cartão de teste, de preferência com fotos que você já tem em outro lugar. Para o passo 4, algo que você aceita perder.
 5. A pasta das cópias, imagens e sessões fica **em outro disco** (o disco do computador ou um HD externo), nunca no cartão
    nem em outro volume dele. O motor recusa o contrário (`destination_on_source`), mas evite.
@@ -27,32 +29,33 @@ Objetivo: o cartão intacto antes e depois, a cópia fiel, a busca no aparelho i
 1. `mkdir -p ~/rv-teste/mac && cd ~/rv-teste/mac`
 2. `revenant-dev disks` e anote o id (`disk4` abaixo; troque pelo seu). Esperado: uma linha `"event":"disk"` com o tamanho
    do cartão, `"removable":true`, `"system":false` e o volume dele em `volumes`.
-3. `sudo revenant-dev digest disk4` — o resumo **antes**. Esperado: `{"event":"digest","bytes":…,"fnv64":"…","unreadable_bytes":0}`.
-   Anote o `fnv64`. (O `digest` lê o cartão sem desmontar; o `sudo` é só para ler o aparelho cru.) Demora o tempo de ler o
-   cartão inteiro.
-4. `sudo revenant-dev preflight disk4 --copy-to ~/rv-teste/mac/card.img --session ~/rv-teste/mac/sessao`
-   Esperado: `{"event":"preflight","disk":"disk4","issues":[]}` e saída 0. **Atenção:** a conferência **desmonta** o cartão
-   (`diskutil unmountDisk`, sem ejetar: o cartão some do Finder mas o leitor continua ligado). É assim de propósito, para ninguém
-   gravar nele enquanto lemos; o passo 9 monta de volta. Se vier `issues` não vazio, copie a linha para o registro e pare.
-5. `sudo revenant-dev scan disk4 --session ~/rv-teste/mac/sessao --extract ~/rv-teste/mac/achados`
+3. `sudo revenant-dev unmount disk4` — **desmonta** o cartão (`diskutil unmountDisk`, sem ejetar: some do Finder, o leitor
+   continua ligado). Fazemos isso **antes** do resumo "antes" porque um volume montado pode ser alterado pelo Spotlight ou pelo
+   `.fseventsd` entre os dois resumos, o que daria um falso alarme. Esperado: `{"event":"unmount","disk":"disk4","held":0}`.
+4. `sudo revenant-dev digest disk4` — o resumo **antes**. Esperado: `{"event":"digest","bytes":…,"fnv64":"…","unreadable_bytes":0}`.
+   Anote o `fnv64`. (O `sudo` é só para ler o aparelho cru.) Demora o tempo de ler o cartão inteiro.
+5. `sudo revenant-dev preflight disk4 --copy-to ~/rv-teste/mac/card.img --session ~/rv-teste/mac/sessao`
+   Esperado: `{"event":"preflight","disk":"disk4","issues":[]}` e saída 0. **Atenção:** a conferência desmonta o cartão se ele ainda
+   estiver montado (aqui já está, do passo 3: ela só confirma). É assim de propósito, para ninguém gravar nele enquanto lemos; o passo 11 monta de volta. Se vier `issues` não vazio, copie a linha para o registro e pare.
+6. `sudo revenant-dev scan disk4 --session ~/rv-teste/mac/sessao --extract ~/rv-teste/mac/achados`
    (crie `achados` antes com `mkdir`). Deixe passar alguns por cento e **tire o leitor da porta USB** no meio.
    Esperado: a busca avisa que o aparelho sumiu (`device_gone`) ou fica esperando você plugar de volta, sem marcar setores
    ruins e sem fechar com resumo. Plugue o leitor de novo.
-6. Repita **o mesmo comando do passo 5** (não repita o `preflight`). Esperado: ele reconhece o mesmo cartão, desmonta de novo
+7. Repita **o mesmo comando do passo 6** (não repita o `preflight`). Esperado: ele reconhece o mesmo cartão, desmonta de novo
    (o Mac pode ter remontado ao plugar; é a mesma desmontagem sem ejetar), retoma de onde parou e imprime as linhas já
    achadas com `"replayed":true`, depois as novas e o `summary`. Anote o `found` do resumo. Se ele disser
    `session_other_source`, o cartão não foi reconhecido: copie a linha para o registro.
-7. `sudo revenant-dev copy disk4 ~/rv-teste/mac/card.img`
+8. `sudo revenant-dev copy disk4 ~/rv-teste/mac/card.img`
    Esperado: linhas `copy_progress` até `copy_summary` com `"complete":true` e `bad:0`. O arquivo `card.img` fica ao lado
    de `card.img.rvmap` (o mapa da cópia). O espaço livre precisa ser pelo menos o tamanho do cartão.
-8. `revenant-dev scan ~/rv-teste/mac/card.img` (sem `sudo`; a imagem é um arquivo). Esperado: o mesmo número de `found`
-   do passo 6 (os mesmos arquivos).
-9. `sudo revenant-dev digest disk4` — o resumo **depois**. Esperado: o **mesmo `fnv64` do passo 3** e `unreadable_bytes` 0.
+9. `revenant-dev scan ~/rv-teste/mac/card.img` (sem `sudo`; a imagem é um arquivo). Esperado: o mesmo número de `found`
+   do passo 7 (os mesmos arquivos).
+10. `sudo revenant-dev digest disk4` — o resumo **depois**. Esperado: o **mesmo `fnv64` do passo 4** e `unreadable_bytes` 0.
    Diferente significa que algo gravou no cartão enquanto ele estava desmontado: pare e registre.
-10. `sudo revenant-dev remount disk4` — **monta o cartão de volta**, como estava. Esperado: `{"event":"remount","disk":"disk4"}`
+11. `sudo revenant-dev remount disk4` — **monta o cartão de volta**, como estava. Esperado: `{"event":"remount","disk":"disk4"}`
     e o cartão aparece no Finder. O Mac pode gravar no volume ao montar (`.fseventsd`, marca de sujo): por isso o resumo
-    "depois" é o do passo 9, feito **antes** do `remount`.
-11. Opcional: `sudo revenant-dev digest disk4` depois do `remount`. Pode diferir do passo 3; só registre.
+    "depois" é o do passo 10, feito **antes** do `remount`.
+12. Opcional: `sudo revenant-dev digest disk4` depois do `remount`. Pode diferir do passo 4; só registre.
 
 ## 2. O mesmo no Windows
 
@@ -62,13 +65,16 @@ Abra o **PowerShell como administrador** (Iniciar, digitar "PowerShell", "Execut
 1. `mkdir $HOME\rv-teste\win; cd $HOME\rv-teste\win`
 2. `revenant-dev disks` e anote o id (`PhysicalDrive2` abaixo). Mesma verificação do passo 1.2: `removable`, `system:false`,
    tamanho. `PhysicalDrive0` costuma ser o disco do sistema: não use.
-3. `revenant-dev digest PhysicalDrive2` — o resumo **antes**; anote o `fnv64`.
+3. `revenant-dev unmount PhysicalDrive2` — trava e desmonta os volumes do cartão (o `E:` some do Explorer; o leitor continua
+   ligado), **antes** do resumo "antes", para nada alterar o cartão entre os dois resumos. Esperado:
+   `{"event":"unmount","disk":"PhysicalDrive2","held":N}`. Em seguida `revenant-dev digest PhysicalDrive2` — o resumo
+   **antes**; anote o `fnv64`.
 4. `revenant-dev preflight PhysicalDrive2 --copy-to $HOME\rv-teste\win\card.img --session $HOME\rv-teste\win\sessao`
    Esperado: `"issues":[]`. A conferência **trava e desmonta** os volumes do cartão (o equivalente do "ejetar sem soltar":
    o `E:` some do Explorer, o leitor continua ligado; o motor segura as travas até o fim do comando).
    Se vier `unmount_failed`, algum programa está usando o cartão: feche-o e repita.
 5. `revenant-dev scan PhysicalDrive2 --session $HOME\rv-teste\win\sessao --extract $HOME\rv-teste\win\achados` (crie `achados`
-   antes). Tire o leitor no meio, plugue de volta e repita **o mesmo comando**: mesmo comportamento do passo 1.5–1.6 do Mac
+   antes). Tire o leitor no meio, plugue de volta e repita **o mesmo comando**: mesmo comportamento do passo 1.6–1.7 do Mac
    (retoma, `"replayed":true`, resumo final).
 6. `revenant-dev copy PhysicalDrive2 $HOME\rv-teste\win\card.img`; depois `revenant-dev scan $HOME\rv-teste\win\card.img`:
    mesmo número de `found` da busca no aparelho.
@@ -102,7 +108,7 @@ Use um cartão que você já sabe que dá erro de leitura. **Não** force um car
    percentual a linha apareceu. Interrompa com Ctrl-C depois dela: o aviso é "pare e faça uma cópia".
 3. `sudo revenant-dev copy disk4 ~/rv-teste/falha/card.img` (Windows: o mesmo, sem `sudo`). Esperado: passes `fast`,
    `skipped`, `trim`, `scrape`, `copy_bad` para cada região perdida e `copy_summary` com `bad` maior que 0. Se travar muito
-   tempo num ponto, Ctrl-C: o mapa é salvo e o mesmo comando retoma. Opcional: repita com `--retries 1` para uma segunda
+   tempo num ponto, Ctrl-C: não há tratador de Ctrl-C, então vale o mapa do último salvamento (se perde até um intervalo de 30 s ou 256 MiB) e o mesmo comando retoma. Opcional: repita com `--retries 1` para uma segunda
    tentativa nos setores ruins (só com o cartão ainda aguentando).
 4. `revenant-dev scan ~/rv-teste/falha/card.img`. Esperado: `{"event":"map",…}` primeiro; as regiões não resgatadas aparecem como `unreadable`
    (nunca como zeros) e nenhum arquivo que as toca sai `intact`. Compare o número de `found` com o da busca direta do passo 2.
@@ -111,8 +117,11 @@ Use um cartão que você já sabe que dá erro de leitura. **Não** force um car
 
 ## 5. Velocidade: aparelho contra a imagem dele
 
-Objetivo: saber se ler o cartão cru perde para ler o arquivo de imagem dele (nos testes automáticos: Mac 113–127 MB/s no
-aparelho contra 148–373 MB/s na imagem, mas aquilo era imagem montada pelo `hdiutil`, não um leitor).
+Objetivo: saber se ler o cartão cru perde para ler o arquivo de imagem dele. Referências dos testes automáticos (imagens
+anexadas pelo sistema, não leitores de cartão), por plataforma:
+- Mac: 113–127 MB/s no aparelho contra 148–154 MB/s na imagem (primeira rodada); 76–79 contra 80–84 (última rodada, com o Mac
+  esquentando).
+- Windows (CI, VHD): 113 MB/s no aparelho contra 373 MB/s no arquivo.
 
 1. Com o cartão bom do passo 1 e a imagem `card.img` dele: rode `revenant-dev scan disk4` (Windows `PhysicalDrive2`) e
    anote o `MB/s` da última linha de progresso no stderr (`scanned 100% … MB/s`).

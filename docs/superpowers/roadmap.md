@@ -7,7 +7,7 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
 
 | Marco | O que dá para fazer | Depois de |
 |---|---|---|
-| **A. Motor completo** | Um desenvolvedor recupera fotos RAW e vídeos de uma imagem de cartão pelo `revenant-dev`. | 1.2–1.5 |
+| **A. Motor completo** (fechado em 25/10/2026, com a 1.5) | Um desenvolvedor recupera fotos RAW e vídeos de uma imagem de cartão pelo `revenant-dev`. | 1.2–1.5 |
 | **B. Primeira tela** | O Sérgio usa o app no Mac dele, sem terminal, para recuperar um cartão de verdade. | 2.1–2.3 |
 | **C. Beta público** | Qualquer pessoa baixa o instalador (Mac ou Windows), segue o guia e recupera os arquivos. | 3 + 4 |
 | **D. 1.0** | O beta já foi usado em cartões reais, os problemas foram corrigidos e a documentação está completa nos 3 idiomas. | uso real |
@@ -29,7 +29,7 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
     JPEG pode reler a sua janela de 64 MiB), conferência em paralelo e mapa de setores ruins (de 21,8 para 503,9 MB/s
     em JPEG denso; números em `crates/revenant-core/README.md`).
   - Não cobre: arquivos em 3 ou mais pedaços e fragmentação de RAW (foram para a 1.6).
-- **1.4, sistemas de arquivos, concluída** (aguardando PR/merge):
+- **1.4, sistemas de arquivos, concluída** (PR #5):
   - FAT12/16/32 e exFAT, em MBR e GPT: arquivos vivos e apagados com o nome, a pasta e as datas originais, até com o
     arquivo fragmentado (cadeia viva) e a FAT com setor ruim.
   - Cartão formatado rápido: os nomes e as pastas voltam pelas pastas antigas que sobraram.
