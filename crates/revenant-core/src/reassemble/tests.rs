@@ -1219,3 +1219,37 @@ fn recheck_spends_its_own_budget_only() {
     let with = spent(10);
     assert!(with > search && with <= search + 10, "{search} then {with}");
 }
+
+#[test]
+fn recheck_ignores_blind_alternatives() {
+    // Q29: piece 0 holds units the format cannot check (4..8). The re-check breaking there could fill them with any free
+    // run (Z) and resume on the piece's own checked units: not content evidence, so not another solution, whatever the
+    // re-check budget.
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..10, 40, 1);
+    let t = card.put(3 * MIB, ID, 10..40, 40, 1);
+    let z = Fragment {
+        start: 5 * MIB,
+        len: units(16),
+    };
+    let src = card.mem();
+    let live = complement(&[a, t, z]);
+    for recheck_tries in [RECHECK_TRIES, 1 << 20] {
+        let limits = Limits {
+            recheck_tries,
+            ..Limits::DEFAULT
+        };
+        let mut toy_ = Toy {
+            blind: 4..8,
+            ..toy(40)
+        };
+        let s = search_on(&src, &mut toy_, MIB, &live, &limits, None)
+            .0
+            .unwrap();
+        assert_eq!(s.pieces, [a, t]);
+        assert!(
+            s.complete && s.unique && s.exhaustive,
+            "recheck_tries {recheck_tries}"
+        );
+    }
+}

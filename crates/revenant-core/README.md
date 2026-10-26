@@ -870,7 +870,9 @@ after a piece that happens to continue the content (a burst of the same scene, a
 search has found exactly one complete solution, a separate re-check tries, for every piece of it, earlier break
 points: first the ones the format marks as suspicious (`Seams::suspicious_breaks`, most suspicious first), then the
 nearest to the piece's end, at most 64 per piece, taken round robin over the pieces; from each it lists the next
-piece's candidates and searches on. Any other complete solution makes the result not unique. The re-check has its own
+piece's candidates and searches on from those with content evidence past the new seam (a blind candidate is not
+followed there: filling units the format cannot check from any free run is no evidence of another file). Any other
+complete solution makes the result not unique. The re-check has its own
 budget (2^14 walks per file); running out of it, or of break points, does not make the search non-exhaustive.
 
 **Candidates with and without evidence.** A candidate passes when its walk completes or checks content past the seam;
@@ -881,7 +883,8 @@ unique. A solution through a blind seam is at most `Unproven`.
 
 **Residual risk, stated plainly.** Uniqueness is decided within bounds: candidates only inside the window, and
 look-alikes inside a piece only at the break points the re-check tries within its budget. A look-alike continuation
-beyond the window, or a swap point inside a long piece past the tried break points, can leave a result unique that is
+beyond the window, a swap point inside a long piece past the tried break points, or a look-alike whose data right after
+the swap point is blind to the format (the re-check follows only evident candidates), can leave a result unique that is
 not. The format's own proof is the guard: formats with positional proof (a video's sample table, a RAW's tile offsets)
 do not depend on the engine's uniqueness; for the others the format orders the re-check so its weakest seams come first.
 

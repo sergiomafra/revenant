@@ -918,8 +918,9 @@ impl<'c, S: Seams> Ctx<'c, S> {
 
     /// The uniqueness re-check of the one complete solution found (Q26, Q28): for every piece, earlier break points (the
     /// format's suspicious ones first, then nearest to the piece's end, at most `break_points` per piece, taken round
-    /// robin over the pieces), each followed by the next piece's candidates and the search from there. Any other
-    /// complete solution makes the result not unique. It spends its own `max_tries` and never changes `exhaustive`:
+    /// robin over the pieces), each followed by the next piece's candidates with content evidence past the new seam
+    /// (Q29: blind ones are not descended into here) and the search from there. Any other complete solution makes the
+    /// result not unique. It spends its own `max_tries` and never changes `exhaustive`:
     /// running out of it or of break points leaves the result as the search left it.
     fn recheck(&mut self, max_tries: u64) {
         let Some((sol, _)) = self.solutions.first().cloned() else {
@@ -988,12 +989,13 @@ impl<'c, S: Seams> Ctx<'c, S> {
                     start: p.start,
                     len: b - starts[i],
                 });
-                let (evident, blinds) = self.classify(&pieces, &st, p.start + (b - starts[i]), b);
-                for (g2, _) in evident {
-                    self.dfs(&mut pieces, &st, g2, b, false);
-                }
-                for g2 in blinds {
-                    self.dfs(&mut pieces, &st, g2, b, true);
+                // Q29: here only an alternative with content evidence past the new seam counts; a blind one (units the
+                // format cannot check, filled from any free run) is not descended into.
+                let (evident, _) = self.classify(&pieces, &st, p.start + (b - starts[i]), b);
+                for (g2, no_evidence) in evident {
+                    if !no_evidence {
+                        self.dfs(&mut pieces, &st, g2, b, false);
+                    }
                 }
             }
         }
