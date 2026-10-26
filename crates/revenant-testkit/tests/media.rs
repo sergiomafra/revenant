@@ -15,13 +15,34 @@ fn sos_end(j: &[u8]) -> usize {
     }
 }
 
+/// Mean absolute difference of two equal-length sample buffers.
+fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let sum: u64 = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| u64::from(x.abs_diff(y)))
+        .sum();
+    sum as f64 / a.len() as f64
+}
+
 #[test]
 fn burst_photos_share_a_frame_and_differ() {
     let burst = jpeg_burst(512, 384, 7, 3);
     assert_eq!(burst.len(), 3);
-    for j in &burst {
-        let img = image::load_from_memory_with_format(j, image::ImageFormat::Jpeg).unwrap();
-        assert_eq!((img.width(), img.height()), (512, 384));
+    let decoded: Vec<Vec<u8>> = burst
+        .iter()
+        .map(|j| {
+            let img = image::load_from_memory_with_format(j, image::ImageFormat::Jpeg).unwrap();
+            assert_eq!((img.width(), img.height()), (512, 384));
+            img.to_rgb8().into_raw()
+        })
+        .collect();
+    // True look-alikes: neighbouring photos differ by about a level per sample (0.78 for seed 7), far below another
+    // scene (about 53 for jpeg_smooth seed 8), and never by nothing.
+    for w in decoded.windows(2) {
+        let mad = mean_abs_diff(&w[0], &w[1]);
+        assert!(mad > 0.1 && mad < 4.0, "mean absolute difference {mad}");
     }
     let head = &burst[0][..sos_end(&burst[0])];
     for j in &burst[1..] {

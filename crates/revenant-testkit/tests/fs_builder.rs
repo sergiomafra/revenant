@@ -941,19 +941,75 @@ fn next_free_wraps_to_the_start() {
 fn zero_chain_delete_clears_the_exfat_chain() {
     const CL: usize = 32 * 1024;
     let chain = [10u32, 11, 20, 21];
-    for style in [DeleteStyle::Camera, DeleteStyle::ZeroChain] {
+    let build = |style| {
         let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, CL as u32);
+        // A chained neighbour right after the deleted file's first run, and a chained file written after the delete.
+        b.add_at("B.JPG", &[5u8; 2 * CL], &[12, 22]);
         b.add_at("A.JPG", &[7u8; 4 * CL], &chain);
         b.delete("A.JPG", style);
+        b.add_at("C.JPG", &[6u8; 2 * CL], &[40, 50]);
         let v = b.build();
-        let got: Vec<u32> = chain.iter().map(|&c| exfat_fat_entry(&v, c)).collect();
-        match style {
-            DeleteStyle::ZeroChain => assert_eq!(got, [0, 0, 0, 0]),
-            _ => assert_eq!(got, [11, 20, 21, 0xFFFF_FFFF]),
-        }
-        // Either way the data stays and the entry set is marked deleted.
+        // Either way the data stays.
         assert_eq!(v[b.cluster_offset(20) as usize], 7);
+        v
+    };
+    let camera = build(DeleteStyle::Camera);
+    let zeroed = build(DeleteStyle::ZeroChain);
+    let entries = |v: &[u8]| -> Vec<u32> { chain.iter().map(|&c| exfat_fat_entry(v, c)).collect() };
+    assert_eq!(entries(&camera), [11, 20, 21, 0xFFFF_FFFF]);
+    assert_eq!(entries(&zeroed), [0, 0, 0, 0]);
+    assert_eq!(
+        [12, 22, 40, 50].map(|c| exfat_fat_entry(&zeroed, c)),
+        [22, 0xFFFF_FFFF, 50, 0xFFFF_FFFF]
+    );
+    // Every other byte of the volume (every other FAT entry included) is the Camera build's.
+    let mut expect = camera.clone();
+    for &c in &chain {
+        let at = 128 * 512 + 4 * c as usize;
+        expect[at..at + 4].fill(0);
     }
+    assert!(
+        zeroed == expect,
+        "only the deleted chain's FAT entries differ"
+    );
+}
+
+/// FAT16 (no root cluster: clusters 2 and 3 are free) with NextFree, `next` two clusters before the end: `A` at [2, 3]
+/// (deleted), a filler on 4..end-2. Returns the builder and `end` (one past the last cluster).
+fn next_free_near_the_end() -> (FsBuilder, u32) {
+    const CL: usize = 2048;
+    let mut b = FsBuilder::new(FsType::Fat16, 16 << 20, CL as u32);
+    b.alloc(Alloc::NextFree);
+    let end = b.cluster_count() + 2;
+    b.add_at("A.JPG", &[1u8; 2 * CL], &[2, 3]);
+    let fill: Vec<u32> = (4..end - 2).collect();
+    b.add_at("FILL.BIN", &vec![2u8; fill.len() * CL], &fill);
+    b.delete("A.JPG", DeleteStyle::Camera);
+    (b, end)
+}
+
+#[test]
+fn next_free_wraps_in_the_middle_of_a_file() {
+    let (mut b, end) = next_free_near_the_end();
+    let c = b.add("C.JPG", &[3u8; 4 * 2048]);
+    assert_eq!(c, [end - 2, end - 1, 2, 3]);
+    let v = b.build();
+    // FAT16 chain end-2 -> end-1 -> 2 -> 3 -> EOC, from the first FAT (1 reserved sector).
+    let fat16 = |c: u32| u16_at(&v, 512 + 2 * c as usize);
+    assert_eq!(
+        c.iter().map(|&c| fat16(c)).collect::<Vec<u16>>(),
+        [(end - 1) as u16, 2, 3, 0xFFFF],
+        "the chain wraps"
+    );
+}
+
+#[test]
+#[should_panic(expected = "volume full")]
+fn next_free_stops_on_a_full_volume() {
+    let (mut b, _) = next_free_near_the_end();
+    b.add("C.JPG", &[3u8; 4 * 2048]);
+    // Every cluster is taken now: one more cluster has nowhere to go.
+    b.add("D.JPG", &[4u8; 1]);
 }
 
 #[test]
