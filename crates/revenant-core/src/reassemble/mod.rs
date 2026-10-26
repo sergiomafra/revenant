@@ -636,6 +636,9 @@ struct Ctx<'c, S: Seams> {
     best: Option<(u64, Vec<Fragment>)>,
     exhaustive: bool,
     stop: Option<Stop>,
+    /// Ranges no candidate may start in besides the path's pieces: the found solution's units during the re-check (Q33:
+    /// they cannot be another file's).
+    excluded: Vec<Fragment>,
 }
 
 impl<'c, S: Seams> Ctx<'c, S> {
@@ -669,6 +672,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
             best: None,
             exhaustive: true,
             stop: None,
+            excluded: Vec::new(),
         }
     }
 
@@ -954,15 +958,9 @@ impl<'c, S: Seams> Ctx<'c, S> {
             l += p.len;
         }
         let total = l;
-        let root = (0, self.seams.begin());
-        let (head, last) = sol.split_at(sol.len() - 1);
-        let Some(w) = self.walk(head, last[0].start, last[0].len, &root.1, total) else {
-            self.end_recheck(saved);
-            return;
-        };
-        let mut resume = vec![root];
-        resume.extend(w.resume);
         let mut lists = Vec::with_capacity(sol.len());
+        // Q33: the top-hinted cut of each piece (when the format gives hints), whose candidates must all be walked.
+        let mut top: Vec<Option<u64>> = Vec::with_capacity(sol.len());
         for (i, p) in sol.iter().enumerate() {
             let (l, end) = (starts[i], starts[i] + p.len);
             let source: &dyn Source = self.source;
@@ -978,6 +976,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
                     list.push(b);
                 }
             }
+            top.push(list.first().copied());
             for b in self.breaks(p.start, l, l + 1, end - 1, false) {
                 if list.len() == self.limits.break_points {
                     break;
@@ -988,6 +987,18 @@ impl<'c, S: Seams> Ctx<'c, S> {
             }
             lists.push(list);
         }
+        let mut top_done = vec![false; sol.len()];
+        let root = (0, self.seams.begin());
+        let (head, last) = sol.split_at(sol.len() - 1);
+        let Some(w) = self.walk(head, last[0].start, last[0].len, &root.1, total) else {
+            self.end_recheck(saved, &top, &top_done);
+            return;
+        };
+        let mut resume = vec![root];
+        resume.extend(w.resume);
+        // Q33: no candidate starts in the solution's own units (its later clusters, decoded out of step, could otherwise
+        // look evident and take the whole budget; they cannot be another file).
+        self.excluded = sol.clone();
         'ranks: for rank in 0..self.limits.break_points {
             for (i, list) in lists.iter().enumerate() {
                 let Some(&b) = list.get(rank) else {
@@ -1014,20 +1025,30 @@ impl<'c, S: Seams> Ctx<'c, S> {
                 });
                 // Q29: here only an alternative with content evidence past the new seam counts; a blind one (units the
                 // format cannot check, filled from any free run) is not descended into.
+                let is_top = rank == 0 && top[i] == Some(b);
+                self.exhaustive = true;
                 let (evident, _) = self.classify(&pieces, &st, p.start + (b - starts[i]), b);
                 for (g2, no_evidence) in evident {
                     if !no_evidence {
                         self.dfs(&mut pieces, &st, g2, b, false);
                     }
                 }
+                // Walked to the end: no cap, budget or cancel cut it.
+                top_done[i] |= is_top && self.exhaustive && self.stop.is_none();
             }
         }
-        self.end_recheck(saved);
+        self.end_recheck(saved, &top, &top_done);
     }
 
-    /// Ends the re-check: `exhaustive` as the search left it, and a re-check budget hit is no stop.
-    fn end_recheck(&mut self, saved: bool) {
-        self.exhaustive = saved;
+    /// Ends the re-check: `exhaustive` as the search left it, unless the candidates of a top-hinted cut were not all
+    /// walked (Q33; a second solution found makes that moot), and a re-check budget hit is no stop.
+    fn end_recheck(&mut self, saved: bool, top: &[Option<u64>], top_done: &[bool]) {
+        self.excluded.clear();
+        let missed = top
+            .iter()
+            .zip(top_done)
+            .any(|(t, &done)| t.is_some() && !done);
+        self.exhaustive = saved && (!missed || self.stop == Some(Stop::Ambiguous));
         if self.stop == Some(Stop::Budget) {
             self.stop = None;
         }
@@ -1055,7 +1076,9 @@ impl<'c, S: Seams> Ctx<'c, S> {
         let mut cands: Vec<u64> = self.anchored(pieces, end, b).into_iter().collect();
         let space = self.space;
         let cap = self.limits.seam_candidates;
-        let (listed, capped) = space.candidates(end, pieces, cap, &mut |g2| self.keep(g2, b));
+        let mut used = pieces.to_vec();
+        used.extend_from_slice(&self.excluded);
+        let (listed, capped) = space.candidates(end, &used, cap, &mut |g2| self.keep(g2, b));
         if capped {
             self.exhaustive = false;
         }

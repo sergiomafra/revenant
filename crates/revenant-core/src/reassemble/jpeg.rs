@@ -4,9 +4,10 @@
 //! The state is the decoder's [`Cursor`] at an MCU-row boundary, with the luma DC values of the rows above it (one
 //! buffer per search, truncated when the search goes back to an earlier state; rows shared between states, so a state
 //! from another branch rebuilds it). A walk decodes from the state over the view; at each seam it learns the seam's MCU
-//! (the first one decoded with bytes of the next piece) and the continuation passes the seam once the MCU row below the
-//! seam's row is decoded and the 1.3 early DC test (`early_base`) does not reject it. The final proof is the multi-seam
-//! DC test (`seams_ok`) over the whole DC grid.
+//! (the first one the decoder cannot complete with the bytes before the seam; `prove` derives it the same way) and the
+//! continuation has evidence once the MCU row below the seam's row is decoded. The early DC test (the 1.3 `early_base`,
+//! generalised to `base_bound` over the trusted rows above and below the seams) drops only what the final test would.
+//! The final proof is the multi-seam DC test (`seams_ok`) over the whole DC grid.
 
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -86,11 +87,13 @@ struct Decoded {
     end: End,
 }
 
-/// A seam a walk crossed: its logical position, its MCU, and whether the MCU row below its row passed.
+/// A seam a walk crossed: its logical position, its MCU, whether the MCU row below its row is decoded (evidence), and
+/// whether the early test has run on it once its rows down to that one were trusted.
 struct Crossed {
     pos: u64,
     mcu: u64,
     evident: bool,
+    tested: bool,
 }
 
 /// Why a walk stopped before the decoder did.
@@ -201,12 +204,16 @@ impl JpegSeams {
         u64::from(self.frame.mcus_y) * self.rows_v()
     }
 
-    /// The early DC test (D11, Q14) of the path's `seams` (logical position, MCU) with the rows decoded through MCU
-    /// `decoded`: the block-row boundaries decoded so far, above and below the seams, bound the final base once they
-    /// are more than half of them ([`base_bound`]; with only the rows above one seam this is the 1.3 `early_base`). The
-    /// position of the first seam (whose MCU row below is decoded) rougher than 3 × the bound + 4, which the final
-    /// test would reject too.
-    fn dc_rejects(&self, tail: &[i32], seams: &[(u64, u64)], decoded: u64) -> Option<u64> {
+    /// The early DC test (D11, Q14) of the path's `seams` (logical position, MCU) with the rows above MCU `trusted`: the
+    /// block-row boundaries decoded there, above and below the seams, bound the final base once they are more than
+    /// half of them ([`base_bound`]; with only the rows above one seam this is the 1.3 `early_base`). The position of
+    /// the first seam (whose rows down to the MCU row below it lie above `trusted`) rougher than 3 × the bound + 4,
+    /// which the final test would reject too.
+    ///
+    /// `trusted` must be a row boundary no continuation of the path cuts before: the walk's boundary before the last
+    /// one it reached (a piece is never cut before it: the search's break points start there), so the rows used belong
+    /// to the final photo whatever is found after them; rows decoded past it may be foreign data that still decodes.
+    fn dc_rejects(&self, tail: &[i32], seams: &[(u64, u64)], trusted: u64) -> Option<u64> {
         if seams.is_empty() {
             return None;
         }
@@ -219,12 +226,15 @@ impl JpegSeams {
             .collect();
         on.sort_unstable();
         on.dedup();
+        // Boundaries between two block rows above `trusted`.
+        let last = (trusted / row * v).saturating_sub(1);
         let known: Vec<f64> = self
             .means
             .iter()
             .enumerate()
-            .filter(|&(i, m)| !m.is_nan() && on.binary_search(&(i as u64 + 1)).is_err())
-            .map(|(_, &m)| m)
+            .map(|(i, &m)| (i as u64 + 1, m))
+            .filter(|&(by, m)| by <= last && !m.is_nan() && on.binary_search(&by).is_err())
+            .map(|(_, m)| m)
             .collect();
         let bound = base_bound(&self.frame, &known, on.len() as u64)?;
         let dc = Dc {
@@ -235,7 +245,7 @@ impl JpegSeams {
         seams.sort_unstable();
         seams
             .into_iter()
-            .filter(|&(_, m)| (m / row + 2) * row <= decoded)
+            .filter(|&(_, m)| (m / row + 2) * row <= trusted)
             .find(|&(_, m)| seam_mean(&self.frame, dc, m).is_some_and(|at| !within(at, bound)))
             .map(|(p, _)| p)
     }
@@ -296,6 +306,46 @@ impl JpegSeams {
                 end: run.end,
             });
         }
+    }
+
+    /// Decodes the whole `view` from the start, up to each of `seams` in turn and then to its end, as the walk does: each
+    /// seam's MCU is the first one the decoder cannot complete below the seam (the state before it is where the next
+    /// phase starts). The seams' MCUs, the luma DC values, how the decoder ended; `None` when cancelled.
+    fn decode_at_seams(
+        &self,
+        view: &dyn Source,
+        seams: &[u64],
+    ) -> Option<(Vec<u64>, Vec<i32>, End)> {
+        let mut r = Reader::new(view);
+        let bpm = blocks_per_mcu(&self.frame) as usize;
+        let mut cur = self.frame.start(self.scan_start);
+        let (mut mcus, mut dc) = (Vec::new(), Vec::new());
+        for to in seams.iter().copied().chain(std::iter::once(view.len())) {
+            let at_seam = to < view.len();
+            let run = jpeg_entropy::decode_rows(
+                &mut r,
+                &self.frame,
+                cur.clone(),
+                to,
+                true,
+                at_seam,
+                u64::MAX,
+                &mut |_, _| !cancelled(),
+            );
+            if cancelled() {
+                return None;
+            }
+            dc.extend_from_slice(&run.dc);
+            match (run.end, run.resume.last()) {
+                (End::OutOfData, Some(last)) if at_seam => {
+                    dc.truncate(last.mcu as usize * bpm);
+                    mcus.push(last.mcu);
+                    cur = last.clone();
+                }
+                (end, _) => return Some((mcus, dc, end)),
+            }
+        }
+        None
     }
 
     /// For every MCU of a decoded photo: where a piece would be cut to splice another photo in at it (before the bytes
@@ -397,13 +447,14 @@ impl JpegSeams {
         self.rows.extend(lead.rows.iter().cloned());
         self.means.extend_from_slice(&lead.means);
         for r in &lead.resume {
-            w.bounds.push(r.0);
+            w.bounds.push((r.0, r.1.cur.mcu));
             w.resume.push_back(r.clone());
         }
         w.crossed.push(Crossed {
             pos: lead.seam,
             mcu: lead.seam_mcu,
             evident: false,
+            tested: false,
         });
         w.known.push((lead.seam, lead.seam_mcu));
         lead.cur.clone()
@@ -428,7 +479,7 @@ impl JpegSeams {
             w.long
                 .get_or_insert_with(|| Reader::with_window(view, LONG_WINDOW))
         };
-        let (crossed, known, bounds, resume, clean_to, halt, next_test, decoded) = (
+        let (crossed, known, bounds, resume, clean_to, halt, next_test) = (
             &mut w.crossed,
             &w.known,
             &mut w.bounds,
@@ -436,7 +487,6 @@ impl JpegSeams {
             &mut w.clean_to,
             &mut w.halt,
             &mut w.next_test,
-            &mut w.decoded,
         );
         let (check_short, check_long) = (&mut w.check_short, &mut w.check_long);
         let run = jpeg_entropy::decode_rows(
@@ -459,7 +509,9 @@ impl JpegSeams {
                 }
                 *clean_to = c.pos;
                 let r = self.complete_row(tail, c.mcu / row);
-                bounds.push(c.pos);
+                // The boundary before this one: no continuation of the path is cut above it.
+                let trusted = bounds.last().map_or(0, |b| b.1);
+                bounds.push((c.pos, c.mcu));
                 if resume.len() == RESUME_POINTS {
                     resume.pop_front();
                 }
@@ -469,17 +521,22 @@ impl JpegSeams {
                     seams: known.clone(),
                 };
                 resume.push_back((c.pos, state));
-                *decoded = c.mcu;
-                // The early test when a seam's MCU row below is decoded, and again as the decoded rows grow (by a
-                // quarter each time): every seam of the path faces the bound from all the rows known.
-                let below = |s: &Crossed| c.mcu >= (s.mcu / row + 2) * row;
-                let reached = crossed.iter().any(|s| !s.evident && below(s));
+                // Evidence: the MCU row below the seam's row is decoded. The early test once the rows down to that one
+                // are trusted, and again as the decoded rows grow (by a quarter each time): every seam of the path faces
+                // the bound from all the trusted rows.
                 for s in crossed.iter_mut() {
-                    s.evident |= below(s);
+                    s.evident |= c.mcu >= (s.mcu / row + 2) * row;
                 }
+                let reached = crossed
+                    .iter_mut()
+                    .filter(|s| !s.tested && trusted >= (s.mcu / row + 2) * row)
+                    .fold(false, |_, s| {
+                        s.tested = true;
+                        true
+                    });
                 if reached || self.means.len() >= *next_test {
                     *next_test = self.means.len() + (self.means.len() / 4).max(1);
-                    if let Some(p) = self.dc_rejects(tail, known, c.mcu) {
+                    if let Some(p) = self.dc_rejects(tail, known, trusted) {
                         *halt = Some(Halt::Seam(p));
                         return false;
                     }
@@ -503,6 +560,7 @@ impl JpegSeams {
                     pos: to,
                     mcu: last.mcu,
                     evident: false,
+                    tested: false,
                 });
                 w.known.push((to, last.mcu));
                 Ok(last.clone())
@@ -546,11 +604,22 @@ impl JpegSeams {
             }
             (None, _) => (None, w.check(clean_to, limit)),
         };
-        // The early test once more with every row this walk decoded.
+        // The boundary before the last one reached, at or before the break: where the search's break points start.
+        let evidence = &w.bounds[..w.bounds.len().saturating_sub(1).max(1)];
+        let checked_at = |at: u64| {
+            evidence
+                .iter()
+                .copied()
+                .filter(|b| b.0 <= at)
+                .max_by_key(|b| b.0)
+        };
+        // The early test once more, with the rows above that boundary (those every continuation keeps).
         let at = match (complete, w.halt) {
-            (None, None) => self
-                .dc_rejects(&[], &w.known, w.decoded)
-                .map_or(at, |p| p.min(at)),
+            (None, None) => {
+                let trusted = checked_at(at).map_or(from.cur.mcu, |b| b.1);
+                self.dc_rejects(&[], &w.known, trusted)
+                    .map_or(at, |p| p.min(at))
+            }
             _ => at,
         };
         let resume: Vec<(u64, JpegState)> = std::mem::take(&mut w.resume).into();
@@ -568,14 +637,7 @@ impl JpegSeams {
                 resume,
             };
         }
-        // The boundary before the last one reached, at or before the break.
-        let evidence = &w.bounds[..w.bounds.len().saturating_sub(1).max(1)];
-        let checked = evidence
-            .iter()
-            .copied()
-            .filter(|&p| p <= at)
-            .max()
-            .unwrap_or(from.cur.pos.min(at));
+        let checked = checked_at(at).map_or(from.cur.pos.min(at), |b| b.0);
         Walked {
             end: WalkEnd::Broken { at },
             checked,
@@ -595,14 +657,12 @@ struct Walk<'v> {
     check_long: Option<Reader<'v>>,
     /// The seams of the path so far: (logical position, MCU).
     known: Vec<(u64, u64)>,
-    /// The MCU of the last row boundary reached.
-    decoded: u64,
     /// The count of known block-row boundaries at which the early test runs next.
     next_test: usize,
     /// The seams this walk crossed.
     crossed: Vec<Crossed>,
-    /// Positions of the row boundaries reached, the walk's start first.
-    bounds: Vec<u64>,
+    /// The row boundaries reached (position, MCU), the walk's start first.
+    bounds: Vec<(u64, u64)>,
     resume: VecDeque<(u64, JpegState)>,
     /// Bytes before this position are known not to be erased.
     clean_to: u64,
@@ -740,12 +800,11 @@ impl Seams for JpegSeams {
             check_short: Reader::with_window(view, SHORT_WINDOW),
             check_long: None,
             known: from.seams.clone(),
-            decoded: from.cur.mcu,
             // The bound needs more than half the boundaries: no test before about half of them is known.
             next_test: (self.blocks_y() as usize / 2)
                 .saturating_sub(2 * (from.seams.len() + seams.len()) + 2),
             crossed: Vec::new(),
-            bounds: vec![from.cur.pos],
+            bounds: vec![(from.cur.pos, from.cur.mcu)],
             resume: VecDeque::new(),
             // The bytes before the first seam were checked by the walk `from` comes from.
             clean_to: new.first().copied().unwrap_or(from.cur.pos),
@@ -801,11 +860,11 @@ impl Seams for JpegSeams {
     /// grid passes the multi-seam test (`seams_ok`) at the seams' MCUs; `Unproven` with seams in a photo of fewer than 4
     /// block rows (not verifiable) or when cancelled; else `Failed`.
     fn prove(&mut self, view: &dyn Source, seams: &[u64]) -> Proof {
-        let Some(d) = self.decode_all(view) else {
+        let Some((mcus, dc, end)) = self.decode_at_seams(view, seams) else {
             return Proof::Unproven;
         };
         let len = view.len();
-        if d.end
+        if end
             != (End::Eoi {
                 at: len.wrapping_sub(2),
             })
@@ -818,15 +877,10 @@ impl Seams for JpegSeams {
         if seams.is_empty() {
             return Proof::Proven;
         }
-        if u64::from(self.frame.mcus_y) * self.rows_v() < 4 {
+        if self.blocks_y() < 4 {
             return Proof::Unproven;
         }
-        // Each seam's MCU: the state before it is the last one whose position is at or before the seam.
-        let mcus: Vec<u64> = seams
-            .iter()
-            .map(|&s| (d.pos.partition_point(|&p| p <= s) as u64).saturating_sub(1))
-            .collect();
-        if seams_ok(&self.frame, &d.dc, &mcus) {
+        if seams_ok(&self.frame, &dc, &mcus) {
             Proof::Proven
         } else {
             Proof::Failed
@@ -1065,28 +1119,43 @@ mod tests {
 
     #[test]
     fn same_frame_neighbour_tail_is_not_intact() {
+        // P2. A photo in 3 runs of 8 KiB clusters. At each seam, a burst neighbour's tail that passes: the photo's own
+        // data from the seam, turning into its neighbour's three MCU rows below it (where both are byte-aligned), so it
+        // decodes to EOI from the photo's state. One copy lies before the true run in candidate order, one after. Both
+        // seams have a look-alike: never unique. Were the early DC test to prune the true seam wrongly, the look-alikes
+        // (the same data at the seam) would go too and nothing would be complete.
         let burst = testkit::jpeg_burst(1024, 768, 5, 2);
-        // About 70 KB each: 8 KiB clusters give 3 runs of at least 2 clusters.
+        let (a, b) = (&burst[0], &burst[1]);
         let cluster = 8 << 10;
         let mut card = noise_card(140, cluster);
-        let a = put_runs(&mut card, &burst[0], cluster, &[40, 61, 90]);
-        let b = put_runs(&mut card, &burst[1], cluster, &[44, 70, 120]);
+        let runs = put_runs(&mut card, a, cluster, &[40, 70, 100]);
+        let (cs, _) = cursors(a);
+        let mcus_x = u64::from(frame_of(a).0.mcus_x);
+        let tail_from = |c: u64| -> Vec<u8> {
+            let mcu = cs.partition_point(|x| x.pos <= c) as u64;
+            let (s, _) = spliced(a, b, (mcu / mcus_x + 4) * mcus_x, |_| true);
+            s[c as usize..].to_vec()
+        };
+        let (c1, c2) = (runs[0].len, runs[0].len + runs[1].len);
+        let (t1, t2) = (tail_from(c1), tail_from(c2));
+        // Seam 1 (after cluster 43): a look-alike at 50, the true run at 70, a look-alike at 80. Seam 2 (after cluster
+        // 73): a look-alike at 90, the true run at 100, a look-alike at 120.
+        for (k, t) in [(50, &t1), (80, &t1), (90, &t2), (120, &t2)] {
+            put(&mut card, at(cluster, k), t);
+        }
         let g = grid(&card, cluster);
         let src = Mem(card);
-        let starts = [a[0].start, b[0].start];
-        let overlaps =
-            |p: &Fragment, f: &Fragment| p.start < f.start + f.len && f.start < p.start + p.len;
-        for (me, other) in [(&a, &b), (&b, &a)] {
-            let s = find(&src, &[g], me[0].start, &starts, &[], &Limits::DEFAULT).expect("found");
-            if s.unique && s.proof == Proof::Proven {
-                assert_eq!(&s.pieces, me, "unique and proven must be its own runs");
-            }
-            let foreign = s
-                .pieces
-                .iter()
-                .any(|p| other.iter().any(|f| overlaps(p, f)));
-            assert!(!(foreign && s.unique && s.proof == Proof::Proven), "{s:?}");
-        }
+        let s = find(
+            &src,
+            &[g],
+            runs[0].start,
+            &[runs[0].start],
+            &[],
+            &Limits::DEFAULT,
+        )
+        .expect("found");
+        assert!(s.complete, "{s:?}");
+        assert!(!s.unique, "{s:?}");
     }
 
     #[test]
@@ -1129,6 +1198,9 @@ mod tests {
         ];
         let g = grid(&card, cluster);
         let src = Mem(card);
+        // The test discriminates only with at most 3 pieces (the true path has 3, the look-alike 2): with more, paths
+        // through the photo's own data decoded out of step (pieces inside A3 and T) can complete, or take the budget,
+        // and make the result non-unique whether or not the blind piece is followed.
         let limits = Limits {
             pieces: 3,
             ..Limits::DEFAULT
@@ -1282,6 +1354,82 @@ mod tests {
         let w = js.walk(&view, &[seam], &begin, view.len());
         assert!(matches!(w.end, WalkEnd::Complete { len } if len == a.len() as u64));
         assert_eq!(js.prove(&view, &[seam]), Proof::Proven);
+    }
+
+    /// P1: a photo that turns into a burst neighbour's data at `pct` % of its MCUs (where both are byte-aligned), stored
+    /// as one run of 4 KiB clusters; the photo's own rest, from the cluster where the two part, lies elsewhere, free.
+    /// The search with the default limits.
+    fn swapped_in_one_run(burst: &[Vec<u8>], pct: u64) -> Search {
+        swapped_with(burst, pct, &Limits::DEFAULT)
+    }
+
+    fn swapped_with(burst: &[Vec<u8>], pct: u64, limits: &Limits) -> Search {
+        let (a, b) = (&burst[0], &burst[1]);
+        let cluster = 4096;
+        let mcus = cursors(a).0.len() as u64;
+        let (s, byte_a) = spliced(a, b, mcus * pct / 100, |x| x % cluster >= 64);
+        let cut = byte_a / cluster * cluster;
+        let mut card = noise_card(260, cluster);
+        let whole = put(&mut card, at(cluster, 10), &s);
+        put(&mut card, at(cluster, 150), &a[cut as usize..]);
+        let g = grid(&card, cluster);
+        let src = Mem(card);
+        let found = find(&src, &[g], whole.start, &[whole.start], &[], limits).expect("found");
+        assert_eq!(found.pieces, [whole], "{pct} %");
+        assert!(found.complete, "{pct} %: {found:?}");
+        found
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "about 30-50 s in debug: runs in the release suite"
+    )]
+    fn a_look_alike_swapped_into_the_upper_half_is_not_intact() {
+        // Q33. The re-check never tries the solution's own later clusters (decoded out of step they resync and look
+        // evident, and would take its whole budget), and must walk the candidates of the top-hinted cut to the end.
+        let burst = testkit::jpeg_burst(2048, 1536, 5, 2);
+        let intact: Vec<u64> = [10, 25, 40]
+            .into_iter()
+            .filter(|&pct| {
+                let found = swapped_in_one_run(&burst, pct);
+                found.unique && found.exhaustive
+            })
+            .collect();
+        assert!(
+            intact.is_empty(),
+            "unique and exhaustive with the swap at {intact:?} %"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "about 30-50 s in debug: runs in the release suite"
+    )]
+    fn a_recheck_cut_short_at_the_top_hinted_cut_is_not_exhaustive() {
+        // Q33 (b): with a re-check budget too small to walk every candidate of the top-hinted cut, the look-alike may
+        // go unseen: the result is then not exhaustive.
+        let burst = testkit::jpeg_burst(2048, 1536, 5, 2);
+        let limits = Limits {
+            recheck_tries: 8,
+            ..Limits::DEFAULT
+        };
+        let found = swapped_with(&burst, 25, &limits);
+        assert!(!(found.unique && found.exhaustive), "{found:?}");
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "about 30-50 s in debug: runs in the release suite"
+    )]
+    fn a_look_alike_swapped_into_the_lower_half_is_not_unique() {
+        let burst = testkit::jpeg_burst(2048, 1536, 5, 2);
+        for pct in [55, 70, 85] {
+            let found = swapped_in_one_run(&burst, pct);
+            assert!(!found.unique, "{pct} %: {found:?}");
+        }
     }
 
     /// [`JpegSeams`] without its hint to the uniqueness re-check.

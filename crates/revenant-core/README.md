@@ -540,10 +540,12 @@ put back together.
 **Three or more pieces** (`reassemble/jpeg.rs`, crate-private; the scan uses it from the reassembly step on, see
 "Reassembly"). The same decoder walks the photo across the pieces the seam search proposes. The walk's state is the
 decoder's state at an MCU-row boundary, with the luma DC values of the rows above it. At each seam the walk learns the
-seam's MCU, the first one decoded with bytes of the next piece. A continuation has content evidence once the MCU row
-below the seam's row is decoded. The early DC test (ruling Q14: it drops only what the final test would reject too) runs
-when that row is reached, and again as more rows are decoded, on every seam of the path. Its bound is the
-`⌊n/2⌋`-th smallest of the block-row boundary means decoded so far, above and below the seams, off them. That needs more
+seam's MCU: the first one the decoder cannot complete with the bytes before the seam (the proof derives it the same
+way). A continuation has content evidence once the MCU row below the seam's row is decoded. The early DC test (ruling Q14: it drops only what the final test would reject too) runs
+once the rows down to that one are trusted, and again as more rows are decoded, on every seam of the path. Its bound
+is the `⌊n/2⌋`-th smallest of the trusted block-row boundary means, above and below the seams, off them. Trusted rows
+are those above the row boundary before the last one the walk reached: the search never cuts a piece above it, so they
+belong to the photo whatever comes after; the last row may already be foreign data that still decodes. That needs more
 than half of them, so a seam in the upper half of a photo is tested only once the walk has decoded past the middle. A
 decode error or a rejected seam before a seam's evidence breaks the walk right at that seam: the candidate is dropped. A
 piece that ends, or meets an erased or unreadable sector (`data_end`), before the row below its seam has no evidence
@@ -900,9 +902,13 @@ search has found exactly one complete solution, a separate re-check tries, for e
 points: first the unit boundaries at or before the positions the format marks as suspicious (`Seams::suspicious_breaks`,
 most suspicious first; positions in one unit count once), then the nearest to the piece's end, at most 64 per piece, taken round robin over the pieces; from each it lists the next
 piece's candidates and searches on from those with content evidence past the new seam (a blind candidate is not
-followed there: filling units the format cannot check from any free run is no evidence of another file). Any other
-complete solution makes the result not unique. The re-check has its own
-budget (2^14 walks per file); running out of it, or of break points, does not make the search non-exhaustive.
+followed there: filling units the format cannot check from any free run is no evidence of another file). No candidate
+starts in a unit of the found solution itself (ruling Q33: those cannot be another file, and the solution's own later
+units, read out of step, can look like a continuation and take the whole budget). Any other complete solution makes
+the result not unique. The re-check has its own
+budget (2^14 walks per file); running out of it, or of break points, does not make the search non-exhaustive, with
+one exception (Q33): when the format gives hints, every candidate at each piece's most suspicious cut must be walked to
+the end (no cap, budget or cancel cutting it short), else the result is not exhaustive.
 
 **Candidates with and without evidence.** A candidate passes when its walk completes or checks content past the seam;
 it is blind when its walk checks nothing past the seam yet does not break right at it (a cluster the format cannot
