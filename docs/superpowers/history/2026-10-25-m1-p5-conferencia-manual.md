@@ -65,20 +65,24 @@ Abra o **PowerShell como administrador** (Iniciar, digitar "PowerShell", "Execut
 1. `mkdir $HOME\rv-teste\win; cd $HOME\rv-teste\win`
 2. `revenant-dev disks` e anote o id (`PhysicalDrive2` abaixo). Mesma verificação do passo 1.2: `removable`, `system:false`,
    tamanho. `PhysicalDrive0` costuma ser o disco do sistema: não use.
-3. `revenant-dev unmount PhysicalDrive2` — trava e desmonta os volumes do cartão (o `E:` some do Explorer; o leitor continua
-   ligado), **antes** do resumo "antes", para nada alterar o cartão entre os dois resumos. Esperado:
-   `{"event":"unmount","disk":"PhysicalDrive2","held":N}`. Em seguida `revenant-dev digest PhysicalDrive2` — o resumo
-   **antes**; anote o `fnv64`.
+3. `revenant-dev unmount PhysicalDrive2` desmonta os volumes, mas as travas só duram enquanto o comando roda; o Windows pode
+   remontar o `E:` no próximo acesso. Esperado: `{"event":"unmount","disk":"PhysicalDrive2","held":N}`. Rode o digest "antes" logo
+   em seguida e, se o `E:` voltou ao Explorer, não o abra. Isso reduz, mas não elimina, a chance de o cartão mudar entre os
+   resumos; uma diferença deve ser anotada, não tratada como prova de gravação do Revenant. O resumo **antes**:
+   `revenant-dev digest PhysicalDrive2`; anote o `fnv64`.
 4. `revenant-dev preflight PhysicalDrive2 --copy-to $HOME\rv-teste\win\card.img --session $HOME\rv-teste\win\sessao`
-   Esperado: `"issues":[]`. A conferência **trava e desmonta** os volumes do cartão (o equivalente do "ejetar sem soltar":
-   o `E:` some do Explorer, o leitor continua ligado; o motor segura as travas até o fim do comando).
+   Esperado: `"issues":[]`. A conferência trava e desmonta os volumes do cartão (o equivalente do "ejetar sem soltar":
+   o `E:` some do Explorer, o leitor continua ligado). Com o cartão já desmontado do passo 3, no Windows é uma nova trava; o
+   motor a segura só até o fim do comando.
    Se vier `unmount_failed`, algum programa está usando o cartão: feche-o e repita.
 5. `revenant-dev scan PhysicalDrive2 --session $HOME\rv-teste\win\sessao --extract $HOME\rv-teste\win\achados` (crie `achados`
    antes). Tire o leitor no meio, plugue de volta e repita **o mesmo comando**: mesmo comportamento do passo 1.6–1.7 do Mac
    (retoma, `"replayed":true`, resumo final).
 6. `revenant-dev copy PhysicalDrive2 $HOME\rv-teste\win\card.img`; depois `revenant-dev scan $HOME\rv-teste\win\card.img`:
    mesmo número de `found` da busca no aparelho.
-7. `revenant-dev digest PhysicalDrive2` — o resumo **depois**: igual ao do passo 3.
+7. `revenant-dev digest PhysicalDrive2` — o resumo **depois**: igual ao do passo 3. Aqui nenhuma trava está ativa (as dos comandos anteriores acabaram com
+   eles), então o Windows pode ter remontado o `E:`: não o abra; uma diferença deve ser anotada, não tratada como prova de
+   gravação do Revenant.
 8. `revenant-dev remount PhysicalDrive2` — solta as travas e deixa o Windows montar o `E:` de novo. Esperado:
    `{"event":"remount",…}` e o cartão volta ao Explorer. Depois do remount o resumo pode diferir (o Windows escreve ao montar).
 
