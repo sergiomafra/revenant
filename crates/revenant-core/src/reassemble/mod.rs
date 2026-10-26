@@ -636,9 +636,11 @@ struct Ctx<'c, S: Seams> {
     best: Option<(u64, Vec<Fragment>)>,
     exhaustive: bool,
     stop: Option<Stop>,
-    /// Ranges no candidate may start in besides the path's pieces: the found solution's units during the re-check (Q33:
-    /// they cannot be another file's).
+    /// Ranges no candidate may start in besides the path's pieces: during the re-check, the rest of the piece being cut
+    /// (Q33, Q34).
     excluded: Vec<Fragment>,
+    /// Set by [`Ctx::cut_short`]: the re-check's top-hinted cut was not walked to the end when it is set during it.
+    short: bool,
 }
 
 impl<'c, S: Seams> Ctx<'c, S> {
@@ -673,7 +675,15 @@ impl<'c, S: Seams> Ctx<'c, S> {
             exhaustive: true,
             stop: None,
             excluded: Vec::new(),
+            short: false,
         }
+    }
+
+    /// Not exhaustive because something was left untried (a cap, a budget, an undecided walk); the piece cap is not
+    /// one of these: past it no alternative fits within the cap (Q34).
+    fn cut_short(&mut self) {
+        self.exhaustive = false;
+        self.short = true;
     }
 
     fn is_cancelled(&self) -> bool {
@@ -690,7 +700,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
             return false;
         }
         if self.tries >= self.max_tries || self.source.read() >= self.max_read {
-            self.exhaustive = false;
+            self.cut_short();
             self.stop = Some(Stop::Budget);
             return false;
         }
@@ -717,7 +727,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
             return false;
         }
         if self.source.read() >= self.max_read {
-            self.exhaustive = false;
+            self.cut_short();
             self.stop = Some(Stop::Budget);
             return false;
         }
@@ -844,7 +854,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
                     self.solution(pieces, g, len - l, blind);
                 }
             }
-            WalkEnd::Stopped => self.exhaustive = false,
+            WalkEnd::Stopped => self.cut_short(),
             WalkEnd::Broken { at } => self.seams_after(pieces, from, g, l, run, &w, at, blind),
         }
     }
@@ -889,7 +899,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
         while abs > g && abs >= lowest {
             if out.len() == self.limits.break_points {
                 if counts {
-                    self.exhaustive = false;
+                    self.cut_short();
                 }
                 break;
             }
@@ -987,7 +997,10 @@ impl<'c, S: Seams> Ctx<'c, S> {
             }
             lists.push(list);
         }
-        let mut top_done = vec![false; sol.len()];
+        // A piece whose cut would need a piece beyond the cap has no alternative to walk (Q34).
+        let mut top_done: Vec<bool> = (0..sol.len())
+            .map(|i| i + 2 > self.space.max_pieces())
+            .collect();
         let root = (0, self.seams.begin());
         let (head, last) = sol.split_at(sol.len() - 1);
         let Some(w) = self.walk(head, last[0].start, last[0].len, &root.1, total) else {
@@ -996,9 +1009,6 @@ impl<'c, S: Seams> Ctx<'c, S> {
         };
         let mut resume = vec![root];
         resume.extend(w.resume);
-        // Q33: no candidate starts in the solution's own units (its later clusters, decoded out of step, could otherwise
-        // look evident and take the whole budget; they cannot be another file).
-        self.excluded = sol.clone();
         'ranks: for rank in 0..self.limits.break_points {
             for (i, list) in lists.iter().enumerate() {
                 let Some(&b) = list.get(rank) else {
@@ -1009,6 +1019,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
                 }
                 // The piece cut at `b` is piece i + 1; the next one must fit too.
                 if i + 2 > self.space.max_pieces() {
+                    // No alternative fits within the piece cap: nothing to walk (counted done above, Q34).
                     continue;
                 }
                 let st = resume
@@ -1023,18 +1034,26 @@ impl<'c, S: Seams> Ctx<'c, S> {
                     start: p.start,
                     len: b - starts[i],
                 });
+                // Q33/Q34: no candidate starts in the rest of the piece being cut (its later units, decoded out of step,
+                // could look evident and take the whole budget, and the alternative is to leave them out); the
+                // solution's other pieces stay candidates (another path may reuse them).
+                self.excluded = vec![Fragment {
+                    start: p.start + (b - starts[i]),
+                    len: p.len - (b - starts[i]),
+                }];
                 // Q29: here only an alternative with content evidence past the new seam counts; a blind one (units the
                 // format cannot check, filled from any free run) is not descended into.
                 let is_top = rank == 0 && top[i] == Some(b);
-                self.exhaustive = true;
+                self.short = false;
                 let (evident, _) = self.classify(&pieces, &st, p.start + (b - starts[i]), b);
                 for (g2, no_evidence) in evident {
                     if !no_evidence {
                         self.dfs(&mut pieces, &st, g2, b, false);
                     }
                 }
-                // Walked to the end: no cap, budget or cancel cut it.
-                top_done[i] |= is_top && self.exhaustive && self.stop.is_none();
+                // Walked to the end: no candidate or break-point cap, budget or cancel cut it short (the piece cap may be
+                // hit: past it no alternative fits).
+                top_done[i] |= is_top && !self.short && self.stop.is_none();
             }
         }
         self.end_recheck(saved, &top, &top_done);
@@ -1080,7 +1099,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
         used.extend_from_slice(&self.excluded);
         let (listed, capped) = space.candidates(end, &used, cap, &mut |g2| self.keep(g2, b));
         if capped {
-            self.exhaustive = false;
+            self.cut_short();
         }
         let first = cands.first().copied();
         // The listing never holds the unit at `end` (no seam), nor does the anchored start.
@@ -1108,7 +1127,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
                 // cluster then foreign data): blind, descended. Only a candidate broken right at the seam is dropped.
                 WalkEnd::Broken { at } if at > b => blinds.push(g2),
                 WalkEnd::Broken { .. } => {}
-                WalkEnd::Stopped => self.exhaustive = false,
+                WalkEnd::Stopped => self.cut_short(),
             }
         }
         (evident, blinds)

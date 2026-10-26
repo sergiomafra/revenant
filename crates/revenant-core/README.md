@@ -903,12 +903,15 @@ points: first the unit boundaries at or before the positions the format marks as
 most suspicious first; positions in one unit count once), then the nearest to the piece's end, at most 64 per piece, taken round robin over the pieces; from each it lists the next
 piece's candidates and searches on from those with content evidence past the new seam (a blind candidate is not
 followed there: filling units the format cannot check from any free run is no evidence of another file). No candidate
-starts in a unit of the found solution itself (ruling Q33: those cannot be another file, and the solution's own later
-units, read out of step, can look like a continuation and take the whole budget). Any other complete solution makes
-the result not unique. The re-check has its own
+starts in the rest of the piece being cut, the units after the cut (rulings Q33, Q34: leaving them out is the
+alternative, and read out of step they can look like a continuation and take the whole budget); the solution's other
+pieces stay candidates, since another path may reuse them. Any other complete solution makes the result not unique. The re-check has its own
 budget (2^14 walks per file); running out of it, or of break points, does not make the search non-exhaustive, with
 one exception (Q33): when the format gives hints, every candidate at each piece's most suspicious cut must be walked to
-the end (no cap, budget or cancel cutting it short), else the result is not exhaustive.
+the end (no candidate or break-point cap, budget or cancel cutting it short), else the result is not exhaustive. Hitting
+the piece cap there does not count, and neither does a piece whose cut would need a piece beyond the cap: no alternative
+fits within it (Q34). The accepted cost: a correct photo next to a whole burst neighbour (whose data passes as a
+continuation at the cut, so the walk there is long) can stay `Partial` when the re-check budget runs out at that cut.
 
 **Candidates with and without evidence.** A candidate passes when its walk completes or checks content past the seam;
 it is blind when its walk checks nothing past the seam yet does not break right at it (a cluster the format cannot

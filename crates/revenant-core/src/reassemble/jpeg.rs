@@ -1389,7 +1389,7 @@ mod tests {
         // Q33. The re-check never tries the solution's own later clusters (decoded out of step they resync and look
         // evident, and would take its whole budget), and must walk the candidates of the top-hinted cut to the end.
         let burst = testkit::jpeg_burst(2048, 1536, 5, 2);
-        let intact: Vec<u64> = [10, 25, 40]
+        let intact: Vec<u64> = [5, 10, 25, 40]
             .into_iter()
             .filter(|&pct| {
                 let found = swapped_in_one_run(&burst, pct);
@@ -1426,10 +1426,114 @@ mod tests {
     )]
     fn a_look_alike_swapped_into_the_lower_half_is_not_unique() {
         let burst = testkit::jpeg_burst(2048, 1536, 5, 2);
-        for pct in [55, 70, 85] {
+        for pct in [55, 70, 85, 95] {
             let found = swapped_in_one_run(&burst, pct);
             assert!(!found.unique, "{pct} %: {found:?}");
         }
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "about 30-50 s in debug: runs in the release suite"
+    )]
+    fn a_later_piece_of_the_solution_reused_by_the_true_path_is_not_unique() {
+        // Q34. The solution is [P, A3]: P is one run holding a's data with MCUs x..y from its burst neighbour b (spliced
+        // where both photos are byte-aligned, x and y chosen so that P's data after y is a's shifted by whole clusters),
+        // and A3 is a's rest. The true path is [a[..c1], A2, A3]: it cuts P before x, goes on in A2 = a[c1..c2] (free,
+        // elsewhere) and reuses the solution's own last piece. The re-check must still list A3 as a candidate.
+        let burst = testkit::jpeg_burst(2048, 1536, 5, 2);
+        let (a, b) = (&burst[0], &burst[1]);
+        let cluster = 4096u64;
+        let (ca, _) = cursors(a);
+        let (cb, _) = cursors(b);
+        let mcus_x = u64::from(frame_of(a).0.mcus_x) as usize;
+        let total = ca.len();
+        // MCUs byte-aligned in both photos, from the middle of the photo on: (MCU, byte in a, byte in b).
+        let aligned: Vec<(usize, u64, u64)> = (total / 2..total * 9 / 10)
+            .filter_map(|m| Some((m, ca[m].byte_aligned()?, cb[m].byte_aligned()?)))
+            .collect();
+        let residue = |x: u64, y: u64| (y.wrapping_sub(x)) % cluster;
+        let mut first: std::collections::HashMap<u64, (usize, u64, u64)> = Default::default();
+        let mut pair = None;
+        for &(m, xa, xb) in &aligned {
+            if let Some(&(m0, x0a, x0b)) = first.get(&residue(xa, xb))
+                && m >= m0 + 8 * mcus_x
+            {
+                pair = Some(((m0, x0a, x0b), (m, xa, xb)));
+                break;
+            }
+            if xa % cluster >= 64 {
+                first.entry(residue(xa, xb)).or_insert((m, xa, xb));
+            }
+        }
+        let ((_, xa, xb), (_, ya, yb)) =
+            pair.expect("two MCUs where a and b part by whole clusters");
+        let mut s = a[..xa as usize].to_vec();
+        s.extend_from_slice(&b[xb as usize..yb as usize]);
+        s.extend_from_slice(&a[ya as usize..]);
+        let (cs, end) = cursors(&s);
+        assert_eq!(
+            (cs.len(), end),
+            (
+                total,
+                End::Eoi {
+                    at: s.len() as u64 - 2
+                }
+            )
+        );
+        // Past y, `s` is `a` shifted by `d` (a multiple of the cluster).
+        let d = (xa + (yb - xb)) as i64 - ya as i64;
+        assert_eq!(d.rem_euclid(cluster as i64), 0);
+        let c1 = xa / cluster * cluster;
+        let c2 = (ya / cluster + 2) * cluster;
+        let e = (c2 as i64 + d) as u64;
+        assert_eq!(s[e as usize..], a[c2 as usize..]);
+        let mut card = noise_card(450, cluster);
+        let p = put(&mut card, at(cluster, 10), &s[..e as usize]);
+        let a2 = put(&mut card, at(cluster, 200), &a[c1 as usize..c2 as usize]);
+        let a3 = put(&mut card, at(cluster, 350), &a[c2 as usize..]);
+        let g = grid(&card, cluster);
+        let src = Mem(card);
+        let found = find(&src, &[g], p.start, &[p.start], &[], &Limits::DEFAULT).expect("found");
+        assert!(found.complete, "{found:?}");
+        assert!(
+            !found.unique,
+            "the true path [a[..c1], {a2:?}, {a3:?}] was not seen: {found:?}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "about 30-50 s in debug: runs in the release suite"
+    )]
+    fn a_solution_at_the_piece_cap_can_be_exhaustive() {
+        // Q34. With at most 2 pieces, the last piece of a 2-piece solution cannot be cut (no third piece): its top-hinted
+        // cut has nothing to walk and does not make the result non-exhaustive.
+        // The second run is the photo's last two clusters, the last holding 51 bytes (seed 8): it has a cut to hint at,
+        // and its one later cluster holds too little (under an MCU row) to decode out of step into evidence, break, and
+        // hit the piece cap in the main search (which would rightly make the result non-exhaustive).
+        let j = testkit::jpeg_smooth(2048, 1536, 8);
+        assert_eq!(j.len() % (16 << 10), 51);
+        let cluster = 16 << 10;
+        let c1 = ((j.len() - 1) / cluster as usize - 1) * cluster as usize;
+        assert!(j.len() - c1 > cluster as usize);
+        let mut card = noise_card(110, cluster);
+        let runs = [
+            put(&mut card, at(cluster, 40), &j[..c1]),
+            put(&mut card, at(cluster, 90), &j[c1..]),
+        ];
+        let g = grid(&card, cluster);
+        let src = Mem(card);
+        let limits = Limits {
+            pieces: 2,
+            ..Limits::DEFAULT
+        };
+        let s = find(&src, &[g], runs[0].start, &[runs[0].start], &[], &limits).expect("found");
+        assert_eq!(s.pieces, runs);
+        assert!(s.complete && s.unique && s.exhaustive, "{s:?}");
+        assert_eq!(s.proof, Proof::Proven);
     }
 
     /// [`JpegSeams`] without its hint to the uniqueness re-check.
