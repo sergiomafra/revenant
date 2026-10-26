@@ -41,13 +41,15 @@ passa pelo cache da busca (nunca relê setor ruim conhecido) e tem orçamento po
   **never run `brew`**; check a binary exists (`which`, `~/.cargo/bin`, `target/release`) before building or installing
   any tool.
 - **Health rule [design §4, §5]:** `Intact` only when every seam is validated by content AND is the only one that passes
-  within the search (no cap or budget hit, every candidate of every seam tried); otherwise `Partial` with the best pieces
-  found. Q16 stays: a JPEG with restart markers (DRI > 0) reassembled from 2+ pieces is at most `Partial`. A RAW seam inside
+  within the search (no cap or budget hit, every candidate of every seam tried, **blind candidates included**: Q2; the
+  search window is 256 MiB / 64 MiB, a look-alike beyond it is an accepted, documented risk: Q4); otherwise `Partial`
+  with the best pieces found. Through reassembly, `Intact` also needs the volume listing not truncated (Q5). Q16 stays: a JPEG with restart markers (DRI > 0) reassembled from 2+ pieces is at most `Partial`. A RAW seam inside
   uncompressed or lossy sensor data is never a proof (bytes placed, at most `Partial`), except a live chain (as today) or a
   proven exFAT old chain (D14).
 - **Where a piece may lie [design §5]:** on a volume's cluster grid when the file starts on one (cluster ≥ 4096, as D13 of
   1.4), else on 512-byte sectors with a smaller budget; only clusters no live file claims (`Listing.live`) and that no
-  `Intact` finding uses (a piece is never used by two `Intact` files).
+  `Intact` finding uses (a piece is never used by two `Intact` files; a RAW and its own preview sharing bytes are the
+  same file, nested, recorded, not two `Intact` files: Q16).
 - **Known size [design §5]:** a file-system entry's size, or the format's (`moov` sample table, TIFF extent): the pieces
   sum to it exactly.
 - **Determinism:** for a source that answers the same every time, the events (minus `Event::Rate`) are identical for any
@@ -56,7 +58,8 @@ passa pelo cache da busca (nunca relê setor ruim conhecido) e tem orçamento po
 - **Speed:** no slowdown above 5% on images without fragmentation (control-build method of 1.4/1.5: this commit and its
   parent built side by side, interleaved, best of 3); reassembly time bounded by the budgets and measured.
 - **Bounded everything** (a constant may have a `cfg(test)` twin seen only by unit tests inside the crate; integration
-  tests lower a limit through an explicit crate-private parameter, P1 of 1.5): every cap below is in `reassemble::Limits`.
+  tests lower a limit through an explicit public parameter, P1 of 1.5: nothing `cfg(test)` or crate-private is visible to
+  `tests/*.rs`): every cap below is in `reassemble::Limits`.
 - **Docs in the same commit [Sérgio]:** each task updates the READMEs it affects and `CHANGELOG.md` `[Unreleased]` for
   anything user-visible.
 - **Commit trailer, always:** `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Conventional Commits. Never
@@ -104,14 +107,17 @@ Cada linha: decisão — custo se estiver errada. Decididas pelo Claude dentro d
   fora da grade (cartão reformatado com outro cluster) só é remontado em poucos pedaços.
 - **D4** Ordem dos candidatos de cada emenda: os inícios de unidade livres em ordem crescente a partir do fim do pedaço
   atual, até 256 MiB depois dele ("o próximo livre"), depois os do início do heap até esse fim ("o primeiro buraco"); no
-  máximo `SEAM_CANDIDATES = 4096` por emenda. Mais que isso ⇒ a emenda não foi esgotada (no máximo `Partial`) — custo:
+  máximo `SEAM_CANDIDATES = 4096` **sobreviventes do pré-filtro** por emenda (Q1; o pré-filtro roda durante a
+  enumeração). Mais que isso ⇒ a emenda não foi esgotada (no máximo `Partial`). A unicidade vale só dentro da janela
+  (Q4) — custo:
   uma continuação a mais de 256 MiB num cartão quase vazio à frente, ou depois de 4096 clusters livres, não é achada
   (o arquivo sai como hoje).
 - **D5** Pontos de quebra de cada emenda: as fronteiras de unidade dentro do pedaço atual entre o último ponto que o
   validador conferiu (`Walked::checked`) e o primeiro sinal de quebra, da mais próxima do sinal para trás, no máximo
   `BREAK_POINTS = 64`; mais ⇒ não esgotada — custo: um vídeo com unidades NAL enormes num cluster pequeno pode passar de
   64 fronteiras sem cabeçalho no meio e sair `Partial`.
-- **D6** `Intact` exige: exatamente uma solução completa na busca toda, nada esgotado por teto ou orçamento, `prove` =
+- **D6** `Intact` exige: exatamente uma solução completa na busca toda (candidatos cegos também contam: Q2), nada esgotado por
+  teto ou orçamento, a listagem do volume não truncada (Q5), `prove` =
   `Proven` (cada emenda provada pelo conteúdo), nenhum setor ilegível nos pedaços (`bad_runs` do cache), o tamanho
   conhecido batendo, a conferência própria do formato sobre a vista (`decode_health` estrito no JPEG, `index_health` no
   vídeo, `preview_health` no RAW) e o Q16. Senão `Partial` com a primeira solução na ordem do D4 (ou, sem solução, o
@@ -177,6 +183,51 @@ Cada linha: decisão — custo se estiver errada. Decididas pelo Claude dentro d
   1.6 para a câmera do Sérgio — custo: nenhum no código.
 - **D22** Os menores herdados da 1.4 (T5, T6, T9, T10) entram onde são baratos (Task 12); o que não couber volta ao
   histórico com dono — custo: nenhum.
+
+## Decisões do pre-flight da execução (Q1–Q19)
+
+Rodadas do controlador antes de despachar as tarefas, sobre os achados de
+`.superpowers/sdd/2026-10-26-m1-p6-fragmentacao-avancada/preflight.md`. Vinculantes: onde diferirem das D1–D22 acima, valem
+as Q. As tarefas já carregam o texto de cada uma. Cada linha: decisão — custo.
+
+- **Q1** (B1) O pré-filtro roda durante a enumeração dos candidatos; o teto de 4096 conta os sobreviventes; as leituras do
+  pré-filtro entram no orçamento do arquivo; vídeo e RAW ganham pré-filtro (Tasks 2, 3, 5, 8, 9) — custo: nenhum.
+- **Q2** (B2) A busca desce também nos candidatos CEGOS; suas soluções completas contam para a unicidade (uma continuação
+  cega verdadeira ao lado de uma vizinha evidente ⇒ não única ⇒ `Partial`) (Tasks 2, 3, 4, 8) — custo: mais trabalho de
+  busca, limitado pelo orçamento; fecha um caminho de falso `Intact`.
+- **Q3** (B3) `search(.., known: Option<u64>)` (Task 2), preenchido com `origin.size` na Task 4 (Tasks 6, 9 só consomem); o
+  tamanho tem de bater quando conhecido — custo: nenhum.
+- **Q4** (S1) Unicidade só dentro da janela de 256 MiB (64 MiB sem grade) é um risco aceito e documentado (Task 2, README,
+  Task 13) — custo: um sósia fora da janela pode deixar uma emenda falsamente única.
+- **Q5** (S2) `Intact` por remontagem exige também a listagem não truncada (`ctx.listing_truncated`, Task 4) — custo:
+  cartões enormes perdem `Intact` nos arquivos remontados.
+- **Q6** (S3) Prova da cadeia antiga (Task 9): bitmap presente, `valid == size`, "reivindica" definido, nenhum início de
+  outro achado dentro da cadeia — custo: menos `Intact` por `OldChain`.
+- **Q7** (S4) Arquivo próprio (prévia do RAW) casa por cobertura, não por igualdade de `Runs` (Tasks 2, 8) — custo: nenhum.
+- **Q8** (S5) Testes com relógio viram determinísticos: contadores e uma fonte que cancela na primeira leitura após o fim
+  da busca (Task 4); o limite de tempo vai para a medição da Task 11 — custo: nenhum.
+- **Q9** (S6) `reassembly_budget_measure` vira teste unitário `#[ignore]` no crate; `real_previews_split_in_three` usa um
+  cartão `FsBuilder` e o `scan` público (Task 11) — custo: nenhum.
+- **Q10** (S7) `session::store::VERSION` passa a 2 (Task 4) — custo: sessões antigas recusadas, aceitável antes da 1.0.
+- **Q11** (S8) O cartão F tem de mostrar que remonta (`Updated`, `frags`, `claimed` não vazios) antes de o teste de
+  retomada depender dele (Task 4) — custo: nenhum.
+- **Q12** (S9) Visibilidade `pub(crate)` ampliada nas tarefas que usam, com os arquivos listados: `formats/jpeg.rs`
+  e `jpeg_join` (Task 3), `pairing::Video` (Task 5), `preview_health` (Task 8) — custo: nenhum.
+- **Q13** (S10) O RED da Task 10 aparece num commit anterior (antes da Task 3) ou sob mutação — custo: nenhum.
+- **Q14** (S11) Testes de emenda cega usam intervalos tomados entre os trechos (Tasks 2, 8) — custo: nenhum.
+- **Q15** (S12) Bloco sem perdas só passa com o marcador de fim exatamente no fim declarado do bloco e a contagem exata;
+  a Task 11 registra se os blocos reais da Sony têm contagens iguais (Tasks 7, 8, 11) — custo: nenhum.
+- **Q16** (S13) RAW e sua própria prévia compartilhando bytes são o mesmo arquivo (aninhado), registrado, não dois
+  `Intact`; os oráculos das Tasks 4 e 10 isentam os aninhados — custo: nenhum.
+- **Q17** (S14) A Task 10 define a saúde esperada por tipo (JPEG DRI 0 `Intact`, ARW sem perdas `Intact`, ARW sem
+  compressão/com perdas dividido no sensor `Partial` com bytes exatos, vídeo conferível `Intact`) — custo: nenhum.
+- **Q18** (S15) As conferências de conteúdo dentro da busca (Task 9) ganham medição de velocidade dentro dos 5% — custo:
+  nenhum.
+- **Q19** Os 11 achados cosméticos aplicados: C1 parâmetro público (Constraints), C2 "D12 da 1.4" (Task 8), C3 candidato
+  da Task 6 vira nota sem mudança, C4 só o construtor de tabelas Huffman (Task 7), C5 `sony_restart_intervals` exige uma
+  amostra Sony (Task 11), C6 CR2 em `sensor` documentado (Task 8), C7 `CheckedSample.size: u64` (Task 5), C8 ajudantes em
+  `tests/support` (Tasks 4, 10), C9 passos por faixa e teto de caixas `moof` (Tasks 2, 6), C10 `capped` do pareamento
+  documentado (Task 4), C11 sem amostras XAVC no histórico (Task 13) — custo: nenhum.
 
 ## Pendências herdadas com dono 1.6
 
@@ -325,7 +376,8 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   impl Taken {
       pub(crate) fn new(live: &[Fragment], claimed: &Runs) -> Taken;
       pub(crate) fn claim(&mut self, pieces: &[Fragment]);
-      /// The `Intact` ranges overlapping `[start, end)` (each as claimed: a whole finding's piece), ascending.
+      /// The claimed `Intact` ranges overlapping `[start, end)`, ascending. `Runs` merges touching ranges, so these are
+      /// merged ranges, not one finding's piece: the caller tests coverage by `own` (Q7), never equality.
       pub(crate) fn overlapping(&self, start: u64, end: u64) -> Vec<Fragment>;
   }
   pub(crate) struct Space<'a> { .. }
@@ -336,13 +388,19 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
       pub(crate) fn unit(&self) -> u64;        // cluster size, or SECTOR
       pub(crate) fn on_grid(&self) -> bool;
       pub(crate) fn max_pieces(&self) -> usize;
-      /// Bytes free in a row from `g` (whole units, at most `max`): stops at a taken range (unless it is exactly one of
-      /// `own`, absolute), at a range of `used`, at a finding start other than `g` itself or an `own` start (D9, D10), at
-      /// the heap end or the source end.
+      /// Bytes free in a row from `g` (whole units, at most `max`): stops at a taken range (unless every claimed byte of
+      /// it is covered by `own` ranges at their exact absolute positions: a coverage test, not equality, because `Runs`
+      /// merges touching ranges: Q7), at a range of `used`, at a finding start other than `g` itself or an `own` start
+      /// (D9, D10), at the heap end or the source end. Steps over taken ranges by range, never per cluster (a 2 TB heap).
       pub(crate) fn free_run(&self, g: u64, used: &[Fragment], own: &[Fragment], max: u64) -> u64;
       /// Candidate starts after a piece ending at `end` (D4): free unit starts ascending from `end` up to `end + window`,
-      /// then (grid only) from the heap start up to `end`; never inside `used`; at most `cap`; `true` when more existed.
-      pub(crate) fn candidates(&self, end: u64, used: &[Fragment], cap: usize) -> (Vec<u64>, bool);
+      /// then (grid only) from the heap start up to `end`; never inside `used`. `keep` (the seam's prefilter, which
+      /// `search` wraps so that its reads are charged to the file's read budget and memoized per file by (absolute start,
+      /// logical seam)) is applied WHILE enumerating, and `cap` counts the survivors only (Q1). The enumeration is
+      /// bounded by window/unit and steps over taken ranges by range. The `bool` is `true` when more survivors existed
+      /// than `cap` ("cap hit"); a window cut is NOT a cap hit (Q4).
+      pub(crate) fn candidates(&self, end: u64, used: &[Fragment], cap: usize,
+                               keep: &mut dyn FnMut(u64) -> bool) -> (Vec<u64>, bool);
   }
   pub(crate) trait Seams {
       type State: Clone;
@@ -358,7 +416,8 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
       fn anchor(&self) -> Option<(u64, u64)> { None }
       /// Logical `[offset, len)` ranges of the file's own embedded files (D10).
       fn own(&self) -> Vec<Fragment> { Vec::new() }
-      /// A cheap reject of candidate `g` for the seam at logical `seam` (default: keep).
+      /// A cheap reject of candidate `g` for the seam at logical `seam` (default: keep). Called while the candidates are
+      /// listed (Q1); `r` reads through the counted source, so its bytes are charged to the file's read budget.
       fn prefilter(&mut self, r: &mut Reader, g: u64, seam: u64) -> bool { let _ = (r, g, seam); true }
   }
   pub(crate) struct Walked<S> {
@@ -382,13 +441,16 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   }
   pub(crate) struct Budget { .. }  // tries and bytes left, per scan; `for_file()` derives the per-file one
   impl Budget { pub(crate) fn new(limits: &Limits) -> Budget; pub(crate) fn spent(&self) -> bool; }
-  pub(crate) fn search<S: Seams>(seams: &mut S, source: &dyn Source, space: &Space, start: u64, limits: &Limits,
-                                 budget: &mut Budget, cancel: &CancelToken) -> Option<Search>;
+  /// `known`: the file-system entry's size for a Deleted-origin file (Q3), else `None`. The effective known length is the
+  /// format's (`Seams::known_len`) and `known`; when both are `Some` they must agree, else no solution is `complete`.
+  /// When any is known, the pieces must sum to it exactly.
+  pub(crate) fn search<S: Seams>(seams: &mut S, source: &dyn Source, space: &Space, start: u64, known: Option<u64>,
+                                 limits: &Limits, budget: &mut Budget, cancel: &CancelToken) -> Option<Search>;
   ```
   The search (an algorithm the signatures do not fix):
   ```text
   dfs(pieces, state, piece_start g, logical L):
-    run  = space.free_run(g, used = pieces, own = seams.own() mapped, max = known − L or seam_window)
+    run  = space.free_run(g, used = pieces, own = seams.own() mapped, max = known − L or seam_window)  // known = effective
     view = Fragmented(source counted, pieces ++ [g, run]);   w = seams.walk(view, state, L + run)
     charge 1 try + bytes read; on budget/cancel: exhaustive = false, stop
     Complete{len} (len == known when known, anchor satisfied)  → record solution (stop at the 2nd: ambiguous)
@@ -397,15 +459,23 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
       floor  = the last resume position ≤ w.checked (or L)
       breaks = logical b in (floor, at] with g + (b − L) a unit boundary, nearest to `at` first, ≤ break_points
       for b in breaks: (pos, st) = last resume with pos ≤ b
-        cands = anchor-implied start first (if free), then space.candidates(abs(b), pieces ++ [g, b−L]) with prefilter
-        any_evidence = false
+        cands = anchor-implied start first (if free), then space.candidates(abs(b), pieces ++ [g, b−L], cap, prefilter)
+                (the prefilter runs inside; the cap counts survivors; its reads are charged to the file's budget)
         for g2 in cands: w2 = walk from st over pieces ++ [g, b−L] ++ [g2, run2]
-            passes if Complete, or w2.checked > b (evidence past the seam)          → dfs(..., g2, b) ; any_evidence = true
-            blind  if neither broken nor evidence before the end of run2          → remember first blind g2
-        if !any_evidence and a blind g2 exists → dfs with the first blind g2, mark the seam Unproven
+            passes if Complete, or w2.checked > b (evidence past the seam)          → evidence list
+            blind  if neither broken nor evidence before the end of run2          → blind list
+            broken                                                                  → dropped
+        // Q2: BLIND candidates are descended into too, always, never only when no candidate had evidence. A true
+        // continuation that is blind (a 1-cluster free run shorter than one unit of evidence) must be able to make an
+        // evident look-alike neighbour NON-unique.
+        for g2 in evidence list (D4 order), then blind list (D4 order): dfs(..., g2, b)   // a path whose own seam stayed
+                                                                                          // blind is Unproven
+        every complete solution through either list counts for `unique`; a blind descent that the budget or a cap cuts
+        short sets exhaustive = false
     Stopped → exhaustive = false
-  result: first solution in candidate order (else best partial = most logical bytes checked); unique = exactly one
-  solution; proof = prove(view of that solution, seams) min Unproven if any seam was blind
+  result: first solution in candidate order (evidence candidates before blind ones at each seam; else best partial = most
+  logical bytes checked); unique = exactly one solution over evidence AND blind paths; proof = prove(view of that
+  solution, seams) min Unproven if any seam was blind
   ```
 
 - [ ] **Step 1: Failing tests** (unit, `reassemble/mod.rs`; toy format `Toy`: a file of `n` units of 4096 bytes, unit i =
@@ -414,14 +484,24 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   `Unproven` if a seam falls in a blind unit, else `Proven`; grid = heap 1 MiB, cluster 4096, in a 16 MiB `Mem`):
   ```rust
   #[test] fn space_lists_free_cluster_starts_in_prior_order() {
-      // taken: live [2 MiB, 3 MiB); claimed [5 MiB, 5 MiB + 8 KiB); candidates(end = 4 MiB, used [], cap 8) ==
+      // taken: live [2 MiB, 3 MiB); claimed [5 MiB, 5 MiB + 8 KiB); candidates(end = 4 MiB, used [], cap 8, keep all) ==
       // [4 MiB, 4 MiB + 4K, ..] (8 of them) and true; candidates(end = 15 MiB + 1 MiB − 8 KiB, ..) == the 2 forward
       // ones then 1 MiB, 1 MiB + 4K, ... (first gap), skipping [2 MiB, 3 MiB)
   }
   #[test] fn space_without_grid_is_forward_only_on_sectors() { /* no grids: unit 512, candidates only in (end, end + 64 MiB) */ }
+  #[test] fn candidate_cap_counts_survivors_not_enumerated_units() {
+      // keep accepts 1 start in 8: with cap 8 over a window of 1000 free units the 8 survivors come back (the 64th unit
+      // is the 8th survivor) and the bool is false; with 125+ survivors available and cap 8 the bool is true; a window
+      // that cuts the enumeration with fewer than cap survivors gives false (a window cut is not a cap hit)
+  }
+  #[test] fn prefilter_reads_are_charged_and_memoized() {
+      // a Toy prefilter reading 16 bytes per candidate: the budget's bytes grow by 16 per distinct (start, seam), and a
+      // second seam query of the same pair costs nothing
+  }
   #[test] fn free_run_stops_at_taken_used_and_finding_starts() {
       // run from 4 MiB stops at a claimed range, at a used piece, at a finding start at 4 MiB + 12 KiB; does not stop at
-      // an Intact range given as `own` at exactly its position, and does stop at one 512 B off
+      // a claimed range wholly covered by `own` at its exact positions (also when two claimed ranges touch and `Runs`
+      // merged them), and does stop at one 512 B off or only partly covered
   }
   #[test] fn toy_file_in_five_pieces_is_unique() {
       // a 40-unit toy file at 1 MiB in 5 runs of 8 units, the runs placed out of order with toy noise (other id) in the
@@ -433,13 +513,32 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   #[test] fn toy_budget_hit_is_not_exhaustive() { /* Limits { file_tries: 3, .. }: exhaustive false, complete false */ }
   #[test] fn piece_cap_is_respected() { /* 6 runs, Limits { pieces: 4 }: complete false, pieces.len() == 4 */ }
   #[test] fn known_len_must_match() { /* known_len = 41 units: the 40-unit solution is not complete */ }
+  #[test] fn entry_size_must_match_when_known() {
+      // search(.., known: Some(41 units)) with a format that gives no known_len: the 40-unit solution is not complete;
+      // known Some(40) completes; known Some(40) with known_len 41 (they disagree): not complete
+  }
   #[test] fn anchor_fixes_the_last_piece() {
       // the last run copied at two places, anchor (logical 32 × 4096, the first copy's start): pieces end with that copy,
       // unique true
   }
   #[test] fn blind_seam_is_placed_in_prior_order_and_unproven() {
-      // units 16..40 blind, a seam at unit 24: the run placed at the first D4 candidate (the true one, next free),
-      // complete true, proof Unproven
+      // units 16..40 blind, a seam at unit 24. With blind data the walk never breaks, so a piece ends only where
+      // `free_run` stops (Q14): the gaps between the runs are TAKEN (claimed `Intact` ranges or finding starts), nothing
+      // else. The run is placed at the first D4 candidate (the true one, next free), complete true, proof Unproven
+  }
+  #[test] fn blind_true_continuation_next_to_an_evident_look_alike_is_not_unique() {
+      // Q2. Toy file of 40 units, unit 8 blind (`blind: 8..9`). Run A = units 0..8 at 1 MiB. The TRUE continuation is
+      // T = unit 8 alone, on a single free cluster with taken ranges on both sides (a 1-unit run, blind: no evidence),
+      // followed by the rest R = units 9..40 elsewhere. Next to it a free LOOK-ALIKE L: a run carrying units 8..40 with
+      // correct headers (id, index, n; other noise bytes), so it has evidence past the seam and completes on its own.
+      // Both reach 40 units: search → complete true, unique FALSE, exhaustive true; and the result is never
+      // (unique && proof == Proven). On the old rule (blind descended into only when no candidate had evidence) only L
+      // is explored and the result is unique: this test is RED there. Without L the same card gives unique true with
+      // proof Unproven (the seam at unit 8 stayed blind)
+  }
+  #[test] fn budget_cut_inside_a_blind_descent_is_not_exhaustive() {
+      // the same card with Limits { file_tries } just enough for the evidence path but not for the blind one:
+      // exhaustive false
   }
   #[test] fn cancel_stops_the_search() { /* cancelled token → None, no try counted */ }
   ```
@@ -449,7 +548,9 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   search runs inside a `CancelScope`).
 - [ ] **Step 4:** suite, clippy, fmt.
 - [ ] **Step 5:** core README "Reassembly" (new section after "Findings in pieces": what a seam is, the space and D3/D4,
-  break points D5, the `Intact` rule D6, budgets D7 with their values, the reading rule D8). Commit:
+  break points D5, the `Intact` rule D6, budgets D7 with their values, the reading rule D8, and, stated plainly,
+  that uniqueness holds only inside the 256 MiB window (64 MiB without a grid): a look-alike beyond it could leave a
+  false unique seam, the content proof being the guard: Q4; blind candidates count toward uniqueness: Q2). Commit:
   `feat(core): seam search engine over the free clusters of a volume`.
 
 ---
@@ -458,8 +559,10 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
 
 **Files:**
 - Create: `crates/revenant-core/src/reassemble/jpeg.rs`
-- Modify: `src/formats/jpeg_join.rs` (`seams_ok`, `early_base` and `boundary_means` → `pub(crate)`), `src/formats/
-  jpeg_entropy.rs` (nothing new public unless needed: `Cursor`, `decode_rows`, `Frame` are already `pub(crate)`)
+- Modify: `src/formats/jpeg_join.rs` (`seams_ok`, `early_base`, `boundary_means`, `within`, `Dc`, `seam_mean` →
+  `pub(crate)`: `boundary_means` takes the private `Dc`), `src/formats/jpeg.rs` (`decode_health`, `walk_header`,
+  `preview_health` → `pub(crate)`; Tasks 4, 8, 9 use them: Q12), `src/formats/jpeg_entropy.rs` (nothing new public
+  unless needed: `Cursor`, `decode_rows`, `Frame` are already `pub(crate)`)
 - Test: unit tests in `reassemble/jpeg.rs` and `jpeg_join.rs`
 - Docs: core README "Fragmented JPEG" (3+ pieces, the multi-seam test), CHANGELOG nothing yet (wired in Task 4)
 
@@ -482,7 +585,8 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   impl Seams for JpegSeams { type State = JpegState; /* Cursor + MCU index; `checked` = the position after the last
       complete MCU row; a candidate passes with ≥ one MCU row decoded below the seam and the early test (`early_base`)
       not rejecting it; `prove` = Proven iff `seams_ok` on the whole DC grid with the seams' MCU indexes; prefilter = the
-      1.3 window rule on the candidate's first sector (a non-data marker, a uniform or unreadable sector → reject) */ }
+      1.3 window rule on the candidate's first sector (a non-data marker, a uniform or unreadable sector → reject), run
+      while the candidates are listed, its reads charged to the file budget (Q1) */ }
   ```
 
 - [ ] **Step 1: Failing tests:**
@@ -504,10 +608,17 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
       // the search of a never returns b's run as a piece with unique && Proven (either a's own runs unique, or
       // unique false); same for b
   }
+  #[test] fn blind_one_cluster_continuation_next_to_a_burst_tail_is_not_intact() {
+      // Q2. A wide photo (jpeg_burst(4096, 1024, 5, 2), asserted in the test: one MCU row is larger than one 32 KiB
+      // cluster) whose middle piece is exactly 1 cluster with taken neighbours (blind: less than one MCU row), the rest
+      // after it; the burst neighbour's tail is free and passes: the search of the photo is never (unique && Proven) —
+      // either the true path is found and unique is false, or the result is not Intact
+  }
   #[test] fn restart_interval_is_reported() { /* jpeg_flat_with_restarts(512, 384, 4): restart_interval() == 4 */ }
   #[test] fn jpeg_without_grid_in_three_pieces_within_the_window() {
       // no grids: jpeg_smooth(1024, 768, 1) cut at sector multiples in 3 runs, the 2nd 3 MiB ahead and the 3rd 7 MiB ahead
-      // → pieces exact, unique
+      // → pieces exact, unique. The prefilter runs during the enumeration and the 4096 cap counts its survivors (Q1):
+      // the 64 MiB window of 512 B sectors is reached, not cut at 2 MiB
   }
   #[test] fn erased_gap_is_not_a_continuation() { /* runs separated by zeroed clusters: the zeroed clusters never appear in pieces */ }
   ```
@@ -526,10 +637,14 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
 **Files:**
 - Modify: `crates/revenant-core/src/reassemble/mod.rs` (`reassemble`, `improves`, health rule), `src/scan/mod.rs`
   (`Commit` fields, `emit_found`, `reassemble` step, `update` merge, docs of `scan`), `src/scan/state.rs` (+ codec),
-  `src/scan/state_tests.rs`, `tests/support/mod.rs` (card `f`)
+  `src/session/store.rs` (`VERSION` 1 → 2, Q10), `src/scan/state_tests.rs`, `tests/support/mod.rs` (card `f`, helpers
+  `final_view`, `exfat_card`), `src/pairing.rs` (`Video` → `pub(crate)` only if the reassembly needs it: Q12)
 - Test: new `crates/revenant-core/tests/reassembly.rs`; `scan/state_tests.rs`
-- Docs: core README "Scan" (the step after pairing), "Resumable scans" (what the state holds now), "Reassembly" (which
-  findings are candidates, D2), CHANGELOG ("Added": photos in three or more pieces are put back together)
+- Docs: core README "Scan" (the step after pairing), "Resumable scans" (what the state holds now), "Sessions" (the
+  format version is now 2: sessions saved by 1.5 are refused by the version check; Q10), "Reassembly" (which findings
+  are candidates, D2; the pairing cap `capped` also blocks JPEG reassembly from `Intact`, conservative: C10; a truncated
+  listing blocks `Intact` through reassembly: Q5), CHANGELOG ("Added": photos in three or more pieces are put back
+  together; "Changed": sessions saved by an earlier version are no longer resumable)
 
 **Interfaces:**
 - Consumes: Tasks 2 and 3; `Commit::{starts, grids, videos, moovs, capped}`, `FsPlan::live`, `pairing::pair_videos`.
@@ -538,10 +653,12 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   // reassemble/mod.rs
   pub(crate) struct Context<'a> {
       pub grids: &'a [Grid], pub live: &'a [Fragment], pub claimed: &'a Runs, pub starts: &'a [u64],
-      pub moovs: &'a [(u64, u64)], pub capped: bool, pub limits: &'a Limits,
+      pub moovs: &'a [(u64, u64)], pub capped: bool, pub listing_truncated: bool, pub limits: &'a Limits,
   }
   /// Every candidate (id order) searched; returns the findings it improves (same id, origin kept with placement Carved
-  /// for a file-system file, D15). `paired`: the pairing's results (their Intact pieces are claimed first).
+  /// for a file-system file, D15). For a candidate of origin `Deleted`, `search` gets `known: Some(origin.size)` (Q3):
+  /// the pieces must sum to the entry's size from this task on. `paired`: the pairing's results (their Intact pieces are
+  /// claimed first). `listing_truncated`: any volume listing dropped entries, so live clusters may be unknown (Q5).
   pub(crate) fn reassemble(source: &CachedSource, candidates: &[Finding], paired: &[Finding], ctx: &Context,
                            cancel: &CancelToken) -> Vec<Finding>;
   /// Whether `new` should replace `old` (D6): strictly better health, or both Partial and `new` is complete (its walk
@@ -556,14 +673,32 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   fn update(&mut self, paired: Vec<Finding>, reassembled: Vec<Finding>) -> Result<(), EngineError>; // reassembled wins per id
   ```
   Health of a result (D6): `Intact` iff `unique && exhaustive && complete && proof == Proven && !ctx.capped &&
-  !frags_capped && !claimed_capped && bad_runs(pieces) empty && known size matches && the format's own check on the view
+  !frags_capped && !claimed_capped && !ctx.listing_truncated && bad_runs(pieces) empty && known size matches && the
+  format's own check on the view
   is Intact && !(Jpeg && restart_interval > 0)`; else `Partial`. A result with 1 piece is contiguous (`fragments` empty).
-  Order in `scan_with`: `pair()` → `reassemble(&paired)` → `Checkpoint::Paired` → `update`.
+  `unique` counts complete solutions through blind candidates too (Q2). Order in `scan_with`: `pair()` →
+  `reassemble(&paired)` → `Checkpoint::Paired` → `update`.
 
 - [ ] **Step 1: Failing tests** (`tests/reassembly.rs`; helper `final_view(events) -> BTreeMap<u64, Finding>` = `Found`
   replaced by `Updated` with the same id; helper `exfat_card()` = testkit `FsBuilder::new(Exfat, 64 MiB, 32 KiB)` in
-  `disk(Mbr{8192})`):
+  `disk(Mbr{8192})`; both helpers live in `tests/support/mod.rs` so `reassembly_cards.rs` reuses them: C8). Write and
+  see the first test below pass its GREEN preconditions before the resume test relies on card F (Q11):
   ```rust
+  // scan/state_tests.rs, FIRST: card F (see below) must really exercise the new state (Q11)
+  #[test] fn the_cards_exercise_what_a_state_carries() {
+      // card F: the scan emits at least one `Updated` produced by reassembly (R in 3 pieces, 3 pieces in the final
+      // finding); the state captured at `Checkpoint::Paired` holds non-empty `frags` and non-empty `claimed`
+  }
+  // reassemble/mod.rs unit (next to the health rule)
+  #[test] fn health_needs_every_condition() {
+      // a Search that satisfies the whole D6 rule → Intact; each of unique, exhaustive, complete, Proven, !capped,
+      // !frags_capped, !claimed_capped, !listing_truncated (Q5), no bad run, known size, own check, Q16 false alone
+      // → Partial
+  }
+  #[test] fn session_version_one_is_refused() {
+      // a session file written with the 1.5 format version (1) is refused by the store's existing version check, with
+      // the same error it gives for any unknown version (asserted); a version-2 file round-trips (Q10)
+  }
   #[test] fn three_piece_jpeg_on_a_quick_formatted_card_is_intact() {
       // exfat_card: 6 photos P1..P6 (jpeg 1024×768 seeds 1–6) added one after another; R (jpeg_smooth 2048×1536 seed 11)
       // added with add_at in 3 runs of ≥ 2 clusters placed after P2, after P4 and after P6; Q (seed 9) in 2 runs after P3
@@ -573,7 +708,8 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   #[test] fn reassembly_events_identical_across_threads_and_caches() { /* the card above: threads [1, 2, 8, 16] × cache [default, 1 MiB] → equal events */ }
   #[test] fn pieces_never_overlap_live_files_or_another_intact() {
       // card with live files around 3 deleted fragmented JPEGs (exFAT, Camera delete on a FAT-chained layout via add_at):
-      // no final finding's piece overlaps a live file's clusters; Intact findings' pieces pairwise disjoint
+      // no final finding's piece overlaps a live file's clusters; Intact findings' pieces pairwise disjoint, except a
+      // RAW and its own nested preview finding, which are the same file (Q16): the oracle exempts nested own findings
   }
   #[test] fn reassembly_never_rereads_known_bad_sectors() {
       // support::SimSource over the first card with a bad sector inside R's 2nd run: the final R is Partial; in the read
@@ -582,9 +718,13 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   #[test] fn hostile_card_stays_within_budget() {
       // a 256 MiB image (no volume): a jpeg_smooth 2048×1536 first piece, then 4096 sectors each starting with the same
       // valid-looking continuation bytes and ending in FF D9: scan finishes, the JPEG final finding is not Intact
-      // (Partial or unchanged), and the scan takes < 30 s in debug (asserted loosely; the real numbers in Task 11)
+      // (Partial or unchanged). No wall-clock assertion (Q8): the time bound lives in Task 11's ignored measure, and the
+      // work bound is the counted-tries assert of `toy_budget_hit_is_not_exhaustive`
   }
-  #[test] fn cancel_during_reassembly_is_prompt() { /* the hostile image, cancel 200 ms after the last Progress → Err "cancelled" within 1 s */ }
+  #[test] fn cancel_during_reassembly_is_prompt() {
+      // deterministic (Q8): the hostile image behind a source wrapper that trips the CancelToken at the FIRST read past
+      // the scan's end (i.e. inside reassembly); the scan returns Err "cancelled". No timers
+  }
   #[test] fn live_files_are_never_candidates() { /* a live fragmented JPEG (add_at, 3 runs): Found Intact with the chain, no Updated */ }
   // scan/state_tests.rs (card `support::cards::f()`: the card of `three_piece_jpeg_on_a_quick_formatted_card_is_intact`
   // plus one bad sector inside P5, as a `Card`, scanned with `block: 1 MiB`)
@@ -595,7 +735,7 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   ```
 - [ ] **Step 2:** FAIL. **Step 3:** implement. `emit_found` pushes candidates (D2) and claims the ranges of `Intact`
   findings (D3, D18); `capture` destructures the new fields (compile error until listed), the codec writes them (`Runs`
-  as `(start, end)` like `own_moovs`), `apply` checks the caps (`SessionCorrupt` past them). In this task only JPEG
+  as `(start, end)` like `own_moovs`), `apply` checks the caps (`SessionCorrupt` past them); `session::store::VERSION` becomes 2 (Q10). In this task only JPEG
   candidates are searched (videos and RAW keep today's results until Tasks 5–8 plug their seams into `reassemble`).
 - [ ] **Step 4:** suite, clippy, fmt; `cargo test --release -p revenant-core`; `bench --images noise,dense-jpeg,exfat-card`
   (release, best of 3) on this commit and its parent, interleaved twice, control rebuild as in 1.4/1.5: within 5%, else
@@ -611,7 +751,8 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
 **Files:**
 - Create: `crates/revenant-core/src/reassemble/video.rs`
 - Modify: `src/formats/isobmff.rs` (`CheckedSample`, `check_sample`), `src/pairing.rs` (uses `check_sample`; `fits`,
-  `load_moov` → `pub(crate)`; `Intact` needs every sample checked), `src/reassemble/mod.rs` (video candidates)
+  `load_moov` and the struct `Video<'f>` → `pub(crate)`, needed by `VideoSeams::with_orphan`: Q12; `Intact` needs every
+  sample checked), `src/reassemble/mod.rs` (video candidates)
 - Test: unit tests in `reassemble/video.rs`, `isobmff.rs`, `pairing.rs`; `tests/pairing.rs` (unchanged, must stay
   green); `tests/reassembly.rs`
 - Docs: core README "Video with a separated index" (C7 closed: every sample), "Reassembly" (videos), CHANGELOG
@@ -621,7 +762,8 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
 - Produces:
   ```rust
   // isobmff.rs
-  #[derive(Clone, Copy, Debug)] pub(crate) struct CheckedSample { pub offset: u64, pub size: u32, pub check: Check }
+  #[derive(Clone, Copy, Debug)] pub(crate) struct CheckedSample { pub offset: u64, pub size: u64, pub check: Check }
+  // (`size: u64` as `isobmff::Sample.size`; a NAL walk converts with a checked conversion: C7)
   /// The 1.3 structural check of one sample (NAL lengths and header bytes with `length_size` from avcC/hvcC, or SOI/EOI
   /// for Motion-JPEG), reading through `read(file offset, buf) -> bool`; `steps` is charged per NAL unit, false when spent.
   pub(crate) fn check_sample(read: &mut dyn FnMut(u64, &mut [u8]) -> bool, s: &CheckedSample, steps: &mut u64) -> bool;
@@ -635,7 +777,9 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   impl Seams for VideoSeams { type State = usize /* next sample index */; /* walk: samples in file order, each wholly
       inside the view checked; `checked` = end of the last passing sample; Broken at the first failing one; Complete
       when the view reaches the known length with every sample passing and the moov bytes at the anchor; prove = Proven
-      iff every seam lies inside or between checked samples and every checkable sample passed */ }
+      iff every seam lies inside or between checked samples and every checkable sample passed; prefilter (Q1) = the
+      first sample that starts past the seam, at its mapped position, passes `check_sample` (a seam with no checkable
+      sample after it is blind and, by Q2, still descended into) */ }
   ```
 
 - [ ] **Step 1: Failing tests:**
@@ -675,7 +819,8 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
 
 **Files:**
 - Modify: `crates/revenant-core/src/reassemble/{video.rs,mod.rs}`, `src/formats/isobmff.rs` (a `moof`/`trun` reader:
-  `fragment_samples`), `src/scan/mod.rs` (candidates: Partial ISO BMFF with a `moov` in the first piece)
+  `fragment_samples`). No change to the candidate rule in `src/scan/mod.rs`: D2 already pushes every non-`Intact`
+  MP4/MOV, so a `moov`-in-the-first-piece video is a candidate already (C3)
 - Test: unit tests in `reassemble/video.rs`, `isobmff.rs`; `tests/reassembly.rs`; `tests/isobmff.rs`
 - Docs: core README "Formats: MP4/MOV" (what is put back now), "Reassembly"; CHANGELOG
 
@@ -695,8 +840,10 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   impl MoofSeams { pub(crate) fn new(source: &dyn Source, start: u64) -> Option<MoofSeams>; }
   impl Seams for MoofSeams { type State = (u64 /* next box offset */, usize); /* walk: top-level boxes in order,
       each header checked (size, type in moof/mdat/sidx/styp/free/skip/mfra), each moof's samples checked in the next
-      mdat; Complete when an `mfra` closes the chain or a FS known size is reached; else the walk ends at the last valid
-      box (at most Partial) */ }
+      mdat; Complete when an `mfra` closes the chain or the effective known size is reached (the FS size comes in through
+      `search`'s `known`, Task 2/Q3; `MoofSeams` itself has none); else the walk ends at the last valid box (at most
+      Partial). The box walk has a box-count cap (`MAX_BOXES`, C9) so a hostile `moof` chain is bounded by count, not
+      only by bytes */ }
   ```
   D17 lives in `reassemble`: before searching, videos that fit the same `moov` are compared first piece to first piece
   (same length, bytes equal through the counted cache); equal ones are one group, only the lowest id is searched.
@@ -728,8 +875,9 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
 ### Task 7: JPEG sem perdas (SOF3) — conferir blocos de RAW
 
 **Files:**
-- Create: `crates/revenant-core/src/formats/jpeg_lossless.rs`; Modify: `src/formats/{mod.rs,jpeg_entropy.rs}` (the Huffman
-  table builder `Huffman` and bit reader become `pub(crate)` or are shared through a small `pub(crate)` API), `src/tiff.rs`
+- Create: `crates/revenant-core/src/formats/jpeg_lossless.rs`; Modify: `src/formats/{mod.rs,jpeg_entropy.rs}` (share ONLY the Huffman table builder
+  and, if needed, the bit reader as `pub(crate)`: the baseline decoder rejects SSSS > 11 and must keep doing so, while
+  lossless codes go to SSSS 16: C4), `src/tiff.rs`
   (`TiffInfo::lossless`, `TiffInfo::ifds`), `crates/revenant-testkit/src/lib.rs` (`lossless_jpeg`)
 - Test: unit tests in `jpeg_lossless.rs`, `tiff.rs`; testkit `tests/media.rs`
 - Docs: core README "TIFF reader (internal)" (lossless ranges, IFD ranges), new "Lossless JPEG check" paragraph under
@@ -749,8 +897,10 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   #[derive(Clone, Debug)] pub(crate) struct LlCursor { pub pos: u64, pub sample: u64, .. }
   pub(crate) struct LlRun { pub end: End /* the 1.3 End */, pub samples: u64, pub resume: Vec<LlCursor> }
   /// Decodes difference codes (Huffman SSSS + SSSS extra bits; 16 → 32768, no extra) from `from`, reading `[from.pos,
-  /// limit)`; `Eoi` only with exactly width × height × components samples then padding and FF D9; restart markers checked
-  /// when DRI > 0; a resume point every row of samples (≤ the 1.3 RESUME_POINTS).
+  /// limit)`, `limit` being the tile's declared end (TileOffsets + TileByteCounts); `Eoi` only with exactly width ×
+  /// height × components samples AND the FF D9 marker ending exactly at `limit` (Q15: Huffman streams resynchronize, so
+  /// a count alone can be reached by chance on a neighbour's tail); restart markers checked when DRI > 0; a resume
+  /// point every row of samples (≤ the 1.3 RESUME_POINTS).
   pub(crate) fn decode_lossless(r: &mut Reader, f: &LosslessFrame, from: LlCursor, limit: u64) -> LlRun;
   // tiff.rs: TiffInfo gains
   pub lossless: Vec<(u64, u64)>,   // `data` ranges of Compression 7 strips/tiles whose first SOF is SOF3
@@ -762,6 +912,10 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   ```rust
   #[test] fn lossless_tile_decodes_whole() { /* lossless_jpeg(256, 256, 1, 14, 3): frame parsed, decode → Eoi at len − 2, samples 65 536 */ }
   #[test] fn lossless_count_must_be_exact() { /* height field patched to 257 → not Eoi (Error or OutOfData); to 255 → Error (data after the last sample) */ }
+  #[test] fn lossless_eoi_must_sit_at_the_declared_tile_end() {
+      // Q15. tile decoded with limit = len → Eoi; limit = len + 64 (the marker is early) → not Eoi; limit = len − 2 → not
+      // Eoi; a tile whose sample count is exact but whose FF D9 is 8 bytes before the declared end → not Eoi
+  }
   #[test] fn lossless_cut_tile_breaks_near_the_cut() { /* tile cut at 60% then noise: End::Error at ≥ the cut − 64 */ }
   #[test] fn lossless_tail_of_another_tile_fails() { /* tile a[..c] ++ tile b[c..] (same frame, other seed) → never Eoi with the exact count */ }
   #[test] fn lossless_resumes_across_a_view() { /* decode through Fragmented([a[..c], a[c..]] at two places) == contiguous decode (same End, samples) */ }
@@ -779,7 +933,8 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
 ### Task 8: RAW fragmentado — ARW primeiro, depois os outros TIFF
 
 **Files:**
-- Create: `crates/revenant-core/src/reassemble/raw.rs`; Modify: `src/reassemble/mod.rs` (RAW candidates, `own`),
+- Create: `crates/revenant-core/src/reassemble/raw.rs`; Modify: `src/reassemble/mod.rs` (RAW candidates, `own`), `src/
+  formats/jpeg.rs` (`preview_health` → `pub(crate)` if Task 3 did not already: Q12),
   `crates/revenant-testkit/src/lib.rs` (`ArwOptions`, `ArwCompression`, `arw`; `TiffRaw` gains `tiles`, empty in
   `tiff_raw`, `panasonic_rw2` and `olympus_orf`)
 - Test: unit tests in `reassemble/raw.rs`; `tests/reassembly.rs`; `tests/tiffraw.rs`
@@ -805,9 +960,12 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   impl Seams for RawSeams { type State = usize /* next unit */; /* units in file order from the TIFF walk of the first
       piece and, as the view grows, of the view: IFD tables (must parse: no structural error), the previews (strict decode
       when wholly inside the view; a seam inside one is checked by decoding across it), lossless tiles (decode_lossless
-      Eoi with the exact count), sensor ranges (blind: no evidence); known_len = the TIFF extent; own = the previews and
-      JPEG-coded ranges (D10); prove = Proven iff every seam lies inside a checked unit that passed or exactly between two
-      checked units, Unproven if one lies in a sensor range */ }
+      with `limit` = the tile's declared end: Eoi exactly there with the exact count: Q15), sensor ranges (blind: no
+      evidence, yet descended into like any blind candidate: Q2, so an evident neighbour can still make a seam
+      non-unique); known_len = the TIFF extent; own = the previews and JPEG-coded ranges (D10; the free-run exemption
+      is a coverage test, Q7); prefilter (Q1) = the first checked unit at the seam passes; prove = Proven iff every seam
+      lies inside a checked unit that passed or exactly between two checked units, Unproven if one lies in a sensor
+      range */ }
   ```
 
 - [ ] **Step 1: Failing tests** (`tests/reassembly.rs`, exFAT card 64 MiB / 32 KiB, RAW written with `add_at`, deleted
@@ -815,8 +973,9 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   ```rust
   #[test] fn lossless_arw_in_four_pieces_is_intact() { /* arw(Lossless, 1024×768, tile 256) 4 runs → Intact, bytes equal */ }
   #[test] fn uncompressed_arw_in_three_pieces_is_partial_with_bytes_in_place() {
-      // arw(Uncompressed) in 3 runs written NextFree with nothing in between → final Partial, extracted bytes == the RAW
-      // (placed by D4 order), never Intact
+      // arw(Uncompressed) in 3 runs; the gaps between the runs are TAKEN (claimed Intact files or finding starts), as
+      // "nothing in between" means exactly that (Q14): blind sensor data never breaks, so a piece ends only where
+      // `free_run` stops. Final Partial, extracted bytes == the RAW (placed by D4 order), never Intact
   }
   #[test] fn lossy_arw_is_never_intact_when_split_in_sensor_data() { /* arw(Lossy), seam inside the strip → Partial */ }
   #[test] fn preview_split_across_a_seam_is_validated() {
@@ -827,10 +986,16 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
       // two arw(Lossless) of the same options but seeds 1, 2, runs interleaved NextFree: each Intact final finding's bytes
       // == its own RAW
   }
-  #[test] fn raw_preview_found_in_a_later_piece_is_its_own() { /* the preview in run 2 is found as a JPEG Intact; the RAW still reassembles (D10) and the JPEG finding stays */ }
+  #[test] fn raw_preview_found_in_a_later_piece_is_its_own() {
+      // the preview in run 2 is found as a JPEG Intact; the RAW still reassembles (D10) and the JPEG finding stays. The
+      // preview and the RAW sharing those bytes are the same file, nested: recorded, not two Intact files (Q16); the
+      // match is by coverage of the claimed ranges by `own` at their exact positions, also when the preview sits next
+      // to an EXIF thumbnail claim that `Runs` merged with it (Q7)
+  }
   // tests/tiffraw.rs (1.4 T9)
   #[test] fn raw_preview_crossing_a_piece_is_not_reported_twice() {
-      // a LIVE ARW (add_at, 2 runs) whose preview crosses the run boundary: the preview is not a second finding (D12);
+      // a LIVE ARW (add_at, 2 runs) whose preview crosses the run boundary: the preview is not a second finding (D12 of
+      // part 1.4, own files; not this plan's D12);
       // if this is green on the parent commit, record it and keep it as a guard (the 1.4 note then becomes a README fact)
   }
   ```
@@ -839,7 +1004,8 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   runs asserting `Partial` with bytes in place goes with `uncompressed_arw_…`.
 - [ ] **Step 4:** suite, clippy, fmt; `cargo test --release -p revenant-core --test reassembly`.
 - [ ] **Step 5:** docs (README: a RAW split inside uncompressed or lossy sensor data comes back with its bytes placed but
-  `Partial`; lossless-compressed ARW tiles prove their seams); CHANGELOG ("Added": RAW photos in pieces, ARW first).
+  `Partial`; lossless-compressed ARW tiles prove their seams; CR2 slices (Compression 6 with SOF3) land in `sensor`,
+  blind, conservatively: C6); CHANGELOG ("Added": RAW photos in pieces, ARW first).
   Commit: `feat(core): reassemble fragmented RAW photos where the seams can be proven`.
 
 ---
@@ -848,12 +1014,13 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
 
 **Files:**
 - Modify: `crates/revenant-core/src/filesystem/{listing.rs,exfat.rs}` (`Placement::OldChain`, the "no other deleted
-  entry claims these clusters" sweep in `place`), `src/scan/fs.rs` (`ViewMeasure::checks`, `merge`), `src/reassemble/mod.rs`
-  (`content_checks`; FS deleted candidates with `known = origin.size`, first piece hypothesis = the listing's pieces;
-  `Space::with_hint`), the `PLACEMENTS` table of the `Placement` codec in `listing.rs`
+  entry claims these clusters" sweep in `place`), `src/scan/fs.rs` (`ViewMeasure::checks`, `merge`, which receives `Commit::starts`), `src/scan/mod.rs` (hands the
+  sorted `starts` to the FS jobs), `src/reassemble/mod.rs` (`content_checks`; first piece hypothesis = the listing's
+  pieces; `Space::with_hint`; the FS size as `known` is already plumbed by Task 4/Q3), the `PLACEMENTS` table of the
+  `Placement` codec in `listing.rs`, `src/formats/jpeg.rs` / `src/pairing.rs` items already widened in Tasks 3 and 5
 - Test: `tests/scan_fs.rs`, `tests/fs_exfat.rs`, `tests/fs_fat.rs`; unit tests in `exfat.rs`, `scan/fs.rs`
-- Docs: core README "File systems: exFAT" (old chain as proof, D14), "Deleted files and folders" (FAT deleted fragmented
-  files are reassembled), "Deduplication" (merge rule), CHANGELOG
+- Docs: core README "File systems: exFAT" (old chain as proof, D14 with the conditions below), "Deleted files and
+  folders" (FAT deleted fragmented files are reassembled), "Deduplication" (merge rule), CHANGELOG
 
 **Interfaces:**
 - Produces:
@@ -863,7 +1030,8 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   // reassemble/mod.rs
   /// Every content check the format has over the view of a whole file (D14): JPEG decodes strictly; video: index Intact
   /// and every checkable sample passes; RAW: TIFF structure, previews strict, lossless tiles whole (sensor seams not
-  /// required). Bounded by the per-file budget.
+  /// required). Bounded by the per-file budget. It runs INSIDE the scan, in the FS jobs, only for `OldChain` deleted
+  /// files and bounded per file (Q18, D20).
   pub(crate) fn content_checks(view: &dyn Source, kind: FileKind, len: u64, cancel: &CancelToken) -> bool;
   impl Space<'_> {
       /// The listing's pieces as the first hypothesis: at each seam, the start of the hint's next piece (when free) is put
@@ -874,6 +1042,13 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   pub(crate) struct ViewMeasure { .., pub checks: bool }  // content_checks, only computed for OldChain deleted files
   // merge: a Deleted OldChain file keeps an Intact view measurement when tail_ok, checks and len == origin.size
   ```
+  The old chain is proof (`Placement::OldChain`) only when ALL hold (design §5.1 four conditions plus Q6): (1) the chain
+  has more than one run; (2) the allocation bitmap is present (`map.bits.is_some()`) and `valid == size`, as `place`
+  already requires for trust; (3) no other deleted entry "claims" any of its clusters, where claims = that entry's
+  NoFatChain recorded run, its own old chain, or its first cluster; (4) no other finding's header start
+  (`Commit::starts`) lies inside the chain's clusters, except its own embedded files (this matters most for an
+  uncompressed or lossy ARW, whose sensor bytes nothing checks); (5) `content_checks` passes, the tail conforms and the
+  length equals the entry's size. Otherwise the chain is only the first hypothesis.
 
 - [ ] **Step 1: Failing tests:**
   ```rust
@@ -894,15 +1069,28 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
       // if they survive elsewhere: here they do not → Partial); B comes out Intact by its own NoFatChain run
   }
   #[test] fn size_mismatch_is_never_intact() { /* entry size patched +4096 via raw_entry: not Intact */ }
+  #[test] fn old_chain_without_a_bitmap_or_with_invalid_length_is_not_proof() {
+      // Q6: the same jpeg in 3 runs, once with the allocation bitmap entry missing, once with ValidDataLength < size:
+      // placement is not OldChain-trusted, the file is not Intact by the chain
+  }
+  #[test] fn old_chain_with_another_findings_start_inside_is_not_proof() {
+      // Q6: an uncompressed ARW whose old chain's 2nd run was overwritten by a later clip whose entry slot was reused
+      // (no visible claim): the clip's header start lies inside the chain → not Intact by the chain
   // exfat.rs unit
-  #[test] fn old_chain_claimed_by_another_deleted_entry_is_guessed() { /* two deleted entries whose chains share a cluster → both placement Guessed */ }
+  #[test] fn old_chain_claimed_by_another_deleted_entry_is_guessed() {
+      // two deleted entries whose chains share a cluster → both placement Guessed; the same when the other entry only
+      // has a NoFatChain recorded run or its first cluster there (Q6 definition of "claims")
+  }
   // scan/fs.rs unit
   #[test] fn merge_keeps_intact_for_a_checked_old_chain() { /* OldChain + checks + tail_ok + size → Intact; checks false → Partial */ }
   ```
 - [ ] **Step 2:** FAIL. **Step 3:** implement (D14, D15; G5). A FS deleted candidate's search starts from the entry's
-  first cluster with `known_len = origin.size` and `Space::with_hint(listing pieces)` (guess or old chain tried first).
+  first cluster with `Space::with_hint(listing pieces)` (guess or old chain tried first); its `known = origin.size` is
+  already passed by Task 4 (Q3).
 - [ ] **Step 4:** suite, clippy, fmt; the 1.4 opt-in suites still compile (`cargo test -p revenant-core --test
-  os_filesystems --no-run`).
+  os_filesystems --no-run`). `content_checks` now runs during the scan: run `bench --images exfat-card,noise,dense-jpeg`
+  (release, best of 3) on this commit and its parent, interleaved twice, within 5%, else stop and report (Q18). The
+  FAT32 64 MiB / 4 KiB tests above rely on the cap counting prefilter survivors (Q1).
 - [ ] **Step 5:** docs; CHANGELOG ("Added": deleted photos and videos in pieces on FAT and exFAT cards can come back
   intact; "Changed": a new placement `old_chain`). Commit:
   `feat(core): deleted fragmented files on FAT and exFAT can come back intact`.
@@ -923,8 +1111,11 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
 
 - [ ] **Step 1: Failing tests** (each card: exFAT 128 MiB with 32 KiB clusters and 128 KiB clusters, both allocations;
   oracle `no_intact_finding_is_glued(events, originals)`: every `Intact` final finding's extracted bytes equal exactly one
-  original file; and `recovered(events, originals)`: the originals whose bytes are all still on the card come out with
-  their exact bytes, `Intact` when the proof exists by the rules above):
+  original file (a RAW and its nested own preview finding are the same file, exempt: Q16); and `recovered(events,
+  originals)`: the originals whose bytes are all still on the card come out with their exact bytes, with the expected
+  health set PER KIND (Q17): JPEG with DRI 0, whole on the card → `Intact`; lossless ARW → `Intact`; uncompressed or
+  lossy ARW split in sensor data → `Partial` with exact bytes; video with every sample checkable → `Intact`; anything
+  else → exact bytes or not `Intact`. The helpers `final_view`, `exfat_card` come from `tests/support` (C8)):
   ```rust
   #[test] fn delete_in_camera_then_shoot_again() { /* 12 shots (ARW lossless + JPEG), delete shots 3, 6, 9 (Camera), 8 more shots + 2 clips; per allocation */ }
   #[test] fn delete_in_camera_uncompressed_raw() { /* same with arw(Uncompressed): ARWs split in sensor data are Partial with exact bytes */ }
@@ -933,8 +1124,10 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   #[test] fn burst_of_look_alikes_interleaved() { /* jpeg_burst(2048, 1536, 4, 6) written NextFree after holes of 1–3 clusters: no_intact_finding_is_glued */ }
   #[test] fn no_intact_finding_is_glued() { /* runs the oracle over every card above (one place, so the Review Focus item has its name) */ }
   ```
-- [ ] **Step 2:** FAIL (before Tasks 3–9 these cards come out `Partial`; run on the Task 9 head: whatever fails here is a
-  bug). **Step 3:** fix what the cards find; each fix gets its own focused test in the owning module.
+- [ ] **Step 2:** show RED (Q13), not on the Task 9 head where they may already pass: run the file on the commit before
+  Task 3 if it compiles there, else under mutation (a temporary, uncommitted change that makes `reassemble` return no
+  findings) and record, per test, red or "green on first run (kept as a guard)". Then run on the Task 9 head: whatever
+  fails there is a bug. **Step 3:** fix what the cards find; each fix gets its own focused test in the owning module.
 - [ ] **Step 4:** suite (debug and `--release`), clippy, fmt; record the counts (Intact / Partial / not recovered per
   card) for the history.
 - [ ] **Step 5:** README "Reassembly" (scenarios, allocation assumption). Commit:
@@ -947,7 +1140,8 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
 **Files:**
 - Modify: `crates/revenant-testkit/src/lib.rs` (`BenchImage::ScatteredCard`, "scattered-card": exFAT 128 KiB clusters,
   the `delete_in_camera_then_shoot_again` pattern repeated to fill the image), `crates/revenant-dev/src/bench.rs`,
-  `crates/revenant-core/tests/{reassembly.rs,real_samples.rs}`, `samples/samples.toml` (A6700 / recent Sony samples if CC0),
+  `crates/revenant-core/src/reassemble/mod.rs` (the budget measure, an `#[ignore]` UNIT test: Q9),
+  `crates/revenant-core/tests/real_samples.rs`, `samples/samples.toml` (A6700 / recent Sony samples if CC0),
   `src/reassemble/mod.rs` (limits adjusted to the measurements, if needed)
 - Docs: core README "Performance" (scattered-card line, reassembly time), "Reassembly" (budgets with measured numbers),
   "Tested against real files" (Sony DRI), dev README ("Benchmark": the new image); CHANGELOG nothing unless limits change
@@ -957,23 +1151,29 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
 
 - [ ] **Step 1: Tests:**
   ```rust
-  // tests/reassembly.rs (release-only, #[ignore], prints numbers)
+  // reassemble/mod.rs, a unit test inside the crate (the counters are crate-private, invisible to tests/*.rs: Q9;
+  // release-only, #[ignore], prints numbers)
   #[test] #[ignore] fn reassembly_budget_measure() {
-      // the hostile image of Task 4 at 1 GiB and a scattered-card of 1 GiB: prints the reassembly step's time, tries and
-      // bytes read per file and per scan, and whether a budget was hit
+      // the hostile image of Task 4 (built here with the testkit) at 1 GiB and a scattered-card of 1 GiB: prints the
+      // reassembly step's time, tries and bytes read per file and per scan, and whether a budget was hit; this is where
+      // the time bound dropped from Task 4's tests (Q8) lives
   }
   // tests/real_samples.rs (ignored like the others)
   #[test] #[ignore] fn sony_restart_intervals() {
       // for every Sony sample (ARW previews; any Sony JPEG): prints file, preview size, DRI (restart_interval helper);
-      // asserts nothing about the value (it is a measurement, D21)
+      // asserts nothing about the value (it is a measurement, D21), only that at least one Sony sample was found when
+      // the samples folder exists (C5). Also prints whether the real Sony lossless tiles have equal TileByteCounts (a
+      // seam at a tile boundary is then no proof: Q15)
   }
   #[test] #[ignore] fn real_previews_split_in_three() {
-      // every sample's largest preview cut in 3 at 32 KiB multiples on an exFAT-like grid (Mem + grids) with another
-      // sample's preview runs as neighbours: each comes back with its exact bytes; Intact iff DRI == 0 (Q16), never a
-      // neighbour's run inside an Intact result
+      // every sample's largest preview cut in 3 at 32 KiB multiples on an exFAT image built with the public testkit
+      // `FsBuilder` and `add_at` (a card, not crate-private `search`/`Space`), another sample's preview runs as
+      // neighbours, scanned through the public `scan` (Q9): each comes back with its exact bytes; Intact iff DRI == 0
+      // (Q16), never a neighbour's run inside an Intact result
   }
   ```
-- [ ] **Step 2:** run them (release): `cargo test --release -p revenant-core --test reassembly -- --ignored --nocapture`;
+- [ ] **Step 2:** run them (release): `cargo test --release -p revenant-core --lib reassembly_budget_measure -- --ignored
+  --nocapture`;
   `scripts/fetch-samples.sh` then `REVENANT_SAMPLES=samples/cache cargo test -p revenant-core --test real_samples --
   --ignored --nocapture` (if the network is not available, say so and leave the measurement to Sérgio in the history).
   For new samples: only raw.pixls.us entries marked CC0 (a Sony ILCE-6700 one if listed; else the newest Sony ARW with
@@ -1041,8 +1241,10 @@ Fora desta parte (design §3): decodificar RAW, formatos novos, NTFS/APFS/HFS+, 
   é provada, apagados no FAT/exFAT, cadeia exFAT como prova) e o que não (RAW sem compressão espalhado nos dados do sensor
   sai `Partial`; continuação fora da janela de 256 MiB ou depois de 4096 candidatos; o padrão de alocação real da Sony a
   conferir).
-- [ ] **Step 4:** history file (pt-BR, same shape as the 1.5 one): D1–D22 with their costs, decisions taken during
-  execution, the budgets and the numbers of Tasks 10 and 11, the Sony DRI result (D21: if the A6700 previews/JPEGs use
+- [ ] **Step 4:** history file (pt-BR, same shape as the 1.5 one): D1–D22 with their costs, the pre-flight rulings
+  Q1–Q19 with their costs (including the accepted risk Q4: a look-alike beyond the window; the nesting of a RAW and its
+  preview, Q16; and, from Q19/C11, that no task looked for XAVC CC0 samples: design says "se o construtor achar"),
+  decisions taken during execution, the budgets and the numbers of Tasks 10 and 11, the Sony DRI result (D21: if the A6700 previews/JPEGs use
   restart markers, say plainly that their fragmented JPEGs come back `Partial` and that this is the main cost of 1.6 for
   Sérgio's camera), the inherited table above with each item's result (C13 included: stays with Módulo 2), and every
   item left open with its owner (**Módulo 2**: show a reassembled finding in place of the old one; the preview reported
