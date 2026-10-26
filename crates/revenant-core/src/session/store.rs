@@ -19,6 +19,7 @@ use std::path::Path;
 
 use crate::EngineError;
 use crate::filesystem::crc32;
+use crate::source::Regular;
 
 const MAGIC: &[u8; 8] = b"RVNTSESS";
 /// The format version this engine writes and reads.
@@ -34,11 +35,18 @@ pub(super) const CHECKPOINTS: [&str; 2] = ["checkpoint-a.rvs", "checkpoint-b.rvs
 
 /// Largest manifest read back (an identity and three numbers).
 pub(super) const MAX_MANIFEST_FILE: u64 = 1 << 20;
-/// Largest listing read back: the listing's caps (262,144 files, 2^20 pieces) stay far below it.
-pub(super) const MAX_LISTING_FILE: u64 = 1 << 30;
-/// Largest checkpoint read back: a scan state is bounded by the scan's caps (the bad map alone up to about 16 MiB), plus
-/// one start per finding.
-pub(super) const MAX_CHECKPOINT_FILE: u64 = 1 << 30;
+/// Largest listing written and read back. A listed file takes about 130 bytes plus its folder and name (repeated per
+/// file) and 16 bytes per piece; at the walk's caps (262,144 files, 2^20 pieces, a path up to 4,096 bytes) a crafted
+/// card could pass 1 GiB, while a card at the file cap with paths of a few hundred bytes stays near 100 MiB. So the
+/// bound is set here rather than derived: a listing over it is not saved (the session stops with `write_failed`; a
+/// scan without a session still reads such a card), and a hostile folder makes the engine read at most this much.
+pub(super) const MAX_LISTING_FILE: u64 = 256 << 20;
+/// Largest checkpoint written and read back. A scan state is bounded by the scan's caps (the bad map up to 2^20 runs of
+/// 16 bytes, 16 MiB; the coverage 65,536 runs, 1 MiB; at most 262,144 carved findings, 65,536 own-file starts, 65,536
+/// orphan folders and 4,096 + 4,096 videos and `moov` candidates, each with its pieces), plus 8 bytes per finding so
+/// far, the one part the caps leave open: 256 MiB holds the state of a scan of well over 10 million findings. A
+/// checkpoint over it is not saved (`write_failed`, the session stays at its previous checkpoint).
+pub(super) const MAX_CHECKPOINT_FILE: u64 = 256 << 20;
 /// Largest event record: a finding with every piece the listing can hold (2^20 × 16 bytes) fits.
 pub(super) const MAX_RECORD: usize = 32 << 20;
 
@@ -111,23 +119,14 @@ pub(super) fn record(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Opens `path` for reading when it is a regular file (a link, a folder or a device is `session_corrupt`); `None` when
-/// there is nothing there.
+/// Opens `path` for reading when it is a regular file (a link, a folder, a device or a FIFO is `session_corrupt`,
+/// never followed, read or waited on: [`crate::source::open_regular`]); `None` when there is nothing there.
 pub(super) fn open_regular(path: &Path) -> Result<Option<File>, EngineError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) => return corrupt(),
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(cause) => return Err(EngineError::Open { cause }),
+    match crate::source::open_regular(path).map_err(|cause| EngineError::Open { cause })? {
+        Regular::Missing => Ok(None),
+        Regular::Other => corrupt(),
+        Regular::File(file) => Ok(Some(file)),
     }
-    let file = File::open(path).map_err(|cause| EngineError::Open { cause })?;
-    let meta = file
-        .metadata()
-        .map_err(|cause| EngineError::Open { cause })?;
-    if !meta.is_file() {
-        return corrupt();
-    }
-    Ok(Some(file))
 }
 
 /// The whole of the regular file `path`, at most `cap` bytes (a longer one is `session_corrupt`); `None` when there is
@@ -160,8 +159,12 @@ pub(super) fn create(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), EngineE
 /// Replaces `dir/name` with `bytes` so that a crash at any moment leaves the previous file or this one: into a new
 /// `<name>.tmp` (whatever was there is removed first, a link included, never what it points to; then created
 /// exclusively, which never follows a link), `sync_all`, renamed over `name` (a link there is replaced, not followed),
-/// then the folder synced, best effort (ruling P33).
-pub(super) fn replace(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), EngineError> {
+/// then the folder synced, best effort (ruling P33). More than `cap` bytes (what the file is read back up to) is
+/// refused (`write_failed`) before anything is touched.
+pub(super) fn replace(dir: &Path, name: &str, bytes: &[u8], cap: u64) -> Result<(), EngineError> {
+    if bytes.len() as u64 > cap {
+        return Err(write_err(std::io::Error::from(ErrorKind::InvalidInput)));
+    }
     let tmp_name = format!("{name}.tmp");
     let tmp = dir.join(&tmp_name);
     match std::fs::remove_file(&tmp) {
@@ -188,8 +191,8 @@ pub(super) fn sync_dir(dir: &Path) {
 }
 
 /// Opens the existing event log `path` for writing, never creating nor truncating it. Refused (`write_failed`) unless
-/// the file opened is the regular file looked at just before (same device and inode, a single link, on Unix); on
-/// Windows a reparse point is opened itself, not followed, so the regular-file check refuses it.
+/// the file opened is the regular file looked at just before (same device and inode on Unix) and has a single link
+/// (on every system); on Windows a reparse point is opened itself, not followed, so the regular-file check refuses it.
 pub(super) fn open_log(path: &Path) -> Result<File, EngineError> {
     let refused = || write_err(std::io::Error::from(ErrorKind::InvalidInput));
     let checked = std::fs::symlink_metadata(path).map_err(write_err)?;
@@ -205,22 +208,26 @@ pub(super) fn open_log(path: &Path) -> Result<File, EngineError> {
     }
     let file = options.open(path).map_err(write_err)?;
     let opened = file.metadata().map_err(write_err)?;
-    if !opened.is_file() || !same_single_file(&checked, &opened) {
+    // A single name on every system: a hard link to a file elsewhere would let the log write into it.
+    if !opened.is_file()
+        || !same_file(&checked, &opened)
+        || !crate::source::single_link(&file).map_err(write_err)?
+    {
         return Err(refused());
     }
     Ok(file)
 }
 
-/// Whether `opened` is the file `checked` described and has a single link (a hard link to a file elsewhere would let
-/// the log write into it).
+/// Whether `opened` is the file `checked` described: same device and inode on Unix; elsewhere the opened handle's own
+/// checks (regular file, reparse point not followed, a single link) stand alone.
 #[cfg(unix)]
-fn same_single_file(checked: &std::fs::Metadata, opened: &std::fs::Metadata) -> bool {
+fn same_file(checked: &std::fs::Metadata, opened: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
-    (checked.dev(), checked.ino()) == (opened.dev(), opened.ino()) && opened.nlink() == 1
+    (checked.dev(), checked.ino()) == (opened.dev(), opened.ino())
 }
 
 #[cfg(not(unix))]
-fn same_single_file(_checked: &std::fs::Metadata, _opened: &std::fs::Metadata) -> bool {
+fn same_file(_checked: &std::fs::Metadata, _opened: &std::fs::Metadata) -> bool {
     true
 }
 
@@ -349,6 +356,28 @@ mod tests {
         ));
     }
 
+    /// The listing and each checkpoint are read back up to 256 MiB, and a file over its cap is never written (so a
+    /// session that saves always reads back): refused before anything is touched, the previous file kept.
+    #[test]
+    fn saved_files_are_capped_both_ways() {
+        const { assert!(MAX_LISTING_FILE <= 256 << 20) };
+        const { assert!(MAX_CHECKPOINT_FILE <= 256 << 20) };
+        let dir = tempfile::tempdir().unwrap();
+        replace(dir.path(), "y.rvs", b"old", 10).unwrap();
+        let r = replace(dir.path(), "y.rvs", &[0u8; 11], 10);
+        assert_eq!(r.unwrap_err().code(), "write_failed");
+        assert_eq!(std::fs::read(dir.path().join("y.rvs")).unwrap(), b"old");
+        assert!(!dir.path().join("y.rvs.tmp").exists());
+        replace(dir.path(), "y.rvs", &[0u8; 10], 10).unwrap();
+        assert_eq!(
+            read_file(&dir.path().join("y.rvs"), 10)
+                .unwrap()
+                .unwrap()
+                .len(),
+            10
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn links_are_never_followed() {
@@ -359,7 +388,7 @@ mod tests {
         // A link planted at the temporary name and at the final name: replaced, the target untouched.
         std::os::unix::fs::symlink(&target, dir.path().join("x.rvs.tmp")).unwrap();
         std::os::unix::fs::symlink(&target, dir.path().join("x.rvs")).unwrap();
-        replace(dir.path(), "x.rvs", b"new").unwrap();
+        replace(dir.path(), "x.rvs", b"new", 100).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"keep");
         assert_eq!(std::fs::read(dir.path().join("x.rvs")).unwrap(), b"new");
         assert!(

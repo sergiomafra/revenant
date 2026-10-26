@@ -12,10 +12,11 @@ use windows_sys::Win32::Foundation::{
     ERROR_MORE_DATA, ERROR_NO_SUCH_DEVICE, ERROR_NOT_READY, GENERIC_READ, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW, GetDriveTypeW,
-    GetFileInformationByHandle, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
-    GetVolumePathNameW, GetVolumePathNamesForVolumeNameW, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+    BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose,
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetFileInformationByHandle, GetVolumeInformationW,
+    GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, GetVolumePathNamesForVolumeNameW,
+    IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -59,6 +60,27 @@ pub fn volume_of_file(file: &File) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     Ok(u64::from(info.dwVolumeSerialNumber))
+}
+
+/// How many names (hard links) the open file has (`nNumberOfLinks`).
+pub(crate) fn link_count(file: &File) -> io::Result<u64> {
+    // SAFETY: BY_HANDLE_FILE_INFORMATION is plain data for which all-zero is valid.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is valid for the lifetime of `file`, and `info` is a valid out-pointer.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(info.nNumberOfLinks))
+}
+
+/// Opens what should be a regular file the engine wrote (a rescue map, a session file) read-only without following a
+/// link: a reparse point is opened itself, so the caller's check on the handle refuses it.
+pub(crate) fn open_file_no_follow(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 /// Opens a whole disk (`\\.\PhysicalDriveN`) for reading only (`GENERIC_READ`), sharing read and write with the system.

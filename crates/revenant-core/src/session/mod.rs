@@ -78,12 +78,33 @@ impl Codec for Manifest {
         e.bool(*filesystems);
     }
     fn dec(d: &mut Dec) -> Result<Self, EngineError> {
-        Ok(Manifest {
+        let manifest = Manifest {
             identity: d.get()?,
             sector: d.u64()?,
             block: d.u64()?,
             filesystems: d.bool()?,
-        })
+        };
+        if !manifest.in_range() {
+            return Err(EngineError::SessionCorrupt);
+        }
+        Ok(manifest)
+    }
+}
+
+/// Smallest and largest sector a session records (a power of two between them).
+const MIN_SECTOR: u64 = 512;
+const MAX_SECTOR: u64 = 64 << 10;
+/// Largest block a session records (a whole number of sectors).
+const MAX_BLOCK: u64 = 1 << 30;
+
+impl Manifest {
+    /// Whether the sector is a power of two from 512 B to 64 KiB and the block a whole number of sectors up to 1 GiB.
+    fn in_range(&self) -> bool {
+        let Manifest { sector, block, .. } = *self;
+        (MIN_SECTOR..=MAX_SECTOR).contains(&sector)
+            && sector.is_power_of_two()
+            && (sector..=MAX_BLOCK).contains(&block)
+            && block % sector == 0
     }
 }
 
@@ -182,7 +203,8 @@ impl Session {
     /// A new session in `dest.dir()`, which must be empty (`session_not_empty`). Stores `identity` and `opts.sector`,
     /// `opts.block` and `opts.filesystems` (ruling D25): a resume always scans with these. Refuses
     /// (`destination_on_source`) a folder no longer on the volume it was checked on; `write_failed` when a file cannot
-    /// be written (or the identity nests deeper than a session reads back).
+    /// be written, or (nothing written) when the identity nests deeper than a session reads back or the sector is not a
+    /// power of two from 512 B to 64 KiB or the block not a whole number of sectors up to 1 GiB.
     pub fn create(
         dest: &Destination,
         identity: SourceIdentity,
@@ -201,7 +223,8 @@ impl Session {
             filesystems: opts.filesystems,
         };
         let payload = encode(&manifest);
-        // A manifest that saves always reads back (an identity nested too deep would not).
+        // A manifest that saves always reads back (an identity nested too deep, or a sector or block out of range,
+        // would not).
         if from_bytes::<Manifest>(&payload).is_err() {
             return Err(EngineError::Write {
                 cause: std::io::Error::from(std::io::ErrorKind::InvalidInput),
@@ -503,6 +526,7 @@ impl<'a> Writer<'a> {
             self.dest.dir(),
             LISTING,
             &store::framed(Kind::Listing, &encode(listing)),
+            store::MAX_LISTING_FILE,
         )
     }
 
@@ -549,6 +573,7 @@ impl<'a> Writer<'a> {
             self.dest.dir(),
             CHECKPOINTS[(generation % 2) as usize],
             &store::framed(Kind::Checkpoint, &encode(&saved)),
+            store::MAX_CHECKPOINT_FILE,
         )?;
         self.point = Point {
             generation,

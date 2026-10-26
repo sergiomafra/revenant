@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::text;
+use crate::source::Regular;
 use crate::{EngineError, SourceIdentity};
 
 /// Most regions a map holds. A `set` that would need more is refused (the copy then marks a failed block bad whole
@@ -328,15 +329,19 @@ impl RescueMap {
         self.pos = pos;
     }
 
-    /// Reads a map file. A file that cannot be opened or read is `open_failed`; anything wrong in it (cut short, a
-    /// checksum that does not match, regions that do not cover the size, more than [`MAX_MAP_REGIONS`]) is
-    /// `map_corrupt`.
+    /// Reads a map file. Nothing there, or a file that cannot be opened or read, is `open_failed`; anything but a
+    /// regular file (a link, even to a map, a folder, a device, a FIFO: never followed, read or waited on) and anything
+    /// wrong in it (cut short, a checksum that does not match, regions that do not cover the size, more than
+    /// [`MAX_MAP_REGIONS`]) is `map_corrupt`.
     pub fn load(path: &Path) -> Result<RescueMap, EngineError> {
         let open = |cause| EngineError::Open { cause };
+        let file = match crate::source::open_regular(path).map_err(open)? {
+            Regular::File(file) => file,
+            Regular::Other => return Err(EngineError::MapCorrupt),
+            Regular::Missing => return Err(open(std::io::ErrorKind::NotFound.into())),
+        };
         let mut bytes = Vec::new();
-        File::open(path)
-            .map_err(open)?
-            .take(MAX_MAP_FILE + 1)
+        file.take(MAX_MAP_FILE + 1)
             .read_to_end(&mut bytes)
             .map_err(open)?;
         if bytes.len() as u64 > MAX_MAP_FILE {
@@ -390,6 +395,45 @@ impl RescueMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a regular file is read as a map: a link (even to a valid map) and a FIFO are `map_corrupt`, the FIFO without
+    /// waiting for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn load_reads_only_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = SourceIdentity::Image {
+            size: 1 << 20,
+            digest: 1,
+        };
+        let real = dir.path().join("real.rvmap");
+        RescueMap::with_cap(1 << 20, 512, identity, 16)
+            .save(&real)
+            .unwrap();
+        assert!(RescueMap::load(&real).is_ok());
+        let link = dir.path().join("link.rvmap");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(RescueMap::load(&link).unwrap_err().code(), "map_corrupt");
+        let fifo = dir.path().join("fifo.rvmap");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(RescueMap::load(&fifo).map(|_| ()).map_err(|e| e.code()));
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("loading a FIFO never waits for a writer");
+        assert_eq!(r, Err("map_corrupt"));
+        // Nothing there is still `open_failed`.
+        let none = dir.path().join("none.rvmap");
+        assert_eq!(RescueMap::load(&none).unwrap_err().code(), "open_failed");
+    }
 
     #[test]
     fn map_cap_refuses_new_regions() {

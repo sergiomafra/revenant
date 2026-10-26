@@ -195,3 +195,70 @@ fn a_cancel_at_a_boundary_saves_a_checkpoint_there() {
         }
     );
 }
+
+/// A manifest's sector must be a power of two from 512 B to 64 KiB and its block a whole number of sectors up to 1 GiB:
+/// `Session::create` refuses other options (`write_failed`, nothing written) and a crafted manifest holding them is
+/// `session_corrupt` when opened or checked.
+#[test]
+fn manifest_sector_and_block_are_checked() {
+    let source = SimSource::new(vec![0u8; MIB as usize]);
+    let bad: [(u64, u64); 8] = [
+        (1000, MIB),
+        (256, MIB),
+        (0, MIB),
+        (128 << 10, MIB),
+        (512, 0),
+        (512, 1000),
+        (4096, 2048),
+        (512, 2 << 30),
+    ];
+    for (sector, block) in bad {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = Destination::check(&FakeDevices::new(), &source, dir.path()).unwrap();
+        let o = ScanOptions {
+            sector,
+            block: block as usize,
+            ..opts()
+        };
+        let r = Session::create(&dest, identity(&source), &o);
+        assert_eq!(r.unwrap_err().code(), "write_failed", "{sector} {block}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        // The same values in a manifest written by hand.
+        let manifest = Manifest {
+            identity: identity(&source),
+            sector,
+            block,
+            filesystems: true,
+        };
+        store::create(dir.path(), EVENTS, &store::header(Kind::Events)).unwrap();
+        store::create(
+            dir.path(),
+            MANIFEST,
+            &store::framed(Kind::Manifest, &encode(&manifest)),
+        )
+        .unwrap();
+        assert_eq!(
+            Session::open(dir.path()).unwrap_err().code(),
+            "session_corrupt",
+            "{sector} {block}"
+        );
+        assert_eq!(
+            check_session(dir.path(), &identity(&source))
+                .unwrap_err()
+                .code(),
+            "session_corrupt"
+        );
+    }
+    // In range: accepted.
+    for (sector, block) in [(512, MIB), (4096, 4 * MIB), (64 << 10, 1 << 30)] {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = Destination::check(&FakeDevices::new(), &source, dir.path()).unwrap();
+        let o = ScanOptions {
+            sector,
+            block: block as usize,
+            ..opts()
+        };
+        Session::create(&dest, identity(&source), &o).unwrap();
+        Session::open(dir.path()).unwrap();
+    }
+}

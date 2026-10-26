@@ -230,10 +230,14 @@ fn open(
             #[cfg(test)]
             tests::before_resume_open(image);
             let file = open_existing(image).map_err(write)?;
-            // The file opened must be the one checked: a regular file of the map's size (and on Unix the same file,
-            // so a link or another file swapped in meanwhile is refused before anything is written).
+            // The file opened must be the one checked: a regular file of the map's size with a single name (a hard
+            // link would let the copy write into a file elsewhere), and on Unix the same file, so a link or another
+            // file swapped in meanwhile is refused before anything is written.
             let opened = file.metadata().map_err(write)?;
-            if !opened.is_file() || !same_file(&meta, &opened) {
+            if !opened.is_file()
+                || !same_file(&meta, &opened)
+                || !crate::source::single_link(&file).map_err(write)?
+            {
                 return Err(invalid());
             }
             if opened.len() != size {
@@ -862,6 +866,45 @@ mod tests {
         }
         // Untouched, the same resume goes through.
         assert!(run().unwrap().complete);
+    }
+
+    /// A resumed image that is a hard link to another file of the same length (the same inode, so the swap checks pass):
+    /// refused before anything is written, the linked file untouched; with the link gone the resume goes through.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_image_is_refused() {
+        let size = 2 * MIB;
+        let source = SimSource::new(vec![5u8; size as usize]);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = Destination::check(&FakeDevices::new(), &source, dir.path()).unwrap();
+        let identity = SourceIdentity::Image { size, digest: 1 };
+        let run = |cancel: &CancelToken| {
+            copy(
+                &source,
+                &identity,
+                &dest,
+                "card.img",
+                &CopyOptions::default(),
+                cancel,
+                &mut |_| {},
+            )
+        };
+        let stopped = CancelToken::default();
+        stopped.cancel();
+        assert_eq!(run(&stopped).unwrap_err().code(), "cancelled");
+        let image = dest.dir().join("card.img");
+        // The image replaced by a hard link to a victim elsewhere on the same volume.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, vec![7u8; size as usize]).unwrap();
+        std::fs::remove_file(&image).unwrap();
+        std::fs::hard_link(&victim, &image).unwrap();
+        let r = run(&CancelToken::default());
+        assert_eq!(r.unwrap_err().code(), "write_failed");
+        assert_eq!(std::fs::read(&victim).unwrap(), vec![7u8; size as usize]);
+        // A single-link image of the same bytes resumes.
+        std::fs::remove_file(&victim).unwrap();
+        assert!(run(&CancelToken::default()).unwrap().complete);
+        assert_eq!(std::fs::read(&image).unwrap(), vec![5u8; size as usize]);
     }
 
     #[test]

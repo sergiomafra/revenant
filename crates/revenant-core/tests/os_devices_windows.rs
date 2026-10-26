@@ -240,6 +240,10 @@ fn junction(link: &Path, target: &Path) -> bool {
 #[ignore]
 fn windows_vhd_round_trip() {
     if std::env::var("REVENANT_OS_DEV").as_deref() != Ok("1") {
+        // On CI this job exists to run the check: a lost variable must fail it, not pass it silently.
+        if on_ci() {
+            panic!("REVENANT_OS_DEV=1 is missing on CI: the VHD check would be skipped");
+        }
         eprintln!("skipped: set REVENANT_OS_DEV=1 (as Administrator) to check against a VHD");
         return;
     }

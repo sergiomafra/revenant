@@ -188,6 +188,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is now found.
 - A small file written inside a Canon CR3's `PRVW` preview was hidden and the CR3 reported intact; a CR3 is now intact only
   if both its preview and its full-size JPEG decode, so the file inside is found.
+- A resumed copy or session no longer writes through a hard link: a copy image or session log that also has another
+  name (on Windows too) is refused before anything is written, so a file elsewhere on the backup drive is never
+  overwritten. A rescue map that is a link or a pipe is refused instead of being followed or waited on.
+- A saved session's files are read back up to a bounded size (256 MiB for the listing and each checkpoint), and a
+  session never saves what it could not read back; a session folder with impossible sector or block sizes is reported as
+  damaged.
 - `revenant-dev`: a bare disk name (`disk4`) while a file of that name sits in the current folder is refused as
   ambiguous instead of reading the disk; a card pulled out while a preview is read stops the scan (and a session waits
   for it) instead of only failing that preview.

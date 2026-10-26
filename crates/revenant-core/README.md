@@ -192,7 +192,7 @@ The folder is resolved first (`std::fs::canonicalize`: symbolic links, and junct
 rules and every later write use the resolved folder, so a link pointing into the card is judged as the card;
 `extract_to` also refuses (`destination_on_source`) when the folder is no longer on the volume it was checked on. Anything
 else written there goes through `dest.create_named(&finding, name, suffix)` (the CLI's previews): the same check, then
-`extract::create_named` in the resolved folder (a new file, never overwriting). Known
+a new file in the resolved folder under the extraction's naming rule (never overwriting). Known
 limit: a folder inside a mounted disk image (DMG, VHD) whose backing file lives on the card is not detected.
 
 An image source (`disk()` is `None`) only gets the volume rule; `ops` is not called. `dir()` is the folder and `info()`
@@ -298,8 +298,9 @@ let summary = rescue::copy(&device, &identity, &dest, "card.img", &opts, &cancel
 `<image>.rvmap`. The image is created at the source's length and never split into pieces; it is sparse (nothing
 allocated until written) only where the file system allows it (APFS, ext4; not HFS+, FAT or NTFS), so the room check
 counts the whole length. `image` must be a plain, safe file name, and an existing `image` that is not a regular file (a
-link), or that is no longer the file checked by the time it is opened (swapped meanwhile; same device and inode on
-Unix, a reparse point opened as itself on Windows), is refused (`write_failed`) before anything is written; the folder
+link), that has more than one name (a hard link to a file elsewhere on the volume, on every system), or that is no
+longer the file checked by the time it is opened (swapped meanwhile; same device and inode on Unix, a reparse point
+opened as itself on Windows), is refused (`write_failed`) before anything is written; the folder
 must still be on the volume it was checked on (`destination_on_source`). The map's temporary file is always created
 new (`create_new`, after removing whatever was there, a link included, never its target), so nothing planted in the
 folder is written through.
@@ -379,8 +380,9 @@ the previous map or the new one, never a mix; failures are `write_failed`, excep
 (the file is complete and synced by then; some file systems refuse it, and at worst a crash right after brings back the
 previous map). A map whose identity nests `mapped` more than 4 deep is not saved (`write_failed`), so a map that saves
 always loads. Two maps are `==` when their contents are. `load(path)` refuses anything that is not
-exactly such a file (`map_corrupt`): cut short anywhere, a checksum that does not match, regions that do not cover the
-size, more than 2^20 regions, or a file over 64 MiB; a file that cannot be opened is `open_failed`.
+exactly such a file (`map_corrupt`): not a regular file (a link, even to a valid map, a folder, a device or a FIFO,
+never followed, read or waited on), cut short anywhere, a checksum that does not match, regions that do not cover the
+size, more than 2^20 regions, or a file over 64 MiB; nothing there, or a file that cannot be opened, is `open_failed`.
 
 `MappedSource::open(image)` opens the image read-only with its map (`map_mismatch` when the map's size is not the
 image's length). A read touching any byte that is not `Rescued` fails with `Read { offset }` of the first such byte, as
@@ -1581,9 +1583,18 @@ scan_session(&source, &identity, &formats, &opts, &mut session, &sopts, &cancel,
 | `events.rvs`                              | records `[len u32][crc32 u32][event]`, appended as the events go out (every one but `Rate`)    |
 | `checkpoint-a.rvs`, `checkpoint-b.rvs`    | CRC-32, then a generation, the log's length and event count, and the scan state or the summary |
 
-Values use the engine's binary encoding (see [Resumable scans](#resumable-scans)): every length checked, every file read
-up to a cap (manifest 1 MiB, listing and checkpoints 1 GiB, an event 32 MiB), so a damaged or hostile folder is
-`session_corrupt`, never a panic or a huge allocation.
+Values use the engine's binary encoding (see [Resumable scans](#resumable-scans)): every length checked, and only a
+regular file read (a link, folder, device or FIFO is `session_corrupt`, never followed or waited on), each up to a cap:
+manifest 1 MiB, listing 256 MiB, each checkpoint 256 MiB, an event record 32 MiB (the log is streamed, one record at a
+time). So a damaged or hostile folder is `session_corrupt`, never a panic, and opening one holds at most one file's
+bytes at a time (256 MiB) plus what they decode to: the newest checkpoint's state and the listing, each bounded by the
+scan's own caps (see `ScanOptions` and [Resumable scans](#resumable-scans)). The manifest's `sector` must be a power of
+two from 512 B to 64 KiB and its `block` a whole number of sectors up to 1 GiB (`session_corrupt` otherwise;
+`Session::create` refuses such options with `write_failed`, nothing written). The caps hold for writing too, so a
+session that saves always reads back: the walk's caps (262,144 files, paths up to 4,096 bytes) let a crafted card's
+listing pass 256 MiB, and a checkpoint grows by 8 bytes per finding (over 10 million findings fit); a listing or
+checkpoint over its cap is not saved (`write_failed`, the session stays at its previous checkpoint; a scan without a
+session still reads such a card).
 
 **Crash safety.** The log is only appended to. A checkpoint is written after the log is flushed and `sync_data`'d, into
 a new temporary file (`sync_all`) renamed over the older of the two checkpoints, then the folder is synced (best effort:
@@ -1592,8 +1603,8 @@ the highest generation (a damaged or torn one, checksum wrong, falls back to the
 past the length it names (a record half written when the power went). Both checkpoints damaged is `session_corrupt`.
 Nothing follows a link planted in the folder: new files are created exclusively (a planted temporary is removed first,
 never its target), a rename replaces a link rather than its target, and the log is reopened only after checking that the
-file opened is the regular file looked at, with a single link (Unix; on Windows a reparse point is opened itself and
-refused).
+file opened is the regular file looked at (same device and inode on Unix; on Windows a reparse point is opened itself
+and refused) and has a single link (on every system: a hard link to a file elsewhere is refused).
 
 **Cost.** A session adds a fixed cost per scan and no measurable cost per byte (ruling P46). The fixed cost is the
 syncs that make it crash-safe: two files and the folder synced at create, and at each checkpoint the log's `sync_data`,
@@ -1767,7 +1778,7 @@ Ids inside a group go by (time, id), the undated last.
 U+FEFF, which can disguise an extension) and U+FFFD become `_`; leading and trailing `.` and spaces are trimmed (`..`
 gives `None`); a Windows reserved stem (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`, their superscript
 forms, `CONIN$`, `CONOUT$`; any case; the stem is what precedes the first `.`, so `CON.tar.gz` counts) gets a `_` in
-front; at most 200 bytes (before a `_N` suffix), cut on a char boundary, keeping an extension of up to 16 bytes. `extract::create_named(dir, &Finding, name, suffix)` is the one public way to create a file under a derived name (`Destination::create_named` calls it after the destination check; the CLI writes previews that way): it sanitizes `name`, replaces the extension by `suffix` when given (which must be empty or start with `.` and hold no unsafe char, else `write_failed`) and applies the `_N` rule. A total path over 260
+front; at most 200 bytes (before a `_N` suffix), cut on a char boundary, keeping an extension of up to 16 bytes. `Destination::create_named(&Finding, name, suffix)` is the one public way to create a file under a derived name (after the destination check; the CLI writes previews that way): it sanitizes `name`, replaces the extension by `suffix` when given (which must be empty or start with `.` and hold no unsafe char, else `write_failed`) and applies the `_N` rule. A total path over 260
 characters on Windows is a write error (`write_failed`) there, never an escape.
 
 ## Tested against real files

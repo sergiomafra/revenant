@@ -31,6 +31,28 @@ pub fn open_file_read_only(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// `O_NOFOLLOW` where its value is certain (macOS); elsewhere 0, and a link swapped in after the caller's look is
+/// followed (the handle check still refuses anything but a regular file).
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(not(target_os = "macos"))]
+const O_NOFOLLOW: i32 = 0;
+
+/// Opens what should be a regular file the engine wrote (a rescue map, a session file) read-only, without blocking on a
+/// FIFO and (on macOS) without following a link: the caller checks the handle.
+pub(crate) fn open_file_no_follow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+        .open(path)
+}
+
+/// How many names (hard links) the open file has.
+pub(crate) fn link_count(file: &File) -> io::Result<u64> {
+    Ok(file.metadata()?.nlink())
+}
+
 pub fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
     file.read_at(buf, offset)
 }

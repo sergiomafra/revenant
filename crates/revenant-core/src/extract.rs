@@ -163,9 +163,9 @@ pub fn extract_as(
 /// `revenant_<start>.<ext>` when nothing is left), then `<stem>_2<ext>`, `<stem>_3<ext>`… when the name is taken (10,000
 /// tries; never overwrites). `suffix` replaces the name's extension when given (`Some(".preview.jpg")`); it must be empty
 /// or start with '.' and hold no separator, control or other unsafe char, else `write_failed` and nothing is created.
-/// This is the only way out of the crate to create a file under a derived name, and the result always lies directly
-/// inside `dir`.
-pub fn create_named(
+/// Outside the crate it is reached only through [`Destination::create_named`] (after the destination check), and the
+/// result always lies directly inside `dir`.
+pub(crate) fn create_named(
     dir: &Path,
     finding: &Finding,
     name: &str,
