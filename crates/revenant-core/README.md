@@ -517,8 +517,8 @@ the photo's contiguous bytes (decoded again, scanned for erased sectors, and dec
 there is one: at most 3 × 64 MiB), its 64 MiB window once, at most 64 MiB for the tries and the checks of files in the
 gap, and the two pieces once more to judge the reassembled photo (at most 64 MiB).
 
-Not covered: progressive, arithmetic-coded or 12-bit JPEGs (any frame the decoder does not cover), a first piece under
-16 KiB, three or more pieces, a second piece that lies before the first, a second piece that ends past the window, and
+Not covered by this two-piece search: progressive, arithmetic-coded or 12-bit JPEGs (any frame the decoder does not
+cover), a first piece under 16 KiB, three or more pieces (see below), a second piece that lies before the first, a second piece that ends past the window, and
 two photos written interleaved (each split in two with the other's pieces in between): they are at most `Partial`, and
 a photo of the same frame glued to the other's tail exactly on a restart marker may even come out `Intact` as a
 contiguous file (the MCU count and restart markers are all right, and a DC step below the seam threshold is not seen).
@@ -536,6 +536,33 @@ tail in the set that was tried). And a photo whose entropy-coded data holds a
 whole 512-byte sector of one repeated byte value is treated as cut there (rulings Q5, C3): camera photos very rarely do
 this, but a large flat area coded with optimized Huffman tables could (all `00`); such a photo is `Partial` and is not
 put back together.
+
+**Three or more pieces** (`reassemble/jpeg.rs`, crate-private; the scan uses it from the reassembly step on, see
+"Reassembly"). The same decoder walks the photo across the pieces the seam search proposes. The walk's state is the
+decoder's state at an MCU-row boundary, with the luma DC values of the rows above it. At each seam the walk learns the
+seam's MCU, the first one decoded with bytes of the next piece. A continuation has content evidence once the MCU row
+below the seam's row is decoded. The early DC test (ruling Q14: it drops only what the final test would reject too) runs
+when that row is reached, and again as more rows are decoded, on every seam of the path. Its bound is the
+`⌊n/2⌋`-th smallest of the block-row boundary means decoded so far, above and below the seams, off them. That needs more
+than half of them, so a seam in the upper half of a photo is tested only once the walk has decoded past the middle. A
+decode error or a rejected seam before a seam's evidence breaks the walk right at that seam: the candidate is dropped. A
+piece that ends, or meets an erased or unreadable sector (`data_end`), before the row below its seam has no evidence
+either way: blind (Q2). A walk that reaches EOI with every MCU must also pass the final test, the 1.3 DC seam test with
+several seams (`jpeg_join::seams_ok`). Its base is the median of the block-row boundary means off **every** seam, and each
+seam's mean must be at most 3 × that base + 4. A photo of fewer than 4 block rows is never proven (`Unproven`). The
+proof (`Seams::prove`) decodes the reassembled photo whole and applies the same test. Off a cluster grid the second
+piece may start at any sector. JPEG decoding falls back into step a few bytes into misaligned data of the same frame
+(the photo's own later bytes, a burst neighbour's), so such starts are candidates with evidence too. With the seam in
+the upper half, each costs a walk past the middle of the photo before the DC test can drop it, and on a card full of
+same-camera data the search can run out of budget: the photo is then at most `Partial`. With restart markers the rule of
+1.3 stays (Q16): a photo reassembled from two or more pieces is at most `Partial` (the reassembly step's health rule
+applies it; `JpegSeams::restart_interval` reports the interval).
+
+For the uniqueness re-check (`Seams::suspicious_breaks`) the JPEG orders the cut positions by how much the DC grid jumps
+at each MCU. At each block of the seam line the MCU would make, it takes how far the vertical DC step across the line is
+from the mean of the steps just above and below it. A smooth photo's steps change slowly, and another photo of the same
+frame spliced in at that MCU shifts them, even a burst neighbour's (DC grids 0.5–1.4 apart). So the re-check cuts a long
+piece first where a look-alike could have been spliced in, not only near its end.
 
 Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`); its
 `fs` module builds FAT12/16/32 and exFAT volumes (with deleted files, raw entries and quick formats) inside MBR or GPT
@@ -838,11 +865,13 @@ its pieces (each rounded out to whole sectors), so files in the gaps between the
 The seam search (`reassemble`, crate-internal; the scan does not call it yet: the reassembly step comes with the next
 task of part 1.6) puts back together a file found in more than two pieces. A **seam** is a logical position of the file
 where one piece ends and the next begins. Each format describes its content through the `Seams` trait: it walks the
-file's logical bytes over a view of the pieces chosen so far plus a candidate run, says where the content stops fitting
+file's logical bytes over a view of the pieces chosen so far plus a candidate run (told where the view's seams are),
+says where the content stops fitting
 (`Broken`), where the file ends (`Complete`), up to where it checked the content (its evidence), and from which states
 a walk may resume in another piece; at the end it proves the whole file (`Proven`, `Unproven` or `Failed`). A format may
 also give the file's known length, an anchor (a logical offset that must sit at a given absolute place, such as a video's
-orphan `moov`), its own embedded files, and a cheap prefilter for candidates.
+orphan `moov`), its own embedded files, and a cheap prefilter for candidates. The JPEG is the first format with seams
+(see "Fragmented JPEG").
 
 **The space.** A piece lies on the volume's cluster grid when the file starts at a cluster start of a volume with
 clusters of at least 4096 bytes; otherwise on 512-byte sectors, forward only, with a 64 MiB window and at most 4 pieces.
@@ -868,8 +897,8 @@ the checked evidence and the break, nearest to the break first, at most 64; more
 **The uniqueness re-check.** A walk that goes on fitting can still run into a look-alike: another file's data right
 after a piece that happens to continue the content (a burst of the same scene, a tail of the same stream). So once the
 search has found exactly one complete solution, a separate re-check tries, for every piece of it, earlier break
-points: first the ones the format marks as suspicious (`Seams::suspicious_breaks`, most suspicious first), then the
-nearest to the piece's end, at most 64 per piece, taken round robin over the pieces; from each it lists the next
+points: first the unit boundaries at or before the positions the format marks as suspicious (`Seams::suspicious_breaks`,
+most suspicious first; positions in one unit count once), then the nearest to the piece's end, at most 64 per piece, taken round robin over the pieces; from each it lists the next
 piece's candidates and searches on from those with content evidence past the new seam (a blind candidate is not
 followed there: filling units the format cannot check from any free run is no evidence of another file). Any other
 complete solution makes the result not unique. The re-check has its own

@@ -486,9 +486,9 @@ fn try_join(
 
 /// Luma DC values in coding order, as two consecutive slices (the first piece's, then the continuation's).
 #[derive(Clone, Copy)]
-struct Dc<'a> {
-    head: &'a [i32],
-    tail: &'a [i32],
+pub(crate) struct Dc<'a> {
+    pub head: &'a [i32],
+    pub tail: &'a [i32],
 }
 
 impl Dc<'_> {
@@ -501,7 +501,7 @@ impl Dc<'_> {
     }
 }
 
-fn blocks_per_mcu(frame: &Frame) -> u64 {
+pub(crate) fn blocks_per_mcu(frame: &Frame) -> u64 {
     let (h, v) = frame.luma_blocks_per_mcu();
     u64::from(h * v)
 }
@@ -555,7 +555,7 @@ impl<'a> Grid<'a> {
 }
 
 /// Mean `|ΔDC|` of every block-row boundary `b` (between rows `b − 1` and `b`) fully decoded, as `(b, mean)`.
-fn boundary_means(frame: &Frame, dc: Dc) -> Vec<(u64, f64)> {
+pub(crate) fn boundary_means(frame: &Frame, dc: Dc) -> Vec<(u64, f64)> {
     let g = Grid::new(frame, dc);
     (1..g.blocks_y)
         .map_while(|by| {
@@ -573,7 +573,7 @@ fn seam_rows(g: &Grid, seam_mcu: u64) -> [(u64, std::ops::Range<u64>); 2] {
 }
 
 /// Mean `|ΔDC|` across the seam at `seam_mcu`; `None` when no pair across it was decoded.
-fn seam_mean(frame: &Frame, dc: Dc, seam_mcu: u64) -> Option<f64> {
+pub(crate) fn seam_mean(frame: &Frame, dc: Dc, seam_mcu: u64) -> Option<f64> {
     let g = Grid::new(frame, dc);
     let (mut sum, mut n) = (0.0, 0);
     for (by, cols) in seam_rows(&g, seam_mcu) {
@@ -590,7 +590,7 @@ fn seam_mean(frame: &Frame, dc: Dc, seam_mcu: u64) -> Option<f64> {
 /// `⌊n/2⌋`-th smallest (from 0) of any `k > ⌊n/2⌋` of them. So a seam rougher than 3 × this bound + 4 fails the final
 /// test too (ruling Q14: the early test only drops tries that cannot pass). With the seam in the upper half of the image
 /// there is no bound: the rows below, not decoded yet, could be rougher than the ones above (sky over a landscape).
-fn early_base(frame: &Frame, known: &[(u64, f64)], seam_mcu: u64) -> Option<f64> {
+pub(crate) fn early_base(frame: &Frame, known: &[(u64, f64)], seam_mcu: u64) -> Option<f64> {
     let g = Grid::new(
         frame,
         Dc {
@@ -618,8 +618,27 @@ fn early_base(frame: &Frame, known: &[(u64, f64)], seam_mcu: u64) -> Option<f64>
     Some(above[i])
 }
 
+/// An upper bound on the base [`seams_ok`] will compare the seams with, from `known`: the means of some block-row
+/// boundaries off every seam of the final image (decoded on both sides, wherever they are), `on_seams` being how many
+/// boundaries lie on the seams known so far. The final base is the median of the `n` boundaries off the final seams,
+/// `n ≤ blocks_y − 1 − on_seams` (later seams only take more away), and the median of `n` values is at most the
+/// `⌊n/2⌋`-th smallest (from 0) of any `k > ⌊n/2⌋` of them, so a seam rougher than 3 × the bound + 4 fails the final test
+/// too (as [`early_base`], which uses the boundaries above one seam only). `None` while `known` is too few.
+pub(crate) fn base_bound(frame: &Frame, known: &[f64], on_seams: u64) -> Option<f64> {
+    let (_, v) = frame.luma_blocks_per_mcu();
+    let blocks_y = u64::from(frame.mcus_y) * u64::from(v);
+    let n = blocks_y.saturating_sub(1).saturating_sub(on_seams);
+    let i = usize::try_from(n / 2).ok()?;
+    if known.len() <= i {
+        return None;
+    }
+    let mut known = known.to_vec();
+    known.sort_by(f64::total_cmp);
+    Some(known[i])
+}
+
 /// The seam is no rougher than the image: `V_seam ≤ 3 × V_base + 4`.
-fn within(at_seam: f64, base: f64) -> bool {
+pub(crate) fn within(at_seam: f64, base: f64) -> bool {
     at_seam <= 3.0 * base + 4.0
 }
 
@@ -641,6 +660,13 @@ fn median(values: impl Iterator<Item = f64>) -> Option<f64> {
 /// decoded with bytes of the second piece. Passes iff the image has at least 4 block rows and the mean `|ΔDC|` across the
 /// seam is at most 3 × the median of the other block-row boundaries' means + 4.
 pub(crate) fn seam_ok(frame: &Frame, dc: &[i32], seam_mcu: u64) -> bool {
+    seams_ok(frame, dc, &[seam_mcu])
+}
+
+/// The DC seam test with several seams (`seams`: the first MCU decoded with bytes of each later piece). The base is the
+/// median of the block-row boundary means off every seam; each seam's mean must be at most 3 × base + 4. Fewer than 4
+/// block rows: false. `seam_ok(f, dc, s) == seams_ok(f, dc, &[s])`.
+pub(crate) fn seams_ok(frame: &Frame, dc: &[i32], seams: &[u64]) -> bool {
     let dc = Dc {
         head: dc,
         tail: &[],
@@ -649,18 +675,65 @@ pub(crate) fn seam_ok(frame: &Frame, dc: &[i32], seam_mcu: u64) -> bool {
     if g.blocks_y < 4 {
         return false;
     }
-    let seam = seam_rows(&g, seam_mcu);
-    let on_seam = |b: u64| seam.iter().any(|(by, cols)| *by == b && !cols.is_empty());
     let base = median(
         boundary_means(frame, dc)
             .into_iter()
-            .filter(|&(b, _)| !on_seam(b))
+            .filter(|&(b, _)| !on_seams(frame, seams, b))
             .map(|(_, m)| m),
     );
-    match (seam_mean(frame, dc, seam_mcu), base) {
-        (Some(at_seam), Some(base)) => within(at_seam, base),
-        _ => false,
+    let Some(base) = base else {
+        return false;
+    };
+    seams
+        .iter()
+        .all(|&s| seam_mean(frame, dc, s).is_some_and(|at_seam| within(at_seam, base)))
+}
+
+/// The first of `seams` the test of [`seams_ok`] rejects, `None` when it accepts them all (for an image of at least 4
+/// block rows; with no boundary off the seams, the first seam).
+pub(crate) fn first_failing(frame: &Frame, dc: &[i32], seams: &[u64]) -> Option<usize> {
+    let dc = Dc {
+        head: dc,
+        tail: &[],
+    };
+    let base = median(
+        boundary_means(frame, dc)
+            .into_iter()
+            .filter(|&(b, _)| !on_seams(frame, seams, b))
+            .map(|(_, m)| m),
+    );
+    let Some(base) = base else {
+        return (!seams.is_empty()).then_some(0);
+    };
+    seams
+        .iter()
+        .position(|&s| !seam_mean(frame, dc, s).is_some_and(|at_seam| within(at_seam, base)))
+}
+
+/// Whether the block-row boundary `by` (between rows `by − 1` and `by`) runs along any of the seams at the MCUs `seams`.
+pub(crate) fn on_seams(frame: &Frame, seams: &[u64], by: u64) -> bool {
+    let g = Grid::new(
+        frame,
+        Dc {
+            head: &[],
+            tail: &[],
+        },
+    );
+    seams.iter().any(|&s| {
+        seam_rows(&g, s)
+            .iter()
+            .any(|(b, cols)| *b == by && !cols.is_empty())
+    })
+}
+
+/// Mean `|ΔDC|` of the block-row boundary `by` when every pair across it was decoded.
+pub(crate) fn boundary_mean(frame: &Frame, dc: Dc, by: u64) -> Option<f64> {
+    let g = Grid::new(frame, dc);
+    if by == 0 || by >= g.blocks_y {
+        return None;
     }
+    let (sum, n) = g.diffs(by, 0..g.blocks_x);
+    (n == g.blocks_x && n > 0).then(|| sum / n as f64)
 }
 
 /// `inner`, with the bytes `[at, at + bytes.len())` served from memory (reads wholly inside them), counting the bytes
@@ -762,6 +835,65 @@ mod tests {
     }
 
     #[test]
+    fn seams_ok_with_one_seam_is_seam_ok() {
+        // The grids of `seam_check_rejects_a_glued_dc_grid`: same answers through the multi-seam test.
+        let big = frame_of(&testkit::jpeg_flat_with_restarts(512, 384, 0));
+        let a = |bx: u64, by: u64| (2 * by + bx) as i32;
+        let b = |bx: u64, by: u64| 500 - 3 * by as i32 + 2 * bx as i32;
+        let mut x = 99u64;
+        let noise = grid(|_, _| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 40) % 200) as i32 - 100
+        });
+        let grids = [
+            grid(a),
+            grid(|bx, by| if by < 24 { a(bx, by) } else { b(bx, by) }),
+            grid(|bx, by| {
+                if by * 64 + bx < 24 * 64 + 10 {
+                    a(bx, by)
+                } else {
+                    b(bx, by)
+                }
+            }),
+            noise,
+        ];
+        let (mut yes, mut no) = (0, 0);
+        for dc in &grids {
+            for seam in [5, 64, 24 * 64, 24 * 64 + 10, 24 * 64 + 17, 47 * 64 + 63] {
+                let one = seam_ok(&big, dc, seam);
+                assert_eq!(seams_ok(&big, dc, &[seam]), one, "seam at {seam}");
+                if one {
+                    yes += 1;
+                } else {
+                    no += 1;
+                }
+            }
+        }
+        assert!(yes > 0 && no > 0, "{yes} {no}");
+        let small = frame_of(&testkit::jpeg_flat_with_restarts(512, 24, 0));
+        let flat = vec![7; 64 * 3];
+        assert_eq!(seams_ok(&small, &flat, &[64]), seam_ok(&small, &flat, 64));
+    }
+
+    #[test]
+    fn seams_ok_rejects_a_second_glued_seam() {
+        let big = frame_of(&testkit::jpeg_flat_with_restarts(512, 384, 0));
+        let a = |bx: u64, by: u64| (2 * by + bx) as i32;
+        let b = |bx: u64, by: u64| 500 - 3 * by as i32 + 2 * bx as i32;
+        // Rows 0..16 and 16..32 from A (a true seam at row 16), rows 32..48 from B (a glued one at row 32).
+        let glued = grid(|bx, by| if by < 32 { a(bx, by) } else { b(bx, by) });
+        assert!(!seams_ok(&big, &glued, &[16 * 64, 32 * 64]));
+        assert!(seams_ok(&big, &grid(a), &[16 * 64]));
+        assert!(seams_ok(&big, &grid(a), &[16 * 64, 32 * 64]));
+        // Each seam is held to the base off every seam: the glued one alone fails too.
+        assert!(!seams_ok(&big, &glued, &[32 * 64]));
+        assert_eq!(first_failing(&big, &glued, &[16 * 64, 32 * 64]), Some(1));
+        assert_eq!(first_failing(&big, &grid(a), &[16 * 64, 32 * 64]), None);
+    }
+
+    #[test]
     fn the_early_seam_test_never_rejects_what_the_final_one_accepts() {
         // Sky over texture, as in a landscape: flat block rows above row `top`, rough ones from it on. Wherever the seam
         // falls, a join the final test accepts must not be dropped after the MCU row below the seam.
@@ -832,6 +964,112 @@ mod tests {
         let base = early_base(&big, &boundary_means(&big, head), 40 * 64).expect("a bound");
         assert!(!within(at_seam, base) && !seam_ok(&big, &glued, 40 * 64));
         assert!(sure > 0, "the early test never fires");
+    }
+
+    #[test]
+    fn the_bound_from_rows_on_both_sides_never_rejects_what_the_final_test_accepts() {
+        // Sky over texture (and texture over sky): the rows decoded so far, above and below the seams, bound the final
+        // base once they are more than half of the boundaries off the seams. Whatever is decoded, a set of seams the
+        // final test accepts is never rejected, and a glued photo is rejected before its end.
+        let big = frame_of(&testkit::jpeg_flat_with_restarts(512, 384, 0));
+        let mut x = 5u64;
+        let mut noise = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 40) % 120) as i32 - 60
+        };
+        let (mut accepted, mut bounded) = (0, 0);
+        for top in [6, 20, 30, 42] {
+            for rough_below in [true, false] {
+                let dc = grid(|_, by| {
+                    if (by >= top) == rough_below {
+                        100 + noise()
+                    } else {
+                        100
+                    }
+                });
+                for seams in [
+                    vec![(top - 2) * 64 + 5],
+                    vec![10 * 64, (top + 2) * 64 + 17],
+                    vec![3 * 64, 40 * 64 + 63],
+                ] {
+                    if !seams_ok(&big, &dc, &seams) {
+                        continue;
+                    }
+                    accepted += 1;
+                    let on: Vec<u64> = (1..48).filter(|&b| on_seams(&big, &seams, b)).collect();
+                    let means = boundary_means(
+                        &big,
+                        Dc {
+                            head: &dc,
+                            tail: &[],
+                        },
+                    );
+                    // Decoded through block row `rows`: the boundaries off the seams among the first `rows − 1`.
+                    for rows in 1..=48u64 {
+                        let known: Vec<f64> = means
+                            .iter()
+                            .filter(|&&(b, _)| b < rows && !on.contains(&b))
+                            .map(|&(_, m)| m)
+                            .collect();
+                        let Some(bound) = base_bound(&big, &known, on.len() as u64) else {
+                            continue;
+                        };
+                        bounded += 1;
+                        for &s in &seams {
+                            let at = seam_mean(
+                                &big,
+                                Dc {
+                                    head: &dc,
+                                    tail: &[],
+                                },
+                                s,
+                            )
+                            .unwrap();
+                            assert!(
+                                within(at, bound),
+                                "seams {seams:?}, rows {rows}, texture from {top}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(accepted > 10 && bounded > 100, "{accepted} {bounded}");
+        // A smooth photo glued to another one in its upper part: rejected once more than half the boundaries are known.
+        let a = |bx: u64, by: u64| (2 * by + bx) as i32;
+        let glued = grid(|bx, by| {
+            if by < 10 {
+                a(bx, by)
+            } else {
+                500 - 3 * by as i32
+            }
+        });
+        assert!(!seams_ok(&big, &glued, &[10 * 64]));
+        let on: Vec<u64> = (1..48).filter(|&b| on_seams(&big, &[10 * 64], b)).collect();
+        let known: Vec<f64> = boundary_means(
+            &big,
+            Dc {
+                head: &glued[..30 * 64],
+                tail: &[],
+            },
+        )
+        .into_iter()
+        .filter(|(b, _)| !on.contains(b))
+        .map(|(_, m)| m)
+        .collect();
+        let bound = base_bound(&big, &known, on.len() as u64).expect("more than half are known");
+        let at = seam_mean(
+            &big,
+            Dc {
+                head: &glued,
+                tail: &[],
+            },
+            10 * 64,
+        )
+        .unwrap();
+        assert!(!within(at, bound));
     }
 
     /// `a = jpeg(640, 480, 3, 0)`: `a[..c]` at 0 then `sectors` sectors of `[00; 510] FF D9`.

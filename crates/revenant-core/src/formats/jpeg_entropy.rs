@@ -389,6 +389,13 @@ impl Cursor {
         (self.mcu, self.bits, self.nbits, self.pred)
     }
 
+    /// The position of the byte holding the next unconsumed bit when the bits consumed so far end on a byte boundary
+    /// (so another stream byte-aligned at the same MCU could be spliced in there), else `None`.
+    #[cfg(test)]
+    pub(crate) fn byte_aligned(&self) -> Option<u64> {
+        self.nbits.is_multiple_of(8).then(|| self.current_byte())
+    }
+
     /// Position of the byte holding the next unconsumed bit.
     fn current_byte(&self) -> u64 {
         if self.nbits == 0 {

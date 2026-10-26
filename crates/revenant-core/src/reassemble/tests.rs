@@ -127,7 +127,14 @@ impl Seams for Toy {
         (0, 0)
     }
 
-    fn walk(&mut self, view: &dyn Source, from: &(u32, u32), limit: u64) -> Walked<(u32, u32)> {
+    fn walk(
+        &mut self,
+        view: &dyn Source,
+        seams: &[u64],
+        from: &(u32, u32),
+        limit: u64,
+    ) -> Walked<(u32, u32)> {
+        let _ = seams;
         let (mut i, mut prev) = *from;
         let mut checked = units(i);
         let mut resume = Vec::new();
@@ -177,7 +184,7 @@ impl Seams for Toy {
     }
 
     fn prove(&mut self, view: &dyn Source, seams: &[u64]) -> Proof {
-        let w = self.walk(view, &(0, 0), view.len());
+        let w = self.walk(view, seams, &(0, 0), view.len());
         if !matches!(w.end, WalkEnd::Complete { len } if len == view.len()) {
             return Proof::Failed;
         }

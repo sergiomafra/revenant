@@ -28,6 +28,8 @@ use crate::pairing::grid_of;
 use crate::scan::CancelToken;
 use crate::source::{DiskId, Fragmented, Source, VolumeId};
 
+pub(crate) mod jpeg;
+
 /// Most pieces of a file on a cluster grid.
 pub(crate) const MAX_PIECES: usize = 16;
 /// Most pieces of a file off any grid (512-byte sectors).
@@ -391,7 +393,15 @@ pub(crate) trait Seams {
     /// The state before the file's first byte (logical 0).
     fn begin(&mut self) -> Self::State;
     /// Walks the file's logical bytes `view` (the pieces so far, then a candidate run) from `from` up to `limit`.
-    fn walk(&mut self, view: &dyn Source, from: &Self::State, limit: u64) -> Walked<Self::State>;
+    /// `seams`: the logical positions where one piece of `view` ends and the next begins, ascending (a format whose
+    /// evidence is measured from a seam, such as the JPEG's MCU row below it, needs to know where they are).
+    fn walk(
+        &mut self,
+        view: &dyn Source,
+        seams: &[u64],
+        from: &Self::State,
+        limit: u64,
+    ) -> Walked<Self::State>;
     /// Final proof over the whole file, `seams` = logical positions where one piece ends and the next begins.
     fn prove(&mut self, view: &dyn Source, seams: &[u64]) -> Proof;
     /// The file's length when the format says it (moov sample table, TIFF extent).
@@ -412,9 +422,11 @@ pub(crate) trait Seams {
         let _ = (r, g, seam);
         true
     }
-    /// Logical break points inside `[start, end)`, a piece of a found solution walked as `view`, that the uniqueness
-    /// re-check should try first, most suspicious first (Q28). The re-check then goes on nearest to the piece's end
-    /// first, at most [`Limits::break_points`] per piece in all. Default: none.
+    /// Logical positions inside `(start, end)`, a piece of a found solution walked as `view`, where the content looks
+    /// least continuous, most suspicious first (Q28): the uniqueness re-check cuts the piece first at the unit boundary
+    /// at or before each (positions in the same unit count once), then goes on nearest to the piece's end, at most
+    /// [`Limits::break_points`] per piece in all. The re-check asks it for every piece of one solution in a row.
+    /// Default: none.
     fn suspicious_breaks(&mut self, view: &dyn Source, start: u64, end: u64) -> Vec<u64> {
         let _ = (view, start, end);
         Vec::new()
@@ -749,11 +761,18 @@ impl<'c, S: Seams> Ctx<'c, S> {
         if !self.charge() {
             return None;
         }
+        let seams: Vec<u64> = pieces
+            .iter()
+            .scan(0, |end, p| {
+                *end += p.len;
+                Some(*end)
+            })
+            .collect();
         let mut v = pieces.to_vec();
         v.push(Fragment { start: g, len: run });
         let source: &dyn Source = self.source;
         let view = Fragmented::new(source, v);
-        Some(self.seams.walk(&view, from, limit))
+        Some(self.seams.walk(&view, &seams, from, limit))
     }
 
     /// Records `pieces ++ [g, len]` as a partial result when it checked more bytes than the best so far.
@@ -950,8 +969,12 @@ impl<'c, S: Seams> Ctx<'c, S> {
             let view = Fragmented::new(source, sol.clone());
             let mut list: Vec<u64> = Vec::new();
             for b in self.seams.suspicious_breaks(&view, l, end) {
-                let inside = l < b && b < end && self.space.is_unit_start(p.start + (b - l));
-                if inside && !list.contains(&b) && list.len() < self.limits.break_points {
+                if b <= l || b >= end || list.len() == self.limits.break_points {
+                    continue;
+                }
+                // The unit boundary at or before the suspicious position: the piece is cut there.
+                let b = l + (self.space.floor(p.start + (b - l)) - p.start);
+                if b > l && !list.contains(&b) {
                     list.push(b);
                 }
             }

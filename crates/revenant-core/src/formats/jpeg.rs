@@ -39,9 +39,9 @@ pub(super) fn is_sof(m: u8) -> bool {
 }
 
 /// Result of walking the header segments.
-pub(super) struct Header {
+pub(crate) struct Header {
     /// Offset just past SOS's segment: where the entropy-coded data starts.
-    pub(super) scan_start: u64,
+    pub(crate) scan_start: u64,
     /// A DAC segment (arithmetic coding conditioning) was seen: the content is beyond our decoder.
     has_dac: bool,
 }
@@ -52,7 +52,7 @@ const CONFIRM_MAX_HEADER: u64 = 1 << 20;
 /// Walks the header segments of the JPEG at `start`, up to and including SOS. A walk that breaks on an unreadable
 /// sector is not proof that this is not a JPEG: the walk then ends where it broke (the search for EOI continues from
 /// there). `None` means "not a JPEG": a bad marker or length, no DQT/SOF, or the end of the source.
-pub(super) fn walk_header(r: &mut Reader, start: u64, limit: u64) -> Option<Header> {
+pub(crate) fn walk_header(r: &mut Reader, start: u64, limit: u64) -> Option<Header> {
     let (mut pos, mut has_dqt, mut has_sof, mut has_dac) = (start + 2, false, false, false);
     // Whether the 4 bytes (marker and length) at `pos` are within `limit` of the start.
     let within = |pos: u64| pos - start + 4 <= limit;
@@ -142,7 +142,7 @@ thread_local! {
 ///   `Intact`; only the lenient one -> `Partial`; neither -> `Damaged`; too large to decode -> `Partial`.
 ///
 /// With unreadable sectors (read as zeros) inside, a success of either kind gives at most `Partial`.
-pub(super) fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
+pub(crate) fn decode_health(r: &mut Reader, start: u64, len: u64) -> Health {
     verify(r, start, len).0
 }
 
@@ -253,7 +253,7 @@ fn cut_health(r: &mut Reader, start: u64, scan_start: u64, end: u64) -> Health {
 /// tables could, and the photo would then be cut there), or of the first unreadable sector overlapping it
 /// (clamped to `from`); `end` if there is neither. Reads each sector of the range once (a sector starting before `end` is
 /// read whole). The cut-file health rule and the gap search share it.
-pub(super) fn data_end(r: &mut Reader, from: u64, end: u64) -> u64 {
+pub(crate) fn data_end(r: &mut Reader, from: u64, end: u64) -> u64 {
     let mut sector = [0u8; SECTOR as usize];
     let mut s = from - from % SECTOR;
     while s < end {
@@ -356,7 +356,7 @@ pub(crate) fn exif_tiff(r: &mut Reader, start: u64, len: u64) -> Option<(u64, u6
 /// any of them cannot be measured (no SOF, zero size, over [`JPEG_MAX_LEN`]), a smaller one must not vouch for the file,
 /// so it is `Partial`; so it is with no preview at all, or a largest one that decodes only leniently or not at all (the
 /// raw data may still be fine).
-pub(super) fn preview_health(r: &mut Reader, previews: &[(u64, u64)]) -> Health {
+pub(crate) fn preview_health(r: &mut Reader, previews: &[(u64, u64)]) -> Health {
     let mut best: Option<(u64, u64, u64)> = None; // (pixels, offset, len)
     for &(o, l) in previews {
         let pixels = match sof_pixels(r, o, l) {
