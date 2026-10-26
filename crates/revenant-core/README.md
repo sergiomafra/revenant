@@ -863,16 +863,27 @@ it); a look-alike continuation beyond it could leave a seam falsely unique, and 
 that (accepted risk). When the format gives an anchor, the start it implies comes first.
 
 **Break points.** When a walk breaks, the piece may end at any unit boundary between the last resume point at or before
-the checked evidence and the break, nearest to the break first, at most 64; more means not exhausted. When the walk
-reaches the file's end, the last piece may still have ended earlier with the rest elsewhere (a look-alike tail right
-after it): its earlier unit boundaries, nearest to the end first, at most 64, are tried too, and any other complete
-solution makes the result not unique.
+the checked evidence and the break, nearest to the break first, at most 64; more means not exhausted.
+
+**The uniqueness re-check.** A walk that goes on fitting can still run into a look-alike: another file's data right
+after a piece that happens to continue the content (a burst of the same scene, a tail of the same stream). So once the
+search has found exactly one complete solution, a separate re-check tries, for every piece of it, earlier break
+points: first the ones the format marks as suspicious (`Seams::suspicious_breaks`, most suspicious first), then the
+nearest to the piece's end, at most 64 per piece, taken round robin over the pieces; from each it lists the next
+piece's candidates and searches on. Any other complete solution makes the result not unique. The re-check has its own
+budget (2^14 walks per file); running out of it, or of break points, does not make the search non-exhaustive.
 
 **Candidates with and without evidence.** A candidate passes when its walk completes or checks content past the seam;
 it is blind when its walk checks nothing past the seam yet does not break right at it (a cluster the format cannot
 check, then foreign data or the end of its run); only a candidate broken right at the seam is dropped. Evident candidates are descended into first, then blind ones, in
 order; both count toward uniqueness, so a blind true continuation next to an evident look-alike makes the result not
 unique. A solution through a blind seam is at most `Unproven`.
+
+**Residual risk, stated plainly.** Uniqueness is decided within bounds: candidates only inside the window, and
+look-alikes inside a piece only at the break points the re-check tries within its budget. A look-alike continuation
+beyond the window, or a swap point inside a long piece past the tried break points, can leave a result unique that is
+not. The format's own proof is the guard: formats with positional proof (a video's sample table, a RAW's tile offsets)
+do not depend on the engine's uniqueness; for the others the format orders the re-check so its weakest seams come first.
 
 **The rule for `Intact`.** The search reports the first complete solution in that order (else the path that checked the
 most bytes), whether it is the only complete solution, whether nothing was cut by a cap or budget, and the proof. A file
@@ -889,6 +900,7 @@ file) must match the sum of the pieces exactly; when both are known and disagree
 | Window on a grid / off it | 256 MiB / 64 MiB                  |
 | Break points per seam     | 64                                |
 | Candidate walks           | 2^16 per file, 2^22 per scan      |
+| Re-check walks            | 2^14 per file (within the scan's) |
 | Bytes read                | 512 MiB per file, 16 GiB per scan |
 | Reassembly candidates     | 4096 findings per scan            |
 | Claimed runs              | 2^18 per scan                     |

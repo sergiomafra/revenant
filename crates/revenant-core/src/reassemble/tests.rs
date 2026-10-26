@@ -22,12 +22,19 @@ fn header(id: u32, i: u32, n: u32) -> [u8; 12] {
     h
 }
 
-/// Unit `i` of a toy file of `n` units: `[id][i][n]` then bytes seeded by `seed` and `i`.
-fn unit(id: u32, i: u32, n: u32, seed: u32) -> Vec<u8> {
+/// The chain tag of unit `i` of the lineage `seed` (what a decoder predictor carries from one unit to the next).
+fn tag(seed: u32, i: u32) -> u32 {
+    seed.wrapping_mul(0x9E37_79B9) ^ i.wrapping_mul(0x85EB_CA6B) ^ 0x5bd1_e995
+}
+
+/// Unit `i` of a toy file of `n` units: `[id][i][n][previous unit's tag][own tag]` then bytes seeded by `seed` and `i`.
+fn unit(id: u32, i: u32, n: u32, seed: u32, prev: u32) -> Vec<u8> {
     let mut u = vec![0u8; U as usize];
     u[..12].copy_from_slice(&header(id, i, n));
+    u[12..16].copy_from_slice(&prev.to_le_bytes());
+    u[16..20].copy_from_slice(&tag(seed, i).to_le_bytes());
     let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(i) | 1;
-    for b in &mut u[12..] {
+    for b in &mut u[20..] {
         x ^= x << 13;
         x ^= x >> 17;
         x ^= x << 5;
@@ -46,9 +53,24 @@ impl Card {
 
     /// Units `units` of a toy file of `n` units with `id`, from `at`; returns their range.
     fn put(&mut self, at: u64, id: u32, units: Range<u32>, n: u32, seed: u32) -> Fragment {
+        let prev = tag(seed, units.start.wrapping_sub(1));
+        self.put_chained(at, id, units, n, seed, prev)
+    }
+
+    /// As [`Card::put`], the first unit chained from tag `prev` (another lineage's unit), the rest from `seed`.
+    fn put_chained(
+        &mut self,
+        at: u64,
+        id: u32,
+        units: Range<u32>,
+        n: u32,
+        seed: u32,
+        prev: u32,
+    ) -> Fragment {
         for (k, i) in units.clone().enumerate() {
             let p = (at + k as u64 * U) as usize;
-            self.0[p..p + U as usize].copy_from_slice(&unit(id, i, n, seed));
+            let before = if k == 0 { prev } else { tag(seed, i - 1) };
+            self.0[p..p + U as usize].copy_from_slice(&unit(id, i, n, seed, before));
         }
         Fragment {
             start: at,
@@ -84,6 +106,10 @@ struct Toy {
     prefilter_calls: u64,
     /// A failed read counts as a good unit (a careless format: only the search's read limit flags it).
     ignore_errors: bool,
+    /// Each unit must carry the previous unit's tag (a decoder predictor carried across units).
+    chained: bool,
+    /// Break points the uniqueness re-check should try first.
+    suspects: Vec<u64>,
 }
 
 fn toy(n: u32) -> Toy {
@@ -94,14 +120,15 @@ fn toy(n: u32) -> Toy {
 }
 
 impl Seams for Toy {
-    type State = u32;
+    /// The next unit, and the tag of the unit before it.
+    type State = (u32, u32);
 
-    fn begin(&mut self) -> u32 {
-        0
+    fn begin(&mut self) -> (u32, u32) {
+        (0, 0)
     }
 
-    fn walk(&mut self, view: &dyn Source, from: &u32, limit: u64) -> Walked<u32> {
-        let mut i = *from;
+    fn walk(&mut self, view: &dyn Source, from: &(u32, u32), limit: u64) -> Walked<(u32, u32)> {
+        let (mut i, mut prev) = *from;
         let mut checked = units(i);
         let mut resume = Vec::new();
         let limit = limit.min(view.len());
@@ -122,33 +149,35 @@ impl Seams for Toy {
                 };
             }
             if !self.blind.contains(&i) {
-                let mut h = [0u8; 12];
+                let mut h = [0u8; 20];
                 let got = view.read_at(s, &mut h);
                 if got.is_err() && self.ignore_errors {
-                    h = header(ID, i, self.n);
-                } else if got.ok() != Some(12) {
+                    h[..12].copy_from_slice(&header(ID, i, self.n));
+                } else if got.ok() != Some(20) {
                     return Walked {
                         end: WalkEnd::Stopped,
                         checked,
                         resume,
                     };
                 }
-                if h != header(ID, i, self.n) {
+                let chain_ok = !self.chained || i == 0 || h[12..16] == prev.to_le_bytes();
+                if h[..12] != header(ID, i, self.n) || !chain_ok {
                     return Walked {
                         end: WalkEnd::Broken { at: s },
                         checked,
                         resume,
                     };
                 }
+                prev = u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
                 checked = s + U;
-                resume.push((s + U, i + 1));
+                resume.push((s + U, (i + 1, prev)));
             }
             i += 1;
         }
     }
 
     fn prove(&mut self, view: &dyn Source, seams: &[u64]) -> Proof {
-        let w = self.walk(view, &0, view.len());
+        let w = self.walk(view, &(0, 0), view.len());
         if !matches!(w.end, WalkEnd::Complete { len } if len == view.len()) {
             return Proof::Failed;
         }
@@ -169,6 +198,15 @@ impl Seams for Toy {
 
     fn anchor(&self) -> Option<(u64, u64)> {
         self.anchor
+    }
+
+    fn suspicious_breaks(&mut self, view: &dyn Source, start: u64, end: u64) -> Vec<u64> {
+        let _ = view;
+        self.suspects
+            .iter()
+            .copied()
+            .filter(|&b| start < b && b < end)
+            .collect()
     }
 
     fn prefilter(&mut self, r: &mut Reader, g: u64, seam: u64) -> bool {
@@ -933,6 +971,12 @@ fn prefilter_read_budget_hit_is_not_exhaustive() {
     };
     let s = search_on(&src, &mut t, MIB, &[], &limits, None).0.unwrap();
     assert!(!s.exhaustive);
+    // Once the bytes are spent the prefilter is not asked again (each call reads a 512-byte sector).
+    assert!(
+        t.prefilter_calls <= 8 * K / SECTOR + 1,
+        "{} prefilter calls",
+        t.prefilter_calls
+    );
 }
 
 #[test]
@@ -1045,4 +1089,133 @@ fn a_walk_cut_by_the_read_limit_is_not_exhaustive() {
     let s = search_on(&src, &mut t, MIB, &[], &limits, None).0.unwrap();
     assert!(s.complete);
     assert!(!s.exhaustive);
+}
+
+#[test]
+fn stopped_walk_is_not_exhaustive() {
+    // The first piece's own walk cannot read its 4th unit.
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = Holes(card.mem(), MIB + units(3)..MIB + units(4));
+    let s = search_on(&src, &mut toy(40), MIB, &[], &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert_eq!(s.len, units(3));
+    assert!(!s.exhaustive);
+}
+
+#[test]
+fn two_piece_files_on_a_free_card_stay_exhaustive() {
+    // RN4: the uniqueness re-check has its own budget; the search's is not spent on it.
+    for tail in [8, 20, 40, 64] {
+        let n = 8 + tail;
+        let mut card = Card::new();
+        let a = card.put(MIB, ID, 0..8, n, 1);
+        card.noise(MIB + units(8), 4);
+        let t = card.put(3 * MIB, ID, 8..n, n, 1);
+        card.noise(3 * MIB + units(tail), 4);
+        let src = card.mem();
+        let (s, budget) = search_on(&src, &mut toy(n), MIB, &[], &Limits::DEFAULT, None);
+        let s = s.unwrap();
+        assert_eq!(s.pieces, [a, t], "tail {tail}");
+        assert!(s.complete && s.unique && s.exhaustive, "tail {tail}");
+        assert_eq!(s.proof, Proof::Proven);
+        let spent = Budget::new(&Limits::DEFAULT).tries_left() - budget.tries_left();
+        assert!(
+            spent <= FILE_TRIES + RECHECK_TRIES,
+            "tail {tail}: {spent} tries"
+        );
+    }
+}
+
+#[test]
+fn recheck_covers_every_piece_not_only_the_last() {
+    // RN3c, chained units: A = true units 0..10, right after it a foreign L1 = units 10..16 chained from A's unit 9,
+    // L1's continuation X = 16..40 elsewhere; the true T = 10..40 elsewhere. The search finds A+L1 then X; the re-check
+    // of the first piece finds A then T: not unique.
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..10, 40, 1);
+    let l1 = card.put_chained(MIB + units(10), ID, 10..16, 40, 5, tag(1, 9));
+    let x = card.put_chained(3 * MIB, ID, 16..40, 40, 5, tag(5, 15));
+    let t = card.put(5 * MIB, ID, 10..40, 40, 1);
+    let src = card.mem();
+    let live = complement(&[a, l1, x, t]);
+    let mut t_ = Toy {
+        chained: true,
+        ..toy(40)
+    };
+    let s = search_on(&src, &mut t_, MIB, &live, &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert_eq!(
+        s.pieces,
+        [
+            Fragment {
+                start: MIB,
+                len: units(16)
+            },
+            x
+        ]
+    );
+    assert!(!s.unique, "the re-check of the first piece finds A + T");
+    assert!(s.exhaustive, "the re-check never clears exhaustive");
+}
+
+#[test]
+fn recheck_tries_the_format_s_suspicious_breaks_first() {
+    // RN2c, chained units: one contiguous run of 100 units where a look-alike lineage takes over at unit 30 (the 70th
+    // break from the end); the true units 30..100 lie elsewhere. With the format's hint the swap point is tried first:
+    // not unique. Without it (default order: the 64 breaks nearest the end) the swap point is never tried and the result
+    // is unique: the accepted residual risk of Q27/Q28 (the format's proof is the guard).
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..30, 100, 1);
+    let l = card.put_chained(MIB + units(30), ID, 30..100, 100, 5, tag(1, 29));
+    let t = card.put(3 * MIB, ID, 30..100, 100, 1);
+    let src = card.mem();
+    let live = complement(&[a, l, t]);
+    let mut hinted = Toy {
+        chained: true,
+        suspects: vec![units(30)],
+        ..toy(100)
+    };
+    let s = search_on(&src, &mut hinted, MIB, &live, &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(!s.unique);
+    let mut plain = Toy {
+        chained: true,
+        ..toy(100)
+    };
+    let s = search_on(&src, &mut plain, MIB, &live, &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(
+        s.unique,
+        "residual risk: the swap point lies past the 64 breaks tried"
+    );
+}
+
+#[test]
+fn recheck_spends_its_own_budget_only() {
+    let mut card = Card::new();
+    card.put(MIB, ID, 0..8, 28, 1);
+    card.noise(MIB + units(8), 4);
+    card.put(3 * MIB, ID, 8..28, 28, 1);
+    card.noise(3 * MIB + units(20), 4);
+    let src = card.mem();
+    let spent = |recheck_tries: u64| {
+        let limits = Limits {
+            recheck_tries,
+            ..Limits::DEFAULT
+        };
+        let (s, budget) = search_on(&src, &mut toy(28), MIB, &[], &limits, None);
+        assert!(s.unwrap().exhaustive);
+        Budget::new(&limits).tries_left() - budget.tries_left()
+    };
+    let search = spent(0);
+    let with = spent(10);
+    assert!(with > search && with <= search + 10, "{search} then {with}");
 }

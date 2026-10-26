@@ -5,9 +5,10 @@
 //! first) and, for each, the free unit starts where the next piece could begin ([`Space::candidates`]: next free
 //! forward within the window, then, on a cluster grid, the first hole from the heap start). A candidate passes when the
 //! walk over it shows content evidence past the seam; a candidate with no evidence either way (blind) is tried too, after
-//! the evident ones, and its complete solutions count toward uniqueness (ruling Q2). A walk that completes also tries
-//! the earlier break points of its last piece (Q26). The window bounds the distance to a candidate, not a piece's
-//! length (Q25). The search is bounded by
+//! the evident ones, and its complete solutions count toward uniqueness (ruling Q2). Once one complete solution is
+//! found, a separate re-check with its own budget tries earlier break points of every piece of it (the format's most
+//! suspicious ones first) for another complete solution (Q26, Q28). The window bounds the distance to a candidate, not a
+//! piece's length (Q25). The search is bounded by
 //! [`Limits`] and a [`Budget`]; any cap or budget hit makes it not exhaustive, and the file can then be at most
 //! `Partial`.
 //!
@@ -43,6 +44,8 @@ pub(crate) const BREAK_POINTS: usize = 64;
 pub(crate) const FILE_TRIES: u64 = 1 << 16;
 /// Candidate walks per scan.
 pub(crate) const SCAN_TRIES: u64 = 1 << 22;
+/// Candidate walks per file for the uniqueness re-check of a found solution (Q28), apart from [`FILE_TRIES`].
+pub(crate) const RECHECK_TRIES: u64 = 1 << 14;
 /// Bytes asked of the source per file.
 pub(crate) const FILE_READ: u64 = 512 << 20;
 /// Bytes asked of the source per scan.
@@ -67,6 +70,7 @@ pub(crate) struct Limits {
     pub break_points: usize,
     pub file_tries: u64,
     pub scan_tries: u64,
+    pub recheck_tries: u64,
     pub file_read: u64,
     pub scan_read: u64,
     pub candidates: usize,
@@ -83,6 +87,7 @@ impl Limits {
         break_points: BREAK_POINTS,
         file_tries: FILE_TRIES,
         scan_tries: SCAN_TRIES,
+        recheck_tries: RECHECK_TRIES,
         file_read: FILE_READ,
         scan_read: SCAN_READ,
         candidates: MAX_CANDIDATES,
@@ -407,6 +412,13 @@ pub(crate) trait Seams {
         let _ = (r, g, seam);
         true
     }
+    /// Logical break points inside `[start, end)`, a piece of a found solution walked as `view`, that the uniqueness
+    /// re-check should try first, most suspicious first (Q28). The re-check then goes on nearest to the piece's end
+    /// first, at most [`Limits::break_points`] per piece in all. Default: none.
+    fn suspicious_breaks(&mut self, view: &dyn Source, start: u64, end: u64) -> Vec<u64> {
+        let _ = (view, start, end);
+        Vec::new()
+    }
 }
 
 pub(crate) struct Walked<S> {
@@ -545,7 +557,10 @@ impl Source for Counted<'_> {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
         if self.read() >= self.limit.load(Ordering::Relaxed) {
             self.over.store(true, Ordering::Relaxed);
-            return Err(EngineError::Cancelled);
+            return Err(EngineError::Read {
+                offset,
+                cause: std::io::Error::other(ReadBudgetSpent),
+            });
         }
         let n = self.inner.read_at(offset, buf)?;
         self.read.fetch_add(n as u64, Ordering::Relaxed);
@@ -560,6 +575,19 @@ impl Source for Counted<'_> {
         self.inner.disk()
     }
 }
+
+/// Why [`Counted`] refused a read: the file's read budget is spent (not a device error, not a cancel). The search
+/// reports it through [`Counted::over`], never as an error.
+#[derive(Debug)]
+struct ReadBudgetSpent;
+
+impl std::fmt::Display for ReadBudgetSpent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("read_budget_spent")
+    }
+}
+
+impl std::error::Error for ReadBudgetSpent {}
 
 /// Why the search stopped before trying everything.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -791,11 +819,6 @@ impl<'c, S: Seams> Ctx<'c, S> {
             WalkEnd::Complete { len } => {
                 if len > l && len <= l + run {
                     self.solution(pieces, g, len - l, blind);
-                    // Q26: the last piece may also end earlier, the rest elsewhere (a look-alike tail right after it).
-                    if pieces.len() + 1 < self.space.max_pieces() {
-                        let breaks = self.breaks(g, l, l + 1, len - 1, false);
-                        self.try_breaks(pieces, from, g, l, &w, breaks, blind);
-                    }
                 }
             }
             WalkEnd::Stopped => self.exhaustive = false,
@@ -890,6 +913,98 @@ impl<'c, S: Seams> Ctx<'c, S> {
                 self.dfs(pieces, &st, g2, b, true);
             }
             pieces.pop();
+        }
+    }
+
+    /// The uniqueness re-check of the one complete solution found (Q26, Q28): for every piece, earlier break points (the
+    /// format's suspicious ones first, then nearest to the piece's end, at most `break_points` per piece, taken round
+    /// robin over the pieces), each followed by the next piece's candidates and the search from there. Any other
+    /// complete solution makes the result not unique. It spends its own `max_tries` and never changes `exhaustive`:
+    /// running out of it or of break points leaves the result as the search left it.
+    fn recheck(&mut self, max_tries: u64) {
+        let Some((sol, _)) = self.solutions.first().cloned() else {
+            return;
+        };
+        let saved = self.exhaustive;
+        self.max_tries = self.tries.saturating_add(max_tries);
+        let mut starts = Vec::with_capacity(sol.len());
+        let mut l = 0;
+        for p in &sol {
+            starts.push(l);
+            l += p.len;
+        }
+        let total = l;
+        let root = (0, self.seams.begin());
+        let (head, last) = sol.split_at(sol.len() - 1);
+        let Some(w) = self.walk(head, last[0].start, last[0].len, &root.1, total) else {
+            self.end_recheck(saved);
+            return;
+        };
+        let mut resume = vec![root];
+        resume.extend(w.resume);
+        let mut lists = Vec::with_capacity(sol.len());
+        for (i, p) in sol.iter().enumerate() {
+            let (l, end) = (starts[i], starts[i] + p.len);
+            let source: &dyn Source = self.source;
+            let view = Fragmented::new(source, sol.clone());
+            let mut list: Vec<u64> = Vec::new();
+            for b in self.seams.suspicious_breaks(&view, l, end) {
+                let inside = l < b && b < end && self.space.is_unit_start(p.start + (b - l));
+                if inside && !list.contains(&b) && list.len() < self.limits.break_points {
+                    list.push(b);
+                }
+            }
+            for b in self.breaks(p.start, l, l + 1, end - 1, false) {
+                if list.len() == self.limits.break_points {
+                    break;
+                }
+                if !list.contains(&b) {
+                    list.push(b);
+                }
+            }
+            lists.push(list);
+        }
+        'ranks: for rank in 0..self.limits.break_points {
+            for (i, list) in lists.iter().enumerate() {
+                let Some(&b) = list.get(rank) else {
+                    continue;
+                };
+                if self.stop.is_some() {
+                    break 'ranks;
+                }
+                // The piece cut at `b` is piece i + 1; the next one must fit too.
+                if i + 2 > self.space.max_pieces() {
+                    continue;
+                }
+                let st = resume
+                    .iter()
+                    .rev()
+                    .find(|r| r.0 <= b)
+                    .unwrap_or(&resume[0])
+                    .clone();
+                let p = sol[i];
+                let mut pieces = sol[..i].to_vec();
+                pieces.push(Fragment {
+                    start: p.start,
+                    len: b - starts[i],
+                });
+                let (evident, blinds) = self.classify(&pieces, &st, p.start + (b - starts[i]), b);
+                for (g2, _) in evident {
+                    self.dfs(&mut pieces, &st, g2, b, false);
+                }
+                for g2 in blinds {
+                    self.dfs(&mut pieces, &st, g2, b, true);
+                }
+            }
+        }
+        self.end_recheck(saved);
+    }
+
+    /// Ends the re-check: `exhaustive` as the search left it, and a re-check budget hit is no stop.
+    fn end_recheck(&mut self, saved: bool) {
+        self.exhaustive = saved;
+        if self.stop == Some(Stop::Budget) {
+            self.stop = None;
         }
     }
 
@@ -995,6 +1110,12 @@ pub(crate) fn search<S: Seams>(
     let mut ctx = Ctx::new(seams, &counted, space, limits, cancel, known, caps);
     let root = (0, ctx.seams.begin());
     ctx.dfs(&mut Vec::new(), &root, start, 0, false);
+    // A read refused during the search makes it not exhaustive; one refused during the re-check does not.
+    let refused = counted.over();
+    if ctx.solutions.len() == 1 && ctx.stop.is_none() {
+        let left = budget.tries_left().saturating_sub(ctx.tries);
+        ctx.recheck(limits.recheck_tries.min(left));
+    }
 
     let Ctx {
         seams,
@@ -1005,7 +1126,7 @@ pub(crate) fn search<S: Seams>(
         stop,
         ..
     } = ctx;
-    let exhaustive = exhaustive && !counted.over();
+    let exhaustive = exhaustive && !refused;
     counted.set_limit(u64::MAX);
     let found = if stop == Some(Stop::Cancelled) {
         None
