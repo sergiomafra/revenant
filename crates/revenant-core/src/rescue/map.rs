@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -386,7 +386,7 @@ impl RescueMap {
                 Some(p) if !p.as_os_str().is_empty() => p,
                 _ => Path::new("."),
             };
-            let _ = File::open(dir).and_then(|d| d.sync_all());
+            let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
         }
         Ok(())
     }
