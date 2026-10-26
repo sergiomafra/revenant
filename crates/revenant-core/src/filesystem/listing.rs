@@ -360,10 +360,11 @@ impl<'a> Collector<'a> {
         }
     }
 
-    /// A live file and its chain; not listed when it has no cluster or the budget runs out. A photo/video whose path
-    /// would pass the path cap keeps its name and loses its folder.
+    /// A live file and its chain; not listed (taking nothing from the budget) when it has no piece inside the source,
+    /// nor when the budget runs out. A photo/video whose path would pass the path cap keeps its name and loses its
+    /// folder.
     pub(super) fn file(&mut self, budget: &mut Budget, mut origin: FsOrigin, chain: Chain) {
-        if chain.runs.is_empty() {
+        if pieces(self.volume, self.source_len, &chain.runs, origin.size).is_empty() {
             return;
         }
         let kind = extension(&origin.name).and_then(FileKind::from_extension);
@@ -1077,6 +1078,98 @@ mod tests {
         for k in kept {
             assert!(capped.files.contains(k), "{:?}", k.origin.path());
         }
+    }
+
+    /// Ruling D28 on exFAT: a root photo met before the bitmap entry waits for it, and may then take a slot a deleted
+    /// photo of an earlier volume holds. Volume 0 (FAT12) lists 4 deleted photos at the lowered cap of 4; volume 1
+    /// (exFAT) has R.JPG's entry set before its bitmap entry.
+    #[test]
+    fn a_root_photo_waiting_for_the_bitmap_takes_a_deleted_slot() {
+        use crate::formats::tests::Mem;
+        use revenant_testkit::fs::{DeleteStyle, FsBuilder, FsType, mbr_disk};
+        let mut first = FsBuilder::new(FsType::Fat12, 2 << 20, 1024);
+        for i in 0..4 {
+            let path = format!("DCIM/GONE{i}.JPG");
+            first.add(&path, &[i as u8 + 1; 3000]);
+            first.delete(&path, DeleteStyle::Camera);
+        }
+        let mut second = FsBuilder::new(FsType::Exfat, 16 << 20, 32 * 1024);
+        second.add("R.JPG", &[7; 1000]);
+        let mut v = second.build();
+        // Root: label, bitmap, up-case table, R.JPG (3 entries); moved to label, up-case, R.JPG, bitmap.
+        let root = second.cluster_offset(second.clusters("")[0]) as usize;
+        let at = |k: usize| root + 32 * k;
+        let bitmap: [u8; 32] = v[at(1)..at(2)].try_into().unwrap();
+        assert_eq!(
+            (v[at(0)], bitmap[0], v[at(2)], v[at(3)]),
+            (0x83, 0x81, 0x82, 0x85)
+        );
+        v.copy_within(at(2)..at(6), at(1));
+        v[at(5)..at(6)].copy_from_slice(&bitmap);
+        let a = first.build();
+        let src = Mem(mbr_disk(
+            &[(2048, &a, 0x01), (8192, &v, 0x07)],
+            &[],
+            24 << 20,
+        ));
+        let l = read_limited(
+            &src,
+            &SourceProbe::new(&src),
+            &CancelToken::default(),
+            &Limits {
+                files: 4,
+                ..Limits::DEFAULT
+            },
+        );
+        let r: Vec<&FsFile> = l
+            .files
+            .iter()
+            .filter(|f| f.origin.name == "R.JPG")
+            .collect();
+        assert_eq!(
+            r.len(),
+            1,
+            "{:?}",
+            l.files.iter().map(|f| f.origin.path()).collect::<Vec<_>>()
+        );
+        assert_eq!((r[0].origin.volume, r[0].origin.state), (1, FsState::Live));
+        assert_eq!(l.files.len(), 4);
+        assert!(l.truncated);
+    }
+
+    /// A live photo whose clusters all lie past the end of the source is never listed: it takes no photo slot.
+    #[test]
+    fn a_live_photo_past_the_source_takes_no_slot() {
+        let v = volume();
+        let mut budget = Budget {
+            files: 1,
+            deleted: 0,
+            evicted: 0,
+            pieces: 10,
+            path_bytes: 4096,
+            paths: 1 << 20,
+            truncated: false,
+        };
+        let origin = |name: &str| FsOrigin {
+            volume: 0,
+            folder: None,
+            name: name.into(),
+            state: FsState::Live,
+            placement: Placement::Chain,
+            size: 512,
+            created: None,
+            modified: None,
+        };
+        // Cluster 900 starts at 449 KiB; the source ends at 64 KiB.
+        let mut col = Collector::new(&v, 64 << 10);
+        col.file(&mut budget, origin("FAR.JPG"), chain(900));
+        assert_eq!(budget.files_left(), 1);
+        col.file(&mut budget, origin("NEAR.JPG"), chain(2));
+        assert_eq!(budget.files_left(), 0);
+        let mut out = Listing::default();
+        col.finish(&Claims::new(1000, 16), &mut out);
+        assert_eq!(out.files.len(), 1);
+        assert_eq!(out.files[0].origin.name, "NEAR.JPG");
     }
 
     #[test]

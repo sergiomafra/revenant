@@ -673,6 +673,9 @@ The same `IsoBmff` detector picks the kind from the `ftyp` brands: major brand `
 An MP4 that merely lists `mif1` has a `moov` and stays `Mp4`; one that lists `heic` among its compatible brands, lost
 its `moov` (a cut before it) and has no `meta` is a `Damaged` `Mp4`; an `avif`/`avis` major brand is never HEIC. The
 price: an MP4 cut before its `moov` that carries a stray top-level `meta` and lists `mif1` is still taken for a HEIC.
+And a HEIF image sequence (`msf1`/`heis`) laid out `ftyp`, `meta`, `mdat`, `moov` is measured as a HEIC without its
+`moov`: once the still images' extents are all inside, the HEIC is complete (below) and the walk stops before the
+`moov`, so the still images come out whole and the sequence's tail (its `moov`) is left out.
 
 - CR3: the `moov`/`stco`/`stsz` rules above apply unchanged (a CR3 has `trak`s). In addition both of its JPEGs must
   decode strictly (the raw image itself is never verified) for `Intact`: the `PRVW` JPEG in the top-level `uuid`
