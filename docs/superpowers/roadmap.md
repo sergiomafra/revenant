@@ -39,10 +39,19 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
   - Arquivo recuperado sem nome ganha um nome por data e câmera; a extração sanea os nomes.
   - Não cobre: arquivo apagado e fragmentado (sai `Partial`, vai para a 1.6); NTFS, APFS e HFS+ (a escultura segue
     cobrindo). Pendências e decisões em `docs/superpowers/history/2026-10-25-m1-p4-pendencias.md`.
-- **1.5, disco de verdade:**
-  - Lê o cartão ou HD direto pelo aparelho no Mac e no Windows, desmontando sem ejetar e sempre só leitura.
-  - Cópia do cartão tolerante a setores ruins.
-  - A busca fica salva e pode ser retomada.
+- **1.5, disco de verdade, concluída** (aguardando PR/merge):
+  - Lê o cartão ou HD direto pelo aparelho no Mac e no Windows, desmontando sem ejetar e sempre só leitura; lista os
+    discos e recusa o disco do sistema.
+  - Conferência prévia: tudo o que já se sabe estar errado (permissão, aparelho mudo, setor ilegível, desmontagem, destino
+    pequeno ou no próprio cartão, sessão de outro cartão) numa lista só, antes da leitura longa.
+  - Cópia do cartão tolerante a setores ruins, com mapa próprio, retomável; a busca na imagem lê o que não foi resgatado
+    como ilegível, nunca como zeros.
+  - A busca fica salva em uma sessão e retoma depois de queda, cabo puxado ou energia, com os mesmos resultados.
+  - Sinais cedo: aviso "disco falhando, faça uma cópia", velocidade e tempo restante.
+  - Não cobre: janela de remontagem e leitura sem root/administrador pelo ajudante privilegiado (2.1); impedir o sono do
+    computador e os textos de cada aviso (Módulo 2); copiar e buscar ao mesmo tempo (ideia para depois). Pendências em
+    `docs/superpowers/history/2026-10-25-m1-p5-pendencias.md`; conferência com hardware em
+    `docs/superpowers/history/2026-10-25-m1-p5-conferencia-manual.md`.
 - **1.6, fragmentação avançada** (depois da 1.5; não segura o marco A):
   - Arquivos em 3 ou mais pedaços (JPEG e vídeo), usando o tamanho de cluster que a 1.4 traz.
   - Fragmentação de RAW, onde houver como validar a emenda (prévia JPEG, tamanhos do sistema de arquivos).

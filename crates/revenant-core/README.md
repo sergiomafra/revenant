@@ -1666,6 +1666,29 @@ rebuild of the head (a one-line change) scanned `dense-jpeg` in 2.11 s with file
 2.13 s on `main`, while the head as first built took 2.26 s. The gap is the code layout of that one build. On this Mac
 an A/B needs such a control rebuild to resolve a difference of about 6%.
 
+**End of 1.5 (session lines).** Part 1.5 added no work to the plain scan path except the early-warning counters and the
+state a session captures at block boundaries, so the plain lines are expected to stay where 1.4 left them. They did
+not: measured at the end of 1.5 (`revenant-dev bench`, default threads, best of 3 scans) the Mac was loaded and
+throttling, and every line came out lower, the ones 1.5 cannot touch included: `noise` 1403.6 / 1360.0 MB/s (two
+full runs), `dense-jpeg` 305.7 / 275.4, `dense-raw` 938.8 / 841.5, `video` 1529.2 / 1454.1, `cut-jpeg` 244.1 / 248.8,
+`exfat-card` 288.3 / 296.8, against 2207.5, 539.8, 1420.3, 2525.4, 439.0 and 459.1 at the end of 1.4. Part 1.5's own
+tasks saw the same slow slot (`dense-jpeg` 205 to 220 MB/s in the middle of the part). Because a single build cannot
+resolve about 6% on this machine (see above), the 1.4 head (`main`, `08aae30`) was built in a separate target and run
+interleaved with the 1.5 head, three rounds with a 30 s pause, best of 3 scans: `noise` 1322.0 / 1724.8 / 1587.6 on
+`main` against 1439.8 / 1285.7 / 1313.1 on the 1.5 head; `dense-jpeg` 270.8 / 367.7 / 302.1 against 305.3 / 284.7 /
+287.1; `exfat-card` 278.9 / 310.8 / 282.6 against 304.5 / 290.6 / 303.1. The spread of `main` against itself (271 to
+368 MB/s on `dense-jpeg`) is larger than any gap between the two builds and the order of the builds changes from round
+to round, so this run shows no slowdown from part 1.5 but cannot rule out one of a few percent. The absolute numbers
+of the end of 1.4 were taken on a quieter machine and are not reproduced today.
+
+The session lines (`bench --images noise,dense-jpeg --session`, same slot, best of 3, a new session per scan): `noise`
+0.71 s (1507.9 MB/s) plain against 1.06 s (1017.2) through a session, `dense-jpeg` 3.61 s (297.2) against 3.97 s
+(270.5), that is 0.35 s and 0.36 s more, the fixed cost of the syncs described under [Sessions](#sessions) (ruling P46:
+it does not grow with the size; at 4 GiB it was 0.08 to 0.2 s). On a card read at device speed it is under 1%. The
+device against the image of the same card, as the opt-in `os_devices` test prints it with images attached by `hdiutil`
+(not a card reader): 76 to 79 MB/s on the raw device against 80 to 84 MB/s on the image file (this run), 113 to 127
+against 148 to 154 in the part's first run, so reading the raw device costs a little, not a multiple.
+
 Every placed file is found in every run. What it means for a card: an SD card reader delivers at most about 100 MB/s
 (UHS-I) to about 300 MB/s (UHS-II), so with the default threads the scan keeps up with the reader on every image here,
 the photo-dense ones included (`dense-jpeg` 503.9 and `dense-raw` 1576.9 MB/s, above the 300 MB/s goal). With one
