@@ -491,7 +491,7 @@ fn foreign_starts<'a>(
 
 /// The cluster grid `(heap, cluster)` that video start `s` sits on: the first of `grids` with a cluster of at least
 /// [`MIN_GRID_CLUSTER`] whose heap holds `s` at a cluster start.
-fn grid_of(grids: &[Grid], s: u64) -> Option<(u64, u64, u64)> {
+pub(crate) fn grid_of(grids: &[Grid], s: u64) -> Option<(u64, u64, u64)> {
     grids.iter().copied().find(|&(heap, cluster, end)| {
         cluster >= MIN_GRID_CLUSTER && heap <= s && s < end && (s - heap).is_multiple_of(cluster)
     })

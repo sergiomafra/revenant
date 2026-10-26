@@ -833,6 +833,69 @@ pieces for a photo it puts back together (see "Fragmented JPEG"); the scan copie
 finding. After an `Intact` finding in pieces, the scan skips heads only inside
 its pieces (each rounded out to whole sectors), so files in the gaps between them are still found.
 
+## Reassembly
+
+The seam search (`reassemble`, crate-internal; the scan does not call it yet: the reassembly step comes with the next
+task of part 1.6) puts back together a file found in more than two pieces. A **seam** is a logical position of the file
+where one piece ends and the next begins. Each format describes its content through the `Seams` trait: it walks the
+file's logical bytes over a view of the pieces chosen so far plus a candidate run, says where the content stops fitting
+(`Broken`), where the file ends (`Complete`), up to where it checked the content (its evidence), and from which states
+a walk may resume in another piece; at the end it proves the whole file (`Proven`, `Unproven` or `Failed`). A format may
+also give the file's known length, an anchor (a logical offset that must sit at a given absolute place, such as a video's
+orphan `moov`), its own embedded files, and a cheap prefilter for candidates.
+
+**The space.** A piece lies on the volume's cluster grid when the file starts at a cluster start of a volume with
+clusters of at least 4096 bytes; otherwise on 512-byte sectors, forward only, with a 64 MiB window and at most 4 pieces.
+A unit is free when it is inside the heap, no live file of the volume's listing holds it, no `Intact` finding (or earlier
+`Intact` reassembly) claimed it, it is not already a piece of the file, and no other finding starts in it. A run of free
+units stops at the first unit that is not free; a claimed range wholly covered by the file's own embedded files at their
+exact places (a RAW's preview found as its own `Intact` JPEG) does not stop it (coverage, not equality, since touching
+claimed ranges are merged). Taken ranges are stepped over range by range, never cluster by cluster.
+
+**The order of candidates.** After a piece ending at absolute `end`: the free unit starts from `end` up to
+`end + 256 MiB` in ascending order ("next free"), then, on a grid, from the heap start (at most 256 MiB of it) up to
+`end` ("first hole"). The unit right at `end` is never a candidate (continuing there is no seam). The prefilter runs
+while the candidates are listed; at most 4096 survivors per seam count, and more than that means the seam was not
+exhausted. A window cut is not a cap hit: **uniqueness holds only inside the window** (256 MiB on a grid, 64 MiB off
+it); a look-alike continuation beyond it could leave a seam falsely unique, and the content proof is the guard against
+that (accepted risk). When the format gives an anchor, the start it implies comes first.
+
+**Break points.** When a walk breaks, the piece may end at any unit boundary between the last resume point at or before
+the checked evidence and the break, nearest to the break first, at most 64; more means not exhausted.
+
+**Candidates with and without evidence.** A candidate passes when its walk completes or checks content past the seam;
+it is blind when its walk neither breaks nor checks anything before its run ends (a one-cluster run shorter than one
+unit of evidence, data the format cannot check). Evident candidates are descended into first, then blind ones, in
+order; both count toward uniqueness, so a blind true continuation next to an evident look-alike makes the result not
+unique. A solution through a blind seam is at most `Unproven`.
+
+**The rule for `Intact`.** The search reports the first complete solution in that order (else the path that checked the
+most bytes), whether it is the only complete solution, whether nothing was cut by a cap or budget, and the proof. A file
+may be `Intact` only when the solution is unique, the search exhaustive and the proof `Proven` (the scan adds its own
+checks); otherwise it is at most `Partial`. A known length (the format's, and a file-system entry's size for a deleted
+file) must match the sum of the pieces exactly; when both are known and disagree, nothing is complete.
+
+**Budgets.**
+
+| Limit                     | Value                             |
+| ------------------------- | --------------------------------- |
+| Pieces on a grid / off it | 16 / 4                            |
+| Candidates per seam       | 4096 (prefilter survivors)        |
+| Window on a grid / off it | 256 MiB / 64 MiB                  |
+| Break points per seam     | 64                                |
+| Candidate walks           | 2^16 per file, 2^22 per scan      |
+| Bytes read                | 512 MiB per file, 16 GiB per scan |
+| Reassembly candidates     | 4096 findings per scan            |
+| Claimed runs              | 2^18 per scan                     |
+
+A file's budget is its own limits within what the scan has left; the prefilter's reads are charged to it (each
+prefilter call reads through its own one-sector reader, and a (start, seam) pair asked again is answered from memory).
+A budget hit stops the file's search, which is then not exhaustive. The search looks at the scan's cancel flag before
+every walk and every prefilter read, and gives nothing when cancelled.
+
+**Reading.** The search reads through the scan's read cache, so a sector known to be unreadable is never read again;
+nothing is written and nothing is remembered per cluster during the scan.
+
 ## File systems: volumes
 
 `filesystem::volumes(source)` lists every FAT12, FAT16, FAT32 and exFAT volume of a source, in offset order (at most 16,

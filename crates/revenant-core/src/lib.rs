@@ -23,6 +23,7 @@ pub mod naming;
 pub(crate) mod pairing;
 pub mod preflight;
 pub mod rate;
+pub(crate) mod reassemble;
 pub mod rescue;
 pub mod scan;
 pub mod session;
