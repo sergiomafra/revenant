@@ -513,6 +513,33 @@ mod tests {
         }
     }
 
+    /// A bare disk name while a file of that name sits in the folder is ambiguous (`open_failed`); the device path
+    /// still names the disk and a path with a folder the file.
+    #[test]
+    fn a_bare_disk_name_shadowed_by_a_file_is_refused() {
+        use crate::devices::device_name_in;
+        let here = tempfile::tempdir().unwrap();
+        let name = |s: &str| {
+            device_name_in(Path::new(s), here.path()).map(|d| d.map(|d| d.as_str().to_string()))
+        };
+        assert_eq!(name("disk4").unwrap().as_deref(), Some("disk4"));
+        assert_eq!(
+            name("PhysicalDrive2").unwrap().as_deref(),
+            Some("PhysicalDrive2")
+        );
+        std::fs::write(here.path().join("disk4"), b"x").unwrap();
+        std::fs::create_dir(here.path().join("PhysicalDrive2")).unwrap();
+        for s in ["disk4", "PhysicalDrive2"] {
+            assert_eq!(name(s).unwrap_err().code(), "open_failed", "{s}");
+        }
+        assert_eq!(name("/dev/rdisk4").unwrap().as_deref(), Some("disk4"));
+        assert_eq!(
+            name(r"\\.\PhysicalDrive2").unwrap().as_deref(),
+            Some("PhysicalDrive2")
+        );
+        assert_eq!(name("./disk4").unwrap(), None);
+    }
+
     #[test]
     fn unknown_volume_forwards_the_disk() {
         let wrapped = UnknownVolume(&StubCard);
@@ -677,5 +704,44 @@ mod tests {
         let mut expected = bytes[4096..5096].to_vec();
         expected.extend_from_slice(&bytes[512..1012]);
         assert_eq!(std::fs::read(path).unwrap(), expected);
+    }
+
+    /// A preview read coming back short means the source vanished: `device_gone` (so a session run waits for the card to
+    /// come back), and no preview file is left.
+    #[test]
+    fn a_short_preview_read_is_device_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image.bin");
+        std::fs::write(&image, vec![1u8; 8192]).unwrap();
+        let source = FileSource::open(&image).unwrap();
+        let f = Finding {
+            id: 1,
+            start: 4096,
+            len: 3000,
+            kind: FileKind::Jpeg,
+            health: Health::Intact,
+            fragments: Vec::new(),
+            origin: None,
+        };
+        let p = Preview {
+            start: 8000,
+            len: 500,
+            width: 64,
+            height: 48,
+            fragments: Vec::new(),
+        };
+        let out = tempfile::tempdir().unwrap();
+        let dest = Destination::check(&SystemDevices, &UnknownVolume(&source), out.path()).unwrap();
+        let e = write_preview(&source, &f, &p, &dest, "a.jpg").unwrap_err();
+        assert!(
+            matches!(e, EngineError::DeviceGone { offset: 8192 }),
+            "{e:?}"
+        );
+        // Which stops the scan (as an extraction's would), so a session run reconnects instead of going on.
+        assert!(crate::scan_cmd::stops_the_scan(&e));
+        assert!(!crate::scan_cmd::stops_the_scan(&EngineError::Write {
+            cause: std::io::ErrorKind::Other.into()
+        }));
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
     }
 }

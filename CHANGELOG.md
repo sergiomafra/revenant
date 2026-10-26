@@ -188,3 +188,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is now found.
 - A small file written inside a Canon CR3's `PRVW` preview was hidden and the CR3 reported intact; a CR3 is now intact only
   if both its preview and its full-size JPEG decode, so the file inside is found.
+- `revenant-dev`: a bare disk name (`disk4`) while a file of that name sits in the current folder is refused as
+  ambiguous instead of reading the disk; a card pulled out while a preview is read stops the scan (and a session waits
+  for it) instead of only failing that preview.

@@ -56,12 +56,28 @@ fn is_device_path(s: &str) -> bool {
 
 /// What a SOURCE argument names: `Some(disk)` for a whole disk, `None` for a file; `not_whole_disk` for any other device
 /// path ([`classify`]), whether it exists or not, and for a bare name that looks like a disk ("disk4s1") and is not an
-/// existing file.
+/// existing file. A bare disk name ("disk4", "PhysicalDrive2") while something of that name sits in the current folder
+/// is ambiguous: `open_failed`, with a hint to give the device path (`/dev/rdisk4`, `\\.\PhysicalDrive2`) for the disk
+/// or a path with a folder (`./disk4`) for the file.
 pub(crate) fn device_name(source: &Path) -> Result<Option<DiskId>, EngineError> {
+    device_name_in(source, Path::new("."))
+}
+
+/// [`device_name`], with bare names looked up in `here` (the current folder).
+pub(crate) fn device_name_in(source: &Path, here: &Path) -> Result<Option<DiskId>, EngineError> {
     let Some(s) = source.to_str() else {
         return Ok(None);
     };
     match classify(s)? {
+        Named::Disk(disk) if is_bare(s) && std::fs::symlink_metadata(here.join(s)).is_ok() => {
+            eprintln!(
+                "hint: \"{s}\" is both a disk and something in this folder: give {} for the disk or ./{s} for the file",
+                disk.device_path().display()
+            );
+            Err(EngineError::Open {
+                cause: std::io::Error::other("ambiguous source name"),
+            })
+        }
         Named::Disk(disk) => Ok(Some(disk)),
         Named::File => {
             let lower = s.to_ascii_lowercase();
@@ -73,6 +89,11 @@ pub(crate) fn device_name(source: &Path) -> Result<Option<DiskId>, EngineError> 
             }
         }
     }
+}
+
+/// Whether `s` is a bare name, with no folder part (`/` or `\\`).
+fn is_bare(s: &str) -> bool {
+    !s.contains(['/', '\\'])
 }
 
 /// A file SOURCE must be a regular file (links followed), checked before it is opened for a clear error (the engine

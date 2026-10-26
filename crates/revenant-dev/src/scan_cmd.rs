@@ -335,8 +335,8 @@ impl Printer<'_> {
     }
 
     /// Reads the finding's details and, unless it is replayed (written by the run that found it), extracts it and
-    /// writes its preview. `None` on a fatal error (kept in `fatal`): the folder no longer where it was checked, or the
-    /// card gone while copying from it.
+    /// writes its preview. `None` on a fatal error (kept in `fatal`, [`stops_the_scan`]): the folder no longer where it
+    /// was checked, or the card gone while copying from it.
     fn finding(
         &mut self,
         source: &dyn Source,
@@ -350,9 +350,7 @@ impl Printer<'_> {
             if let Some(dest) = &self.targets.extract {
                 match extract_to(source, f, dest, &name) {
                     Ok(p) => out.file = Some(p.display().to_string()),
-                    Err(
-                        e @ (EngineError::DestinationOnSource | EngineError::DeviceGone { .. }),
-                    ) => {
+                    Err(e) if stops_the_scan(&e) => {
                         self.fatal = Some(e);
                         return None;
                     }
@@ -362,7 +360,7 @@ impl Printer<'_> {
             if let (Some(dest), Some(p)) = (&self.targets.previews, &details.preview) {
                 match write_preview(source, f, p, dest, &name) {
                     Ok(path) => out.preview_file = Some(path.display().to_string()),
-                    Err(e @ EngineError::DestinationOnSource) => {
+                    Err(e) if stops_the_scan(&e) => {
                         self.fatal = Some(e);
                         return None;
                     }
@@ -409,9 +407,18 @@ impl Printer<'_> {
     }
 }
 
+/// Whether an extraction's or a preview's error stops the scan (kept as fatal) instead of marking that one finding: the
+/// folder no longer where it was checked, or the card gone (a session run then waits for it to come back).
+pub(crate) fn stops_the_scan(e: &EngineError) -> bool {
+    matches!(
+        e,
+        EngineError::DestinationOnSource | EngineError::DeviceGone { .. }
+    )
+}
+
 /// Writes the preview's bytes (all its pieces, in order) into the checked folder as `<stem of the file's name>.preview.jpg`
-/// (`_2`, `_3`… if it exists; never overwrites), so a file and its preview sit side by side. A read or write error
-/// removes the incomplete file.
+/// (`_2`, `_3`… if it exists; never overwrites), so a file and its preview sit side by side. Every piece is read before
+/// the file is created (a read coming back short is `device_gone`); a write error removes the incomplete file.
 pub(crate) fn write_preview(
     source: &dyn Source,
     f: &Finding,
@@ -423,11 +430,12 @@ pub(crate) fn write_preview(
     let mut data = Vec::with_capacity(p.len as usize);
     for range in p.ranges() {
         let mut piece = vec![0u8; range.len as usize];
+        // The engine's preview lies inside the source, so a read coming back short means the source vanished there
+        // (ruling D1): `device_gone`, which a session run waits out like any other vanished read.
         let n = source.read_at(range.start, &mut piece)?;
         if n != piece.len() {
-            return Err(EngineError::Read {
+            return Err(EngineError::DeviceGone {
                 offset: range.start + n as u64,
-                cause: std::io::ErrorKind::UnexpectedEof.into(),
             });
         }
         data.extend_from_slice(&piece);

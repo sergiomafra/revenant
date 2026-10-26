@@ -27,8 +27,10 @@ Every command prints JSON lines on stdout, progress and hints on stderr. A fatal
 and exits with 1; `preflight` and `copy` exit with 2 when the pre-flight check found issues.
 
 - `<SOURCE>`: a disk image file, or a whole disk: `disk4` (also `/dev/disk4`, `/dev/rdisk4`) on macOS, `PhysicalDrive2`
-  (also `\\.\PhysicalDrive2`) on Windows (see [Reading a card directly](#reading-a-card-directly)). A whole-disk name
-  always means the disk (write `./disk4` for a file of that name). A partition or any other device node
+  (also `\\.\PhysicalDrive2`) on Windows (see [Reading a card directly](#reading-a-card-directly)). A bare whole-disk
+  name means the disk, but while something of that name sits in the current folder it is ambiguous and refused
+  (`open_failed`, with a hint on stderr): write the device path (`/dev/rdisk4`, `\\.\PhysicalDrive2`) for the disk or
+  `./disk4` for the file. A partition or any other device node
   (`disk4s1`, `/dev/disk4s1`, `/dev/null`, `\\.\E:`, `\\?\Volume{…}`) is refused with `not_whole_disk`, even when it
   exists: read as a file it would not be known as part of the card, so nothing would keep the extraction, the copy or
   the session off the card. Name the whole disk instead. A Windows long path to a file (`\\?\C:\…`,
@@ -142,7 +144,9 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
 - With `--extract`, a `found` line gets `"file":"<path>"`. If extracting that one finding fails (for example
   `write_failed` when the folder is not writable), it gets `"error":"<code>"` instead and the scan continues.
 - With `--previews`, a `found` line that has a `preview` gets `"preview_file":"<path>"`, or `"preview_error":"<code>"`
-  (`read_failed`, `write_failed`) if writing that preview failed; the scan continues.
+  (`read_failed`, `write_failed`) if writing that preview failed; the scan continues. As with `--extract`, a card gone
+  while its preview is read (`device_gone`, a read coming back short included) or the folder no longer where it was
+  checked (`destination_on_source`) stops the scan instead (with `--session`, the scan waits for the card to come back).
 - Fatal errors print `error: <code>` to stderr and exit with 1 (for example `open_failed`, `destination_on_source`).
 - Reading a disk: an `unmount` line comes first, `{"event":"unmount","disk":"disk4","held":0}` (`held`: the volume locks
   kept while reading, always 0 on macOS), or, when the unmount failed,
