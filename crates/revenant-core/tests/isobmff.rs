@@ -1184,3 +1184,37 @@ fn mp4_listing_heic_cut_before_moov_is_a_damaged_mp4() {
         (FileKind::Mp4, v.len() as u64, Health::Damaged)
     );
 }
+
+#[test]
+fn camera_videos_parse_in_every_layout() {
+    use testkit::{AvcOptions, VideoCodec, VideoLayout};
+    let o = AvcOptions {
+        samples: 30,
+        seed: 9,
+        mov: false,
+        mdat_pad: 700,
+        small_nals: true,
+    };
+    for codec in [VideoCodec::Avc, VideoCodec::Hevc] {
+        for layout in [
+            VideoLayout::MoovAtEnd,
+            VideoLayout::MoovFirst,
+            VideoLayout::MoovFirstMdatSizeZero,
+            VideoLayout::Fragmented {
+                samples_per_fragment: 8,
+            },
+        ] {
+            let v = testkit::camera_video(&o, codec, layout);
+            let src = Counting {
+                bytes: v.bytes.clone(),
+                read: Default::default(),
+            };
+            let m = IsoBmff.measure(&src, 0).unwrap();
+            assert_eq!(
+                (m.len, m.health),
+                (v.bytes.len() as u64, Health::Intact),
+                "{codec:?} {layout:?}"
+            );
+        }
+    }
+}

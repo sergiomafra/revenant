@@ -1,8 +1,8 @@
 //! The synthetic FAT/exFAT volumes and MBR/GPT disks, checked against the Microsoft specifications' field offsets.
 
 use revenant_testkit::fs::{
-    DeleteStyle, FsBuilder, FsStamp, FsType, HiddenSectors, Partitioning, crc32, disk, disk_with,
-    mbr_disk, quick_format_in_place,
+    Alloc, DeleteStyle, FsBuilder, FsStamp, FsType, HiddenSectors, Partitioning, crc32, disk,
+    disk_with, mbr_disk, quick_format_in_place,
 };
 
 fn u16_at(v: &[u8], at: usize) -> u16 {
@@ -189,7 +189,11 @@ fn cluster_count_must_fit_the_type() {
 
 #[test]
 fn fat_delete_styles() {
-    for style in [DeleteStyle::Camera, DeleteStyle::WindowsFat32] {
+    for style in [
+        DeleteStyle::Camera,
+        DeleteStyle::WindowsFat32,
+        DeleteStyle::ZeroChain,
+    ] {
         let mut b = FsBuilder::new(FsType::Fat32, 48 << 20, 512);
         b.add_at("DSC00002.JPG", &[9u8; 1500], &[70_000, 70_001, 70_002]);
         let live = b.build();
@@ -212,7 +216,7 @@ fn fat_delete_styles() {
             assert_eq!(fat32_entry(&v, c), 0);
         }
         let high = match style {
-            DeleteStyle::Camera => [1, 0],
+            DeleteStyle::Camera | DeleteStyle::ZeroChain => [1, 0],
             DeleteStyle::WindowsFat32 => [0, 0],
         };
         assert_eq!(e[20..22], high, "{style:?}");
@@ -882,4 +886,83 @@ fn exfat_name_hash_uses_the_upper_case_name() {
             .wrapping_add(byte as u16);
     }
     assert_eq!(u16_at(&e[at + 1], 4), hash);
+}
+
+/// exFAT FAT entry of `c` (one FAT at sector 128).
+fn exfat_fat_entry(v: &[u8], c: u32) -> u32 {
+    u32_at(v, 128 * 512 + 4 * c as usize)
+}
+
+#[test]
+fn next_free_allocation_rotates_past_freed_gaps() {
+    const CL: usize = 32 * 1024;
+    let run = |alloc: Option<Alloc>| {
+        let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, CL as u32);
+        if let Some(a) = alloc {
+            b.alloc(a);
+        }
+        let a = b.add("DCIM/A.JPG", &[1u8; 4 * CL]);
+        let bb = b.add("DCIM/B.JPG", &[2u8; 4 * CL]);
+        b.delete("DCIM/A.JPG", DeleteStyle::Camera);
+        b.add("DCIM/C.JPG", &[3u8; 6 * CL]);
+        (a, bb, b.clusters("DCIM/C.JPG"))
+    };
+    let (a, b, c) = run(Some(Alloc::NextFree));
+    let last = *b.last().unwrap();
+    assert_eq!(c, (last + 1..last + 7).collect::<Vec<u32>>());
+    let (a2, b2, c2) = run(None);
+    assert_eq!(
+        (a2, b2),
+        (a.clone(), b.clone()),
+        "the same until the delete"
+    );
+    let last = *b.last().unwrap();
+    let expect: Vec<u32> = a.iter().copied().chain([last + 1, last + 2]).collect();
+    assert_eq!(c2, expect);
+    let (_, _, c3) = run(Some(Alloc::FirstFit));
+    assert_eq!(c3, expect, "FirstFit is the default");
+}
+
+#[test]
+fn next_free_wraps_to_the_start() {
+    const CL: usize = 32 * 1024;
+    let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, CL as u32);
+    b.alloc(Alloc::NextFree);
+    let a = b.add("A.JPG", &[1u8; 4 * CL]);
+    let end = b.cluster_count() + 2;
+    // Fill the volume up to its last cluster, free A's clusters, then add: the pointer wraps to A's gap.
+    let fill = (end - a[3] - 1) as usize;
+    b.add("FILL.BIN", &vec![2u8; fill * CL]);
+    b.delete("A.JPG", DeleteStyle::Camera);
+    assert_eq!(b.add("C.JPG", &[3u8; 2 * CL]), a[..2].to_vec());
+}
+
+#[test]
+fn zero_chain_delete_clears_the_exfat_chain() {
+    const CL: usize = 32 * 1024;
+    let chain = [10u32, 11, 20, 21];
+    for style in [DeleteStyle::Camera, DeleteStyle::ZeroChain] {
+        let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, CL as u32);
+        b.add_at("A.JPG", &[7u8; 4 * CL], &chain);
+        b.delete("A.JPG", style);
+        let v = b.build();
+        let got: Vec<u32> = chain.iter().map(|&c| exfat_fat_entry(&v, c)).collect();
+        match style {
+            DeleteStyle::ZeroChain => assert_eq!(got, [0, 0, 0, 0]),
+            _ => assert_eq!(got, [11, 20, 21, 0xFFFF_FFFF]),
+        }
+        // Either way the data stays and the entry set is marked deleted.
+        assert_eq!(v[b.cluster_offset(20) as usize], 7);
+    }
+}
+
+#[test]
+fn zero_chain_on_fat_is_a_camera_delete() {
+    let build = |style| {
+        let mut b = FsBuilder::new(FsType::Fat32, 48 << 20, 512);
+        b.add("A.JPG", &[1u8; 3 * 512]);
+        b.delete("A.JPG", style);
+        b.build()
+    };
+    assert!(build(DeleteStyle::ZeroChain) == build(DeleteStyle::Camera));
 }

@@ -55,6 +55,20 @@ fn encode_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
 /// of two low-frequency sinusoids whose orientation and phase come from `seed`. Neighbouring 8×8 blocks have close DC
 /// values, so a seam between two different images shows in the DC grid.
 pub fn jpeg_smooth(width: u32, height: u32, seed: u64) -> Vec<u8> {
+    encode_rgb(&smooth_pixels(width, height, seed, 0), width, height)
+}
+
+/// `n` photos of one scene and one frame (same size, tables and sampling): photo k is [`jpeg_smooth`]'s scene shifted by
+/// `k` pixels right, so neighbouring photos have near-equal DC grids (the "burst" a seam test must still tell apart).
+/// Photo 0 is `jpeg_smooth(width, height, seed)`.
+pub fn jpeg_burst(width: u32, height: u32, seed: u64, n: usize) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|k| encode_rgb(&smooth_pixels(width, height, seed, k as u32), width, height))
+        .collect()
+}
+
+/// The RGB pixels of [`jpeg_smooth`]'s scene, shifted `shift` pixels right (pixel `x` shows the scene at `x - shift`).
+fn smooth_pixels(width: u32, height: u32, seed: u64, shift: u32) -> Vec<u8> {
     let mut rng = SplitMix64(seed);
     let mut unit = || (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
     let tau = std::f64::consts::TAU;
@@ -67,7 +81,10 @@ pub fn jpeg_smooth(width: u32, height: u32, seed: u64) -> Vec<u8> {
     let mut pixels = Vec::with_capacity(width as usize * height as usize * 3);
     for y in 0..height {
         for x in 0..width {
-            let (fx, fy) = (f64::from(x) / size, f64::from(y) / size);
+            let (fx, fy) = (
+                (f64::from(x) - f64::from(shift)) / size,
+                f64::from(y) / size,
+            );
             for channel in 0..3 {
                 let shift = f64::from(channel) * 0.7;
                 let v: f64 = waves
@@ -81,7 +98,7 @@ pub fn jpeg_smooth(width: u32, height: u32, seed: u64) -> Vec<u8> {
             }
         }
     }
-    encode_rgb(&pixels, width, height)
+    pixels
 }
 
 fn app1_segment(payload: &[u8]) -> Vec<u8> {
@@ -360,7 +377,7 @@ fn mp4_build(
     }
 }
 
-/// Shape of a synthetic H.264 camera video built by [`avc_video`].
+/// Shape of a synthetic camera video built by [`avc_video`] or [`camera_video`].
 pub struct AvcOptions {
     /// Video samples (frames).
     pub samples: usize,
@@ -384,10 +401,11 @@ pub struct AvcVideo {
     pub moov: std::ops::Range<usize>,
 }
 
-/// One NAL unit with a 4-byte big-endian length: `header`, then `payload` seeded random bytes.
-fn push_nal(out: &mut Vec<u8>, header: u8, payload: usize, rng: &mut SplitMix64) {
-    out.extend_from_slice(&((payload + 1) as u32).to_be_bytes());
-    out.push(header);
+/// One NAL unit with a 4-byte big-endian length: `header` (1 byte for H.264, 2 for HEVC), then `payload` seeded random
+/// bytes.
+fn push_nal(out: &mut Vec<u8>, header: &[u8], payload: usize, rng: &mut SplitMix64) {
+    out.extend_from_slice(&((payload + header.len()) as u32).to_be_bytes());
+    out.extend_from_slice(header);
     let at = out.len();
     out.resize(at + payload, 0);
     rng.fill(&mut out[at..]);
@@ -397,69 +415,94 @@ fn push_nal(out: &mut Vec<u8>, header: u8, payload: usize, rng: &mut SplitMix64)
 /// with an `avcC` (lengthSizeMinusOne = 3), `stsz` per sample, `stsc` 4 samples per chunk, `stco`. Each sample holds 1–3
 /// NAL units (4-byte big-endian length, header byte `0x65` for the first sample of a chunk, else `0x41`, seeded random
 /// payload); sample sizes are in [2 KiB, 24 KiB] from `seed` (with `small_nals`, NAL payloads in [64, 448] bytes instead).
-/// Chunks follow each other in `mdat`, then `mdat_pad` random bytes.
+/// Chunks follow each other in `mdat`, then `mdat_pad` random bytes. Byte for byte
+/// `camera_video(opts, VideoCodec::Avc, VideoLayout::MoovAtEnd)`.
 pub fn avc_video(opts: &AvcOptions) -> AvcVideo {
-    let mut rng = SplitMix64(opts.seed);
-    let mut payload = Vec::new();
-    let mut sizes = Vec::with_capacity(opts.samples);
-    for i in 0..opts.samples {
-        let header = if i % 4 == 0 { 0x65 } else { 0x41 };
-        let nals = 1 + (rng.next() % 3) as usize;
-        let start = payload.len();
-        if opts.small_nals {
-            for _ in 0..nals {
-                let len = 64 + (rng.next() % 385) as usize;
-                push_nal(&mut payload, header, len, &mut rng);
-            }
-        } else {
-            let size = 2048 + (rng.next() % (22 * 1024 + 1)) as usize;
-            // Split the sample into `nals` units of about equal size (each unit: 4-byte length, header, payload).
-            let body = size - 5 * nals;
-            for j in 0..nals {
-                let len = if j + 1 == nals {
-                    body - (nals - 1) * (body / nals)
-                } else {
-                    body / nals
-                };
-                push_nal(&mut payload, header, len, &mut rng);
-            }
-        }
-        sizes.push((payload.len() - start) as u32);
-    }
-    let at = payload.len();
-    payload.resize(at + opts.mdat_pad, 0);
-    rng.fill(&mut payload[at..]);
+    camera_video(opts, VideoCodec::Avc, VideoLayout::MoovAtEnd)
+}
 
-    let brand: &[u8; 4] = if opts.mov { b"qt  " } else { b"isom" };
-    let mut ftyp = brand.to_vec();
-    ftyp.extend_from_slice(&0u32.to_be_bytes());
-    ftyp.extend_from_slice(brand);
-    let ftyp = bmff_box(b"ftyp", &ftyp);
-    let mdat = bmff_box(b"mdat", &payload);
-    let data_at = ftyp.len() + 8;
+/// The video codec of a [`camera_video`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoCodec {
+    /// H.264: `avc1` with an `avcC`, 1-byte NAL headers.
+    Avc,
+    /// H.265: `hvc1` with an `hvcC`, 2-byte NAL headers.
+    Hevc,
+}
 
-    // Chunk offsets (absolute in the file): every 4 samples.
-    let mut chunks = Vec::new();
-    let mut off = data_at as u32;
-    for (i, &s) in sizes.iter().enumerate() {
-        if i % 4 == 0 {
-            chunks.push(off);
+/// Where a [`camera_video`] keeps its index and its media data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoLayout {
+    /// `ftyp, mdat, moov` (the camera case).
+    MoovAtEnd,
+    /// `ftyp, moov, mdat`.
+    MoovFirst,
+    /// `ftyp, moov, mdat` with the mdat size field 0 (to the end of the file).
+    MoovFirstMdatSizeZero,
+    /// `ftyp, moov (with mvex/trex, empty sample tables), then (moof, mdat)` per fragment of `samples_per_fragment`
+    /// samples (the last one may be shorter).
+    Fragmented { samples_per_fragment: usize },
+}
+
+/// A full box (version 0, `flags`) holding `body`.
+fn full_box(kind: &[u8; 4], flags: u32, body: &[u8]) -> Vec<u8> {
+    let mut p = flags.to_be_bytes().to_vec();
+    p.extend_from_slice(body);
+    bmff_box(kind, &p)
+}
+
+/// The `stsd` payload (after version and flags) of a 1920×1080 video with lengthSizeMinusOne = 3.
+fn video_sample_entry(codec: VideoCodec) -> Vec<u8> {
+    // Visual sample entry: reserved (6), data reference index (2), then 70 bytes of visual fields, then the config box.
+    let mut entry = vec![0u8; 78];
+    entry[7] = 1;
+    entry[24..28].copy_from_slice(&(1920u32 << 16 | 1080).to_be_bytes());
+    entry[74..76].copy_from_slice(&0x18u16.to_be_bytes());
+    entry[76..78].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    let kind = match codec {
+        VideoCodec::Avc => {
+            // avcC: version 1, profile, compatibility, level, lengthSizeMinusOne = 3, no SPS, no PPS.
+            entry.extend(bmff_box(b"avcC", &[1, 0x64, 0, 0x28, 0xFF, 0xE0, 0]));
+            b"avc1"
         }
-        off += s;
-    }
-    let full_box = |kind: &[u8; 4], body: &[u8]| {
-        let mut p = vec![0u8; 4]; // version and flags
-        p.extend_from_slice(body);
-        bmff_box(kind, &p)
+        VideoCodec::Hevc => {
+            // hvcC (ISO/IEC 14496-15 §8.3.3.1), the 23-byte fixed part and no arrays: version 1, Main profile (general
+            // profile space 0, tier 0, idc 1), compatibility flags, progressive/frame-only constraint flags, level 4.0,
+            // min_spatial_segmentation 0, parallelism 0, 4:2:0, 8-bit luma and chroma, average frame rate 0, then
+            // constantFrameRate 0, numTemporalLayers 1, temporalIdNested 1, lengthSizeMinusOne 3; numOfArrays 0.
+            let hvcc = [
+                1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 120, 0xF0, 0, 0xFC, 0xFD, 0xF8, 0xF8,
+                0, 0, 0x0F, 0,
+            ];
+            entry.extend(bmff_box(b"hvcC", &hvcc));
+            b"hvc1"
+        }
     };
+    let mut stsd = 1u32.to_be_bytes().to_vec();
+    stsd.extend(bmff_box(kind, &entry));
+    stsd
+}
+
+/// The `moov` of a [`camera_video`]: `mvhd`, one video `trak` (`tkhd` with `track_id`, `hdlr`, `minf/stbl` with `stsd`,
+/// `stsz`, `stsc`, `stco`), then `mvex` when given.
+fn camera_moov(
+    codec: VideoCodec,
+    sizes: &[u32],
+    chunks: &[u32],
+    track_id: u32,
+    mvex: Option<Vec<u8>>,
+) -> Vec<u8> {
     let mut stsz = 0u32.to_be_bytes().to_vec(); // sample_size 0: a table follows
     stsz.extend_from_slice(&(sizes.len() as u32).to_be_bytes());
     sizes
         .iter()
         .for_each(|s| stsz.extend_from_slice(&s.to_be_bytes()));
-    // 4 samples per chunk; a shorter last chunk gets its own entry.
-    let mut runs = vec![[1u32, 4, 1]];
-    if sizes.len() % 4 != 0 {
+    // 4 samples per chunk; a shorter last chunk gets its own entry. No samples: no entry.
+    let mut runs = Vec::new();
+    if !sizes.is_empty() {
+        runs.push([1u32, 4, 1]);
+    }
+    if !sizes.len().is_multiple_of(4) {
         runs.push([chunks.len() as u32, (sizes.len() % 4) as u32, 1]);
     }
     let mut stsc = (runs.len() as u32).to_be_bytes().to_vec();
@@ -470,23 +513,13 @@ pub fn avc_video(opts: &AvcOptions) -> AvcVideo {
     chunks
         .iter()
         .for_each(|c| stco.extend_from_slice(&c.to_be_bytes()));
-    // avc1: reserved (6), data reference index (2), then 70 bytes of visual fields, then the avcC box.
-    let mut avc1 = vec![0u8; 78];
-    avc1[7] = 1;
-    avc1[24..28].copy_from_slice(&(1920u32 << 16 | 1080).to_be_bytes());
-    avc1[74..76].copy_from_slice(&0x18u16.to_be_bytes());
-    avc1[76..78].copy_from_slice(&0xFFFFu16.to_be_bytes());
-    // avcC: version 1, profile, compatibility, level, lengthSizeMinusOne = 3, no SPS, no PPS.
-    avc1.extend(bmff_box(b"avcC", &[1, 0x64, 0, 0x28, 0xFF, 0xE0, 0]));
-    let mut stsd = 1u32.to_be_bytes().to_vec();
-    stsd.extend(bmff_box(b"avc1", &avc1));
     let stbl = bmff_box(
         b"stbl",
         &[
-            full_box(b"stsd", &stsd),
-            full_box(b"stsz", &stsz),
-            full_box(b"stsc", &stsc),
-            full_box(b"stco", &stco),
+            full_box(b"stsd", 0, &video_sample_entry(codec)),
+            full_box(b"stsz", 0, &stsz),
+            full_box(b"stsc", 0, &stsc),
+            full_box(b"stco", 0, &stco),
         ]
         .concat(),
     );
@@ -497,15 +530,175 @@ pub fn avc_video(opts: &AvcOptions) -> AvcVideo {
         b"mdia",
         &[bmff_box(b"hdlr", &hdlr), bmff_box(b"minf", &stbl)].concat(),
     );
-    let trak = bmff_box(b"trak", &[bmff_box(b"tkhd", &[0; 84]), mdia].concat());
-    let moov = bmff_box(b"moov", &[bmff_box(b"mvhd", &[0; 100]), trak].concat());
+    // tkhd version 0: version/flags (4), creation (4), modification (4), track_ID (4), ...
+    let mut tkhd = [0u8; 84];
+    tkhd[12..16].copy_from_slice(&track_id.to_be_bytes());
+    let trak = bmff_box(b"trak", &[bmff_box(b"tkhd", &tkhd), mdia].concat());
+    let mut body = [bmff_box(b"mvhd", &[0; 100]), trak].concat();
+    body.extend(mvex.unwrap_or_default());
+    bmff_box(b"moov", &body)
+}
 
-    let bytes = [ftyp, mdat, moov].concat();
-    let moov_at = data_at + payload.len();
-    AvcVideo {
-        mdat_payload: data_at..moov_at,
-        moov: moov_at..bytes.len(),
-        bytes,
+/// One movie fragment: `moof(mfhd(seq), traf(tfhd(track 1, default-base-is-moof), trun(data offset, sample sizes)))`
+/// for samples whose data follows in the next `mdat`'s payload.
+fn movie_fragment(seq: u32, sizes: &[u32]) -> Vec<u8> {
+    let build = |data_offset: u32| {
+        let mfhd = full_box(b"mfhd", 0, &seq.to_be_bytes());
+        let tfhd = full_box(b"tfhd", 0x02_0000, &1u32.to_be_bytes());
+        let mut trun = (sizes.len() as u32).to_be_bytes().to_vec();
+        trun.extend_from_slice(&data_offset.to_be_bytes());
+        sizes
+            .iter()
+            .for_each(|s| trun.extend_from_slice(&s.to_be_bytes()));
+        // Flags: data-offset-present (0x1), sample-size-present (0x200).
+        let trun = full_box(b"trun", 0x201, &trun);
+        let traf = bmff_box(b"traf", &[tfhd, trun].concat());
+        bmff_box(b"moof", &[mfhd, traf].concat())
+    };
+    // The data offset is from the start of the moof to the first sample, the payload of the mdat right after it.
+    let len = build(0).len() as u32;
+    build(len + 8)
+}
+
+/// A camera video. Each sample holds 1–3 length-prefixed NAL units (4-byte big-endian length, seeded random payload);
+/// sample sizes are in [2 KiB, 24 KiB] from `seed` (with `small_nals`, NAL payloads in [64, 448] bytes instead), then
+/// `mdat_pad` random bytes end the last `mdat`. Avc: `avc1` sample entry with an `avcC` (lengthSizeMinusOne = 3), NAL
+/// header `0x65` for the first sample of a chunk, else `0x41`. Hevc: `hvc1` sample entry with an `hvcC`
+/// (lengthSizeMinusOne = 3), NAL headers of 2 bytes (type 19 for the first sample of a chunk, else 1;
+/// `nuh_layer_id = 0`, `nuh_temporal_id_plus1 = 1`). A chunk is 4 samples (`stsc`), or a fragment's samples when
+/// fragmented. The NAL units are structurally valid and never decode as real video.
+///
+/// Non-fragmented layouts list the samples in `stsz`/`stsc`/`stco` (chunks back to back in one `mdat`) with a `tkhd` of
+/// track ID 0; the fragmented one has empty sample tables, a `tkhd` of track ID 1, an `mvex/trex` for track 1 and one
+/// `moof` (sequence numbers from 1) and `mdat` per fragment. `AvcVideo::moov` is the `moov` box wherever it is;
+/// `mdat_payload` the first `mdat`'s payload.
+pub fn camera_video(opts: &AvcOptions, codec: VideoCodec, layout: VideoLayout) -> AvcVideo {
+    let key_every = match layout {
+        VideoLayout::Fragmented {
+            samples_per_fragment,
+        } => {
+            assert!(samples_per_fragment > 0, "fragments hold samples");
+            samples_per_fragment
+        }
+        _ => 4,
+    };
+    let (key, other, header_len): (&[u8], &[u8], usize) = match codec {
+        VideoCodec::Avc => (&[0x65], &[0x41], 1),
+        // forbidden_zero_bit, nal_unit_type (6), nuh_layer_id (6), nuh_temporal_id_plus1 (3).
+        VideoCodec::Hevc => (&[19 << 1, 1], &[1 << 1, 1], 2),
+    };
+    let mut rng = SplitMix64(opts.seed);
+    let mut samples = Vec::new();
+    let mut sizes = Vec::with_capacity(opts.samples);
+    for i in 0..opts.samples {
+        let header = if i % key_every == 0 { key } else { other };
+        let nals = 1 + (rng.next() % 3) as usize;
+        let start = samples.len();
+        if opts.small_nals {
+            for _ in 0..nals {
+                let len = 64 + (rng.next() % 385) as usize;
+                push_nal(&mut samples, header, len, &mut rng);
+            }
+        } else {
+            let size = 2048 + (rng.next() % (22 * 1024 + 1)) as usize;
+            // Split the sample into `nals` units of about equal size (each unit: 4-byte length, header, payload).
+            let body = size - (4 + header_len) * nals;
+            for j in 0..nals {
+                let len = if j + 1 == nals {
+                    body - (nals - 1) * (body / nals)
+                } else {
+                    body / nals
+                };
+                push_nal(&mut samples, header, len, &mut rng);
+            }
+        }
+        sizes.push((samples.len() - start) as u32);
+    }
+    let mut pad = vec![0u8; opts.mdat_pad];
+    rng.fill(&mut pad);
+
+    let brand: &[u8; 4] = if opts.mov { b"qt  " } else { b"isom" };
+    let mut ftyp = brand.to_vec();
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(brand);
+    let ftyp = bmff_box(b"ftyp", &ftyp);
+
+    // Chunk offsets (absolute in the file) of samples back to back from `data_at`: every 4 samples.
+    let chunks_at = |data_at: usize| {
+        let mut chunks = Vec::new();
+        let mut off = data_at as u32;
+        for (i, &s) in sizes.iter().enumerate() {
+            if i % 4 == 0 {
+                chunks.push(off);
+            }
+            off += s;
+        }
+        chunks
+    };
+    let payload = [samples, pad.clone()].concat();
+    match layout {
+        VideoLayout::MoovAtEnd => {
+            let data_at = ftyp.len() + 8;
+            let moov = camera_moov(codec, &sizes, &chunks_at(data_at), 0, None);
+            let moov_at = data_at + payload.len();
+            let bytes = [ftyp, bmff_box(b"mdat", &payload), moov].concat();
+            AvcVideo {
+                mdat_payload: data_at..moov_at,
+                moov: moov_at..bytes.len(),
+                bytes,
+            }
+        }
+        VideoLayout::MoovFirst | VideoLayout::MoovFirstMdatSizeZero => {
+            // The chunk offsets are 32-bit whatever their value: the moov's length does not depend on them.
+            let moov_len = camera_moov(codec, &sizes, &chunks_at(0), 0, None).len();
+            let data_at = ftyp.len() + moov_len + 8;
+            let moov = camera_moov(codec, &sizes, &chunks_at(data_at), 0, None);
+            assert_eq!(moov.len(), moov_len);
+            let mut mdat = bmff_box(b"mdat", &payload);
+            if layout == VideoLayout::MoovFirstMdatSizeZero {
+                mdat[..4].copy_from_slice(&0u32.to_be_bytes());
+            }
+            let moov_at = ftyp.len();
+            let bytes = [ftyp, moov, mdat].concat();
+            AvcVideo {
+                mdat_payload: data_at..bytes.len(),
+                moov: moov_at..data_at - 8,
+                bytes,
+            }
+        }
+        VideoLayout::Fragmented {
+            samples_per_fragment,
+        } => {
+            // trex: track 1, sample description 1, default duration, size and flags 0.
+            let mut trex = 1u32.to_be_bytes().to_vec();
+            trex.extend_from_slice(&1u32.to_be_bytes());
+            trex.extend_from_slice(&[0; 12]);
+            let mvex = bmff_box(b"mvex", &full_box(b"trex", 0, &trex));
+            let moov = camera_moov(codec, &[], &[], 1, Some(mvex));
+            let moov_at = ftyp.len();
+            let mut bytes = [ftyp, moov].concat();
+            let moov_range = moov_at..bytes.len();
+            let mut first_payload = None;
+            let mut at = 0;
+            let fragments = sizes.chunks(samples_per_fragment).count();
+            for (f, frag) in sizes.chunks(samples_per_fragment).enumerate() {
+                let len = frag.iter().map(|&s| s as usize).sum::<usize>();
+                let mut data = payload[at..at + len].to_vec();
+                at += len;
+                if f + 1 == fragments {
+                    data.extend_from_slice(&pad);
+                }
+                bytes.extend(movie_fragment(f as u32 + 1, frag));
+                let data_at = bytes.len() + 8;
+                first_payload.get_or_insert(data_at..data_at + data.len());
+                bytes.extend(bmff_box(b"mdat", &data));
+            }
+            AvcVideo {
+                mdat_payload: first_payload.expect("a fragmented video holds samples"),
+                moov: moov_range,
+                bytes,
+            }
+        }
     }
 }
 

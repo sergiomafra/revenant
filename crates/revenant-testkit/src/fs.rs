@@ -29,6 +29,20 @@ pub enum DeleteStyle {
     Camera,
     /// As `Camera`, and the short entry's high cluster word set to 0 (as Windows does on FAT32).
     WindowsFat32,
+    /// exFAT: as `Camera` and every FAT entry of the chain set to 0 (a computer that clears the chain); FAT: same as
+    /// `Camera`.
+    ZeroChain,
+}
+
+/// How the builder picks free clusters for the files and directories it adds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Alloc {
+    /// The lowest free cluster (today's behavior): fills the first gap.
+    #[default]
+    FirstFit,
+    /// The first free cluster at or after the one after the last cluster allocated, wrapping to cluster 2 at the end
+    /// (a rotating pointer, as many cameras and FAT drivers do).
+    NextFree,
 }
 
 /// FAT/exFAT time stamp (2 s resolution); `utc_offset_min` is written only on exFAT (multiple of 15).
@@ -576,6 +590,10 @@ pub struct FsBuilder {
     owner: Vec<u32>,
     /// No free cluster below this one.
     first_free: u32,
+    /// The allocation policy for every later `add`/`mkdir`.
+    policy: Alloc,
+    /// `Alloc::NextFree`'s pointer: the cluster after the last one allocated (2 past the end).
+    next: u32,
     overrides: Vec<(u32, u32)>,
 }
 
@@ -598,6 +616,8 @@ impl FsBuilder {
             alloc: vec![false; n],
             owner: vec![0; n],
             first_free: 2,
+            policy: Alloc::FirstFit,
+            next: 2,
             overrides: Vec::new(),
         };
         match fs {
@@ -631,8 +651,11 @@ impl FsBuilder {
         self.geo.fs != FsType::Exfat
     }
 
-    /// The lowest free cluster (does not mark it).
+    /// The next free cluster by the allocation policy (does not mark it).
     fn take_free(&mut self) -> u32 {
+        if self.policy == Alloc::NextFree {
+            return self.pick(1)[0];
+        }
         let n = self.geo.count + 2;
         let mut c = self.first_free;
         while c < n && self.alloc[c as usize] {
@@ -641,6 +664,37 @@ impl FsBuilder {
         assert!(c < n, "volume full");
         self.first_free = c;
         c
+    }
+
+    /// `need` free clusters by the allocation policy, in allocation order (does not mark them).
+    fn pick(&self, need: usize) -> Vec<u32> {
+        let end = self.geo.count + 2;
+        let mut picked = Vec::with_capacity(need);
+        match self.policy {
+            Alloc::FirstFit => {
+                let mut c = self.first_free;
+                while picked.len() < need {
+                    assert!(c < end, "volume full");
+                    if !self.alloc[c as usize] {
+                        picked.push(c);
+                    }
+                    c += 1;
+                }
+            }
+            Alloc::NextFree => {
+                let mut c = self.next;
+                let mut seen = 0;
+                while picked.len() < need {
+                    assert!(seen < self.geo.count, "volume full");
+                    if !self.alloc[c as usize] {
+                        picked.push(c);
+                    }
+                    seen += 1;
+                    c = if c + 1 == end { 2 } else { c + 1 };
+                }
+            }
+        }
+        picked
     }
 
     /// Writes a FAT chain through `run`.
@@ -659,6 +713,13 @@ impl FsBuilder {
             );
             self.alloc[c as usize] = true;
             self.owner[c as usize] = id as u32 + 1;
+        }
+        if let Some(&last) = clusters.last() {
+            self.next = if last + 1 == self.geo.count + 2 {
+                2
+            } else {
+                last + 1
+            };
         }
         self.nodes[id].clusters.extend_from_slice(clusters);
         if fat_chain {
@@ -867,18 +928,7 @@ impl FsBuilder {
                 assert_eq!(c.len(), need, "{} bytes need {need} clusters", data.len());
                 c.to_vec()
             }
-            None => {
-                let mut picked = Vec::with_capacity(need);
-                let mut c = self.first_free;
-                while picked.len() < need {
-                    assert!(c < self.geo.count + 2, "volume full");
-                    if !self.alloc[c as usize] {
-                        picked.push(c);
-                    }
-                    c += 1;
-                }
-                picked
-            }
+            None => self.pick(need),
         };
         let contiguous = clusters.windows(2).all(|w| w[1] == w[0] + 1);
         // An empty file has no clusters: AllocationPossible only, first cluster 0, as real writers do.
@@ -898,7 +948,8 @@ impl FsBuilder {
         }
     }
 
-    /// `data` in the next free clusters (first fit, ascending); returns its clusters in file order. On exFAT a
+    /// `data` in the next free clusters by the allocation policy ([`FsBuilder::alloc`]; first fit, ascending, by
+    /// default); returns its clusters in file order. On exFAT a
     /// contiguous file is NoFatChain (an empty file: flags 0x01, first cluster 0, length 0). A name that is not an
     /// upper-case 8.3 name gets LFN entries (FAT; SFN "XXXXXX~1.EXT"). That includes a lower-case 8.3 name such as
     /// `a.jpg`: real Windows would write the SFN `A       JPG` with the NT case flags (byte 12) and no LFN; this builder
@@ -922,6 +973,14 @@ impl FsBuilder {
         self.add_file(dir, name.to_vec(), data, None)
     }
 
+    /// The allocation policy of every later `add`, `add_utf16`, `mkdir` and directory growth (default
+    /// [`Alloc::FirstFit`]). `add_at` places a file where it is told, and moves the `NextFree` pointer past its last
+    /// cluster like any other allocation.
+    pub fn alloc(&mut self, a: Alloc) -> &mut Self {
+        self.policy = a;
+        self
+    }
+
     /// Default 2025-12-14 07:12:04 for both.
     pub fn stamp(&mut self, path: &str, created: FsStamp, modified: FsStamp) -> &mut Self {
         let id = self.find(path);
@@ -931,7 +990,8 @@ impl FsBuilder {
     }
 
     /// Camera: FAT ← 0xE5 on byte 0 of the SFN and its LFN entries, chain entries ← 0; exFAT ← InUse bits cleared,
-    /// bitmap bits cleared, FAT entries kept. WindowsFat32: as Camera and the SFN's high cluster word ← 0.
+    /// bitmap bits cleared, FAT entries kept. WindowsFat32: as Camera and the SFN's high cluster word ← 0. ZeroChain:
+    /// as Camera, and on exFAT the FAT entries of the chain ← 0 too.
     /// A directory: its entries first (recursively), then itself. The deleted entries keep their directory slots for
     /// good (the builder never reuses them), and their freed clusters go back to the allocator.
     pub fn delete(&mut self, path: &str, style: DeleteStyle) -> &mut Self {
@@ -957,7 +1017,7 @@ impl FsBuilder {
         for &c in &clusters {
             if self.owner[c as usize] == id as u32 + 1 {
                 self.release(c);
-                if self.fat_like() {
+                if self.fat_like() || style == DeleteStyle::ZeroChain {
                     self.fat[c as usize] = 0;
                 }
             }
