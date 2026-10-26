@@ -9,7 +9,9 @@ use std::process::Command;
 
 use revenant_testkit::fs::{DeleteStyle, FsBuilder, FsStamp, FsType, Partitioning, disk};
 use revenant_testkit::jpeg;
-use revenant_testkit::os_fs::{OsFs, OsImage, OsLayout, available, fsck, with_raw_mounted};
+use revenant_testkit::os_fs::{
+    OsFs, OsImage, OsLayout, available, fsck, temp_dir, with_raw_mounted,
+};
 
 const MIB: usize = 1 << 20;
 
@@ -83,7 +85,7 @@ fn builder_images_mount_on_macos() {
             &volume,
             len + 4 * MIB,
         );
-        let dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir();
         let path = dir.path().join("card.img");
         std::fs::write(&path, &image).unwrap();
 
@@ -189,7 +191,7 @@ fn exfat_utc_offset_is_honoured() {
     }
     let volume = b.build();
     let image = disk(Partitioning::Mbr { first_lba: 2048 }, &volume, 20 * MIB);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir();
     let path = dir.path().join("card.img");
     std::fs::write(&path, &image).unwrap();
     with_raw_mounted(&path, |m| {

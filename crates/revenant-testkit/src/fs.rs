@@ -222,7 +222,9 @@ impl Geo {
         geo
     }
 
-    /// The geometry of an existing volume, from its own boot sector.
+    /// The geometry of an existing volume, from its own boot sector. A boot sector is taken as exFAT by bytes 3..11 being
+    /// `EXFAT   `: that field is the exFAT specification's FileSystemName (§3.1.2), which must hold exactly that, not a
+    /// free OEM name as on FAT.
     fn read(v: &[u8]) -> Geo {
         assert!(v.len() >= 512, "no boot sector");
         let u16_at = |at: usize| u16::from_le_bytes([v[at], v[at + 1]]) as u64;

@@ -19,18 +19,28 @@ from the page cache, against 22 and 158 MB/s before, faster than an SD card read
 disks, and after a quick format through the old folders) to bring back deleted photos and videos with their original names, folders
 and dates, tells a file the file system lists apart from the same photo found by its signature (each photo comes out
 once), gives files without a name a readable one (`2025-12-14_07-12-05_ILCE-7M4.JPG`), and groups the results by
-session, day, camera and folder. It is tested against real camera files as well as synthetic ones. More engine work
-comes next (reading cards directly), then a graphical app.
+session, day, camera and folder. It also reads a card or disk directly, on Mac and Windows, read-only: it lists the
+connected disks, refuses the one holding the system, unmounts the card without ejecting it, checks everything it already
+knows to be wrong before a long read (permission, a disk that does not answer, room for a copy), copies a failing card into
+an image with a rescue map that tolerates bad sectors and can be resumed, warns early when a card is failing, and saves a
+scan so it resumes with the same results after a crash or a pulled cable. It is tested against real camera files as well
+as synthetic ones and, optionally, against disk images attached to the computer. A graphical app comes next.
 
 ## Trying the engine (developers)
 
 ```sh
 cargo build --release -p revenant-dev
 target/release/revenant-dev scan card.img --extract ~/recovered
+target/release/revenant-dev disks                               # the connected disks
+sudo target/release/revenant-dev scan disk4 --extract ~/recovered   # a card read directly (macOS)
 ```
 
-This prints one JSON line per finding, with its photo details and preview. See
-[crates/revenant-dev](crates/revenant-dev/README.md) for the output format and how to make a read-only image of a card.
+This prints one JSON line per finding, with its photo details and preview. It reads a disk image file or a whole card
+directly, read-only (as root on macOS, from a terminal run as administrator on Windows: `revenant-dev scan
+PhysicalDrive2`); do not open the card in Finder or Explorer meanwhile. It can also copy a failing card into an image
+with a rescue map (`revenant-dev copy disk4 card.img`) and save a scan to resume it later (`--session`). See
+[crates/revenant-dev](crates/revenant-dev/README.md) for the output format, reading a card directly, copying a card and
+saved scans.
 
 ## License
 

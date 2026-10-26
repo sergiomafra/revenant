@@ -952,3 +952,64 @@ fn probe_keeps_a_volume_whose_fat_is_where_it_says() {
         )]
     );
 }
+
+/// `volume` (4096-byte sectors) at LBA 256 of a 4096-byte-sector MBR (1 MiB), plus a second entry of the same type
+/// at LBA `256 + back`, read with 4096-byte sectors: the volume's own backup boot sector (sector 6 of a FAT32, the
+/// backup region at 12 of an exFAT).
+fn with_an_entry_on_its_backup(volume: &[u8], kind: u8, back: u32) -> Vec<u8> {
+    let mut d = vec![0u8; 24 * MIB];
+    entry(&mut d[..512], 0, kind, 256, 4096);
+    entry(&mut d[..512], 1, kind, 256 + back, 4096 - back);
+    sign(&mut d[..512]);
+    d[MIB..MIB + volume.len()].copy_from_slice(volume);
+    d
+}
+
+/// 1.4 T3: an MBR candidate read with 4096-byte sectors that lands on the backup boot sector of a 4K volume already
+/// found is that volume again, not a second one.
+#[test]
+fn no_ghost_volume_from_a_4k_backup_boot_sector() {
+    for (fs, volume, kind, back) in [
+        (FsKind::Fat32, fat32_4k(), 0x0C, 6),
+        (FsKind::Exfat, exfat_4k(), 0x07, 12),
+    ] {
+        let d = with_an_entry_on_its_backup(&volume, kind, back);
+        assert_eq!(
+            found_quickly(&d),
+            [expected_4k(fs, MIB as u64, Scheme::Mbr)],
+            "{fs:?}"
+        );
+    }
+}
+
+/// A 4K exFAT whose primary boot sector is gone is read from its backup region (sector 12 of 4096 bytes).
+#[test]
+fn backup_boot_of_a_4k_exfat_is_found() {
+    let mut d = with_an_entry_on_its_backup(&exfat_4k(), 0x07, 12);
+    d[MIB..MIB + 512].fill(0);
+    let mut want = expected_4k(FsKind::Exfat, MIB as u64, Scheme::Mbr);
+    want.from_backup = true;
+    assert_eq!(found_quickly(&d), [want]);
+}
+
+/// Reads one `volumes` call makes on a typical card (FAT32 at LBA 8192), measured when it was pinned (ruling C20).
+const TYPICAL_CARD_READS: u64 = 8;
+
+/// What a typical card costs: a pinned number of reads, so a change that reads more shows up here.
+#[test]
+fn typical_card_reads_few_sectors() {
+    let b = FsBuilder::new(FsType::Fat32, 48 * MIB as u64, 512);
+    let d = disk(Partitioning::Mbr { first_lba: 8192 }, &b.build(), 56 * MIB);
+    let (_file, inner) = source(&d);
+    let src = Counting {
+        inner,
+        reads: AtomicU64::new(0),
+        bytes: AtomicU64::new(0),
+    };
+    assert_eq!(volumes(&src).len(), 1);
+    let reads = src.reads.into_inner();
+    assert!(
+        reads <= TYPICAL_CARD_READS,
+        "{reads} reads (pinned at {TYPICAL_CARD_READS})"
+    );
+}

@@ -39,6 +39,33 @@ jobs:
       - name: Test (release)
         run: cargo test --release -p revenant-core
 
+  # Opt-in: the engine against a real \\.\PhysicalDriveN backed by a fixed VHD that the test itself creates with
+  # diskpart in its temp dir (the runner is Administrator). The test detaches the VHD in a drop guard; the last step
+  # detaches anything a crash left behind, found by the test's own folder name (never another disk).
+  windows-devices:
+    name: real devices (Windows VHD)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test against a VHD
+        run: cargo test -p revenant-core --test os_devices_windows -- --ignored --test-threads=1 --nocapture
+        env:
+          REVENANT_OS_DEV: 1
+      - name: Detach leftover VHDs
+        if: always()
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path $env:TEMP -Directory -Filter 'revenant-vhd-*' -ErrorAction SilentlyContinue | ForEach-Object {
+            $vhd = Join-Path $_.FullName 'card.vhd'
+            if (Test-Path $vhd) {
+              $script = Join-Path $env:RUNNER_TEMP 'detach.txt'
+              Set-Content -Path $script -Value "select vdisk file=`"$vhd`"`r`ndetach vdisk"
+              diskpart /s $script
+              Write-Host "detached (or was not attached): $vhd"
+            }
+          }
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

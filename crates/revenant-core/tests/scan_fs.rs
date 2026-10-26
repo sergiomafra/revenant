@@ -1143,3 +1143,58 @@ fn bad_sector_in_an_earlier_piece_lowers_a_listed_file() {
         );
     }
 }
+
+/// 1.4 T7: a deleted file whose first cluster lies inside an `Intact` finding's range (a skip range) is merged without
+/// the carving at its start, even when that carving would win: its placement stays `Guessed`, never `Carved`.
+#[test]
+fn carving_at_a_skipped_start_is_not_merged() {
+    // A Motion-JPEG MOV whose second chunk (one sector in) is a JPEG frame: `Intact`, the frame being its own data.
+    let frame = jpeg_smooth(256, 192, 5);
+    let mut payload = vec![0x11u8; 484];
+    payload.extend_from_slice(&frame);
+    payload.resize(payload.len() + 3000, 0x22);
+    let mov = revenant_testkit::mp4_with(
+        &Mp4Options {
+            mdat_len: 0,
+            moov_at_end: true,
+            mov: true,
+            mdat_64bit: false,
+        },
+        b"mjpa",
+        &payload,
+        &[0, 484],
+    );
+    assert_eq!(
+        &mov[512..515],
+        &[0xFF, 0xD8, 0xFF],
+        "the frame starts one sector in"
+    );
+    // A deleted DSC00002.JPG of the frame's size at the frame's sector (cluster X + 1). One cluster in the middle of
+    // its span is allocated in the FAT with no owner (lost), so the guess skips it: a placement worse than the carving.
+    let x = 50_000u32;
+    let n = frame.len().div_ceil(512) as u32;
+    let mut b = card();
+    sibling(&mut b);
+    let path = format!("{DIR}/DSC00002.JPG");
+    b.add_at(&path, &frame, &(x + 1..x + 1 + n).collect::<Vec<_>>());
+    b.delete(&path, DeleteStyle::Camera);
+    b.set_fat(x + 4, 0x0FFF_FFFF);
+    let mut img = placed(&b);
+    img[at(&b, x)..at(&b, x) + mov.len()].copy_from_slice(&mov);
+    let ev = events(&img);
+    let movie = founds(&ev)
+        .into_iter()
+        .find(|f| f.start == at(&b, x) as u64)
+        .expect("the MOV");
+    assert_eq!(
+        (movie.kind, movie.health, movie.len),
+        (FileKind::Mov, Health::Intact, mov.len() as u64)
+    );
+    let f = named(&ev, &path);
+    let o = f.origin.as_ref().unwrap();
+    assert_eq!(
+        (o.state, o.placement),
+        (FsState::Deleted, Placement::Guessed),
+        "{f:?}"
+    );
+}

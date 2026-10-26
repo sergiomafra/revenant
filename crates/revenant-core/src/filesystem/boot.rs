@@ -53,6 +53,18 @@ pub(super) fn valid(sector: &[u8]) -> bool {
     fields(sector).is_some()
 }
 
+/// The bytes of a FAT or exFAT boot sector the system rewrites while the volume is mounted (ruling D7): FAT12/16 byte
+/// 37 and FAT32 byte 65 (the dirty flags of `BS_Reserved1`), exFAT bytes 106, 107 (`VolumeFlags`) and 112
+/// (`PercentInUse`). Empty for anything else.
+pub(super) fn volatile_bytes(sector: &[u8]) -> &'static [usize] {
+    match fields(sector).map(|b| b.fs) {
+        Some(FsKind::Fat12 | FsKind::Fat16) => &[37],
+        Some(FsKind::Fat32) => &[65],
+        Some(FsKind::Exfat) => &[106, 107, 112],
+        None => &[],
+    }
+}
+
 fn fields(s: &[u8]) -> Option<Boot> {
     if s.len() < 512 || s[510..512] != [0x55, 0xAA] {
         return None;

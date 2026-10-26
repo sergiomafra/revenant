@@ -1,7 +1,8 @@
 # revenant-dev
 
 Developer command line for the Revenant engine (`revenant-core`). It is a tool for developers and testers, **not** the
-end-user app (that comes later, with a graphical interface). It reads its source read-only.
+end-user app (that comes later, with a graphical interface). It reads its source read-only: a disk image file, or a
+whole card or disk read directly.
 
 ## Build
 
@@ -13,23 +14,50 @@ cargo build --release -p revenant-dev
 ## Usage
 
 ```sh
-revenant-dev scan <IMAGE> [--extract <DIR>] [--previews <DIR>] [--allow-same-volume] [--threads N] [--group session|day|camera|folder]
+revenant-dev scan <SOURCE> [--extract <DIR>] [--previews <DIR>] [--session <DIR>] [--allow-same-volume] [--no-unmount] [--threads N] [--group session|day|camera|folder]
+revenant-dev disks
+revenant-dev preflight <DISK> [--copy-to <IMAGE>] [--session <DIR>] [--no-unmount]
+revenant-dev unmount <DISK>
+revenant-dev remount <DISK>
+revenant-dev copy <SOURCE> <IMAGE> [--retries N] [--no-unmount] [--allow-same-volume]
+revenant-dev digest <SOURCE>
 ```
 
-- `<IMAGE>`: a disk image file (scanning devices directly comes in a later part).
+Every command prints JSON lines on stdout, progress and hints on stderr. A fatal error prints `error: <code>` on stderr
+and exits with 1; `preflight` and `copy` exit with 2 when the pre-flight check found issues.
+
+- `<SOURCE>`: a disk image file, or a whole disk: `disk4` (also `/dev/disk4`, `/dev/rdisk4`) on macOS, `PhysicalDrive2`
+  (also `\\.\PhysicalDrive2`) on Windows (see [Reading a card directly](#reading-a-card-directly)). A bare whole-disk
+  name means the disk, but while something of that name sits in the current folder it is ambiguous and refused
+  (`open_failed`, with a hint on stderr): write the device path (`/dev/rdisk4`, `\\.\PhysicalDrive2`) for the disk or
+  `./disk4` for the file. A partition or any other device node
+  (`disk4s1`, `/dev/disk4s1`, `/dev/null`, `\\.\E:`, `\\?\Volume{…}`) is refused with `not_whole_disk`, even when it
+  exists: read as a file it would not be known as part of the card, so nothing would keep the extraction, the copy or
+  the session off the card. Name the whole disk instead. A Windows long path to a file (`\\?\C:\…`,
+  `\\?\UNC\server\share\…`) is a file path and is accepted; `/` counts as `\` in these prefixes. A file SOURCE must be
+  a regular file (links followed): on macOS and Linux a link into `/dev` is `not_whole_disk`; a FIFO, socket, folder or
+  any other node is `open_failed` (the engine checks the opened file again, so a node swapped in meanwhile is refused
+  too). The same rules hold for `copy` and
+  `digest`. An image file with its rescue map beside it (`<SOURCE>.rvmap`, written by `copy`) is read through
+  the map (see [Copying a card](#copying-a-card)).
 - `--extract <DIR>`: copies each finding into `<DIR>` as soon as it is found, under its original name when the file
   system listed one, else `YYYY-MM-DD_HH-MM-SS[_<camera>].<EXT>` from its details, else `revenant_<start as 12 hex digits>.<ext>`
   (`_2`, `_3`… if the name exists; see "Names" in the core README). `<DIR>` must already exist and be a folder;
-  otherwise the command stops before scanning with `error: open_failed` (exit 1). The engine refuses to extract onto the
-  source's own volume (error `destination_on_source`, exit 1), so use a folder on another disk.
+  otherwise the command stops before scanning with `error: open_failed` (exit 1). The folder is checked once, before
+  scanning, against the source: never on an image file's own volume, and, for a disk, never on any volume of that disk
+  (`destination_on_source`, exit 1) nor on a folder whose disks the system cannot tell (`destination_unknown`), so use
+  a folder on another disk. Every file is then written only into that checked folder.
 - `--previews <DIR>`: writes each finding's embedded preview JPEG (the one in the `preview` field) into `<DIR>` as
   `<stem of the file's name>.preview.jpg` (`DSC01235.ARW` gives `DSC01235.preview.jpg`; `_2`, `_3`… if the name exists; never overwrites), the same naming as
   `--extract`, so a file and its preview sit side by side. Same folder rules as `--extract`: `<DIR>` must exist
   (`open_failed` otherwise) and must not be on the source's volume (`destination_on_source`, exit 1, checked before
   scanning).
+- `--session <DIR>`: saves the scan into `<DIR>` (created when absent), or resumes the scan saved there; see
+  [Saved scans](#saved-scans). Same folder rules as `--extract`.
 - `--allow-same-volume`: **developer only: use when scanning an image FILE, never a card.** Treats the source's volume as
-  unknown, so extraction (and previews) onto the same volume is allowed. Tests use it because the image and the output folder live in the
-  same temporary directory.
+  unknown, so extraction, previews and the session onto the same volume are allowed. Tests use it because the image and
+  the output folder live in the same temporary directory. Refused for a disk (`destination_on_source`).
+- `--no-unmount`: reads a disk with its volumes mounted (by default they are unmounted first; see below).
 - `--threads N`: threads that measure candidate files (default 0 = one per core, at most 16; 1 = measure on the scan
   thread; capped at 64). The output is identical for any value.
 - `--group session|day|camera|folder`: after the last `found`/`updated` line and before `summary`, prints one line per
@@ -75,6 +103,13 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   ```
 
   Files found by the byte scan alone carry none of these keys, and lines without them are exactly as before.
+- A card with many unreadable sectors early on gets one `disk_failing` line, right after the scan reaches the first block
+  where the `unreadable` lines so far add up to 16 runs or 4 MiB (`read`: bytes scanned at that point). It means: stop
+  and make an image of the card first (see "Making a card image" below), then scan the image.
+
+  ```json
+  {"event":"disk_failing","unreadable_runs":16,"unreadable_bytes":8192,"read":5242880}
+  ```
 - `kind`: `jpeg`, `mp4`, `mov`, `cr2`, `nef`, `arw`, `dng`, `orf`, `rw2`, `raf`, `cr3`, `heic` or `tiff`.
   `health`: `intact`, `partial` or `damaged`.
 - `health` follows the engine: a file containing unreadable sectors is never `intact`. Files inside a `partial` or
@@ -109,19 +144,72 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
 - With `--extract`, a `found` line gets `"file":"<path>"`. If extracting that one finding fails (for example
   `write_failed` when the folder is not writable), it gets `"error":"<code>"` instead and the scan continues.
 - With `--previews`, a `found` line that has a `preview` gets `"preview_file":"<path>"`, or `"preview_error":"<code>"`
-  (`read_failed`, `write_failed`) if writing that preview failed; the scan continues.
+  (`read_failed`, `write_failed`) if writing that preview failed; the scan continues. As with `--extract`, a card gone
+  while its preview is read (`device_gone`, a read coming back short included) or the folder no longer where it was
+  checked (`destination_on_source`) stops the scan instead (with `--session`, the scan waits for the card to come back).
 - Fatal errors print `error: <code>` to stderr and exit with 1 (for example `open_failed`, `destination_on_source`).
+- Reading a disk: an `unmount` line comes first, `{"event":"unmount","disk":"disk4","held":0}` (`held`: the volume locks
+  kept while reading, always 0 on macOS), or, when the unmount failed,
+  `{"event":"unmount","disk":"disk4","error":"unmount_failed","volumes":["disk4s1"]}` with the volumes still mounted; the
+  scan then goes on with them mounted (the system may write to them). stderr ends with how to remount.
+- Reading an image with its rescue map: a first line `{"event":"map","rescued":15990784,"unrescued":786432}` (bytes);
+  every byte the copy did not rescue reads as unreadable (an `unreadable` line), never as zeros, and no file touching
+  it is `intact`.
+- With `--session`, the lines a resumed scan replays from the saved scan carry `"replayed":true` (and no `file` or
+  `preview_file`: they were written by the run that found them); the summary and `group` lines never do.
+- The progress line on stderr also shows the reading speed and the time left: `scanned 42% (… of … bytes), 85.3 MB/s,
+  ETA 3m12s`.
+
+Other commands:
+
+- `disks`: one line per connected whole disk (sorted by id); `vendor`, `model`, `serial` and a volume's `fs`, `label` and
+  `mount_point` are left out when the system does not know them, `solid_state` is `null` when it does not say:
+
+  ```json
+  {"event":"disk","id":"disk4","size":63864569856,"logical_sector":512,"physical_sector":512,"vendor":"Generic","model":"SD Card Reader","serial":"000000000820","removable":true,"internal":false,"system":false,"virtual":false,"solid_state":null,"volumes":[{"id":"disk4s1","fs":"exfat","label":"CARD","mount_point":"/Volumes/CARD","size":63847792640}]}
+  ```
+- `preflight <DISK> [--copy-to <IMAGE>] [--session <DIR>] [--no-unmount]`: the pre-flight check (see "Pre-flight check"
+  in the core README): permission, the disk answering (first, middle and last sector, 10 s each at most), the unmount
+  (unless `--no-unmount`; the disk stays unmounted), the copy's destination (`--copy-to` is the image FILE: its folder is
+  checked, its map is `<IMAGE>.rvmap`) and a session to resume. One line; exit 2 when `issues` is not empty:
+
+  ```json
+  {"event":"preflight","disk":"disk4","issues":[{"code":"destination_too_small","need":63864569856,"free":10737418240}]}
+  ```
+
+  Issue codes: `permission_denied`, `device_not_found`, `system_disk`, `open_failed`, `device_not_responding` and
+  `sample_unreadable` (with `offset`), `unmount_failed` (with `volumes`), `destination_too_small` (`need`, `free`),
+  `destination_on_source`, `destination_unknown`, `destination_file_too_large` (`limit`), `session_other_source`,
+  `session_corrupt`.
+- `unmount <DISK>`: `{"event":"unmount","disk":"disk4","held":0}`; `remount <DISK>`: `{"event":"remount","disk":"disk4"}`.
+- `copy <SOURCE> <IMAGE>`: `copy_progress` lines (one each time the pass or the percent of `pos` changes), a
+  `copy_bad` line per region marked bad, then the summary (bytes in each state):
+
+  ```json
+  {"event":"copy_progress","pass":"fast","pos":1048576,"untried":63863521280,"rescued":1048576,"to_trim":0,"to_scrape":0,"bad":0,"bytes_per_sec":41943040,"eta_secs":1523}
+  {"event":"copy_bad","start":52428800,"len":512}
+  {"event":"copy_summary","untried":0,"rescued":63864569344,"to_trim":0,"to_scrape":0,"bad":512,"complete":true}
+  ```
+
+  `pass`: `fast`, `skipped`, `trim`, `scrape`, `retry` (with `"retry":N`) or `done`; `eta_secs` is left out until known.
+- `digest <SOURCE>`: `{"event":"digest","bytes":63864569856,"fnv64":"8f3c2a91d04e5b67","unreadable_bytes":0}`: the
+  FNV-1a 64 of every byte (16 hex digits), sectors that cannot be read hashed as zeros and counted. A file is read
+  plainly (a map beside it is not used), a disk directly (not unmounted). Compare a card with its copy: equal digests
+  and no unreadable bytes mean an identical copy.
 
 ## Benchmark
 
 ```sh
-cargo run --release -p revenant-dev -- bench [--size-mib N=1024] [--runs N=3] [--images a,b,..=all] [--dir DIR=temp] [--threads N=0]
+cargo run --release -p revenant-dev -- bench [--size-mib N=1024] [--runs N=3] [--images a,b,..=all] [--dir DIR=temp] [--threads N=0] [--session]
 ```
 
 Writes each synthetic image into a fresh temp dir under `--dir`, scans it `--runs` times and prints one JSON line per image
 (`image`, `bytes`, `placed` = files put in the image, `found` = findings of the best run, `threads` = the measuring
-threads actually used (`--threads 0` resolves to one per core, at most 16), `runs`, `best_seconds`, `mb_per_s` with
-MB = 10^6 bytes). The temp files are removed at the end. Always measure with a release build.
+threads actually used (`--threads 0` resolves to one per core, at most 16), `runs`, `session`, `best_seconds`,
+`mb_per_s` with MB = 10^6 bytes). With `--session`, each image is then scanned `--runs` times more through a saved
+session (a new one each time, in a fresh folder of the temp dir, default checkpoint cadence: every 256 MiB or 30 s) and
+a second line with `"session":true` follows the plain one (`"session":false`); its time includes creating the session.
+The temp files are removed at the end. Always measure with a release build.
 
 Images (files go back to back, each at the next 512-byte boundary, the rest is seeded noise):
 
@@ -145,41 +233,89 @@ Compare only runs of the same `--size-mib`; the baseline is 1024 MiB. `--runs 1`
 can overlap the writeback of the image. The `dense-jpeg` images are noise-encoded (about 11 MB per 3000x2000 file, more
 entropy than real photos), so cross-check final speed claims with the real samples.
 
+## Reading a card directly
+
+`scan`, `copy` and `digest` read a whole card or disk directly, read-only, which needs root on macOS and Administrator
+on Windows:
+
+```sh
+revenant-dev disks                                   # find the card: removable, the right size, not "system"
+sudo revenant-dev scan disk4 --extract ~/recovered   # macOS
+```
+
+On Windows, open a terminal with "Run as administrator", then `revenant-dev disks` and
+`revenant-dev scan PhysicalDrive2 --extract D:\recovered`.
+
+- **Do not open the card in Finder or Explorer, and stop using it** (no camera, no copying files) until the recovery is
+  over: every write to it can overwrite a deleted photo.
+- Before reading, the card's volumes are **unmounted, not ejected**, so the system stops writing to it while it stays
+  connected (`unmount` line; `--no-unmount` reads it mounted). Revenant never mounts it again by itself: run
+  `revenant-dev remount disk4` when done (stderr says so). On Windows the volumes are locked while the command runs and
+  Windows may mount them again once it ends.
+- The disk holding the running system is refused (`system_disk`). `--extract`, `--previews` and `--session` are checked
+  once, before anything is read, against the whole card: a folder on any of its volumes is refused
+  (`destination_on_source`), and so is one whose disks the system cannot tell (`destination_unknown`, a network folder
+  for example). `--allow-same-volume` is refused for a disk.
+- A bad sector is read once, at the card's physical sector size. Many unreadable sectors early on give a
+  `disk_failing` line: stop and copy the card first ([Copying a card](#copying-a-card)).
+- If the card is disconnected (a loose cable, the computer sleeping) during a scan with `--session`, stderr asks to plug
+  it back in; the scan waits (checking every half second), finds the same card again even under another disk name
+  (another card is never taken for it), unmounts it again and goes on in the same session. The system may write to the
+  card in the short window between plugging it in and that unmount. The card found again is always unmounted, even
+  with `--no-unmount` (the safer direction). Without `--session` the scan stops with `error: device_gone`.
+
+## Copying a card
+
+A failing card should be copied once, then scanned from the copy. `copy` writes an image file and its rescue map
+(`<IMAGE>.rvmap`): the readable parts first, the damaged areas skipped and come back to later, sector by sector, each bad
+sector read once.
+
+```sh
+sudo revenant-dev preflight disk4 --copy-to /Volumes/Backup/card.img   # optional: everything known to be wrong, at once
+sudo revenant-dev copy disk4 /Volumes/Backup/card.img                   # the image's folder must not be on the card
+revenant-dev scan /Volumes/Backup/card.img --extract ~/recovered          # read through its map
+revenant-dev remount disk4                                                # when done with the card
+```
+
+- `copy` with a disk first checks the image's folder against the whole card (`destination_on_source` or
+  `destination_unknown`, exit 1, with the card still mounted and untouched), then runs the pre-flight check (unmounting
+  unless `--no-unmount`) and, if it finds any issue (no
+  permission, a card that does not answer, a destination on the card, without room for the whole card, or on FAT32 for
+  a card over 4 GiB), prints the `preflight` line and exits with 2 before writing anything.
+- Interrupted (a crash, Ctrl-C, the card pulled out), the same command resumes from the map; pulling the card out never
+  marks sectors bad. A map made from another card is refused (`map_other_source`).
+- `--retries N` reads each bad sector up to N more times at the end (default 0, so a dying card is not hammered); it
+  can be asked on a later run of the same copy.
+- Scanning the image: with its map beside it, what the copy did not rescue is unreadable, never zeros (`map` line, see
+  Output); without the map, those zeros would look like data.
+- `copy` of an image file works the same (a copy of a copy, or tests); `--allow-same-volume` lets the new image go onto
+  the source image's volume.
+- `revenant-dev digest disk4` and `revenant-dev digest card.img` compare the copy with the card.
+
+## Saved scans
+
+`--session <DIR>` saves the scan into a folder of its own (created when absent; the same rules as `--extract`, so never
+on the card), so it can be taken up again after Ctrl-C, a crash, a pulled cable or a power loss:
+
+```sh
+sudo revenant-dev scan disk4 --session ~/scans/card1 --extract ~/recovered
+# … interrupted; later, the same command:
+sudo revenant-dev scan disk4 --session ~/scans/card1 --extract ~/recovered
+```
+
+The resumed run first prints the lines saved so far, each with `"replayed":true` (not extracted again), then scans on
+from the last checkpoint (every 256 MiB or 30 s): the whole output is the uninterrupted scan's. Running it on a finished
+scan only prints its results again. A session made from another card (or from a copy whose image changed) is refused
+(`session_other_source`). Sessions also work for image files (`revenant-dev scan card.img --session …`).
+
 ## Making a card image (read-only)
 
-Work on an image of the card, not on the card itself. Imaging only reads from the card. Revenant cannot make the image
-yet (its own bad-sector-tolerant copy comes in a later part); until then we recommend
-[GNU ddrescue](https://www.gnu.org/software/ddrescue/), an external tool (GPL, installed separately, not part of
-Revenant). It copies the easily readable areas first and comes back to the areas around bad sectors at the end, leaves
-only the sectors it could not read as zeros (so every other byte stays at its offset), and keeps a map file, so an
-interrupted copy resumes where it stopped. Do not use `dd bs=4m conv=noerror,sync`: it replaces the whole 4 MiB block
-around each bad sector with zeros.
-
-macOS:
-
-**Double-check the device name with `diskutil list` before running `ddrescue`, and never swap the two paths: the second
-one is written to.**
-
-```sh
-diskutil list                          # find the card: /dev/diskN
-diskutil unmountDisk /dev/diskN        # unmount without ejecting
-sudo ddrescue /dev/rdiskN card.img card.map
-```
-
-Replace `N` with the card's number. `card.img` (and `card.map`) must be on a different disk than the card, with enough
-free space. `/dev/rdiskN` is the raw device, which already bypasses the system's cache. On Linux, the same copy is
-`sudo ddrescue -d /dev/sdX card.img card.map` (`-d`: direct disc access, bypassing the cache). Running the same command
-again with the same map file resumes an interrupted copy; adding `-r3` retries the unreadable sectors up to three more
-times.
-
-Windows: use a read-only imaging tool (for example FTK Imager, which can create a raw image of a physical drive) rather than
-`dd`, and save the image to a different drive than the card.
-
-Then:
-
-```sh
-revenant-dev scan card.img --extract ~/recovered --allow-same-volume   # only if ~/recovered is on the same disk as card.img
-```
+Work on an image of the card, not on the card itself, when the card is failing or will be scanned more than once. Make it
+with `revenant-dev copy` ([Copying a card](#copying-a-card)): it only reads from the card, copies the readable areas first
+and the areas around bad sectors at the end, reads each bad sector once, and keeps a map, so an interrupted copy resumes
+where it stopped and a scan of the image knows which parts were never rescued. External tools such as `dd` or GNU
+ddrescue are no longer needed (and `dd bs=4m conv=noerror,sync` replaces the whole block around each bad sector with
+zeros, which then look like data).
 
 ## Checking against real file systems (macOS, opt-in)
 
@@ -212,6 +348,45 @@ REVENANT_OS_FS=1 cargo test -p revenant-core --test os_filesystems -- --ignored 
 It checks that every live file is found once with its path, `Intact` and extracting to the bytes written, and that each
 deleted photo whose clusters were not reused is found `Deleted` and `Intact`. Run it with `--test-threads=1`: every image's
 volume is named `RVT`, so two mounted at once would clash.
+
+## Checking against real devices (opt-in)
+
+Two opt-in tests in the engine read real device nodes that are backed by synthetic images, never a physical disk:
+
+```sh
+# macOS: images that hdiutil creates and attaches, read as /dev/rdiskN
+REVENANT_OS_DEV=1 cargo test -p revenant-core --test os_devices -- --ignored --test-threads=1 --nocapture
+# Windows, as Administrator: a VHD that diskpart creates and attaches, read as \\.\PhysicalDriveN
+REVENANT_OS_DEV=1 cargo test -p revenant-core --test os_devices_windows -- --ignored --test-threads=1 --nocapture
+```
+
+- `os_devices` (macOS) has macOS format an exFAT card and a FAT32 card (64 MiB, MBR) with `hdiutil create`, writes
+  photos, a RAW and a video into `DCIM/100TEST` and deletes one photo, then attaches the card **read-write** (so any write
+  by the engine would show in the image) next to a second image of the other file system that holds the copy and the
+  session. Through `SystemDevices` it lists the disk (virtual, 64 MiB, mounted), refuses a destination on the card's
+  volume, unmounts it without ejecting, hashes the whole device, runs the pre-flight check (no issues), scans the device
+  and compares every event with a scan of the image's own bytes, copies it (cancelled after the first progress, then
+  resumed from its saved map) to exactly those bytes, runs a session cancelled at its middle event and resumes it to the
+  same events, hashes the device again (unchanged), and remounts it. It prints the device's and the file's read speed.
+- `os_devices_windows` (Windows) has `diskpart` create a fixed 64 MiB VHD in the test's temp dir, attach it, make an MBR
+  FAT32 volume labelled `RVT` and give it a drive letter, and writes four photos through that letter (one deleted). It
+  finds the disk number from the VHD's own path (`detail vdisk`), never by guessing, then runs the same steps: a
+  directory symlink and a junction into the VHD's volume are refused as destinations while a plain folder on another
+  volume is accepted, the unmount holds a volume lock (the volume cannot be opened meanwhile), and the copy, the scan,
+  the session and the hashes are checked as on macOS before the remount. A drop guard detaches the VHD, also on panic.
+
+Both only ever operate on what the test itself created in its own temp dir: on macOS only image files in a temp folder
+the testkit made are attached, the engine's `diskutil` calls go only to the disk `hdiutil attach` printed for them
+(confirmed with `hdiutil info` right before each unmount, open and remount), and only that disk is detached. Nothing
+runs `sudo`: when the attached image's `/dev/rdiskN` cannot be read without root the macOS test prints `skipped: needs
+read access to /dev/rdiskN` and passes (the images `hdiutil` attaches for a user are normally readable by that user).
+Run them with `--test-threads=1`. Without `REVENANT_OS_DEV=1` (or off their system) they print `skipped: <reason>` and
+pass.
+
+CI runs the Windows test in the `windows-devices` job (`windows-latest`, where the runner is Administrator), which also
+detaches, in a final step that always runs, any VHD a crash left in a `revenant-vhd-*` temp folder. If a runner cannot
+create or attach a VHD the job fails with diskpart's output (on CI the test never skips silently); the fallback is the
+compile and unit tests on every platform plus the manual checklist.
 
 ## Real camera samples
 

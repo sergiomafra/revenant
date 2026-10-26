@@ -14,6 +14,23 @@ Every engine error is an `EngineError`; each variant has a stable `snake_case` c
 | `DestinationOnSource` | `destination_on_source` |
 | `Write`               | `write_failed`          |
 | `Cancelled`           | `cancelled`             |
+| `DeviceGone`          | `device_gone`           |
+| `PermissionDenied`    | `permission_denied`     |
+| `DeviceNotFound`      | `device_not_found`      |
+| `NotWholeDisk`        | `not_whole_disk`        |
+| `SystemTool`          | `system_tool_failed`    |
+| `Unsupported`         | `unsupported_platform`  |
+| `DestinationUnknown`  | `destination_unknown`   |
+| `UnmountFailed`       | `unmount_failed`        |
+| `RemountFailed`       | `remount_failed`        |
+| `SystemDisk`          | `system_disk`           |
+| `MapCorrupt`          | `map_corrupt`           |
+| `MapMismatch`         | `map_mismatch`          |
+| `MapOtherSource`      | `map_other_source`      |
+| `SessionCorrupt`      | `session_corrupt`       |
+| `SessionVersion`      | `session_version`       |
+| `SessionOtherSource`  | `session_other_source`  |
+| `SessionNotEmpty`     | `session_not_empty`     |
 
 ```rust
 use revenant_core::EngineError;
@@ -23,19 +40,354 @@ assert_eq!(EngineError::Cancelled.code(), "cancelled");
 ## Source
 
 `source::Source` is the engine's read-only disk-access layer: `len()`, `read_at(offset, buf)` (positional, no shared cursor; fills
-the buffer except at the end of the source, returns 0 past the end) and `volume()`. There is no write method.
+the buffer except at the end of the source, returns 0 past the end), `volume()` and `disk()` (the whole disk the source reads
+when it is a device, else `None`; `Fragmented` and the scan's cache answer their inner source's). There is no write method.
 
 `source::FileSource` implements it for regular files (disk image files), opened read-only (`pread` on Unix, `seek_read` on
-Windows); reading devices directly comes in a later part. `source::volume_of(path)` returns the `VolumeId` of any existing
+Windows). Anything else is refused (`open_failed`), checked on the opened handle (so a node swapped in after an earlier
+check is caught): a device node, a FIFO (opened without waiting for a writer on Unix), a socket, a folder. `source::volume_of(path)` returns the `VolumeId` of any existing
 path (device id on Unix, volume serial number on Windows), so extraction onto the source's own volume can be refused. A test
 scans `src/source/` to ensure no write-capable open flags are ever introduced, and another checks that the image's bytes and
 modification time are unchanged after a full scan that extracts every finding.
+
+A source that vanishes (a card pulled out, a cable cut) is `EngineError::DeviceGone { offset }` (`device_gone`; `offset`
+is that of the read that failed, or the first byte a short read did not return), never a bad sector: a source returns it
+when it can tell, and a read that comes back short before the length the source announced
+counts as vanished too. The scan stops with it (below), extraction stops with it and removes the incomplete file, and the
+scan's cache never remembers those sectors as unreadable: it keeps the first offset and loads nothing from the source
+again (what it already holds is still served).
+
+### Devices
+
+`source::DeviceSource` reads a whole card or disk directly, read-only. Only whole disks: `source::DiskId::parse` accepts
+`disk4`, `/dev/disk4`, `/dev/rdisk4`, `PhysicalDrive2` and `\\.\PhysicalDrive2` on every platform (canonical names `disk4`,
+`PhysicalDrive2`); a partition (`disk4s1`) or anything else is `not_whole_disk`. A device is opened with
+`device::SystemDevices.open(&disk)` (see [Disks](#disks)) and wrapped with `DeviceSource::new(raw, disk)`:
+
+```rust,ignore
+use revenant_core::device::{DeviceOps, SystemDevices};
+use revenant_core::source::{DeviceSource, DiskId};
+let disk = DiskId::parse("disk4")?;
+let source = DeviceSource::new(SystemDevices.open(&disk)?, disk);
+```
+
+`open` reads the raw node on macOS (`/dev/rdisk4`, plain `File::open`) and `\\.\PhysicalDrive2` on Windows (`GENERIC_READ`
+only, sharing read and write); it needs root or Administrator (`permission_denied` otherwise), a missing disk is
+`device_not_found`, and other systems answer `unsupported_platform`. Its geometry (`Geometry { size, logical_sector,
+physical_sector }`) comes on macOS from `diskutil info -plist` (`TotalSize` or `Size`, `DeviceBlockSize`) and `ioreg -a -r
+-c IOBlockStorageDevice -l` (the device's `Physical Block Size`, else the logical size); after the node is opened,
+`diskutil info` is asked again and the open fails with `device_not_found` unless it still describes the same medium (size,
+sector size, names, `DiskUUID`…), so a card swapped between the query and the open is never read with the old geometry.
+On Windows the geometry comes from the open handle itself: `IOCTL_DISK_GET_LENGTH_INFO` and the storage access alignment
+property (else the drive geometry's bytes per sector).
+
+System tools are run by absolute path (`/usr/sbin/diskutil`, `/usr/sbin/ioreg`, `/bin/df`), with stdin and stderr closed,
+their output bounded to 16 MiB and their run time to 30 s (a tool stuck on a dying disk is killed); any failure is
+`system_tool_failed`, never a panic.
+
+A device reads only whole logical sectors; `DeviceSource` accepts any offset and length and aligns inside: an aligned
+request goes straight to the caller's buffer, a partial sector at either end through a sector buffer aligned to 4096 bytes.
+4Kn disks (4096-byte logical sectors) and 512e disks (512 logical, 4096 physical) are transparent. Scans and copies on a
+device use `DeviceSource::scan_sector()` (`max(physical, logical)`) as `ScanOptions::sector`, so a bad physical sector is
+read once and reported as one unreadable run of its size. A read error is `device_gone` when the error says the device
+left (macOS `ENOENT`/`ENXIO`/`ENODEV`; Windows `ERROR_DEVICE_NOT_CONNECTED`, `ERROR_NO_SUCH_DEVICE`, `ERROR_DEV_NOT_EXIST`,
+`ERROR_NOT_READY`, `ERROR_FILE_NOT_FOUND`) or when the device is no longer present (macOS: `/dev/diskN` is gone; Windows:
+`IOCTL_STORAGE_CHECK_VERIFY2` fails); otherwise it is a bad sector (`read_failed`). `source::RawDevice` (aligned reads
+and the geometry) is what `DeviceSource::new(raw, disk)` wraps, for a privileged helper or a test double.
+
+### Disks
+
+`device::DeviceOps` is what the engine asks the operating system about disks (`list`, `open`, `destination`), so a
+privileged helper (Module 2.1) or a test double can serve it; `device::SystemDevices` is the running system's (macOS,
+Windows; elsewhere every call is `unsupported_platform`). `destination` needs no privilege and may stay outside the helper.
+
+`list()` returns the connected whole disks, sorted by id (`disk2` before `disk10`), each a `DiskInfo`: `id`, `geometry`,
+`vendor`, `model`, `serial` (often the card reader's, not the card's), `removable`, `internal`, `system`, `virtual_disk`,
+`solid_state` (`None` when the system does not say) and its `volumes` (`VolumeInfo { id, fs, label, mount_point, size }`).
+
+- macOS: the whole disks of `diskutil list -plist`, each completed by `diskutil info -plist` of the disk and of each of
+  its partitions, plus one `ioreg -a -r -c IOBlockStorageDevice -l` (vendor, product, serial, physical sector). APFS
+  containers the system synthesizes (`disk3` on top of `disk0s2`) are not listed: they are shown through their physical
+  disk. The system disk is the one holding `/`: the `ParentWholeDisk` of `diskutil info -plist /` and the disks of its
+  `APFSPhysicalStores`. `removable` is `Removable` or `RemovableMedia`, `internal` is `Internal`, `solid_state` is
+  `SolidState`, and an image attached with `hdiutil` (`VirtualOrPhysical` `Virtual`, bus `Disk Image`) is `virtual_disk`.
+  A disk whose info cannot be read (it left meanwhile) is left out; the list, the info of `/` (or one naming no disk) or
+  `ioreg` failing fails the listing with `system_tool_failed`: a listing never silently shows no system disk.
+- Windows: `\\.\PhysicalDrive0` to `63`, opened without read access (queries only): `IOCTL_STORAGE_QUERY_PROPERTY` (vendor,
+  product, serial, removable media, bus type; the seek penalty for `solid_state`), the drive geometry and the access
+  alignment. Every volume (`FindFirstVolumeW`/`FindNextVolumeW`) is attached to the disks of its extents
+  (`IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS`), with its file system and label (`GetVolumeInformationW`) and first mount point.
+  The system disk holds the volume of the Windows folder (`GetSystemWindowsDirectoryW`, not an environment variable); a
+  dynamic volume spanning several disks marks them all, and a system volume that cannot be found or has no extent fails
+  the listing (`open_failed`). A destination volume with more extents than the 64 read is refused, never half-checked. USB, SD,
+  MMC and 1394 buses are external, virtual buses (a VHD) are `virtual_disk`.
+
+`unmount(&disk)` unmounts every volume of a disk **without ejecting it**, so the system stops writing to the card while
+it is read, and returns an `UnmountGuard`; `remount(&disk, Some(guard))` mounts the volumes again. The engine never
+remounts by itself: remounting gives the system back the chance to write to the card, so it happens only when asked.
+The system disk is never unmounted: `unmount` refuses it with `system_disk` before running anything, and a disk not
+listed is `device_not_found`.
+
+- macOS: `diskutil unmountDisk diskN` (never `force`; it also unmounts the volumes of an APFS container on the disk and
+  succeeds when nothing is mounted), then a listing confirms it. The tool failing or a volume of the disk still mounted is
+  `unmount_failed` with `volumes` (the ones the listing shows mounted; an APFS container's volumes are not listed, so they
+  may be empty); a disk gone from the listing is `device_not_found`. The guard holds nothing. `remount` is `diskutil
+  mountDisk diskN`.
+- Windows: every volume with an extent on the disk is locked and dismounted (`FSCTL_LOCK_VOLUME`, then
+  `FSCTL_DISMOUNT_VOLUME`), and the guard keeps the locks for the session so Windows does not mount the volumes again;
+  dropping the guard releases them, after which Windows mounts a volume on its next access. A volume that cannot be
+  locked (in use) makes the call fail with `unmount_failed` naming it, and the volumes that did lock are released, so
+Windows may mount them again. While any local volume's disks cannot be told (its extents query failed), nothing is
+locked and the call fails closed with `unmount_failed` naming that volume, since it could lie on the card. A volume
+whose drive holds no media (an empty slot of a multi-slot card reader) is not unknown: it lies on no disk, so it never
+blocks an unmount; CDs and network volumes (`GetDriveTypeW`) have no disks either. "No media" needs the volume's open
+to fail with `ERROR_NOT_READY`, or its extents query to fail with it and the media check on the same handle
+(`IOCTL_STORAGE_CHECK_VERIFY2`) to answer `ERROR_NO_MEDIA_IN_DRIVE` or `ERROR_NOT_READY`, and a second try 300 ms later
+to say the same; anything else fails closed. Only the unmount makes that second try: the listing, `destination` and the
+reconnect polls ask each volume once and never wait (a "no media" volume simply has no disks there), and the unmount
+waits 300 ms once for all the volumes that said "no media", then asks only those again (a four-slot reader costs 300 ms,
+not 1.2 s). The residual risk: a card that stays not ready through both tries and whose
+media check says no media would be skipped and left mounted (it is then unreadable for the scan as well). Each volume is
+  opened read-only first; only when Windows refuses the lock or the dismount on that handle (`ERROR_ACCESS_DENIED`) is
+  it opened again with write access, solely to repeat the two requests. That handle never reads or writes data (the
+  engine's single exception to opening anything for writing, recorded in the project rules and checked by the
+  `source_has_no_write_path` test); the card's data is still read only through the read-only `\\.\PhysicalDriveN`.
+  `remount` releases the guard and queries each volume, which mounts it.
+
+Locking a volume on Windows needs Administrator. When the unmount fails, a scan can still go ahead with the card mounted: the engine
+still never writes to it, but the system may (warning the user is the app's job).
+
+**Reconnecting.** `device::reconnect(&ops, &identity, &cancel, poll)` waits for a card that was disconnected (a loose
+cable, the computer sleeping) to come back, and returns `Reconnected { source, unmount }`. Every `poll` (the app uses
+500 ms) it lists the disks with the same size and model as the identity (and the same serial when both have one; the
+system disk never), opens each candidate read-only only to read its identity sectors, on a thread of its own (a probe),
+and compares with `same_source` when the probe answers. A probe is never waited for: a candidate whose reads hang does
+not hold up the others, and is not opened again until its probe returns (so a hung disk costs one blocked thread, not
+one per poll; at most 16 probes run at once). A candidate that does not match is closed and nothing is unmounted; the
+one that matches is closed, unmounted, and only then opened again and its identity read once more (after the unmount):
+still the card → returned as `source` (`unmount` holds the guard, or the error when the unmount failed: the card is
+then read mounted); not (another card took its name meanwhile) → closed, and waiting goes on. Nothing but the identity
+sectors is read before the unmount. Errors: `cancelled` (seen while waiting), `device_not_found` for an identity that is
+not a device's, `unsupported_platform`, or the error of opening the card again. The remount window: the system mounts the card by itself
+when it comes back and may write to it (`.fseventsd`, a dirty flag) before `reconnect` unmounts it; closing that window
+(refusing the mount while a session lasts) is for the privileged helper of Module 2.1.
+
+Both the pre-flight check (below) and `reconnect` open the disk before unmounting it (`reconnect` only to read the
+identity sectors): opening is read-only and never writes.
+
+### Destination
+
+`Destination::check(&ops, &source, dir)` checks a destination folder once against the source; extraction (`extract_to`),
+and later the copy and the session, write only into a `Destination`. The folder must exist (`open_failed` otherwise) and:
+
+- must not be on the source's volume (an image file's): `destination_on_source`;
+- for a device source (`Source::disk()` is `Some`), must not be on any volume of that disk: `ops.destination(dir)` gives
+  the disks the folder lives on (`DestInfo { disks, fs, free_bytes, max_file_bytes }`), and the source's disk among them
+  is `destination_on_source`. An APFS volume counts as its container and the disks of its physical stores, so a folder
+  on an APFS volume whose store is a partition of the card is refused too;
+- for a device source, when those disks cannot be told (a network folder, a failed query, no disk) the folder is refused
+  with `destination_unknown`: it could be the card itself, and nothing is ever written to the card being recovered.
+
+The folder is resolved first (`std::fs::canonicalize`: symbolic links, and junctions on Windows, are followed), and the
+rules and every later write use the resolved folder, so a link pointing into the card is judged as the card;
+`extract_to` also refuses (`destination_on_source`) when the folder is no longer on the volume it was checked on. Anything
+else written there goes through `dest.create_named(&finding, name, suffix)` (the CLI's previews): the same check, then
+a new file in the resolved folder under the extraction's naming rule (never overwriting). Known
+limit: a folder inside a mounted disk image (DMG, VHD) whose backing file lives on the card is not detected.
+
+An image source (`disk()` is `None`) only gets the volume rule; `ops` is not called. `dir()` is the folder and `info()`
+what it lives on (`None` for an image source). On macOS `destination` runs `df -P -k <dir>` (the volume's node and the
+space available) and `diskutil info -plist <node>` (`ParentWholeDisk`, `APFSPhysicalStores`, `FilesystemType`); on Windows
+the volume of the folder (`GetVolumePathNameW`, `GetVolumeNameForVolumeMountPointW`), its extents, file system and
+`GetDiskFreeSpaceExW`. On FAT (macOS `msdos`, Windows `FAT`/`FAT32`) `max_file_bytes` is 4 GiB − 1 (`device::FAT_MAX_FILE`).
+
+### Source identity
+
+`SourceIdentity` recognizes a source later (a resumed copy, a reconnected card, a reopened session); compare two with
+`same_source`, never `==`.
+
+- `SourceIdentity::of_device(&info, &source)` = size, model, serial and `table`, always computed: the FNV-1a 64 digest of
+  sector 0, of sectors 1 to 33 when sector 0 is a protective MBR (a GPT), and of the boot sector of the first volume the
+  table names (each a logical sector). The bytes the system rewrites while a FAT or exFAT volume is mounted are zeroed
+  first (FAT12/16 byte 37, FAT32 byte 65, exFAT bytes 106, 107 and 112; also in sector 0 when the card has no partition
+  table), so mounting the card does not change it, while reformatting it does. An unreadable sector counts as zeros; a
+  device that is gone is `device_gone`.
+- `SourceIdentity::of_image(&source)` = size and the FNV-1a 64 of the first MiB, the MiB at the middle (aligned down to
+  1 MiB) and the last MiB.
+- `SourceIdentity::of_mapped(&mapped_source)` = a rescue copy's image read through its map (below): `Mapped { size,
+  digest, origin }`, the digest `of_image` would give with every byte not rescued counted as zero, and `origin`, the
+  identity of the source the map records. Rescuing more of those three MiB (a copy resumed meanwhile) changes it.
+- `same_source`: devices match when sizes, models and `table`s are equal, and the serials too when both sides have one
+  (readers often report their own serial, so it is only an extra check). Two identical cloned cards look the same. Images and
+  mapped images match when equal; a device, an image and a mapped image never match one another.
 
 `source::Fragmented::new(source, pieces)` is a read-only logical view of pieces (`Fragment { start, len }`, absolute ranges)
 of a source, in the given order: offset 0 is the first byte of the first piece. Each piece is first clamped to the inner
 source's end (as `extract` clamps it), and `len()` is the sum of the clamped lengths. A read crosses pieces in order; a read
 error is the inner source's, so its offset is absolute in the inner source; `volume()` is the inner source's.
 `absolute(start, len)` maps a logical range back to absolute pieces of the source, merging pieces that touch.
+
+## Pre-flight check
+
+`preflight::preflight(&ops, &PreflightRequest { disk, unmount, copy_to, session, sample_timeout })` is called before any long read
+(a scan or a copy of a disk) and returns `Preflight { disk, issues, guard }`: the disk as listed, **every** problem
+already known (empty when none), and the unmount's guard when one was asked and succeeded (keep it while the disk is
+read). Nothing is written anywhere. In this order:
+
+1. **Find** the disk in the listing: not there is `device_not_found`, a listing that fails is `open_failed`, and the
+   system disk is `system_disk` (never opened, unmounted or read); each ends the check.
+2. **Open** it read-only: `permission_denied` (root or Administrator needed), `device_not_found` (gone meanwhile) or
+   `open_failed` (any other failure); each ends the check.
+3. **Unmount** (when `unmount`): a failure is `unmount_failed` with the volumes still mounted (the check goes on: the
+   disk can still be read mounted); a disk gone meanwhile is `device_not_found` and ends the check.
+4. **Samples**: the first, the middle (`sectors / 2`) and the last logical sector, one after another, each read on its
+   own thread and waited for at most `sample_timeout` (callers pass `preflight::SAMPLE_TIMEOUT`, 10 s). A read that does
+   not return in time is `device_not_responding { offset }` and ends the sampling; its thread is left behind, blocked
+   until the system gives up on the read (a dying disk can hold it for minutes), and the call returns anyway. That
+   thread keeps the device open meanwhile, so ejecting the disk may fail as busy until the system gives up. In the
+   worst case the whole check waits about 4 × `sample_timeout` (three slow samples, then the one identity read, for a
+   resumed copy's map or a session). A failed read is `sample_unreadable { offset }`; a device that vanishes is `device_not_found`.
+5. **Copy destination** (when `copy_to`, the image file a copy would write): its parent folder goes through
+   `Destination::check` (`destination_on_source`; `destination_unknown` for anything else, including a folder that
+   does not exist). Then the same room checks as `rescue::copy` (shared code): the free space against what is still to
+   copy, `destination_too_small { need, free }`, and the file system's largest file against the disk's size,
+   `destination_file_too_large { limit }` (FAT32: 4 GiB − 1; the image is never split). What is still to copy is the
+   whole disk, or, when `map_path(copy_to)` holds a map of this same disk (`same_source` against the identity read now,
+   under the same timeout), the bytes the map does not call rescued (its bad bytes count too: whether retries will be
+   asked is not known yet). A map of another disk, of another size or that cannot be read counts as a fresh copy (the
+   copy itself refuses it).
+6. **Session** (when `session`, the folder of a saved session to resume): a folder holding no session is fine; a
+   manifest that cannot be read, or of an unsupported version, is `session_corrupt`; a session not made from this disk
+   (`same_source` against the identity read now, under the same timeout) is `session_other_source`. The identity is read
+   at most once per check (shared with step 5); when the samples did not all answer or it cannot be read in time, the
+   disk cannot be told apart and nothing is reported (the resume itself still refuses another disk).
+
+| Issue                     | Code                         |
+| ------------------------- | ---------------------------- |
+| `PermissionDenied`        | `permission_denied`          |
+| `DeviceNotFound`          | `device_not_found`           |
+| `SystemDisk`              | `system_disk`                |
+| `OpenFailed`              | `open_failed`                |
+| `NotResponding`           | `device_not_responding`      |
+| `SampleUnreadable`        | `sample_unreadable`          |
+| `UnmountFailed`           | `unmount_failed`             |
+| `DestinationTooSmall`     | `destination_too_small`      |
+| `DestinationOnSource`     | `destination_on_source`      |
+| `DestinationUnknown`      | `destination_unknown`        |
+| `DestinationFileTooLarge` | `destination_file_too_large` |
+| `SessionOtherSource`      | `session_other_source`       |
+| `SessionCorrupt`          | `session_corrupt`            |
+
+The issues come in the order of the steps (an unmount failure, then the samples', then the destination's: room before the
+file-size limit, then the session's).
+
+## Rescue copy
+
+`revenant_core::rescue` copies a whole card (or disk) into an image file around its bad sectors (`copy`, design §5.4),
+keeps the map of what the image holds, and reads the image back through it.
+
+### Copying
+
+```rust,ignore
+let dest = Destination::check(&SystemDevices, &device, dir)?; // never on the card's disk
+let opts = CopyOptions { sector: device.scan_sector(), ..CopyOptions::default() };
+let summary = rescue::copy(&device, &identity, &dest, "card.img", &opts, &cancel, &mut |event| { /* … */ })?;
+```
+
+`copy(source, identity, dest, image, opts, cancel, on_event)` writes `dest.dir()/image` and its map
+`<image>.rvmap`. The image is created at the source's length and never split into pieces; it is sparse (nothing
+allocated until written) only where the file system allows it (APFS, ext4; not HFS+, FAT or NTFS), so the room check
+counts the whole length. `image` must be a plain, safe file name, and an existing `image` that is not a regular file (a
+link), that has more than one name (a hard link to a file elsewhere on the volume, on every system), or that is no
+longer the file checked by the time it is opened (swapped meanwhile; same device and inode on Unix, a reparse point
+opened as itself on Windows), is refused (`write_failed`) before anything is written; the folder
+must still be on the volume it was checked on (`destination_on_source`). The map's temporary file is always created
+new (`create_new`, after removing whatever was there, a link included, never its target), so nothing planted in the
+folder is written through.
+
+Before creating or touching anything, when the destination knows what it lives on (`dest.info()`, a device source):
+its largest file (`max_file_bytes`, 4 GiB − 1 on FAT32) must hold the whole image, and its free space what is still to
+copy (the whole length on a fresh copy; on a resume the bytes still untried, to trim or to scrape, plus the bad ones
+when `retries > 0`, so a finished copy needs no room); otherwise `write_failed` and no file is created. A copy from an image file (no `info()`) skips these two checks.
+
+The source is read directly (not through the scan's cache), in passes (`CopyOptions` defaults in brackets):
+
+1. **Fast** — the untried bytes in block-aligned chunks [1 MiB]. A chunk that fails becomes `ToTrim`, and the next
+   `skip` bytes are jumped over (left untried): [64 KiB] after the first failure, doubling on each consecutive one up to
+   `min(1 GiB, size / 64)`, back to the minimum after a good chunk. A failing area is left early instead of being read
+   block by block, so most of a damaged card is copied while it still works.
+2. **Skipped** — what the jumps left, in the same chunks, without jumping.
+3. **Trim** — each `ToTrim` run sector by sector from its start until a sector fails, then from its end backward until
+   one fails (those are `Bad`); the middle becomes `ToScrape`.
+4. **Scrape** — each `ToScrape` sector once: read → `Rescued`, failed → `Bad`.
+5. **Retry** — only with `retries > 0` [0]: each `Bad` sector read once more per repetition. None by default, so a dying
+   card is not hammered on the sectors that already failed; without retries a bad sector is read at most twice (in its
+   failing block, then alone). On a finished map, `retries` runs only the repetitions not done yet (a copy that ended
+   after `n` stores `Pass::Retry(n)`, one that ended with none `Pass::Done`).
+
+`sector` [512] is the map's and the sector-by-sector passes' granularity: against a device pass
+`DeviceSource::scan_sector()`, so a bad physical sector is read once. A source that vanishes (`device_gone`, or a read
+that comes back short) or a cancel (`cancelled`) stops the copy: the map is saved and the error returned, and nothing
+is marked for the read that stopped it, so pulling the card out never turns sectors bad. A write error is `write_failed`.
+
+Resume by calling `copy` again with the same `image`: the map's identity must be `same_source` as `identity`
+(`map_other_source`: another card), and its size and sector the source's and `opts.sector`, the image's length the
+map's (`map_mismatch`). The copy goes on from the pass and position the map records and never reads again what is
+rescued. The map is saved (after the image's `sync_data`, so it never claims bytes the image does not hold) every
+`save_every` [30 s] or `save_bytes` rescued [256 MiB], at each pass change and when the copy stops; a crash or power
+loss resumes from the last save. The map is saved right after the image is created (and the image removed if that
+fails); an image left without a map anyway (a crash in between) makes every later copy fail (`open_failed`) until it is
+deleted.
+
+`on_event` gets `CopyEvent::Progress { pass, pos, totals, bytes_per_sec, eta_secs }` after every read (bytes in each
+state, the reading speed smoothed by `rate::RateMeter` with a 10 s half-life, and the seconds left at that speed), `Bad
+{ start, len }` when a region is marked bad and `Saved` after each map save; the last `Progress` of a finished copy has
+`Pass::Done`. The result is `CopySummary { totals, complete }`, `complete` when nothing is left untried, to trim or to
+scrape.
+
+### The map
+
+`RescueMap::new(size, sector, identity)` covers `[0, size)` with merged regions (neighbors always differ in state), all
+`Untried` at first. A region is `Untried` (not read yet), `Rescued` (the image holds the card's bytes), `ToTrim` or
+`ToScrape` (a failed block whose edges or middle are still to be read sector by sector) or `Bad` (sectors that failed
+one by one). `set(start, len, state)` takes multiples of the sector (the end clamps to the size) and merges; `state_at`,
+`regions()` (ascending, contiguous from 0, summing to the size) and `totals()` (bytes per state) read it. The map also
+records the source's `SourceIdentity` and the copy's pass and position (`pass()`, `set_pass`: `Fast`, `Skipped`, `Trim`,
+`Scrape`, `Retry(n)`, `Done`).
+
+The map holds at most `MAX_MAP_REGIONS` (2^20) regions: a `set` that would need more returns false and changes nothing.
+The copy then finishes coarsely, never failing: each `ToTrim` and `ToScrape` region becomes `Bad` whole without being
+read; the untried bytes are still read in blocks, a failed block is marked `Bad` whole when the map has room, and when
+not even that fits, the rest of that untried stretch is marked `Bad` unread. On a disk with millions of scattered errors
+good sectors near bad ones are lost that way; nothing unread is ever called rescued.
+
+The map lives next to the image as `<image>.rvmap` (`map_path`), in our own text format (UTF-8, decimal numbers, one
+space between fields):
+
+```text
+revenant-rescue-map 1
+size <u64> sector <u32>
+identity device <size> <hex model or -> <hex serial or -> <table hex> | identity image <size> <digest hex>
+pass <fast|skipped|trim|scrape|retry:N|done> <pos>
+<start> <len> <state>          (one line per region, ascending; state untried|rescued|to_trim|to_scrape|bad)
+end <crc32 of every byte before this line, 8 lowercase hex digits>
+```
+
+Hex values are lowercase (model and serial as the hex of their UTF-8 bytes; digests as 16 digits). `save(path)` writes
+a new `<path>.tmp` (whatever was there removed first, a link but never its target; created with `create_new`, which
+never follows a link), `sync_all`s it, renames it over `path` and (on Unix) syncs the folder, so a crash at any moment leaves
+the previous map or the new one, never a mix; failures are `write_failed`, except the folder sync, which is best effort
+(the file is complete and synced by then; some file systems refuse it, and at worst a crash right after brings back the
+previous map). A map whose identity nests `mapped` more than 4 deep is not saved (`write_failed`), so a map that saves
+always loads. Two maps are `==` when their contents are. `load(path)` refuses anything that is not
+exactly such a file (`map_corrupt`): not a regular file (a link, even to a valid map, a folder, a device or a FIFO,
+never followed, read or waited on), cut short anywhere, a checksum that does not match, regions that do not cover the
+size, more than 2^20 regions, or a file over 64 MiB; nothing there, or a file that cannot be opened, is `open_failed`.
+
+`MappedSource::open(image)` opens the image read-only with its map (`map_mismatch` when the map's size is not the
+image's length). A read touching any byte that is not `Rescued` fails with `Read { offset }` of the first such byte, as
+a bad sector of the card would: the scan reports the holes as `Unreadable` and calls nothing in them `Intact`, where a
+plain `FileSource` of the image would read the zeros the copy left there as data. `volume()` is the image file's.
 
 ## Formats: JPEG
 
@@ -318,11 +670,14 @@ pieces are identical, and fragmented MP4 (`moof`).
 ## Formats: CR3 and HEIC (ISO BMFF)
 
 The same `IsoBmff` detector picks the kind from the `ftyp` brands: major brand `crx ` is `FileKind::Cr3` (extension
-`cr3`); a
-HEIC brand (`heic heix heim heis mif1 msf1`) as major or compatible brand, with no `moov` anywhere in the file, is
-`FileKind::Heic` (extension `heic`). An MP4 that merely lists `mif1` has a `moov` and stays `Mp4`; an `avif`/`avis`
-major
-brand is never HEIC.
+`cr3`); a HEIC brand (`heic heix heim heis mif1 msf1`) as major or compatible brand, with no `moov` in the file, is
+`FileKind::Heic` (extension `heic`) when that brand is the major one or the file has a top-level `meta` (ruling D27).
+An MP4 that merely lists `mif1` has a `moov` and stays `Mp4`; one that lists `heic` among its compatible brands, lost
+its `moov` (a cut before it) and has no `meta` is a `Damaged` `Mp4`; an `avif`/`avis` major brand is never HEIC. The
+price: an MP4 cut before its `moov` that carries a stray top-level `meta` and lists `mif1` is still taken for a HEIC.
+And a HEIF image sequence (`msf1`/`heis`) laid out `ftyp`, `meta`, `mdat`, `moov` is measured as a HEIC without its
+`moov`: once the still images' extents are all inside, the HEIC is complete (below) and the walk stops before the
+`moov`, so the still images come out whole and the sequence's tail (its `moov`) is left out.
 
 - CR3: the `moov`/`stco`/`stsz` rules above apply unchanged (a CR3 has `trak`s). In addition both of its JPEGs must
   decode strictly (the raw image itself is never verified) for `Intact`: the `PRVW` JPEG in the top-level `uuid`
@@ -341,6 +696,10 @@ brand is never HEIC.
   data reference, a zero length meaning "the whole resource", an `iloc` version above 2, more than 65,536 items or
   262,144 extents) make the file at best `Partial`. The pixel data is HEVC (or similar) and is never decoded: `Intact`
   means complete structure with every extent inside the file, not that the image decodes.
+  A HEIC is complete once every extent its `iloc` lists (all checkable) ends inside what the walk has covered (ruling
+  D27): from there the walk continues only through trailing `free skip wide uuid meta udta mfra` boxes, so a stray
+  `moov` after it neither joins it nor turns it into a video, and an unreadable sector right after it is what follows
+  the file (it stays `Intact`), as for a video whose `moov` and `mdat` were both seen.
 - A sector-aligned file head inside `mdat` is normally "another file starts here". For CR3 and HEIC the starts of the
   file's own data (CR3: the chunks of every track, which include its full-size JPEG; HEIC: the `iloc` extents) are
   skipped, so a JPEG the file itself keeps there does not cut it; so is, for a CR3, a head inside its full-size JPEG or
@@ -505,8 +864,17 @@ Layouts, tried from sector 0:
   (its primary, or this one as its backup), the earlier volume is reported if its primary is there, or if its first FAT
   starts where its boot sector says (FAT entry 0 = the media byte then `FF FF`) and the probed one's does not.
 
+Ghosts (1.4 T3): an MBR entry read with 4096-byte sectors can land on the backup boot sector of a 4K volume already
+found (sector 6 of a FAT32, the backup region at 12 of an exFAT: an entry at the volume's LBA + 6 or + 12). Such a
+candidate, the same file system with the same serial at the found volume's offset + 6 or 12 of its sectors, is dropped:
+the volume is reported once. Probe limit: when a probe offset is the backup boot sector of a volume whose primary boot
+sector and first FAT sector are both gone, nothing is left to tell the two apart, and the volume is reported at the probe
+offset (6 or 12 sectors past its real start).
+
 The partition's own record of where the volume sits (FAT `BPB_HiddSec`, exFAT `PartitionOffset`) is never used for
-placement: a volume is where its table entry (or probe) points.
+placement: a volume is where its table entry (or probe) points. The legacy variant in which a logical partition's
+`BPB_HiddSec` counts from its own EBR instead of from the start of the disk is not supported: nothing here reads it, and
+the testkit writes the absolute value for logical partitions too, as current formatters do.
 
 A FAT boot sector is valid with `55 AA` at 510, a jump (`EB ?? 90` or `E9`), BytsPerSec 512/1024/2048/4096, SecPerClus a
 power of two ≤ 128, RsvdSecCnt ≥ 1, NumFATs 1 or 2, a data region starting before the end, and at least one cluster. It
@@ -538,7 +906,9 @@ all (a test counts them on every hostile case):
 - when probing, 7 offsets, each at most 19 reads and 219,136 bytes (the offset and the one 6 or 12 sectors earlier, the
   two FAT entry-0 sectors, a label).
 
-No read is larger than 128 KiB, and none is allocated before it is known to lie inside the source.
+No read is larger than 128 KiB, and none is allocated before it is known to lie inside the source. A typical card (one
+FAT32 partition at LBA 8192) costs 8 reads, pinned by a test (`typical_card_reads_few_sectors`) so a change that reads
+more shows up.
 
 ## File systems: FAT
 
@@ -667,7 +1037,10 @@ the deleted photos/videos wait, never more than the photo slots left (a later li
 
 Bounds (each lowerable in unit tests): per volume at most 65,536 directories, 4,000,000 directory entries (every
 32-byte slot read counts, the end marker included), depth 32 (the root is 0), 2 MiB per directory, 65,536 contested
-clusters; per listing at most 262,144 photo/video files and `MAX_PIECES` (2^20) pieces, counting a file's runs (a
+clusters; per listing at most 262,144 photo/video files (live files of every volume first, ruling D28: when the cap is
+full, a live photo/video takes the slot of the last deleted one listed, which is then dropped and the listing marked
+truncated; the price is that on a card at the cap the deleted files of later volumes lose their name, though the
+carving still finds them) and `MAX_PIECES` (2^20) pieces, counting a file's runs (a
 photo/video's pieces, an other file's ranges in `live`) and a directory's runs. A file that would pass either cap is not
 listed at all (not in `files`, `others` or `live`); a directory past the piece cap is still walked but its ranges are not
 in `live`. Once the entry cap is reached the walk of the volume stops: no further directory is read. Following chains
@@ -773,7 +1146,9 @@ and File Name §7.7 entries).
   there, or a NoFatChain run the bitmap shows in use). A directory whose first cluster is outside the heap or already
   claimed is not entered.
 - **Deleted files and folders.** A set is deleted when its File entry's InUse bit is clear, or a folder above it is
-  deleted. Deleted photos/videos wait, and are placed only once the live walk is done, against the live claims (a
+  deleted. The File entry decides for the whole set: the InUse bits of its Stream Extension and File Name entries are
+  not looked at, so a set whose bits disagree (the File entry in use, a name entry not, or the reverse) is live or
+  deleted as its File entry says. Deleted photos/videos wait, and are placed only once the live walk is done, against the live claims (a
   claimed cluster is in use whatever the bitmap says; ruling R10), with what the live files left of the caps:
   - NoFatChain: the run as recorded (`placement` `recorded`, cut at the heap's end); trusted only when every cluster
     of it is free in the bitmap today;
@@ -1004,7 +1379,9 @@ only in part as wholly unreadable, which only makes health more conservative); e
 a read that overlaps it fails every time without touching the source again, also when its window is loaded again after
 being evicted (the load reads around the known bad runs). The map keeps at most 1,048,576 merged runs; past that, new
 unreadable sectors are not remembered and are read again when their window is loaded again (slower, with the same results
-and events). A block that lies wholly inside an `Intact` finding whose bytes have all gone through the cache already (the
+and events). Measured with a synthetic source (`bad_run_cap_measure`, ignored, release): 1 GiB of zeros and then 1 MiB
+with an isolated unreadable sector every KiB scans in about 0.4 s and leaves 1024 runs, far under the cap; a dying card
+is checked by hand. A block that lies wholly inside an `Intact` finding whose bytes have all gone through the cache already (the
 detector walked the file) is not read again; its unreadable sectors come from the bad-sector map, so its `Unreadable` events
 are the same. The cache is `Send + Sync`: windows are shared across threads, and a window being loaded by one thread is
 waited for by the others, never read twice at once. The scan looks at the heads of a block straight in the cache's windows,
@@ -1054,6 +1431,21 @@ Events:
 - `Unreadable { start, len }`: when a block cannot be read it is re-read sector by sector; each run of consecutive failed
   sectors (also across blocks) is one event and counts in `ScanSummary::unreadable_bytes`. A run is split where a finding
   ends. The scan then continues.
+- `DiskFailing { unreadable_runs, unreadable_bytes, read }`: the disk is failing, make a copy first (ruling D20). Once per
+  scan, right after the `Progress { read, .. }` of the first block boundary where the `Unreadable` events emitted so far
+  reach `scan::FAILING_RUNS` (16) runs or `scan::FAILING_BYTES` (4 MiB); the fields are those counts at that point. Why
+  these numbers: a healthy card has no unreadable sector at all, so 16 separate failures (or 4 MiB in one place) already
+  say the medium is degrading, and every further pass over a dying card can cost more of it; the earlier the person is
+  told to copy it, the more the copy saves. The cost: a card with 16 scattered bad sectors that reads fine elsewhere gets
+  the warning too. A run still open at a boundary counts once it is emitted (a run that ends only with the source, after
+  the last `Progress`, never flags). Deterministic: it depends only on the `Unreadable` events, so it is the same for any
+  `threads` and `cache_bytes`.
+- `Rate { bytes_per_sec, eta_secs, stalls }`: only with `ScanOptions::rates` (default `false`, ruling D21), right after
+  each `Progress` (after its `DiskFailing` when both fall on the same boundary: the order is always `Progress`,
+  `DiskFailing`, `Rate`). `bytes_per_sec` is the reading speed smoothed by `rate::RateMeter` (10 s half-life; 0 until
+  known), `eta_secs` the seconds left at that speed (`None` while unknown), `stalls` the cache window loads so far that
+  took more than `scan::STALL` (2 s): a device that struggles. It is the only event that depends on timing: it is
+  outside the determinism contract (compare event lists with it filtered out) and is never stored in a session.
 - `Updated(Finding)`: a better version of a finding already reported, which replaces the earlier `Found` with the same
   `id`. Emitted after every `Found` (and the last `Progress`), before `scan` returns, in id order; counted in
   `ScanSummary::updated`. Today: a video put back together with its separated `moov` (see "Video with a separated
@@ -1061,12 +1453,169 @@ Events:
   [File systems: after a quick format](#file-systems-after-a-quick-format)); one event per id, both merged.
 
 `CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block
-examined and each block read ahead, before and after every event and while waiting for a measurement. Once it is seen no
-further event is emitted (a cancel from inside the callback makes that event the last one), the measuring threads drop
+examined and each block read ahead, before and after every event and while waiting for a measurement. A block
+boundary's `Progress`, `DiskFailing` and `Rate` count as one event here: checked before and after the group, so a cancel
+from inside their callback stops the scan right after the whole boundary (where a saved session can still checkpoint).
+Once it is seen no further event is emitted (a cancel from inside the callback makes that event, or that boundary, the
+last one), the measuring threads drop
 their remaining jobs, and `scan` returns `EngineError::Cancelled` after every thread has stopped (a measurement already
 running is finished first, except a JPEG gap search, which gives up as soon as it sees the cancel, and a `zune-jpeg`
 validation decode, which is skipped when the cancel is seen before waiting for the decode budget or once the budget is
-granted); findings still pending are dropped.
+granted); findings still pending are dropped. Cancellation is also seen inside the reads: the scan's cache checks it
+before loading each 1 MiB window, before each stretch of it and before each sector of a window resolved sector by
+sector, and then fails the read (keeping nothing), so any measurement still running ends quickly and a slow failing
+device stops within about one sector read. The FAT32 high-word heads the listing reads beside the cache are not read at
+all once the scan is cancelled or the source has vanished.
+
+A source that vanishes during the scan (`DeviceGone`, or a short read) stops it the same way with
+`EngineError::DeviceGone`: it is checked before and after every event and before each block, so the events emitted are
+exactly the first ones of the scan the device would have allowed, with no `Unreadable` for the missing sectors. A
+file-system listing read while cancelled or after the source vanished (including the FAT32 high-word heads read beside
+the cache) is never used: the scan returns that error before emitting any `Volume`.
+
+## Resumable scans
+
+A scan can be stopped and taken up again where it was, with exactly the events it would have emitted had it not stopped.
+The saved session ([Sessions](#sessions)) stores this on disk; inside the engine, `scan_with` (crate private; `scan` is
+`scan_with` with neither a resume nor a hook) hands a hook three kinds of checkpoint:
+
+- `Listing`, once, after the file-system listing (an empty one with `filesystems: false`) and before any event. A
+  listing read while the scan was cancelled or after the source vanished is never handed over (nor any `Volume`
+  emitted): the scan returns `cancelled` or `device_gone` instead (ruling P3).
+- `Boundary`, at every block boundary, right after its `Progress` and its `DiskFailing` (the fixed order is `Progress`,
+  `DiskFailing`, `Rate`), with the bytes read and the events emitted so far. Every event counts except `Rate`, which is
+  timing and never part of a saved scan (ruling P4). The state is built only when the hook asks for it. `stopping` says
+  the scan was cancelled or the source vanished once the boundary's events were out: the state is still good
+  (everything in it was committed before), and the scan returns that error right after the hook.
+- `Paired`, after the pairing step, before the `Updated` events.
+
+**What the state holds** (ruling D22): the shape of the scan it belongs to (the sector and block sizes as the scan
+uses them, file systems on or off, the source's length: a scan of another shape refuses it, ruling P44), the position
+(the next block's start) and the event count; everything the
+in-order half of the scan carries from block to block (the summary, the open unreadable run, the `Unreadable` count and
+whether `DiskFailing` was sent, the findings not yet emitted, the next id, the orphan `moov` candidates and the ranges of
+the ISO BMFF findings that rule some out, the `Damaged` videos kept for pairing, the caps' flags, the start of every
+finding, the next listed file, the own-file starts of `Partial` RAWs with their owners' ranges, the old-folder
+candidates and the findings on a cluster grid they may name); the skip ranges; the last bytes the `moov` and old-folder
+searches saw before the position (a header across the boundary is still found); the cache's **whole** bad map (ruling
+P5) and its coverage from the position on. The capture names every field of the commit loop, so a field added later
+does not compile until it is saved or rebuilt. Rebuilt on resume, not stored: the cluster grids, the volumes and what the
+scan keeps of the listing, from the listing saved once at `Listing`. Encoded with the engine's own binary format (no
+`serde`): integers little-endian, enums by their `as_str` name, every length checked against what remains, so damaged
+bytes (or a state that cannot belong to the scan: another shape, a position past the end or off a block boundary, runs
+out of order, a cap passed) are `session_corrupt`, never a panic. A damaged count reserves at most 1024 items ahead (the
+rest grows only as items actually decode), so it cannot make the decoder reserve gigabytes.
+
+**The guarantee**: for a source that answers the same every time (the same bytes, the same unreadable sectors), a scan
+resumed from any checkpoint emits exactly the events the uninterrupted scan emitted after it, ids and summary included,
+for any `threads` and `cache_bytes` on either side.
+
+**What a resume reads again** (ruling D24): the blocks the stopped scan had read ahead past the position (at most the
+read-ahead, `lookahead_blocks × block`, plus what was read since the last saved checkpoint), the pieces below the
+position of listed files that start after it, and what the pairing loads (a resume from `Paired` runs the pairing again).
+Never: the listing (ruling D23: read again with a fuller bad map it could come out different), a sector of the saved bad
+map (the cache starts with it, including runs below the position that the pairing or a file's pieces may touch), or a
+block wholly inside an `Intact` finding across the position whose bytes the cache had already read (its coverage comes
+back with the state; for that the cache now keeps its coverage from the walk's position on, not from the read-ahead's).
+Starting from the position, a scan without file systems or pairing reads nothing below it.
+
+**Memory**: the state is bounded by the caps the scan already has (pending findings, 4096 + 4096 pairing candidates,
+65,536 own-file starts, 65,536 old-folder candidates, 262,144 grid findings and one start per finding), plus the bad map
+(at most 2^20 runs, 16 bytes each in the saved form: about 16 MiB) and at most 65,536 coverage runs. The listing is
+saved once, up to a few hundred MiB in the worst case of the listing's caps.
+
+## Sessions
+
+A session saves a scan into a folder of its own, so it can be taken up again after a cancel, a card pulled out, a crash
+of the program or a power loss, with exactly the events of an uninterrupted scan, and so a finished scan's results can be
+read back later without the card.
+
+```rust
+use revenant_core::session::{Session, SessionOptions, scan_session};
+let dest = Destination::check(&ops, &source, folder)?;             // never on the source
+let mut session = Session::create(&dest, identity.clone(), &opts)?; // the folder must be empty
+let summary = scan_session(&source, &identity, &formats, &opts, &mut session, &SessionOptions::default(), &cancel,
+    &mut |event| { /* … */ })?;
+// Later, after a crash or a disconnect:
+let dest = Destination::check(&ops, &source, folder)?;  // checked again, with the caller's ops
+let mut session = Session::open_checked(&dest)?; // state(): Fresh, Interrupted { read, total } or Finished(summary)
+scan_session(&source, &identity, &formats, &opts, &mut session, &sopts, &cancel, &mut on_event)?;
+```
+
+- **One folder per session, never on the source.** `Session::create(&dest, identity, &opts)` takes a folder checked
+  with `Destination::check` (not on the card, through any of its volumes) that must be empty (`session_not_empty`). It
+  records the source's identity (see [Source identity](#source-identity)) and the scan's `sector`, `block` and
+  `filesystems`: a resume always scans with these, whatever the caller's `opts` say (threads, cache size and rates do
+  come from the caller). `Session::open_checked(&dest)` reopens one in a folder the caller checked again with
+  `Destination::check` and its own `DeviceOps` (`open_failed` when there is no session there): the way to resume a
+  card's session. `Session::open(folder)` reopens one without a check, to read its results (`events()`) or to resume an
+  image's session (its folder is then checked with the volume rule alone, no system asked); resuming a device's session
+  opened that way is refused (`destination_unknown`, nothing read or written), since only the caller's `DeviceOps` can
+  tell which disks the folder lives on.
+- **One session per source.** `scan_session` refuses (`session_other_source`, before anything is read or written) an
+  `identity` that is not `same_source` as the session's: for a card, size, model and the digest of its identity sectors
+  (the serial number counts only when both sides have one), so the same card in another reader resumes and a reformatted
+  or different card does not; for a rescue copy's image read through its map (`SourceIdentity::of_mapped`), the map's
+  state, so rescuing more of the image meanwhile makes it another source (ruling P7). `check_session(folder, &identity)`
+  answers the same from the manifest alone (`Ok` when the folder holds no session), and the pre-flight check reports it.
+- **Replay.** `scan_session` first hands out the stored events (`replay_len()` of them), then scans on from the last
+  checkpoint: the whole sequence is the uninterrupted scan's, ids and summary included, for any `threads` and
+  `cache_bytes` (the guarantee and its condition are those of [Resumable scans](#resumable-scans)). `Rate` events are
+  never stored nor counted. A **finished** session only replays: the source is not read and nothing is written, so its
+  results come back with the card gone (`events()` reads them without any source).
+- **Cadence.** A checkpoint is saved at the next block boundary once `SessionOptions::checkpoint_bytes` (default 256 MiB)
+  were scanned or `checkpoint_every` (default 30 s) passed since the last one, after the pairing step, and when the scan
+  finishes (with its summary). A cancel or a vanished card seen at a block boundary saves one there; seen anywhere else,
+  the last checkpoint stands and the resume redoes (identically) what came after it: at most about 256 MiB or 30 s of
+  scanning, plus the read-ahead. A listing read while cancelled or after the card vanished is never saved (ruling P3):
+  the resume reads the file systems again.
+- **Errors.** `session_other_source`, `session_not_empty`, `session_version` (written by a version this engine cannot
+  read), `session_corrupt` (damaged beyond the fallbacks below), `write_failed`, `destination_on_source` (the folder is
+  no longer on the volume it was checked on), and the scan's own. On any error the session stays at its last checkpoint,
+  ready to run again.
+
+**The folder** (ruling D25): every file starts with `RVNTSESS`, a kind byte and the format version (`u16`, 1).
+
+| File                                      | Holds                                                                                          |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `session.rvs`                             | CRC-32, then the identity, `sector`, `block`, `filesystems`                                    |
+| `listing.rvs`                             | CRC-32, then the file-system listing, saved once (an empty one with file systems off)         |
+| `events.rvs`                              | records `[len u32][crc32 u32][event]`, appended as the events go out (every one but `Rate`)    |
+| `checkpoint-a.rvs`, `checkpoint-b.rvs`    | CRC-32, then a generation, the log's length and event count, and the scan state or the summary |
+
+Values use the engine's binary encoding (see [Resumable scans](#resumable-scans)): every length checked, and only a
+regular file read (a link, folder, device or FIFO is `session_corrupt`, never followed or waited on), each up to a cap:
+manifest 1 MiB, listing 256 MiB, each checkpoint 256 MiB, an event record 32 MiB (the log is streamed, one record at a
+time). So a damaged or hostile folder is `session_corrupt`, never a panic, and opening one holds at most one file's
+bytes at a time (256 MiB) plus what they decode to: the newest checkpoint's state and the listing, each bounded by the
+scan's own caps (see `ScanOptions` and [Resumable scans](#resumable-scans)). The manifest's `sector` must be a power of
+two from 512 B to 64 KiB and its `block` a whole number of sectors up to 1 GiB (`session_corrupt` otherwise;
+`Session::create` refuses such options with `write_failed`, nothing written). The caps hold for writing too, so a
+session that saves always reads back: the walk's caps (262,144 files, paths up to 4,096 bytes) let a crafted card's
+listing pass 256 MiB, and a checkpoint grows by 8 bytes per finding (over 10 million findings fit); a listing or
+checkpoint over its cap is not saved (`write_failed`, the session stays at its previous checkpoint; a scan without a
+session still reads such a card).
+
+**Crash safety.** The log is only appended to. A checkpoint is written after the log is flushed and `sync_data`'d, into
+a new temporary file (`sync_all`) renamed over the older of the two checkpoints, then the folder is synced (best effort:
+some file systems refuse it, ruling P33); the listing is written the same way. Opening takes the valid checkpoint with
+the highest generation (a damaged or torn one, checksum wrong, falls back to the other) and drops whatever the log holds
+past the length it names (a record half written when the power went). Both checkpoints damaged is `session_corrupt`.
+Nothing follows a link planted in the folder: new files are created exclusively (a planted temporary is removed first,
+never its target), a rename replaces a link rather than its target, and the log is reopened only after checking that the
+file opened is the regular file looked at (same device and inode on Unix; on Windows a reparse point is opened itself
+and refused) and has a single link (on every system: a hard link to a file elsewhere is refused).
+
+**Cost.** A session adds a fixed cost per scan and no measurable cost per byte (ruling P46). The fixed cost is the
+syncs that make it crash-safe: two files and the folder synced at create, and at each checkpoint the log's `sync_data`,
+the checkpoint's `sync_all` and the folder sync (on macOS `sync_all` is a full flush of the drive's cache, tens of
+milliseconds each). Checkpoints come every 256 MiB or 30 s, after the pairing step and at the end. Measured with
+`revenant-dev bench --session` (release, best of 3, default cadence, on the machine of [Performance](#performance)):
+at 1 GiB the session took 0.3 to 0.4 s more than a plain scan (`noise` 0.73 to 1.11 s, `dense-jpeg` 3.56 to 3.77 s); at
+4 GiB 0.08 to 0.2 s more on `noise` (1.88 to 1.99 s plain, 2.07 to 2.10 s through a session), and nothing on
+`dense-jpeg` (15.3 s through a session against 16.2 to 16.7 s for a plain scan run in the same place of the bench, after
+the plain runs; with the cadence checkpoints off it is the same 15.3 s). The difference does not grow with the size: on
+a card read at device speed (100 to 300 MB/s) it is well under 1%.
 
 ## Deduplication
 
@@ -1128,6 +1677,29 @@ rebuild of the head (a one-line change) scanned `dense-jpeg` in 2.11 s with file
 2.13 s on `main`, while the head as first built took 2.26 s. The gap is the code layout of that one build. On this Mac
 an A/B needs such a control rebuild to resolve a difference of about 6%.
 
+**End of 1.5 (session lines).** Part 1.5 added no work to the plain scan path except the early-warning counters and the
+state a session captures at block boundaries, so the plain lines are expected to stay where 1.4 left them. They did
+not: measured at the end of 1.5 (`revenant-dev bench`, default threads, best of 3 scans) the Mac was loaded and
+throttling, and every line came out lower, the ones 1.5 cannot touch included: `noise` 1403.6 / 1360.0 MB/s (two
+full runs), `dense-jpeg` 305.7 / 275.4, `dense-raw` 938.8 / 841.5, `video` 1529.2 / 1454.1, `cut-jpeg` 244.1 / 248.8,
+`exfat-card` 288.3 / 296.8, against 2207.5, 539.8, 1420.3, 2525.4, 439.0 and 459.1 at the end of 1.4. Part 1.5's own
+tasks saw the same slow slot (`dense-jpeg` 205 to 220 MB/s in the middle of the part). Because a single build cannot
+resolve about 6% on this machine (see above), the 1.4 head (`main`, `08aae30`) was built in a separate target and run
+interleaved with the 1.5 head, three rounds with a 30 s pause, best of 3 scans: `noise` 1322.0 / 1724.8 / 1587.6 on
+`main` against 1439.8 / 1285.7 / 1313.1 on the 1.5 head; `dense-jpeg` 270.8 / 367.7 / 302.1 against 305.3 / 284.7 /
+287.1; `exfat-card` 278.9 / 310.8 / 282.6 against 304.5 / 290.6 / 303.1. The spread of `main` against itself (271 to
+368 MB/s on `dense-jpeg`) is larger than any gap between the two builds and the order of the builds changes from round
+to round, so this run shows no slowdown from part 1.5 but cannot rule out one of a few percent. The absolute numbers
+of the end of 1.4 were taken on a quieter machine and are not reproduced today.
+
+The session lines (`bench --images noise,dense-jpeg --session`, same slot, best of 3, a new session per scan): `noise`
+0.71 s (1507.9 MB/s) plain against 1.06 s (1017.2) through a session, `dense-jpeg` 3.61 s (297.2) against 3.97 s
+(270.5), that is 0.35 s and 0.36 s more, the fixed cost of the syncs described under [Sessions](#sessions) (ruling P46:
+it does not grow with the size; at 4 GiB it was 0.08 to 0.2 s). On a card read at device speed it is under 1%. The
+device against the image of the same card, as the opt-in `os_devices` test prints it with images attached by `hdiutil`
+(not a card reader): 76 to 79 MB/s on the raw device against 80 to 84 MB/s on the image file (this run), 113 to 127
+against 148 to 154 in the part's first run, so reading the raw device costs a little, not a multiple.
+
 Every placed file is found in every run. What it means for a card: an SD card reader delivers at most about 100 MB/s
 (UHS-I) to about 300 MB/s (UHS-II), so with the default threads the scan keeps up with the reader on every image here,
 the photo-dense ones included (`dense-jpeg` 503.9 and `dense-raw` 1576.9 MB/s, above the 300 MB/s goal). With one
@@ -1147,14 +1719,24 @@ choose: `sanitize(name)`, or `revenant_<start>.<ext>` when nothing is left of it
 nothing is ever overwritten, on case-sensitive and case-insensitive volumes alike and for NFC/NFD forms of one name
 (`DSC00001.JPG` and `dsc00001.jpg` give two files; after 10,000 attempts it fails with `write_failed`).
 
+`extract_to(source, &Finding, &Destination, name)` writes into a folder already checked with `Destination::check` (see
+[Destination](#destination)); `extract_as` is `Destination::check(&SystemDevices, ..)` followed by `extract_to`, so it checks
+on every call (cheap for an image; with a device source it asks the system each time, so check once and use `extract_to`). The
+returned path lies in the resolved folder (links followed: on macOS a temporary folder under `/var` comes back under
+`/private/var`).
+
 - Refuses with `destination_on_source` when the destination is on the source's volume (writing to a damaged card could destroy
-  what is still recoverable). If the source's volume is unknown (`None`) extraction is allowed. If the destination's volume
-  cannot be determined (e.g. the directory does not exist) it returns `open_failed` and writes nothing.
+  what is still recoverable) or, for a device source, on any volume of that device; with a device source a destination
+  whose disks cannot be told is `destination_unknown`. If an image source's volume is unknown (`None`) extraction is
+  allowed. If the destination's volume cannot be determined (e.g. the directory does not exist) it returns `open_failed`
+  and writes nothing.
 - A finding in pieces is written as its pieces (`Finding::ranges()`) one after another, in file order; the file is still
   named after the original name or, without one, after `start` (the first piece's start).
 - A chunk that cannot be read is re-read sector by sector (512 bytes); only the unreadable sectors are written as zeros, so a
   partial file comes out instead of none. Each piece stops at the source's end, even if its length runs past it.
 - A write error returns `write_failed` and removes the incomplete file.
+- A source that vanishes (`device_gone`, or a read coming back short before the source's end) is never written as zeros:
+  the copy stops, the incomplete file is removed and `device_gone` is returned.
 
 ## Grouping
 
@@ -1196,7 +1778,7 @@ Ids inside a group go by (time, id), the undated last.
 U+FEFF, which can disguise an extension) and U+FFFD become `_`; leading and trailing `.` and spaces are trimmed (`..`
 gives `None`); a Windows reserved stem (`CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9`, their superscript
 forms, `CONIN$`, `CONOUT$`; any case; the stem is what precedes the first `.`, so `CON.tar.gz` counts) gets a `_` in
-front; at most 200 bytes (before a `_N` suffix), cut on a char boundary, keeping an extension of up to 16 bytes. `extract::create_named(dir, &Finding, name, suffix)` is the one public way to create a file under a derived name (the CLI writes previews with it): it sanitizes `name`, replaces the extension by `suffix` when given (which must be empty or start with `.` and hold no unsafe char, else `write_failed`) and applies the `_N` rule. A total path over 260
+front; at most 200 bytes (before a `_N` suffix), cut on a char boundary, keeping an extension of up to 16 bytes. `Destination::create_named(&Finding, name, suffix)` is the one public way to create a file under a derived name (after the destination check; the CLI writes previews that way): it sanitizes `name`, replaces the extension by `suffix` when given (which must be empty or start with `.` and hold no unsafe char, else `write_failed`) and applies the `_N` rule. A total path over 260
 characters on Windows is a write error (`write_failed`) there, never an escape.
 
 ## Tested against real files

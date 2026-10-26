@@ -127,6 +127,21 @@ impl OrphanFinder {
         self.tail.clear();
     }
 
+    /// The last bytes seen (at most `MAX_HEAD - 1`) and where they end (a saved scan state).
+    pub(crate) fn tail(&self) -> (Vec<u8>, u64) {
+        (self.tail.clone(), self.tail_end)
+    }
+
+    /// Restores a tail [`OrphanFinder::tail`] gave; `false` (nothing changed) when it is longer than one can be.
+    pub(crate) fn set_tail(&mut self, tail: Vec<u8>, end: u64) -> bool {
+        if tail.len() >= MAX_HEAD as usize {
+            return false;
+        }
+        self.tail = tail;
+        self.tail_end = end;
+        true
+    }
+
     /// Looks at `bytes`, which start at the absolute offset `from`; pushes each candidate whose head ends in them to
     /// `out` (those of one call sorted) until it holds `cap`, then sets `capped`.
     pub(crate) fn feed(

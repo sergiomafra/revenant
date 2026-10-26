@@ -497,7 +497,7 @@ impl<'a> Walk<'a, '_> {
             .and_then(FileKind::from_extension)
             .is_some()
         {
-            (&mut self.early_photos, self.budget.files_left())
+            (&mut self.early_photos, self.budget.live_files_left())
         } else {
             self.live_file(ch, d);
             return;

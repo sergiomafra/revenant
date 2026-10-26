@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use super::fs::{FsJobResult, FsPlan, fs_job};
 use super::{CancelToken, HEAD_LEN};
+use crate::EngineError;
 use crate::cache::{CachedSource, Runs};
 use crate::filesystem::{OrphanDir, OrphanFinder};
 use crate::formats::{
@@ -160,6 +161,8 @@ pub(super) struct Block {
     pub(super) orphans: Vec<OrphanDir>,
     /// More than [`MAX_BLOCK_ORPHANS`] were met in this block: the rest were not kept.
     pub(super) orphans_capped: bool,
+    /// The finders' tails before this block was fed to them: a scan resumed at `pos` starts from them (ruling D22).
+    pub(super) tails: FinderTails,
 }
 
 /// Most `moov` candidates kept per block.
@@ -172,6 +175,37 @@ pub(super) const MAX_BLOCK_ORPHANS: usize = 8192;
 pub(super) struct Finders {
     pub(super) moov: MoovFinder,
     pub(super) orphan: Option<OrphanFinder>,
+}
+
+/// What the finders keep between blocks: the last bytes each one saw and where they end (`orphan`: only with volumes).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FinderTails {
+    pub(crate) moov: (Vec<u8>, u64),
+    pub(crate) orphan: Option<(Vec<u8>, u64)>,
+}
+
+impl Finders {
+    pub(super) fn tails(&self) -> FinderTails {
+        FinderTails {
+            moov: (self.moov.tail.clone(), self.moov.tail_end),
+            orphan: self.orphan.as_ref().map(OrphanFinder::tail),
+        }
+    }
+
+    /// Restores tails [`Finders::tails`] gave; `false` when one is longer than it can be or an old-directory tail
+    /// comes without volumes (or the reverse).
+    pub(super) fn restore(&mut self, tails: FinderTails) -> bool {
+        let FinderTails { moov, orphan } = tails;
+        if moov.0.len() >= MOOV_HEAD {
+            return false;
+        }
+        (self.moov.tail, self.moov.tail_end) = moov;
+        match (&mut self.orphan, orphan) {
+            (Some(o), Some((tail, end))) => o.set_tail(tail, end),
+            (None, None) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Bytes of a candidate `moov` box header looked at: size, `moov`, the first child's size and `mvhd`.
@@ -314,6 +348,17 @@ impl<'s> Shared<'s> {
         }
     }
 
+    /// `Err(Cancelled)` once the scan is cancelled, else `Err(DeviceGone)` once the source has vanished (ruling D1).
+    pub(super) fn check(&self) -> Result<(), EngineError> {
+        if self.cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        match self.cache.gone() {
+            Some(offset) => Err(EngineError::DeviceGone { offset }),
+            None => Ok(()),
+        }
+    }
+
     /// Whether a committed skip range holds the sector start `at`.
     pub(super) fn skipped(&self, at: u64) -> bool {
         lock(&self.skips).covers(at, at + 1)
@@ -380,10 +425,18 @@ impl<'s> Shared<'s> {
 
     /// Reads the block `[pos, end)` (or defers it) and, with workers, queues a job for each head to examine and for each
     /// kept file-system file starting in it. `finders` search the bytes read for orphan `moov` candidates and old
-    /// directories.
-    pub(super) fn fill(&self, pos: u64, end: u64, workers: bool, finders: &mut Finders) -> Block {
+    /// directories. Fails (nothing queued) when a window of the block cannot be loaded: the scan was cancelled or the
+    /// source vanished.
+    pub(super) fn fill(
+        &self,
+        pos: u64,
+        end: u64,
+        workers: bool,
+        finders: &mut Finders,
+    ) -> Result<Block, EngineError> {
         let sector = self.sector;
         let sectors = (end - pos).div_ceil(sector) as usize;
+        let tails = finders.tails();
         if lock(&self.skips).covers(pos, end) && self.cache.covered(pos, end) {
             let mut bad = None;
             for (s, l) in self.cache.bad_runs(pos, end) {
@@ -396,7 +449,7 @@ impl<'s> Shared<'s> {
             if let Some(o) = &mut finders.orphan {
                 o.reset();
             }
-            return Block {
+            return Ok(Block {
                 pos,
                 end,
                 bad,
@@ -406,7 +459,8 @@ impl<'s> Shared<'s> {
                 moovs_capped: false,
                 orphans: Vec::new(),
                 orphans_capped: false,
-            };
+                tails,
+            });
         }
         let mut bad: Option<Vec<bool>> = None;
         let mut heads = Vec::new();
@@ -450,7 +504,7 @@ impl<'s> Shared<'s> {
                 }
                 at = sector_end;
             }
-        });
+        })?;
         orphans.sort_unstable();
         if orphans.len() > MAX_BLOCK_ORPHANS {
             orphans.truncate(MAX_BLOCK_ORPHANS);
@@ -476,7 +530,7 @@ impl<'s> Shared<'s> {
             drop(q);
             self.queued.notify_all();
         }
-        Block {
+        Ok(Block {
             pos,
             end,
             bad,
@@ -486,7 +540,8 @@ impl<'s> Shared<'s> {
             moovs_capped,
             orphans,
             orphans_capped,
-        }
+            tails,
+        })
     }
 
     /// The head at `at` read now (for a deferred block), if the sector is readable and some format recognizes it.

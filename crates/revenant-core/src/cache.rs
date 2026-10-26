@@ -6,12 +6,21 @@
 //! shared bad map. Loaded windows are kept, least recently used first out, up to the capacity. Loading a window again
 //! after it was evicted reads around the bad runs already known and never touches them again. A read that overlaps an
 //! unreadable sector fails every time, as the source would, without touching the source again.
+//!
+//! A source that vanishes (it returns [`EngineError::DeviceGone`], or a read comes back short before the length it
+//! announced) is never taken for bad sectors: the load fails with `DeviceGone`, nothing of it is kept, the first offset is
+//! remembered ([`CachedSource::gone`]) and no window is loaded from the source again (the windows already loaded are
+//! still served). With a cancel token ([`CachedSource::with_cancel`]), a load stops with [`EngineError::Cancelled`] before
+//! it starts and at each sector of a sector-by-sector resolution, keeping nothing either.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
 
 use crate::EngineError;
-use crate::source::{Source, VolumeId};
+use crate::scan::{CancelToken, STALL};
+use crate::source::{DiskId, Source, VolumeId, read_full};
 
 /// Bytes per cache window (rounded down to a whole number of sectors, at least one).
 pub(crate) const CACHE_WINDOW: usize = 1 << 20;
@@ -20,6 +29,9 @@ pub(crate) const CACHE_WINDOW: usize = 1 << 20;
 const MAX_BAD_RUNS: usize = 1 << 20;
 /// Most merged runs of coverage kept; the lowest are dropped past it (a dropped run only means a block is read again).
 const MAX_COVERAGE_RUNS: usize = 1 << 16;
+
+/// Half-open runs `(start, end)`, ascending (a saved bad map or coverage).
+pub(crate) type RunList = Vec<(u64, u64)>;
 
 /// Merged, non-overlapping, non-adjacent half-open runs `start -> end`.
 #[derive(Default)]
@@ -91,6 +103,20 @@ impl Runs {
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
+
+    /// The runs as `(start, end)`, ascending.
+    pub(crate) fn to_vec(&self) -> Vec<(u64, u64)> {
+        self.0.iter().map(|(&s, &e)| (s, e)).collect()
+    }
+
+    /// The runs `(start, end)` as [`Runs::to_vec`] gives them: `None` unless each is non-empty and each starts past the
+    /// previous one's end (ascending, disjoint, not touching), and there are at most `cap`.
+    pub(crate) fn from_vec(runs: Vec<(u64, u64)>, cap: usize) -> Option<Runs> {
+        let valid = runs.len() <= cap
+            && runs.iter().all(|&(s, e)| s < e)
+            && runs.windows(2).all(|w| w[0].1 < w[1].0);
+        valid.then(|| Runs(runs.into_iter().collect()))
+    }
 }
 
 /// A loaded window.
@@ -119,6 +145,8 @@ struct State {
     bad: Runs,
     /// Windows fully resolved with every unreadable sector in them remembered.
     coverage: Runs,
+    /// The first offset at which the source vanished.
+    gone: Option<u64>,
 }
 
 impl State {
@@ -145,8 +173,11 @@ pub(crate) struct CachedSource<'a> {
     window: u64,
     capacity: usize,
     bad_cap: usize,
+    cancel: Option<CancelToken>,
     state: Mutex<State>,
     loaded: Condvar,
+    /// Window loads that took more than [`STALL`].
+    stalls: AtomicU64,
 }
 
 /// Removes a `Loading` slot left behind if the loading thread panics, so the waiters do not wait forever.
@@ -178,8 +209,40 @@ impl<'a> CachedSource<'a> {
             window,
             capacity: capacity.max(window as usize),
             bad_cap: MAX_BAD_RUNS,
+            cancel: None,
             state: Mutex::new(State::default()),
             loaded: Condvar::new(),
+            stalls: AtomicU64::new(0),
+        }
+    }
+
+    /// Cancellation checked before every window load and at each sector of a sector-by-sector resolution (ruling D3): a
+    /// load seeing it returns [`EngineError::Cancelled`] and keeps nothing.
+    pub(crate) fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// The first offset at which the source vanished (ruling D1): a `DeviceGone` from the source, or a short read before
+    /// `len()`. Once set, no window is loaded from the source again.
+    pub(crate) fn gone(&self) -> Option<u64> {
+        self.lock().gone
+    }
+
+    /// Records that the source vanished at `offset` (a reader beside the cache saw it); the first offset is kept.
+    pub(crate) fn mark_gone(&self, offset: u64) {
+        self.lock().gone.get_or_insert(offset);
+    }
+
+    /// Whether the cache's cancel token is set or the source has vanished: a reader beside the cache stops reading then.
+    pub(crate) fn stopped(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled) || self.gone().is_some()
+    }
+
+    fn check_cancel(&self) -> Result<(), EngineError> {
+        match &self.cancel {
+            Some(c) if c.is_cancelled() => Err(EngineError::Cancelled),
+            _ => Ok(()),
         }
     }
 
@@ -188,9 +251,33 @@ impl<'a> CachedSource<'a> {
         self.lock().coverage.covers(start, end)
     }
 
+    /// Window loads so far that took more than [`STALL`] (a slow or struggling device; timing-based).
+    pub(crate) fn stalls(&self) -> u64 {
+        self.stalls.load(Ordering::Relaxed)
+    }
+
     /// Unreadable runs `(start, len)` inside [start, end), merged, ascending.
     pub(crate) fn bad_runs(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
         self.lock().bad.within(start, end)
+    }
+
+    /// A consistent copy of the bad map (whole) and of the coverage runs that end past `pos`, as `(start, end)` runs (a
+    /// saved scan state, ruling D22).
+    pub(crate) fn snapshot(&self, pos: u64) -> (RunList, RunList) {
+        let st = self.lock();
+        let coverage = st.coverage.0.range(..).filter(|&(_, &e)| e > pos);
+        (st.bad.to_vec(), coverage.map(|(&s, &e)| (s, e)).collect())
+    }
+
+    /// Restores a bad map and coverage [`CachedSource::snapshot`] gave (a resumed scan, before any read): a known bad
+    /// sector is never read again. `None` when either does not fit the caps or is not ascending disjoint runs.
+    pub(crate) fn restore(&self, bad: RunList, coverage: RunList) -> Option<()> {
+        let bad = Runs::from_vec(bad, self.bad_cap)?;
+        let coverage = Runs::from_vec(coverage, MAX_COVERAGE_RUNS)?;
+        let mut st = self.lock();
+        st.bad = bad;
+        st.coverage = coverage;
+        Some(())
     }
 
     /// The scan tells the cache its position: coverage runs entirely below `pos` are pruned (keeps ≤ 65,536 runs).
@@ -205,16 +292,21 @@ impl<'a> CachedSource<'a> {
     /// Lends the bytes of `[start, end)` without copying them: calls `f(at, bytes, bad)` for each window it spans, in
     /// order, where `bytes` starts at the absolute offset `at` and `bad` lists that window's unreadable runs (absolute
     /// `(start, end)`, ascending; their bytes are zeros). Stops early at the end of the source. The window is held only
-    /// during the call.
-    pub(crate) fn visit(&self, start: u64, end: u64, mut f: impl FnMut(u64, &[u8], &[(u64, u64)])) {
+    /// during the call. A window that cannot be loaded (cancelled, or the source vanished) ends the visit with that error.
+    pub(crate) fn visit(
+        &self,
+        start: u64,
+        end: u64,
+        mut f: impl FnMut(u64, &[u8], &[(u64, u64)]),
+    ) -> Result<(), EngineError> {
         let end = end.min(self.len);
         let mut pos = start;
         while pos < end {
             let index = pos / self.window;
-            let w = self.window_at(index);
+            let w = self.window_at(index)?;
             let from = (pos - index * self.window) as usize;
             if from >= w.data.len() {
-                break; // the source shrank
+                break; // defensive: a window is whole except at the source's end
             }
             let to = (w.data.len() as u64).min(end - index * self.window) as usize;
             f(pos, &w.data[from..to], &w.bad);
@@ -223,10 +315,12 @@ impl<'a> CachedSource<'a> {
                 break;
             }
         }
+        Ok(())
     }
 
-    /// The window with index `index`, loading it if needed.
-    fn window_at(&self, index: u64) -> Arc<Window> {
+    /// The window with index `index`, loading it if needed. A load fails, keeping nothing, with `Cancelled` once the
+    /// cancel token is set and with `DeviceGone` once the source has vanished.
+    fn window_at(&self, index: u64) -> Result<Arc<Window>, EngineError> {
         let mut st = self.lock();
         loop {
             let state = &mut *st;
@@ -237,7 +331,7 @@ impl<'a> CachedSource<'a> {
                     state.tick += 1;
                     *used = state.tick;
                     state.lru.insert(state.tick, index);
-                    return w;
+                    return Ok(w);
                 }
                 Some(Slot::Loading) => {
                     st = self.loaded.wait(st).unwrap_or_else(PoisonError::into_inner);
@@ -245,6 +339,10 @@ impl<'a> CachedSource<'a> {
                 None => break,
             }
         }
+        if let Some(offset) = st.gone {
+            return Err(EngineError::DeviceGone { offset });
+        }
+        self.check_cancel()?;
         let start = index * self.window;
         let want = (self.len - start).min(self.window) as usize;
         st.slots.insert(index, Slot::Loading);
@@ -268,7 +366,21 @@ impl<'a> CachedSource<'a> {
             index,
             armed: true,
         };
-        let (window, new_bad) = self.load(buf, start, want, &known);
+        let began = Instant::now();
+        let loaded = self.load(buf, start, want, &known);
+        if began.elapsed() > STALL {
+            self.stalls.fetch_add(1, Ordering::Relaxed);
+        }
+        let (window, new_bad) = match loaded {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                if let EngineError::DeviceGone { offset } = e {
+                    self.mark_gone(offset);
+                }
+                // The guard removes the `Loading` slot and wakes the waiters, who then see the error themselves.
+                return Err(e);
+            }
+        };
         let window = Arc::new(window);
 
         let mut st = self.lock();
@@ -301,12 +413,15 @@ impl<'a> CachedSource<'a> {
         guard.armed = false;
         drop(st);
         self.loaded.notify_all();
-        window
+        Ok(window)
     }
 
     /// Reads the window `[start, start + want)` from the inner source around the `known` bad runs (`(start, len)`,
     /// ascending, inside it), which are never touched. Each stretch between them is read with one read, or sector by sector
     /// if that fails. Returns the window and the unreadable runs found now (absolute `(start, end)`, ascending).
+    ///
+    /// `DeviceGone` from the source, or a short read (the window lies inside `len()`, so the source vanished), fails the
+    /// load with `DeviceGone`; a cancel seen between two sectors fails it with `Cancelled`. Nothing found is kept then.
     ///
     /// `data` is a recycled buffer (or empty): every byte kept is overwritten by a read or zeroed.
     fn load(
@@ -315,7 +430,7 @@ impl<'a> CachedSource<'a> {
         start: u64,
         want: usize,
         known: &[(u64, u64)],
-    ) -> (Window, Vec<(u64, u64)>) {
+    ) -> Result<(Window, Vec<(u64, u64)>), EngineError> {
         let end = start + want as u64;
         data.resize(want, 0);
         let mut bad: Vec<(u64, u64)> = Vec::new();
@@ -333,30 +448,25 @@ impl<'a> CachedSource<'a> {
         if cur < end {
             plan.push((cur, end, false));
         }
-        let mut filled = want;
-        'plan: for (from, to, is_known) in plan {
+        for (from, to, is_known) in plan {
             if is_known {
                 data[(from - start) as usize..(to - start) as usize].fill(0);
                 push_run(&mut bad, from, to);
                 continue;
             }
+            self.check_cancel()?;
             let rel = (from - start) as usize;
             let stretch = &mut data[rel..(to - start) as usize];
-            match self.inner.read_at(from, stretch) {
-                Ok(n) if n < stretch.len() => {
-                    filled = rel + n; // the source ends (or shrank) here
-                    break 'plan;
-                }
-                Ok(_) => {}
+            match read_full(self.inner, from, stretch) {
+                Ok(()) => {}
+                Err(e @ EngineError::DeviceGone { .. }) => return Err(e),
                 Err(_) => {
                     for (i, chunk) in stretch.chunks_mut(self.sector as usize).enumerate() {
+                        self.check_cancel()?;
                         let at = from + i as u64 * self.sector;
-                        match self.inner.read_at(at, chunk) {
-                            Ok(n) if n < chunk.len() => {
-                                filled = (at - start) as usize + n;
-                                break 'plan;
-                            }
-                            Ok(_) => {}
+                        match read_full(self.inner, at, chunk) {
+                            Ok(()) => {}
+                            Err(e @ EngineError::DeviceGone { .. }) => return Err(e),
                             Err(_) => {
                                 chunk.fill(0);
                                 let to = at + chunk.len() as u64;
@@ -368,10 +478,7 @@ impl<'a> CachedSource<'a> {
                 }
             }
         }
-        data.truncate(filled);
-        let data_end = start + filled as u64;
-        bad.retain(|&(s, _)| s < data_end);
-        (Window { data, bad }, new_bad)
+        Ok((Window { data, bad }, new_bad))
     }
 
     #[cfg(test)]
@@ -406,7 +513,8 @@ impl Source for CachedSource<'_> {
     }
 
     /// Exactly what the inner source would return, memoized. A range overlapping an unreadable sector fails with the
-    /// offset of the first such sector in it, every time, without reading that sector again.
+    /// offset of the first such sector in it, every time, without reading that sector again. A range needing a window
+    /// that cannot be loaded fails with `Cancelled` or `DeviceGone` (see [`CachedSource::window_at`]).
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
         if offset >= self.len {
             return Ok(0);
@@ -416,10 +524,10 @@ impl Source for CachedSource<'_> {
         while done < want {
             let pos = offset + done as u64;
             let index = pos / self.window;
-            let w = self.window_at(index);
+            let w = self.window_at(index)?;
             let from = (pos - index * self.window) as usize;
             if from >= w.data.len() {
-                break; // the source shrank
+                break; // defensive: a window is whole except at the source's end
             }
             let n = (w.data.len() - from).min(want - done);
             let end = pos + n as u64;
@@ -441,6 +549,10 @@ impl Source for CachedSource<'_> {
     fn volume(&self) -> Option<VolumeId> {
         self.inner.volume()
     }
+
+    fn disk(&self) -> Option<DiskId> {
+        self.inner.disk()
+    }
 }
 
 #[cfg(test)]
@@ -456,6 +568,8 @@ mod tests {
         bad: Vec<(u64, u64)>,
         calls: AtomicU64,
         bad_attempts: AtomicU64,
+        /// Every read reaching this offset fails with `DeviceGone`.
+        gone: Option<u64>,
     }
 
     impl Mem {
@@ -466,6 +580,7 @@ mod tests {
                 bad,
                 calls: AtomicU64::new(0),
                 bad_attempts: AtomicU64::new(0),
+                gone: None,
             }
         }
     }
@@ -478,6 +593,13 @@ mod tests {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let end = offset + buf.len() as u64;
+            if let Some(g) = self.gone
+                && end > g
+            {
+                return Err(EngineError::DeviceGone {
+                    offset: offset.max(g),
+                });
+            }
             if self.bad.iter().any(|&(s, e)| offset < e && end > s) {
                 self.bad_attempts.fetch_add(1, Ordering::SeqCst);
                 return Err(EngineError::Read {
@@ -497,6 +619,35 @@ mod tests {
         fn volume(&self) -> Option<VolumeId> {
             None
         }
+    }
+
+    /// A source that reads the whole disk `disk4`.
+    struct OnDisk(Mem);
+
+    impl Source for OnDisk {
+        fn len(&self) -> u64 {
+            self.0.len()
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+            self.0.read_at(offset, buf)
+        }
+        fn volume(&self) -> Option<VolumeId> {
+            None
+        }
+        fn disk(&self) -> Option<DiskId> {
+            DiskId::parse("disk4").ok()
+        }
+    }
+
+    #[test]
+    fn the_cache_forwards_the_disk() {
+        let plain = Mem::new(4096, 1, Vec::new());
+        assert_eq!(CachedSource::new(&plain, 512, MIB as usize).disk(), None);
+        let device = OnDisk(Mem::new(4096, 1, Vec::new()));
+        assert_eq!(
+            CachedSource::new(&device, 512, MIB as usize).disk(),
+            DiskId::parse("disk4").ok()
+        );
     }
 
     /// splitmix64.
@@ -708,5 +859,23 @@ mod tests {
         cache.forget_coverage_below(2 * MIB);
         assert!(!cache.covered(0, MIB));
         assert_eq!(cache.bad_runs(0, 4 * MIB), vec![(bad, 512)]);
+    }
+
+    #[test]
+    fn gone_is_not_remembered_as_bad() {
+        let inner = Mem {
+            gone: Some(3 * MIB),
+            ..Mem::new(8 * MIB, 10, Vec::new())
+        };
+        let cache = CachedSource::new(&inner, 512, 64 * MIB as usize);
+        let first = read(&cache, 0, MIB as usize).unwrap();
+        let mut buf = vec![0u8; 2 * MIB as usize];
+        assert!(matches!(
+            cache.read_at(2 * MIB, &mut buf),
+            Err(EngineError::DeviceGone { offset }) if offset == 3 * MIB
+        ));
+        assert!(cache.bad_runs(0, u64::MAX).is_empty());
+        assert_eq!(cache.gone(), Some(3 * MIB));
+        assert_eq!(read(&cache, 0, MIB as usize), Ok(first));
     }
 }

@@ -307,7 +307,11 @@ fn extract_as_names_the_file_and_falls_back() {
     let p = extract_as(&f.source, &f.finding, dir.path(), "..").unwrap();
     assert_eq!(p.file_name().unwrap(), "revenant_000000001000.jpg");
     let p = extract_as(&f.source, &f.finding, dir.path(), "../../evil.jpg").unwrap();
-    assert_eq!(p.parent().unwrap(), dir.path());
+    // Written through the resolved folder (`/var` is `/private/var` on macOS).
+    assert_eq!(
+        p.parent().unwrap(),
+        std::fs::canonicalize(dir.path()).unwrap()
+    );
     assert_eq!(p.file_name().unwrap(), "_.._evil.jpg");
 }
 
@@ -404,7 +408,8 @@ fn hostile_names_stay_inside_the_destination() {
         let before = names_in(root.path());
         for f in &found {
             let p = extract(&source, f, &dest).unwrap();
-            assert_eq!(p.parent().unwrap(), dest, "{ty:?} {:?}", f.origin);
+            let resolved = std::fs::canonicalize(&dest).unwrap();
+            assert_eq!(p.parent().unwrap(), resolved, "{ty:?} {:?}", f.origin);
         }
         assert_eq!(names_in(&dest).len(), hostile.len(), "{ty:?}");
         assert_eq!(names_in(root.path()), before);
@@ -416,27 +421,32 @@ fn hostile_names_stay_inside_the_destination() {
     }
 }
 
+/// The one public way to create a file under a derived name goes through the checked destination.
 #[test]
 fn create_named_stays_inside_the_directory() {
-    use revenant_core::extract::create_named;
+    use revenant_core::Destination;
+    use revenant_core::device::SystemDevices;
     let f = fixture(other(), None, 0);
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("d");
     std::fs::create_dir(&dir).unwrap();
+    let dest = Destination::check(&SystemDevices, &f.source, &dir).unwrap();
     let abs = root.path().join("abs").display().to_string();
     for name in ["../x.jpg", abs.as_str(), "a/../../b.jpg", "..", "CON.jpg"] {
-        let (p, _file) = create_named(&dir, &f.finding, name, None).unwrap();
-        assert_eq!(p.parent().unwrap(), dir, "{name}");
+        let (p, _file) = dest.create_named(&f.finding, name, None).unwrap();
+        assert_eq!(p.parent().unwrap(), dest.dir(), "{name}");
     }
     assert_eq!(names_in(root.path()), vec!["d".to_string()]);
     // A hostile suffix is refused and nothing is created.
     let before = names_in(&dir);
     for suffix in ["/../evil", ".a/b", "x", ".a\\b", ".a\u{0}", ".\u{202E}jpg"] {
-        let res = create_named(&dir, &f.finding, "ok.jpg", Some(suffix));
+        let res = dest.create_named(&f.finding, "ok.jpg", Some(suffix));
         assert!(matches!(res, Err(EngineError::Write { .. })), "{suffix:?}");
     }
     assert_eq!(names_in(&dir), before);
     assert_eq!(names_in(root.path()), vec!["d".to_string()]);
-    let (p, _f) = create_named(&dir, &f.finding, "DSC1.ARW", Some(".preview.jpg")).unwrap();
+    let (p, _f) = dest
+        .create_named(&f.finding, "DSC1.ARW", Some(".preview.jpg"))
+        .unwrap();
     assert_eq!(p.file_name().unwrap(), "DSC1.preview.jpg");
 }

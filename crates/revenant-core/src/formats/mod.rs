@@ -123,6 +123,17 @@ pub enum Health {
     Damaged,
 }
 
+impl Health {
+    /// Stable lowercase identifier (`"intact"`, `"partial"`, `"damaged"`), as saved in a scan state.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Health::Intact => "intact",
+            Health::Partial => "partial",
+            Health::Damaged => "damaged",
+        }
+    }
+}
+
 /// One piece of a file: the absolute byte range `[start, start + len)` of the source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Fragment {

@@ -1,6 +1,6 @@
 //! A read-only logical view of pieces of a source, so a file found in pieces reads as one contiguous file.
 
-use super::{Source, VolumeId};
+use super::{DiskId, Source, VolumeId};
 use crate::EngineError;
 use crate::formats::Fragment;
 
@@ -107,5 +107,9 @@ impl Source for Fragmented<'_> {
 
     fn volume(&self) -> Option<VolumeId> {
         self.source.volume()
+    }
+
+    fn disk(&self) -> Option<DiskId> {
+        self.source.disk()
     }
 }

@@ -1118,3 +1118,69 @@ fn confirms_agrees_with_measure() {
         assert_eq!(confirms, expected, "{name}");
     }
 }
+
+/// A HEIC whose length is a whole number of 512-byte sectors (the image item grown to fill the last one).
+fn heic_aligned() -> Vec<u8> {
+    let first = testkit::heic(60_000, 5, &exif());
+    let pad = (512 - first.len() % 512) % 512;
+    let v = testkit::heic(60_000 + pad, 5, &exif());
+    assert_eq!(v.len() % 512, 0);
+    v
+}
+
+/// Ruling D27: a HEIC whose `iloc` extents all end inside what was walked is complete; an unreadable sector right after
+/// its last box is what follows the file, not a cut.
+#[test]
+fn unreadable_sector_after_a_complete_heic_keeps_it_intact() {
+    let v = heic_aligned();
+    let img = DiskImage::zeros(v.len() + 4096).put(0, &v).save();
+    let source = BadSector {
+        inner: FileSource::open(img.path()).unwrap(),
+        bad: v.len() as u64,
+    };
+    let m = IsoBmff.measure(&source, 0).unwrap();
+    assert_eq!(
+        (m.kind, m.len, m.health),
+        (FileKind::Heic, v.len() as u64, Health::Intact)
+    );
+}
+
+/// Ruling D27: a stray `moov` box right after a complete HEIC (on the next sector) neither joins it nor turns it into
+/// a video.
+#[test]
+fn loose_moov_after_a_heic_does_not_change_its_kind() {
+    let v = heic_aligned();
+    let video = testkit::mp4(&opts());
+    let moov = &video[find(&video, b"moov") - 4..];
+    let img = DiskImage::zeros(v.len() + moov.len() + 4096)
+        .put(0, &v)
+        .put(v.len(), moov)
+        .save();
+    let m = IsoBmff
+        .measure(&FileSource::open(img.path()).unwrap(), 0)
+        .unwrap();
+    assert_eq!(
+        (m.kind, m.len, m.health),
+        (FileKind::Heic, v.len() as u64, Health::Intact)
+    );
+}
+
+/// Ruling D27: without `moov`, a HEIC brand only among the compatible ones (major `isom`) and no top-level `meta` is a
+/// video that lost its index, not a HEIC.
+#[test]
+fn mp4_listing_heic_cut_before_moov_is_a_damaged_mp4() {
+    let mut ftyp_payload = b"isom".to_vec();
+    ftyp_payload.extend_from_slice(&0u32.to_be_bytes());
+    ftyp_payload.extend_from_slice(b"isommif1heic");
+    let mut payload = vec![0u8; 50_000];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i as u32).wrapping_mul(2_654_435_761).to_be_bytes()[1];
+    }
+    let v = [bx(b"ftyp", &ftyp_payload), bx(b"mdat", &payload)].concat();
+    let img = DiskImage::zeros(AT + v.len() + 4096).put(AT, &v).save();
+    let m = measure(&img).unwrap();
+    assert_eq!(
+        (m.kind, m.len, m.health),
+        (FileKind::Mp4, v.len() as u64, Health::Damaged)
+    );
+}

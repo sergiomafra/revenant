@@ -4,22 +4,26 @@
 
 mod fs;
 mod pipeline;
+mod state;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::EngineError;
 use crate::cache::{CACHE_WINDOW, CachedSource, Runs};
 use crate::filesystem::{
-    FsOrigin, FsState, MAX_FILES, MAX_HEAD, MAX_ORPHAN_DIRS, OrphanDir, OrphanFinder, Placement,
-    SourceProbe, Volume, head_len, kind_class, orphan_entries,
+    FsOrigin, FsState, Listing, MAX_FILES, MAX_HEAD, MAX_ORPHAN_DIRS, OrphanDir, OrphanFinder,
+    Placement, SourceProbe, Volume, head_len, kind_class, orphan_entries,
 };
 use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
+use crate::rate::RateMeter;
 use crate::source::Source;
 use fs::{FsJobResult, FsPlan, merge, tail_fits};
 use pipeline::{Block, CloseQueue, Finders, Head, Measured, Outcome, Shared};
+pub(crate) use state::{Checkpoint, Resume, ScanState};
 
 /// Bytes of a sector start shown to `Format::recognizes`.
 const HEAD_LEN: usize = 16;
@@ -122,6 +126,9 @@ pub struct ScanOptions {
     /// Read the FAT/exFAT file systems first (the default): files they list come out with their [`Finding::origin`].
     /// `false` scans by signature alone: no `Volume` events and every origin `None`.
     pub filesystems: bool,
+    /// Emit an [`Event::Rate`] right after each `Progress` (default `false`, ruling D21). Timing-based: the only event
+    /// outside the determinism contract.
+    pub rates: bool,
     /// Tests: no `fs_job` reuse of the carving.
     #[cfg(test)]
     pub(crate) no_reuse: bool,
@@ -167,6 +174,7 @@ impl Default for ScanOptions {
             cache_bytes: 256 * 1024 * 1024,
             threads: 0,
             filesystems: true,
+            rates: false,
             #[cfg(test)]
             no_reuse: false,
             #[cfg(test)]
@@ -213,7 +221,32 @@ pub enum Event {
     /// every `Found`, before `scan` returns, one per id in id order (today: a video put back together with its separated
     /// `moov`, and a finding an old folder of a quick-formatted card names, ruling D11; both merged into one).
     Updated(Finding),
+    /// Once per scan (ruling D20), right after the `Progress` of the first block boundary where the `Unreadable` events
+    /// emitted so far reach [`FAILING_RUNS`] runs or [`FAILING_BYTES`] bytes: the disk is failing, make a copy first.
+    /// Deterministic: it depends only on the `Unreadable` events emitted.
+    DiskFailing {
+        unreadable_runs: u64,
+        unreadable_bytes: u64,
+        read: u64,
+    },
+    /// Only with [`ScanOptions::rates`] (ruling D21), right after each `Progress` (after its `DiskFailing` when both fall
+    /// on the same boundary: the fixed order is `Progress`, `DiskFailing`, `Rate`). Timing-based: outside the determinism
+    /// contract and never stored in a session. `bytes_per_sec`: the reading speed, an exponential moving average with a
+    /// 10 s half-life (0 until known); `eta_secs`: seconds left at that speed; `stalls`: window loads that took more than
+    /// [`STALL`] so far.
+    Rate {
+        bytes_per_sec: u64,
+        eta_secs: Option<u64>,
+        stalls: u64,
+    },
 }
+
+/// Unreadable runs that make a scan report [`Event::DiskFailing`].
+pub const FAILING_RUNS: u64 = 16;
+/// Unreadable bytes that make a scan report [`Event::DiskFailing`].
+pub const FAILING_BYTES: u64 = 4 << 20;
+/// A window load slower than this counts as a stall in [`Event::Rate`].
+pub const STALL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ScanSummary {
@@ -252,6 +285,7 @@ fn within(inner: &[Fragment], outer: &[Fragment]) -> bool {
 }
 
 /// A finding emitted without origin that starts on a volume's cluster grid: an old directory may name it (ruling D11).
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Carved {
     id: u64,
     start: u64,
@@ -277,6 +311,7 @@ impl Carved {
 }
 
 /// A finding not yet emitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Pending {
     finding: Finding,
     /// Its byte ranges (the pieces, or the whole file).
@@ -289,9 +324,17 @@ struct Pending {
 struct Commit<'a, 's> {
     shared: &'a Shared<'s>,
     on_event: &'a mut dyn FnMut(Event),
+    /// Events emitted, every one but `Rate` (ruling P4); a resumed scan starts from the saved count.
+    events: u64,
     summary: ScanSummary,
     /// The open unreadable run `(start, len)`.
     run: Option<(u64, u64)>,
+    /// `Unreadable` events emitted (their bytes are `summary.unreadable_bytes`).
+    unreadable_runs: u64,
+    /// `DiskFailing` has been emitted (once per scan, ruling D20).
+    failing_sent: bool,
+    /// The reading speed, with `ScanOptions::rates` (ruling D21).
+    rate: Option<RateMeter>,
     /// Found but not yet emitted, in start order.
     pending: VecDeque<Pending>,
     next_id: u64,
@@ -335,23 +378,57 @@ thread_local! {
 }
 
 impl Commit<'_, '_> {
-    /// Emits `event` unless the scan is cancelled; a cancel seen afterwards stops the scan before anything else is
-    /// emitted.
+    /// Emits `event` unless the scan is cancelled or the source has vanished; either seen afterwards stops the scan
+    /// before anything else is emitted.
     fn emit(&mut self, event: Event) -> Result<(), EngineError> {
-        if self.shared.cancel.is_cancelled() {
-            return Err(EngineError::Cancelled);
-        }
+        self.shared.check()?;
+        self.events += u64::from(!matches!(event, Event::Rate { .. }));
         (self.on_event)(event);
-        if self.shared.cancel.is_cancelled() {
-            return Err(EngineError::Cancelled);
-        }
-        Ok(())
+        self.shared.check()
     }
 
     fn flush_run(&mut self) -> Result<(), EngineError> {
         if let Some((start, len)) = self.run.take() {
             self.summary.unreadable_bytes += len;
+            self.unreadable_runs += 1;
             self.emit(Event::Unreadable { start, len })?;
+        }
+        Ok(())
+    }
+
+    /// Emits `event` without looking at the cancel flag or the source: only for the events of a boundary, which go out
+    /// together.
+    fn emit_now(&mut self, event: Event) {
+        self.events += u64::from(!matches!(event, Event::Rate { .. }));
+        (self.on_event)(event);
+    }
+
+    /// A block boundary: `Progress`, then `DiskFailing` the first time the `Unreadable` events emitted so far reach a
+    /// threshold (ruling D20), then `Rate` with `ScanOptions::rates` (ruling D21): always in that order, and together:
+    /// a cancel or a vanished source is looked at before them only, so one seen while they are handed out stops the
+    /// scan right after the whole boundary (where a saved session can still checkpoint it).
+    fn progress(&mut self, read: u64, total: u64) -> Result<(), EngineError> {
+        self.shared.check()?;
+        self.emit_now(Event::Progress { read, total });
+        if !self.failing_sent
+            && (self.unreadable_runs >= FAILING_RUNS
+                || self.summary.unreadable_bytes >= FAILING_BYTES)
+        {
+            self.failing_sent = true;
+            self.emit_now(Event::DiskFailing {
+                unreadable_runs: self.unreadable_runs,
+                unreadable_bytes: self.summary.unreadable_bytes,
+                read,
+            });
+        }
+        if let Some(rate) = &mut self.rate {
+            rate.sample(read, Instant::now());
+            let event = Event::Rate {
+                bytes_per_sec: rate.bytes_per_sec(),
+                eta_secs: rate.eta_secs(total.saturating_sub(read)),
+                stalls: self.shared.cache.stalls(),
+            };
+            self.emit_now(event);
         }
         Ok(())
     }
@@ -881,9 +958,15 @@ impl Commit<'_, '_> {
 ///
 /// `opts.sector` is raised to at least 16 (the head length) and `opts.block` rounded down to whole sectors, so a head
 /// never straddles two blocks. Cancellation is checked before each block examined or read ahead, before and after
-/// every event, while waiting for a measurement and during the pairing step: once it is seen no further event is
-/// emitted, the measuring threads drop their remaining jobs, and the scan returns `Err(Cancelled)` after they have all
-/// stopped; findings still pending and `Updated` events not yet emitted are dropped.
+/// every event (a boundary's `Progress`, `DiskFailing` and `Rate` count as one: checked before and after the group),
+/// while waiting for a measurement and during the pairing step: once it is seen no further event is emitted, the measuring threads drop their remaining jobs, and the scan returns `Err(Cancelled)` after they have all
+/// stopped; findings still pending and `Updated` events not yet emitted are dropped. The cache also checks it before each
+/// window load and each sector of a sector-by-sector resolution (ruling D3), so a running measurement ends quickly.
+///
+/// A source that vanishes (ruling D1: `DeviceGone`, or a short read before its length, seen by the cache or by the
+/// FAT32 high-word probe) stops the scan like a cancel, with `Err(DeviceGone)`; its sectors are never reported
+/// `Unreadable`, so the events emitted are a prefix of the scan's events on the whole source. A listing read while
+/// cancelled or after the source vanished is never used (ruling P3): no `Volume` is emitted.
 pub fn scan(
     source: &dyn Source,
     formats: &[Box<dyn Format>],
@@ -891,28 +974,74 @@ pub fn scan(
     cancel: &CancelToken,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<ScanSummary, EngineError> {
+    scan_with(source, formats, opts, cancel, on_event, None, None)
+}
+
+/// The hook [`scan_with`] calls at each [`Checkpoint`]; an error stops the scan with it.
+pub(crate) type Hook<'h> = &'h mut dyn FnMut(Checkpoint) -> Result<(), EngineError>;
+
+/// [`scan`], resumable (ruling D22). `hook` is called at each [`Checkpoint`]: once with the listing (only after a fresh
+/// listing, and only when it was not read during a cancel or after the source vanished: then the scan returns that error
+/// without calling it, ruling P3), at every block boundary, and after the pairing step.
+///
+/// With `resume`, nothing before `state.position()` is examined again and the listing is not read (ruling D23): the
+/// scan rebuilds what it keeps of the listing from `resume.listing`, emits no `Volume`, and its events continue exactly
+/// after the first `state.events()` events of the scan the state was saved from. For a source that answers the same
+/// every time, those are the events the uninterrupted scan emitted after that point, for any `threads` and
+/// `cache_bytes`. What a resume reads again (ruling D24): the blocks the saved scan had read ahead, the pieces before
+/// the position of file-system files starting after it, and what the pairing loads; never a sector the state's bad
+/// map holds. A state that cannot belong to this scan (a position past the end or off a block boundary, runs out of
+/// order, a cap passed) gives `SessionCorrupt`.
+pub(crate) fn scan_with(
+    source: &dyn Source,
+    formats: &[Box<dyn Format>],
+    opts: &ScanOptions,
+    cancel: &CancelToken,
+    on_event: &mut dyn FnMut(Event),
+    resume: Option<Resume>,
+    mut hook: Option<Hook>,
+) -> Result<ScanSummary, EngineError> {
     let sector = opts.sector_len();
     let block = opts.block_len();
     let lookahead = opts.lookahead_blocks();
     let threads = opts.resolved_threads();
     let workers = if threads > 1 { threads } else { 0 };
-    let cache = CachedSource::new(source, sector, opts.cache_bytes.max(CACHE_WINDOW));
+    let cache = CachedSource::new(source, sector, opts.cache_bytes.max(CACHE_WINDOW))
+        .with_cancel(cancel.clone());
     let mut shared = Shared::new(cache, formats, cancel, sector);
     let total = shared.total;
-    // The file systems first (ruling D1): metadata through the cache, the high-word heads through a probe over the raw
-    // source that refuses what the cache knows to be unreadable. Nothing is skipped because of them (ruling R10).
-    let (volumes, listing_truncated): (Vec<Volume>, bool) = if opts.filesystems {
-        let listing = crate::filesystem::read_with(
-            &shared.cache,
-            &SourceProbe::beside(source, &shared.cache),
-            cancel,
-        );
-        let out = (listing.volumes.clone(), listing.truncated);
-        shared.fs = FsPlan::new(listing, sector, total);
-        out
-    } else {
-        (Vec::new(), false)
+    let shape = state::Shape {
+        sector,
+        block,
+        filesystems: opts.filesystems,
+        total,
     };
+    let (listing, state) = match resume {
+        Some(Resume { listing, state }) => (listing, Some(state)),
+        None => {
+            // The file systems first (ruling D1): metadata through the cache, the high-word heads through a probe over
+            // the raw source that refuses what the cache knows to be unreadable. Nothing is skipped because of them
+            // (ruling R10).
+            let listing = if opts.filesystems {
+                crate::filesystem::read_with(
+                    &shared.cache,
+                    &SourceProbe::beside(source, &shared.cache),
+                    cancel,
+                )
+            } else {
+                Listing::default()
+            };
+            // A listing read while cancelled or after the source vanished may lack what it could not read: never used
+            // nor saved (P3).
+            shared.check()?;
+            if let Some(h) = hook.as_mut() {
+                h(Checkpoint::Listing(&listing))?;
+            }
+            (listing, None)
+        }
+    };
+    let (volumes, listing_truncated) = (listing.volumes.clone(), listing.truncated);
+    shared.fs = FsPlan::new(listing, sector, total);
     #[cfg(test)]
     {
         shared.reuse = !opts.no_reuse;
@@ -933,14 +1062,15 @@ pub fn scan(
 
     std::thread::scope(|s| {
         let _close = CloseQueue(&shared);
-        for _ in 0..workers {
-            s.spawn(|| shared.work());
-        }
         let mut commit = Commit {
             shared: &shared,
             on_event,
+            events: 0,
             summary: ScanSummary::default(),
             run: None,
+            unreadable_runs: 0,
+            failing_sent: false,
+            rate: None,
             pending: VecDeque::new(),
             next_id: 1,
             moovs: Vec::new(),
@@ -958,31 +1088,42 @@ pub fn scan(
             carved: Vec::new(),
             orphans_capped: false,
         };
-        commit.summary.listing_truncated = listing_truncated;
-        for volume in &volumes {
-            commit.emit(Event::Volume {
-                volume: volume.clone(),
-                listing_truncated,
-            })?;
-        }
         let mut finders = Finders {
             orphan: (!volumes.is_empty()).then(|| OrphanFinder::new(&volumes)),
             ..Finders::default()
         };
-        let mut ahead: VecDeque<Block> = VecDeque::with_capacity(lookahead);
-        let mut fill_pos = 0u64;
-        loop {
-            if cancel.is_cancelled() {
-                return Err(EngineError::Cancelled);
+        let resumed = state.is_some();
+        // Restored before any read: a known bad sector is never read again (ruling P5).
+        let position = match state {
+            Some(state) => state.apply(&mut commit, &shared, &mut finders, shape)?,
+            None => 0,
+        };
+        for _ in 0..workers {
+            s.spawn(|| shared.work());
+        }
+        commit.rate = opts.rates.then(|| {
+            let mut meter = RateMeter::new();
+            meter.sample(position, Instant::now());
+            meter
+        });
+        if !resumed {
+            commit.summary.listing_truncated = listing_truncated;
+            for volume in &volumes {
+                commit.emit(Event::Volume {
+                    volume: volume.clone(),
+                    listing_truncated,
+                })?;
             }
+        }
+        let mut ahead: VecDeque<Block> = VecDeque::with_capacity(lookahead);
+        let mut fill_pos = position;
+        loop {
+            shared.check()?;
             while ahead.len() < lookahead && fill_pos < total {
-                if cancel.is_cancelled() {
-                    return Err(EngineError::Cancelled);
-                }
+                shared.check()?;
                 let end = (fill_pos + block).min(total);
-                ahead.push_back(shared.fill(fill_pos, end, workers > 0, &mut finders));
+                ahead.push_back(shared.fill(fill_pos, end, workers > 0, &mut finders)?);
                 fill_pos = end;
-                shared.cache.forget_coverage_below(fill_pos);
             }
             let Some(mut b) = ahead.pop_front() else {
                 break;
@@ -1000,17 +1141,52 @@ pub fn scan(
             let keep_from = read.saturating_sub(MOOV_HEAD);
             shared.prune_skips(read.saturating_sub(MOOV_HEAD.max(MAX_HEAD)));
             commit.own_moovs.drop_below(keep_from);
-            commit.emit(Event::Progress { read, total })?;
+            // Coverage below the walk is never looked at again; from it on it is part of a saved state (ruling D24: a
+            // resume does not read the core of an `Intact` finding across the point again).
+            shared.cache.forget_coverage_below(read);
+            commit.progress(read, total)?;
+            if let Some(h) = hook.as_mut() {
+                let state = || state::capture(&commit, &shared, &ahead, &finders, shape, read);
+                // Everything up to this boundary was committed before a cancel or a vanished source was seen: the
+                // state is still good, and the scan stops right after the hook.
+                let stopping = shared.check().is_err();
+                h(Checkpoint::Boundary {
+                    read,
+                    events: commit.events,
+                    state: &state,
+                    stopping,
+                })?;
+            }
         }
         commit.flush_run()?;
         while let Some(p) = commit.pending.pop_front() {
             commit.emit_found(p)?;
         }
-        if total == 0 {
-            commit.emit(Event::Progress { read: 0, total })?;
+        if total == 0 && !resumed {
+            commit.progress(0, total)?;
+            if let Some(h) = hook.as_mut() {
+                let state = || state::capture(&commit, &shared, &ahead, &finders, shape, 0);
+                h(Checkpoint::Boundary {
+                    read: 0,
+                    events: commit.events,
+                    state: &state,
+                    stopping: shared.check().is_err(),
+                })?;
+            }
         }
         let paired = commit.pair()?;
+        if let Some(h) = hook.as_mut() {
+            // A source gone during the pairing: the last boundary stays the point to resume from.
+            shared.check()?;
+            let state = || state::capture(&commit, &shared, &ahead, &finders, shape, total);
+            h(Checkpoint::Paired {
+                events: commit.events,
+                state: &state,
+            })?;
+        }
         commit.update(paired)?;
+        // The pairing and the old directories read through the cache too: a source gone then may have changed them.
+        shared.check()?;
         Ok(commit.summary)
     })
 }

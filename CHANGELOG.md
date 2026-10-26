@@ -7,6 +7,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `revenant-dev` lists the connected disks, runs the pre-flight check, unmounts and remounts a card, copies a card into
+  an image with its rescue map (resumable, checked first: it stops before writing anything when the destination cannot
+  hold the card or is on it), prints a digest of a card or image, and scans a card directly, an image with its map (what
+  was never rescued is unreadable, never zeros), or a saved session (resumed after a crash or a pulled cable, waiting
+  for the card to be plugged back in, with the lines already found marked as replayed). With a card, `--extract`,
+  `--previews` and `--session` are checked once against the whole card and `--allow-same-volume` is refused, so nothing
+  is ever written to it; a partition or any other device node is refused (name the whole disk).
+
+- A scan can be saved into a folder of its own and resumed after the card is disconnected, the program crashes or is
+  closed, or the power goes, with the same results as an uninterrupted scan; a finished scan's results can be opened
+  again without the card. A session refuses to resume on another card (or on a rescue copy whose image changed
+  meanwhile), never lives on the card itself, and the pre-flight check says up front when a session belongs to another
+  card or cannot be read. `revenant-dev bench --session` measures a scan through a session.
+- An early "disk failing, make a copy" signal: once the scan meets 16 unreadable areas or 4 MiB of unreadable data, it
+  says so right away (once), so a dying card can be copied before it gets worse. A scan can also report its reading
+  speed, the time left and how often the device stalled.
+- A pre-flight check reports, before a long read, everything already known to be wrong, all at once: a missing
+  permission to read the disk, a disk that does not answer or cannot read its first, middle or last sector (it never
+  waits more than 10 s for one), a failed unmount, and a copy destination that cannot hold the card (not enough room,
+  FAT32 for a card over 4 GiB, a folder on the card itself or on a disk that cannot be told). The disk holding the
+  running system is refused outright, never unmounted or read.
+- A card that is disconnected and plugged back in is found again (even under another disk name), told apart from
+  look-alike cards (one that stops answering never holds up the search), and unmounted again before anything but its
+  identity is read.
+- A bad-sector-tolerant, resumable copy of a card or disk into an image file: the readable parts are copied first, the
+  damaged areas are skipped and come back later sector by sector, each bad sector is read once (no retries unless
+  asked), and the copy reports bytes rescued, bad and left, speed and time left. It resumes where it stopped after a
+  crash, a cancel or the card being pulled out (which never marks sectors bad), refuses to resume onto another card, and
+  refuses up front a destination without room for it or on FAT32 when the card is over 4 GiB (the image is never split).
+- Scanning a card image together with its rescue map treats the parts of the card that were never rescued as unreadable,
+  never as zeros, so no photo or video in them is called intact. The map (`<image>.rvmap`) is saved so that a crash
+  or power loss leaves the previous map or the new one, never a damaged one.
+- The engine unmounts a card's volumes without ejecting it (macOS and Windows), so the system stops writing to it while
+  it is read; it says which volumes are still in use when that fails, never remounts by itself, and remounts on request.
+- The engine lists the connected disks (macOS and Windows) with their size, sector sizes, maker, model, whether they are
+  removable, internal, the system disk, a disk image or a solid-state drive, and their volumes; APFS containers are shown
+  through their physical disk.
+- The engine reads a whole card or disk directly, read-only (macOS `/dev/rdiskN`, Windows `\\.\PhysicalDriveN`, with
+  root or Administrator), including disks with 4096-byte sectors; a bad sector is read once, and a disk that disconnects
+  is reported as gone, never as bad sectors.
 - Recovered files can be grouped by shooting session (a pause of more than 2 hours starts a new one), by day, by
   camera and by folder, for the results screen; "by folder" is offered only when the folder structure survived.
   `revenant-dev scan --group` prints the groups.
@@ -94,6 +134,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Extraction from a whole card or disk refuses a destination on any volume of that device (also an APFS volume whose
+  container lives on it), and a destination whose disks cannot be determined (a network folder), so nothing is ever
+  written to the card being recovered.
+- A card or disk disconnected in the middle of a scan or an extraction stops it with `device_gone` instead of being
+  reported as unreadable sectors (or extracted as zeros); cancelling is prompt on slow or failing devices.
 - A partial RAW (TIFF-based RAW, RAF, CR3) no longer lists its own preview (or full-size JPEG) as a separate photo; a
   damaged RAW still does, and a photo written elsewhere inside a RAW is still found.
 - Videos on a FAT/exFAT card are put back together on cluster boundaries, so more come out intact; a video the file
@@ -128,6 +173,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A complete HEIC photo followed by an unreadable sector, or by a stray `moov` box, is now intact and stays a HEIC (it was
+  partial, or taken for a video).
+- An MP4 video that lists a HEIC brand and lost its `moov` index is now reported as a damaged MP4, not a damaged HEIC.
+- A disk with 4096-byte sectors no longer shows the same volume twice when a partition entry points at its backup boot
+  sector.
+- When the listing of a card is full (262,144 photos and videos), live files of every volume are now listed before
+  deleted ones; a deleted file of an earlier volume no longer takes the place of a live one.
 - Half a photo followed by zeros, by another photo's data or by its own data with a gap, then an end-of-image marker, was
   reported intact (the decoder used for the check fills in what is missing), as a file of its own or as a RAW's preview.
   Common JPEGs are now verified by Revenant's own decoder, which checks every block is there (and is faster); such a
@@ -136,3 +188,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is now found.
 - A small file written inside a Canon CR3's `PRVW` preview was hidden and the CR3 reported intact; a CR3 is now intact only
   if both its preview and its full-size JPEG decode, so the file inside is found.
+- A resumed copy or session no longer writes through a hard link: a copy image or session log that also has another
+  name (on Windows too) is refused before anything is written, so a file elsewhere on the backup drive is never
+  overwritten. A rescue map that is a link or a pipe is refused instead of being followed or waited on.
+- A saved session's files are read back up to a bounded size (256 MiB for the listing and each checkpoint), and a
+  session never saves what it could not read back; a session folder with impossible sector or block sizes is reported as
+  damaged.
+- `revenant-dev`: a bare disk name (`disk4`) while a file of that name sits in the current folder is refused as
+  ambiguous instead of reading the disk; a card pulled out while a preview is read stops the scan (and a session waits
+  for it) instead of only failing that preview.

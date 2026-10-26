@@ -1,3 +1,5 @@
+mod support;
+
 use revenant_core::formats::{FileKind, Format, Health, IsoBmff, Jpeg, Measurement, all_formats};
 use revenant_core::source::{FileSource, Source, VolumeId};
 use revenant_core::{CancelToken, EngineError, Event, Fragment, ScanOptions, ScanSummary, scan};
@@ -1885,4 +1887,42 @@ fn foreign_jpeg_at_an_own_start_running_past_the_raw_is_found() {
         found.contains(&((8192 + p.start) as u64, FileKind::Jpeg, Health::Intact)),
         "{found:?}"
     );
+}
+
+/// Pending item of 1.3 (cap of 2^20 unreadable runs): a 1 GiB + 1 MiB source of zeros (virtual, no `Vec` of that size,
+/// C7) whose last MiB has an isolated unreadable sector every KiB. Prints the scan time and the unreadable runs (each
+/// isolated sector is one run in the cache's bad map, the peak at the end of the scan) and checks the cap holds. Run in
+/// release: `cargo test --release -p revenant-core --test scan -- --ignored bad_run_cap_measure --nocapture`.
+#[test]
+#[ignore]
+fn bad_run_cap_measure() {
+    const GIB: u64 = 1 << 30;
+    const CAP: u64 = 1 << 20;
+    let mut src = support::SimSource::zeros(GIB + (1 << 20));
+    for k in 0..1024u64 {
+        src = src.bad(GIB + k * 1024, 512);
+    }
+    let started = std::time::Instant::now();
+    let (mut runs, mut bytes) = (0u64, 0u64);
+    let summary = scan(
+        &src,
+        &all_formats(),
+        &ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |e| {
+            if let Event::Unreadable { len, .. } = e {
+                runs += 1;
+                bytes += len;
+            }
+        },
+    )
+    .unwrap();
+    let took = started.elapsed();
+    println!(
+        "bad_run_cap_measure: {:.2} s, {runs} unreadable runs ({bytes} bytes), summary {} unreadable bytes",
+        took.as_secs_f64(),
+        summary.unreadable_bytes
+    );
+    assert_eq!((runs, bytes), (1024, 1024 * 512));
+    assert!(runs <= CAP, "{runs} runs past the cap");
 }

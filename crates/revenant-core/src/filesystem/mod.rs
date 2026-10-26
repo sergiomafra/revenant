@@ -13,6 +13,7 @@ mod listing;
 mod orphans;
 mod partitions;
 
+use crate::EngineError;
 use crate::cache::CachedSource;
 use crate::source::Source;
 use partitions::Candidate;
@@ -97,7 +98,10 @@ impl Limits {
 
 /// Reads the head of a cluster for the FAT32 high-word check (ruling D10): 512 bytes from the raw source, outside the
 /// scan's cache. `None` means "does not recognize": a read error, the end of the source, or (ruling C2) a range the
-/// cache already knows to hold an unreadable sector, which is then not read at all.
+/// cache already knows to hold an unreadable sector, which is then not read at all. Beside the scan's cache, a source
+/// that vanished (`DeviceGone`, or a short read before its length) is reported to the cache (ruling P3), so the scan
+/// stops with `device_gone` instead of using the listing; and once the scan is cancelled or the source has vanished
+/// nothing is read at all (each check would be one more slow read of a dying card).
 pub(crate) trait Probe {
     fn read512(&self, at: u64) -> Option<[u8; 512]>;
 }
@@ -130,11 +134,24 @@ impl Probe for SourceProbe<'_, '_> {
     fn read512(&self, at: u64) -> Option<[u8; 512]> {
         let end = at.checked_add(512)?;
         if let Some(cache) = self.known_bad
-            && !cache.bad_runs(at, end).is_empty()
+            && (cache.stopped() || !cache.bad_runs(at, end).is_empty())
         {
             return None;
         }
-        read_exact(self.source, at, 512)?.try_into().ok()
+        if end > self.source.len() {
+            return None;
+        }
+        let mut buf = [0u8; 512];
+        let gone = match self.source.read_at(at, &mut buf) {
+            Ok(512) => return Some(buf),
+            Ok(n) => at + n as u64,
+            Err(EngineError::DeviceGone { offset }) => offset,
+            Err(_) => return None,
+        };
+        if let Some(cache) = self.known_bad {
+            cache.mark_gone(gone);
+        }
+        None
     }
 }
 
@@ -226,22 +243,39 @@ pub fn volumes(source: &dyn Source) -> Vec<Volume> {
 }
 
 /// Parses each distinct candidate offset inside the source, lowest first, until [`MAX_VOLUMES`] volumes are found. At
-/// an offset given both with and without a required sector size, the one without is kept.
+/// an offset given both with and without a required sector size, the one without is kept. A candidate whose boot
+/// sector is the backup of a volume already found (1.4 T3: an entry read with 4096-byte sectors can land there) is
+/// dropped: see [`is_backup_of`].
 fn parse_all(source: &dyn Source, mut cands: Vec<Candidate>) -> Vec<Volume> {
     let len = source.len();
     cands.retain(|c| c.offset < len);
     cands.sort_by_key(|c| (c.offset, c.sector_size.is_some()));
     cands.dedup_by_key(|c| c.offset);
-    let mut out = Vec::new();
+    let mut out: Vec<Volume> = Vec::new();
     for c in cands {
         if out.len() == MAX_VOLUMES {
             break;
         }
-        if let Some(v) = boot::parse(source, c.offset, c.scheme, c.sector_size) {
+        if let Some(v) = boot::parse(source, c.offset, c.scheme, c.sector_size)
+            && !out.iter().any(|w| is_backup_of(&v, w))
+        {
             out.push(v);
         }
     }
     out
+}
+
+/// Whether `v` was read from the backup boot sector of `w`: the same file system and serial, at `w`'s offset plus 6
+/// sectors (FAT32) or 12 (exFAT) of `w`'s sector size.
+fn is_backup_of(v: &Volume, w: &Volume) -> bool {
+    let back = match w.fs {
+        FsKind::Fat32 => 6,
+        FsKind::Exfat => 12,
+        FsKind::Fat12 | FsKind::Fat16 => return false,
+    };
+    v.fs == w.fs
+        && v.serial == w.serial
+        && w.offset.checked_add(back * u64::from(w.sector_size)) == Some(v.offset)
 }
 
 /// The volumes at the probe offsets (scheme `None`), one per offset, in offset order.
@@ -261,6 +295,23 @@ fn probe(source: &dyn Source) -> Vec<Volume> {
     out.sort_by_key(|v| v.offset);
     out.truncate(MAX_VOLUMES);
     out
+}
+
+/// Where the first volume starts according to the partition table (the lowest candidate offset inside the source; 0
+/// when sector 0 is itself a boot sector), whatever its file system. `None` without a table or a volume. Reads only
+/// the tables (bounded as in [`volumes`]); read errors count as no table.
+pub(crate) fn first_volume(source: &dyn Source) -> Option<u64> {
+    partitions::candidates(source)
+        .iter()
+        .map(|c| c.offset)
+        .filter(|&o| o < source.len())
+        .min()
+}
+
+/// The bytes of a boot sector the system rewrites while its volume is mounted (ruling D7); empty when `sector` is not a
+/// FAT or exFAT boot sector.
+pub(crate) fn volatile_boot_bytes(sector: &[u8]) -> &'static [usize] {
+    boot::volatile_bytes(sector)
 }
 
 /// Exactly `len` bytes at `offset`, or `None` (read error, or the source ends first).
@@ -317,6 +368,87 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 1 MiB of zeros that has vanished past `gone` (`DeviceGone`), or reads short past it (`short`); counts its reads.
+    struct Vanishing {
+        gone: u64,
+        short: bool,
+        reads: std::sync::atomic::AtomicU64,
+    }
+
+    impl Vanishing {
+        fn new(gone: u64, short: bool) -> Self {
+            Vanishing {
+                gone,
+                short,
+                reads: Default::default(),
+            }
+        }
+
+        fn reads(&self) -> u64 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Source for Vanishing {
+        fn len(&self) -> u64 {
+            1 << 20
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let end = offset + buf.len() as u64;
+            if end <= self.gone {
+                buf.fill(0);
+                Ok(buf.len())
+            } else if self.short {
+                let n = self.gone.saturating_sub(offset) as usize;
+                buf[..n].fill(0);
+                Ok(n)
+            } else {
+                Err(EngineError::DeviceGone { offset })
+            }
+        }
+
+        fn volume(&self) -> Option<crate::source::VolumeId> {
+            None
+        }
+    }
+
+    #[test]
+    fn probe_reports_a_vanished_source_to_the_cache() {
+        for short in [false, true] {
+            let raw = Vanishing::new(8192, short);
+            let cache = CachedSource::new(&raw, 512, 1 << 20);
+            let probe = SourceProbe::beside(&raw, &cache);
+            assert!(probe.read512(4096).is_some());
+            assert_eq!(cache.gone(), None);
+            assert!(probe.read512(8192 - 256).is_none());
+            let want = if short { 8192 } else { 8192 - 256 };
+            assert_eq!(cache.gone(), Some(want), "{short}");
+        }
+    }
+
+    #[test]
+    fn probe_beside_a_stopped_cache_reads_nothing() {
+        // Cancelled.
+        let raw = Vanishing::new(u64::MAX, false);
+        let cancel = crate::scan::CancelToken::default();
+        let cache = CachedSource::new(&raw, 512, 1 << 20).with_cancel(cancel.clone());
+        let probe = SourceProbe::beside(&raw, &cache);
+        assert!(probe.read512(4096).is_some());
+        let before = raw.reads();
+        cancel.cancel();
+        assert!(probe.read512(4096).is_none());
+        assert_eq!(raw.reads(), before);
+        // Gone (seen by the cache).
+        let raw = Vanishing::new(u64::MAX, false);
+        let cache = CachedSource::new(&raw, 512, 1 << 20);
+        cache.mark_gone(1 << 19);
+        let probe = SourceProbe::beside(&raw, &cache);
+        assert!(probe.read512(4096).is_none());
+        assert_eq!(raw.reads(), 0);
+    }
 
     #[test]
     fn crc32_check_value() {
