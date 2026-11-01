@@ -175,6 +175,8 @@ struct Placed {
     tiles: Vec<Range<usize>>,
     /// How it was deleted, if it was.
     deleted: Option<DeleteStyle>,
+    /// Deleted, and its entry's slots taken by a later one ([`FsBuilder::reuse_slots`]): no entry is left.
+    overwritten: bool,
 }
 
 fn placed(path: String, kind: FileKind, bytes: Cow<'static, [u8]>, clusters: Vec<u32>) -> Placed {
@@ -186,6 +188,7 @@ fn placed(path: String, kind: FileKind, bytes: Cow<'static, [u8]>, clusters: Vec
         preview: None,
         tiles: Vec::new(),
         deleted: None,
+        overwritten: false,
     }
 }
 
@@ -247,6 +250,13 @@ struct Cam {
     first: u32,
     /// Minutes since the first file.
     clock: u32,
+    /// Each file stamped a minute after the one before; `false`: every file keeps the builder's one default stamp (a
+    /// camera whose clock was never set).
+    stamps: bool,
+    /// [`Cam::reuse_slots`] is on.
+    reuse: bool,
+    /// The files' entries in directory order (indexes in `files`).
+    entries: Vec<usize>,
 }
 
 impl Cam {
@@ -264,27 +274,61 @@ impl Cam {
             files: Vec::new(),
             first,
             clock: 0,
+            stamps: true,
+            reuse: false,
+            entries: Vec::new(),
         }
     }
 
     fn shoot(&mut self, seq: &[Shot]) {
         let new = shoot(&mut self.b, seq);
-        for f in &new {
+        for f in new {
             self.stamp(&f.path);
+            self.entered(f);
         }
-        self.files.extend(new);
     }
 
     /// A lone file, written like a shot's.
     fn add(&mut self, path: String, kind: FileKind, bytes: Vec<u8>) {
         let clusters = self.b.add(&path, &bytes);
         self.stamp(&path);
-        self.files
-            .push(placed(path, kind, Cow::Owned(bytes), clusters));
+        self.entered(placed(path, kind, Cow::Owned(bytes), clusters));
+    }
+
+    /// Keeps `f`, its entry where the builder put it: with reused slots, over the first deleted entry of as many
+    /// slots (the exFAT set of a name: 2 + one per 15 characters), which is gone then.
+    fn entered(&mut self, f: Placed) {
+        let i = self.files.len();
+        let slots = |p: &Placed| 2 + p.path.rsplit('/').next().unwrap().len().div_ceil(15);
+        let taken = self.reuse.then(|| {
+            self.entries.iter().position(|&j| {
+                let g = &self.files[j];
+                g.deleted.is_some() && !g.overwritten && slots(g) == slots(&f)
+            })
+        });
+        match taken.flatten() {
+            Some(pos) => {
+                let j = self.entries[pos];
+                self.files[j].overwritten = true;
+                self.entries[pos] = i;
+            }
+            None => self.entries.push(i),
+        }
+        self.files.push(f);
+    }
+
+    /// New entries take the slots of deleted ones, as cameras do.
+    fn reuse_slots(&mut self) {
+        assert_eq!(self.fs, FsType::Exfat, "slots counted as exFAT sets");
+        self.b.reuse_slots(true);
+        self.reuse = true;
     }
 
     /// Each file a minute after the one before (an older entry over the same clusters loses to the newer one).
     fn stamp(&mut self, path: &str) {
+        if !self.stamps {
+            return;
+        }
         self.clock += 1;
         let k = self.clock;
         let t = FsStamp {
@@ -413,6 +457,7 @@ struct File {
 struct Card {
     name: String,
     fs: FsType,
+    cluster: u64,
     disk: Vec<u8>,
     files: Vec<File>,
 }
@@ -458,7 +503,7 @@ fn finish(
                     disk[q.start as usize..(q.start + q.len) as usize]
                         == p.bytes[from..from + q.len as usize]
                 });
-            let entry = match (gone, p.deleted) {
+            let entry = match (gone || p.overwritten, p.deleted) {
                 (true, _) => Entry::Gone,
                 (false, None) => Entry::Live,
                 (false, Some(s)) => Entry::Deleted(s),
@@ -480,6 +525,7 @@ fn finish(
     Card {
         name,
         fs,
+        cluster,
         disk,
         files,
     }
@@ -534,16 +580,10 @@ enum Want {
     /// `Intact` when its continuation is the only one that passes in its window; else the reassembly, `Partial`. Its
     /// exact bytes either way.
     Joined,
-    /// A video placed by content: its sample table proves every seam, so `Intact` with its exact bytes. Two gaps the
-    /// cards found are recorded instead of failing (both never `Intact`, so no false `Intact`; for the controller's
-    /// ruling, see the task report): a deleted `moov`-at-end video whose file-system guess holds its own `moov` is not
-    /// searched (its `moov` is no orphan) and stays `Partial` with its exact bytes; one whose first piece ends the heap
-    /// and goes on at its start is not recovered whole.
-    Video,
 }
 
 /// Q51: `Intact` where a proof exists (one piece; a live chain; a surviving exFAT chain no other entry claims, D14; a
-/// video, every seam proven by its sample table; a lossless RAW whose every seam lies on a tile boundary), `Partial`
+/// video, every seam proven by its sample table ([`sample_proven`]); a lossless RAW whose every seam lies on a tile boundary), `Partial`
 /// where the content places pieces it cannot prove (a JPEG in pieces, Q37; a RAW with a seam inside a tile, its preview
 /// or its sensor data, Q44/Q45).
 fn want(card: &Card, f: &File) -> Want {
@@ -566,7 +606,13 @@ fn want(card: &Card, f: &File) -> Want {
         _ => {}
     }
     match f.kind {
-        FileKind::Mp4 => Want::Video,
+        FileKind::Mp4
+            if f.seams
+                .iter()
+                .all(|&at| sample_proven(&f.bytes, at, card.cluster)) =>
+        {
+            Want::Intact
+        }
         FileKind::Arw if !f.tiles.is_empty() => {
             let starts: HashSet<u64> = f.tiles.iter().skip(1).map(|t| t.start as u64).collect();
             if f.seams.iter().all(|s| starts.contains(s)) {
@@ -578,6 +624,31 @@ fn want(card: &Card, f: &File) -> Want {
         FileKind::Jpeg if f.pieces.len() == 2 => Want::Joined,
         _ => Want::Partial,
     }
+}
+
+/// Whether a seam at logical `at` of the camera clip `bytes` (`ftyp`, `mdat`, `moov`) is one its sample table proves
+/// (Task 5, Q39): a NAL unit starts within one cluster before it and within one cluster from it, so the bytes checked on
+/// both sides lie within one unit of the seam. A seam past the `mdat` lies in the `moov`, which the search places by
+/// itself (its orphan or own `moov`).
+fn sample_proven(bytes: &[u8], at: u64, cluster: u64) -> bool {
+    let be = |p: usize| u32::from_be_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+    let mut pos = 0;
+    while &bytes[pos + 4..pos + 8] != b"mdat" {
+        pos += be(pos);
+    }
+    let end = pos + be(pos);
+    if at >= end as u64 {
+        return true;
+    }
+    let mut nals = Vec::new();
+    let mut q = pos + 8;
+    while q + 4 <= end {
+        nals.push(q as u64);
+        q += 4 + be(q);
+    }
+    let before = nals.iter().any(|&n| n < at && at - n <= cluster);
+    let after = nals.iter().any(|&n| n >= at && n - at < cluster);
+    before && after
 }
 
 /// The absolute ranges of logical `r` of a file in `pieces`.
@@ -609,8 +680,6 @@ struct Outcome {
     recovered: Vec<String>,
     /// Two-piece JPEGs placed by content that the 1.3 join made `Intact` (exact bytes).
     joined: Vec<String>,
-    /// Videos placed by content that did not come out `Intact` ([`Want::Video`]).
-    gaps: Vec<String>,
     secs: f64,
 }
 
@@ -672,7 +741,6 @@ fn scanned(mut card: Card) -> Outcome {
     let mut counts = [0; 3];
     let mut recovered = Vec::new();
     let mut joined = Vec::new();
-    let mut gaps = Vec::new();
     for o in card.files.iter().filter(|o| o.whole) {
         let want = want(&card, o);
         let found = view
@@ -680,10 +748,6 @@ fn scanned(mut card: Card) -> Outcome {
             .find(|f| f.start == o.pieces[0].start && f.kind == o.kind);
         let Some(f) = found else {
             counts[2] += 1;
-            if want == Want::Video {
-                gaps.push(format!("{} {:?}: not found", o.path, o.entry));
-                continue;
-            }
             recovered.push(format!("{} {:?} ({want:?}): not found", o.path, o.entry));
             continue;
         };
@@ -693,18 +757,8 @@ fn scanned(mut card: Card) -> Outcome {
             Health::Damaged => 2,
         }] += 1;
         let exact = bytes_of(f)[..] == o.bytes[..];
-        if want == Want::Video && f.health != Health::Intact {
-            gaps.push(format!(
-                "{} {:?} {} pieces: exact {exact}, {}",
-                o.path,
-                o.entry,
-                o.pieces.len(),
-                describe(f)
-            ));
-            continue;
-        }
         let health_ok = match want {
-            Want::Intact | Want::Video => f.health == Health::Intact,
+            Want::Intact => f.health == Health::Intact,
             Want::Partial => f.health == Health::Partial,
             Want::Joined => f.health != Health::Damaged,
         };
@@ -729,16 +783,12 @@ fn scanned(mut card: Card) -> Outcome {
         glued,
         recovered,
         joined,
-        gaps,
         secs: t.elapsed().as_secs_f64(),
     };
     eprintln!(
         "{}: {} findings; whole files Intact {} / Partial {} / not recovered {}; {:.1} s; joined Intact {:?}",
         out.card, out.findings, out.counts[0], out.counts[1], out.counts[2], out.secs, out.joined
     );
-    for g in &out.gaps {
-        eprintln!("  video gap: {g}");
-    }
     out
 }
 
@@ -877,35 +927,89 @@ fn exfat(cluster: u64, alloc: Alloc) -> Cam {
 }
 
 /// [`camera_life`] with 8 more shots, then 2 of them deleted in camera as well (exFAT keeps their chains, D14).
-fn delete_in_camera_cards(raw: ArwCompression) -> Vec<Outcome> {
+fn delete_in_camera_cards(raw: ArwCompression, variants: &[(u64, Alloc, Camera)]) -> Vec<Outcome> {
     let mut cards: Vec<Box<dyn Fn() -> Card + Send + Sync>> = Vec::new();
-    for cluster in CLUSTERS {
-        for alloc in ALLOCS {
-            cards.push(Box::new(move || {
-                let first = pairs(1..13, raw);
-                let mut cam =
-                    camera_life(exfat(cluster, alloc), raw, &first, &three_six_nine(raw), 8);
-                for n in [14, 18] {
-                    cam.delete_shot(n, DeleteStyle::Camera);
-                }
-                cam.card(format!(
-                    "delete in camera, {raw:?}, {}",
-                    label(cluster, alloc)
-                ))
-            }));
-        }
+    for &(cluster, alloc, how) in variants {
+        cards.push(Box::new(move || {
+            let mut cam = exfat(cluster, alloc);
+            if how.reuse_slots {
+                cam.reuse_slots();
+            }
+            cam.stamps = how.stamps;
+            let first = pairs(1..13, raw);
+            let mut cam = camera_life(cam, raw, &first, &three_six_nine(raw), 8);
+            for n in [14, 18] {
+                cam.delete_shot(n, DeleteStyle::Camera);
+            }
+            if how.reuse_slots {
+                // One more shot: it takes shot 14's slots and clusters first, then whatever comes next (shot 18's
+                // clusters, whose entries stay: their old chain rewritten under them, Q50 N-1).
+                cam.shoot(&pairs(21..22, raw));
+            }
+            cam.card(format!(
+                "delete in camera, {raw:?}, {}{}{}",
+                label(cluster, alloc),
+                if how.reuse_slots {
+                    ", slots reused"
+                } else {
+                    ""
+                },
+                if how.stamps { "" } else { ", clock unset" },
+            ))
+        }));
     }
     outcomes(cards)
 }
 
+/// How the camera writes its entries.
+#[derive(Clone, Copy)]
+struct Camera {
+    /// A new entry takes a deleted entry's slots ([`FsBuilder::reuse_slots`]).
+    reuse_slots: bool,
+    /// Files stamped a minute apart; `false`: a clock never set, every stamp equal.
+    stamps: bool,
+}
+
+const PLAIN: Camera = Camera {
+    reuse_slots: false,
+    stamps: true,
+};
+
+/// Every cluster size with both allocations, plainly.
+fn every_variant() -> Vec<(u64, Alloc, Camera)> {
+    CLUSTERS
+        .iter()
+        .flat_map(|&c| ALLOCS.iter().map(move |&a| (c, a, PLAIN)))
+        .collect()
+}
+
 fn delete_in_camera() -> &'static [Outcome] {
     static ALL: OnceLock<Vec<Outcome>> = OnceLock::new();
-    ALL.get_or_init(|| delete_in_camera_cards(ArwCompression::Lossless))
+    ALL.get_or_init(|| {
+        let mut v = every_variant();
+        // A camera that reuses the deleted entries' slots (so old chains can prove a placement, D14, or be rewritten,
+        // Q50 N-1), one per cluster size, and one whose clock was never set (every stamp equal, Q52).
+        let reuse = Camera {
+            reuse_slots: true,
+            stamps: true,
+        };
+        v.push((32 * KIB, Alloc::FirstFit, reuse));
+        v.push((128 * KIB, Alloc::NextFree, reuse));
+        v.push((
+            32 * KIB,
+            Alloc::FirstFit,
+            Camera {
+                reuse_slots: false,
+                stamps: false,
+            },
+        ));
+        delete_in_camera_cards(ArwCompression::Lossless, &v)
+    })
 }
 
 fn delete_in_camera_uncompressed_cards() -> &'static [Outcome] {
     static ALL: OnceLock<Vec<Outcome>> = OnceLock::new();
-    ALL.get_or_init(|| delete_in_camera_cards(ArwCompression::Uncompressed))
+    ALL.get_or_init(|| delete_in_camera_cards(ArwCompression::Uncompressed, &every_variant()))
 }
 
 /// [`camera_life`] up to 20 shots on the card, quick-formatted in camera, then 6 more shots over the start.

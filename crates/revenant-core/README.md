@@ -1268,11 +1268,14 @@ Cards built the way a camera fills them, each on exFAT (128 MiB, 32 KiB and 128 
 of the testkit: the lowest free cluster first (`Alloc::FirstFit`) and a rotating next-free pointer that wraps at the
 end of the card (`Alloc::NextFree`). A shot is its ARW (1536×1024, lossless or uncompressed) written first, then its
 JPEG (DRI 0, sizes that differ from shot to shot); a long clip fills the card so the pointer wraps into the holes;
-every cluster no file took holds old data (noise); each file is a minute newer than the one before.
+every cluster no file took holds old data (noise); each file is a minute newer than the one before, except on one card
+whose clock was never set (every stamp equal).
 
 - **Delete in camera, shoot again**: 12 shots, shots 3, 6 and 9 deleted in camera, 8 more shots and 2 clips (in the
   holes, or at the end and then in the holes), then 2 of the new shots deleted in camera too; lossless and uncompressed
-  RAWs.
+  RAWs. Two more cards (one per cluster size) with a camera that reuses the deleted entries' slots
+  (`FsBuilder::reuse_slots`), then one more shot written over a deleted shot's clusters whose entry stays (its old
+  chain rewritten under it, ruling Q50 N-1); and one with every stamp equal.
 - **Format in camera, shoot again**: the same life up to 20 shots, quick-formatted, then 6 shots over the start: the old
   files have no entry left, they are carved and reassembled from content.
 - **Delete on a computer**: JPEG-only shots and clips culled in camera (holes smaller than a RAW next to larger ones),
@@ -1285,12 +1288,13 @@ Two oracles run over every card (ruling Q51). `no_intact_finding_is_glued`: the 
 finding equal exactly one file ever written (a RAW's own preview found at its place in the RAW is the same file, Q16);
 never relaxed. `recovered`: every file still whole on the card comes back at its start with its exact bytes and the
 health its proof allows: `Intact` for one piece, a live chain, a surviving exFAT chain no other entry claims (D14), a
-video placed by content (its sample table) and a lossless RAW cut only at tile boundaries; `Partial` for a RAW cut
-inside a tile, its preview or its sensor data and for a JPEG in three or more pieces placed by content (Q37); a JPEG in
-two pieces may be `Intact` through the 1.3 two-piece join (unchanged by Q37). Two gaps for videos are recorded, not
-failed (never `Intact`): a deleted `moov`-at-end video in pieces whose file-system guess is already exact holds its own
-`moov`, which is then no orphan, so it is not searched and stays `Partial` with its exact bytes; one whose first piece
-ends the heap and goes on at its start (the next-free pointer wrapping) is not recovered whole.
+video placed by content whose every seam its samples prove (a NAL unit starts within one cluster on each side; with
+4 KiB clusters and NAL units of up to 24 KiB that often fails, and the video is `Partial` with its exact bytes) and a
+lossless RAW cut only at tile boundaries; `Partial` for a RAW cut inside a tile, its preview or its sensor data and
+for a JPEG in three or more pieces placed by content (Q37); a JPEG in two pieces may be `Intact` through the 1.3
+two-piece join (unchanged by Q37), with its exact bytes. A clip whose first piece ends the heap and goes on at its
+start (the next-free pointer wrapping) is put back like any other: the candidate order already looks from the heap
+start ("first hole").
 
 The allocation is an assumption (design D19): how Sony's firmware picks clusters is not known, so the cards may not
 cover the real pattern; the manual run on a real card (part 1.6, task 13) checks it. The cards are built and scanned
