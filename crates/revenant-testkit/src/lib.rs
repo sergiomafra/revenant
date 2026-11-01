@@ -1090,10 +1090,13 @@ pub struct ArwOptions {
     /// With `align`: tiles whose coded data is tuned ([`lossless_jpeg_sized`], real codes, no fill bytes) so that they
     /// end on a multiple of `align`.
     pub sized_tiles: Vec<usize>,
+    /// When not 0, zeros after the sensor data up to a multiple of `pad_to` bytes, inside the file (Sony pads its ARWs
+    /// to 4 KiB or 64 KiB); no IFD references them, `raw` ends where the sensor data does.
+    pub pad_to: usize,
 }
 
 impl Default for ArwOptions {
-    /// Lossless, 1024×768 in tiles of 256, a 640×480 preview, seed 1, no thumbnail, nothing aligned.
+    /// Lossless, 1024×768 in tiles of 256, a 640×480 preview, seed 1, no thumbnail, nothing aligned, no padding.
     fn default() -> Self {
         ArwOptions {
             compression: ArwCompression::Lossless,
@@ -1109,6 +1112,7 @@ impl Default for ArwOptions {
             aligned_tiles: Vec::new(),
             flat_tiles: Vec::new(),
             sized_tiles: Vec::new(),
+            pad_to: 0,
         }
     }
 }
@@ -1306,9 +1310,13 @@ pub fn arw(opts: &ArwOptions) -> TiffRaw {
     bytes.extend_from_slice(&preview);
     bytes.resize(raw_at as usize, 0);
     bytes.extend(sensor);
+    let raw_end = bytes.len();
+    if opts.pad_to > 0 {
+        bytes.resize(raw_end.next_multiple_of(opts.pad_to), 0);
+    }
     TiffRaw {
         preview: Some(prev_at as usize..prev_at as usize + preview.len()),
-        raw: raw_at as usize..bytes.len(),
+        raw: raw_at as usize..raw_end,
         tiles: if code == 7 { ranges } else { Vec::new() },
         thumbnail: thumb.map(|t| thumb_at as usize..thumb_at as usize + t.len()),
         bytes,

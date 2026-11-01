@@ -549,3 +549,22 @@ fn arw_tiles_can_end_on_a_grid_unpadded() {
         assert_eq!(count, 256 * 256);
     }
 }
+
+#[test]
+fn arw_pads_to_a_grain_after_its_structure() {
+    // As Sony does (4 KiB on the ILCE-7M5, 64 KiB on the ILCE-7S): zeros after the sensor data, up to a multiple of
+    // the grain, inside the file; the structure (and `raw`) ends where it did.
+    use revenant_testkit::{ArwOptions, arw};
+    let plain = arw(&ArwOptions::default());
+    let padded = arw(&ArwOptions {
+        pad_to: 64 * 1024,
+        ..ArwOptions::default()
+    });
+    assert_eq!(
+        padded.bytes.len(),
+        plain.bytes.len().next_multiple_of(64 * 1024)
+    );
+    assert_eq!(&padded.bytes[..plain.bytes.len()], &plain.bytes[..]);
+    assert!(padded.bytes[plain.bytes.len()..].iter().all(|&b| b == 0));
+    assert_eq!(padded.raw, plain.raw);
+}
