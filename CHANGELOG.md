@@ -211,6 +211,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A deleted video in pieces whose place the card's file system already gave right (only other files between its
+  pieces) came back with its exact bytes but only partial, and one whose piece ran into an old deleted entry's spot
+  could not be put back at all: both now come back intact when every frame checks out across the seams.
 - Two deleted files that once started at the same place on a card, with the same date and time (a camera whose clock
   was never set, or a photo deleted and re-shot within two seconds), could give one photo's bytes, plus the leftover
   bytes after them, under the other's name and size, reported intact. Neither name is given now: the photo found there

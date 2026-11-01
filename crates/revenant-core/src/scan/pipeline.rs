@@ -222,7 +222,7 @@ pub(super) struct MoovFinder {
 }
 
 /// The declared size, when `b` (16 bytes) is a candidate `moov` box header.
-fn moov_head(b: &[u8]) -> Option<u64> {
+pub(crate) fn moov_head(b: &[u8]) -> Option<u64> {
     let size = u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
     (&b[4..8] == b"moov" && &b[12..16] == b"mvhd" && (24..=MOOV_MAX_LEN + 8).contains(&size))
         .then_some(size)

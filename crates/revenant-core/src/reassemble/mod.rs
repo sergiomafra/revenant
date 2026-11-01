@@ -1720,6 +1720,17 @@ pub(crate) fn reassemble(
         .filter(|f| matches!(f.kind, FileKind::Mp4 | FileKind::Mov) && !done(f))
         .cloned()
         .collect();
+    // A video whose own `moov` lies inside its (not `Intact`) finding, at the end of its `mdat` (a deleted file's guess
+    // that holds it): that `moov` is no orphan, so the scan did not keep it; it joins the list here, and the video is
+    // searched with it, its finding's pieces as the first hypothesis (ruling Q52).
+    let mut all_moovs = ctx.moovs.to_vec();
+    all_moovs.extend(videos.iter().filter_map(|f| video::own_moov(source, f)));
+    all_moovs.sort_unstable();
+    all_moovs.dedup();
+    let ctx = &Context {
+        moovs: &all_moovs,
+        ..*ctx
+    };
     let mut moovs = video::Moovs::new(source, &videos, ctx.moovs.len(), ctx.moov_budget);
     // Which video first had a complete solution with each orphan `moov` (index in `ctx.moovs`).
     let mut owner: HashMap<usize, u64> = HashMap::new();

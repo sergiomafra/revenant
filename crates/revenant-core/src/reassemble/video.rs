@@ -1358,6 +1358,35 @@ fn twins(
     out
 }
 
+/// The own `moov` of video `f` (not `Intact`) as `(absolute start, declared size)`: the box header at the end of its
+/// `mdat` ([`Video::of`]), read through its finding's pieces, when the whole box lies inside them (ruling Q52). One
+/// 16-byte read.
+pub(crate) fn own_moov(source: &CachedSource, f: &Finding) -> Option<(u64, u64)> {
+    if f.health == Health::Intact {
+        return None;
+    }
+    let v = Video::of(&mut Reader::new(source), f)?;
+    let view = Fragmented::new(source, f.ranges());
+    let mut head = [0u8; 16];
+    if view.read_at(v.p, &mut head).ok()? != head.len() {
+        return None;
+    }
+    let size = crate::scan::moov_head(&head)?;
+    if v.p.checked_add(size)? > f.len {
+        return None;
+    }
+    let mut at = 0u64;
+    f.ranges()
+        .iter()
+        .find_map(|r| {
+            let inside = (at..at + r.len).contains(&v.p);
+            let q = inside.then(|| r.start + (v.p - at));
+            at += r.len;
+            q
+        })
+        .map(|q| (q, size))
+}
+
 /// What the search of one video gave.
 pub(crate) struct Searched {
     /// The finding it becomes, when that improves it.

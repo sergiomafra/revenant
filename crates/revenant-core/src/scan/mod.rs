@@ -4,6 +4,7 @@
 
 mod fs;
 mod pipeline;
+pub(crate) use pipeline::moov_head;
 mod state;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -798,6 +799,9 @@ impl Commit<'_, '_> {
                     .then_some(r.carved.as_ref())
                     .flatten();
                 let m = merge(&self.shared.fs.kept[k], &r.view, carved);
+                // A file start only where a format recognizes a head: an old entry over clusters another file took
+                // since is reported, but it is no start that stops a piece (ruling Q52).
+                let head = r.view.m.is_some() || carved.is_some();
                 let own = r.own_of(&m);
                 let measurement = Measurement {
                     len: m.len,
@@ -805,7 +809,7 @@ impl Commit<'_, '_> {
                     health: m.health,
                     fragments: m.fragments,
                 };
-                self.add(at, measurement, Some(m.origin), own);
+                self.add(at, measurement, Some(m.origin), own, head);
             }
             if bad {
                 match &mut self.run {
@@ -865,7 +869,7 @@ impl Commit<'_, '_> {
                             self.skip(&ranges(at, m.len, &m.fragments));
                         }
                     }
-                    Some(Measured { m, own }) => self.add(at, m, None, own),
+                    Some(Measured { m, own }) => self.add(at, m, None, own, true),
                     None => {}
                 }
             }
@@ -960,8 +964,16 @@ impl Commit<'_, '_> {
     /// origin is not a live file and whose ranges overlap a live file is at most `Partial` (ruling D7), and so is one
     /// with a known unreadable sector in a piece below `at`. A `Partial` one
     /// keeps the starts of its `own` files after `at` (sector-aligned ones: no head is examined elsewhere) with its
-    /// ranges, so a carved file found there inside it is not reported (ruling D12).
-    fn add(&mut self, at: u64, mut m: Measurement, origin: Option<FsOrigin>, own: Vec<Fragment>) {
+    /// ranges, so a carved file found there inside it is not reported (ruling D12). Its start counts among the finding
+    /// starts (the pairing's and the reassembly's) only when `head`: a format recognized a head there.
+    fn add(
+        &mut self,
+        at: u64,
+        mut m: Measurement,
+        origin: Option<FsOrigin>,
+        own: Vec<Fragment>,
+        head: bool,
+    ) {
         if m.len == 0 {
             return;
         }
@@ -1031,7 +1043,9 @@ impl Commit<'_, '_> {
                 self.own_len += 1;
             }
         }
-        self.starts.push(at);
+        if head {
+            self.starts.push(at);
+        }
         let finding = Finding {
             id: self.next_id,
             start: at,

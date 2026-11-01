@@ -1447,3 +1447,84 @@ fn a_padded_tile_of_a_reported_neighbour_is_not_taken_intact() {
     let _ = fb;
     assert_ne!(fa.health, Health::Intact, "{fa:#?}");
 }
+
+#[test]
+fn deleted_video_whose_guess_holds_its_moov_is_intact() {
+    // A clip in 2 runs with exactly a live photo between them, deleted by a computer (the chain cleared): the file
+    // system's guess (the free clusters from its first one) is already right, and its own `moov`, at the end of the
+    // guess, is no orphan. The reassembly takes that `moov` and the guess as its first hypothesis: the samples prove
+    // the seam, Intact (Q52).
+    for small_nals in [false, true] {
+        let v = avc_video(&small_video(120, 3, small_nals));
+        let n = clusters_for(v.bytes.len());
+        let k = n / 3;
+        let clusters = cut_runs(&[300, 301 + k], &[k], n);
+        let (src, pieces) = raw_card(&[deleted("C0001.MP4", &v.bytes, clusters)], &[300 + k], &[]);
+        assert_eq!(pieces[0].len(), 2);
+        let events = events_of(&src, &ScanOptions::default());
+        let view = final_view(&events);
+        let f = at(&view, pieces[0][0].start);
+        assert_eq!(f.fragments, pieces[0], "{f:#?}");
+        assert_eq!(
+            (f.kind, f.health),
+            (FileKind::Mp4, Health::Intact),
+            "{f:#?}"
+        );
+        same(&extracted(&src, f), &v.bytes);
+    }
+}
+
+#[test]
+fn a_stale_entry_inside_a_deleted_video_does_not_stop_it() {
+    // As above, and an old photo's entry, deleted before the clip was written over its cluster (inside the clip's second
+    // run): the scan reports a finding there for the entry, but no format recognizes a head at that cluster, so it is
+    // no file start that would stop the clip's piece (Q52).
+    let v = avc_video(&small_video(120, 3, false));
+    let n = clusters_for(v.bytes.len());
+    let k = n / 3;
+    let clusters = cut_runs(&[300, 301 + k], &[k], n);
+    let old_at = 301 + k + 4;
+    let old = jpeg(96, 96, 77, 0);
+    let (src, pieces) = raw_card(
+        &[
+            deleted("DSC00001.JPG", &old, vec![old_at]),
+            deleted("C0001.MP4", &v.bytes, clusters),
+        ],
+        &[300 + k],
+        &[],
+    );
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[1][0].start);
+    assert_eq!(f.fragments, pieces[1], "{f:#?}");
+    assert_eq!(
+        (f.kind, f.health),
+        (FileKind::Mp4, Health::Intact),
+        "{f:#?}"
+    );
+    same(&extracted(&src, f), &v.bytes);
+}
+
+#[test]
+fn deleted_video_wrapping_past_the_heap_end_is_intact() {
+    // A rotating allocator wrapped: the clip's first run is the heap's last clusters, the rest goes on near its start
+    // (deleted by a computer, the chain cleared). The candidate order looks from the heap start after the window past
+    // the piece ("first hole"), so the clip is put back with its orphan `moov`, the samples proving the seam.
+    let v = avc_video(&small_video(120, 3, false));
+    let n = clusters_for(v.bytes.len());
+    let last = exfat_card().cluster_count() + 2;
+    let k = 4;
+    let clusters = cut_runs(&[last - k, 300], &[k], n);
+    let (src, pieces) = raw_card(&[deleted("C0001.MP4", &v.bytes, clusters)], &[], &[]);
+    assert_eq!(pieces[0].len(), 2);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_eq!(f.fragments, pieces[0], "{f:#?}");
+    assert_eq!(
+        (f.kind, f.health),
+        (FileKind::Mp4, Health::Intact),
+        "{f:#?}"
+    );
+    same(&extracted(&src, f), &v.bytes);
+}

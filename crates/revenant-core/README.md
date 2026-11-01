@@ -1121,7 +1121,9 @@ MP4/MOV video (its index elsewhere, see "Video in three or more pieces"; its ind
 **The space.** A piece lies on the volume's cluster grid when the file starts at a cluster start of a volume with
 clusters of at least 4096 bytes; otherwise on 512-byte sectors, forward only, with a 64 MiB window and at most 4 pieces.
 A unit is free when it is inside the heap, no live file of the volume's listing holds it, no `Intact` finding (or earlier
-`Intact` reassembly) claimed it, it is not already a piece of the file, and no other finding starts in it. A run of free
+`Intact` reassembly) claimed it, it is not already a piece of the file, and no other finding starts in it (a finding a
+file-system entry placed where no format recognizes a head, an old entry over clusters another file took since, is no
+start: ruling Q52). A run of free
 units stops at the first unit that is not free; a claimed range wholly covered by the file's own embedded files at their
 exact places (a RAW's preview found as its own `Intact` JPEG) does not stop it (coverage, not equality, since touching
 claimed ranges are merged); for the same reason a unit taken only by such files, were the piece to start there, is a
@@ -1217,7 +1219,10 @@ TIFF RAW (ARW, CR2, NEF, DNG, ORF, RW2, TIFF), and any JPEG, MP4/MOV or TIFF RAW
 the same pieces). JPEGs, TIFF RAWs (see "Fragmented RAW") and videos are searched: a video with its index first or in
 fragments (see "Videos with the index first, open-ended or fragmented"), or one with no `moov` of its own that the
 pairing did not make `Intact` and an orphan `moov` fits (see "Video in three or more pieces"; only a complete solution,
-its `moov` in place, can replace such a video's finding). The scan
+its `moov` in place, can replace such a video's finding). A video not `Intact` whose own `moov` lies inside its finding,
+at the end of its `mdat` (a deleted file's guess that already holds it: that `moov` is no orphan), is searched with
+that `moov` too, its finding's pieces as the first hypothesis, `Intact` when the samples prove the seams (ruling Q52;
+one 16-byte read per video candidate). The scan
 also keeps the ranges of every `Intact` finding it emits (at most 2^18 merged runs; past that, no reassembly is
 `Intact`): those, the listing's live ranges, the pairing's `Intact` results and every earlier `Intact` reassembly are
 taken (see "The space"). Only this bookkeeping, one push or a few run merges per finding emitted, happens during the
