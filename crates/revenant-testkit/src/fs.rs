@@ -996,9 +996,10 @@ impl FsBuilder {
     }
 
     /// When on (default off), every later file or directory entry takes the slots of the first deleted entry in its
-    /// directory that needs as many slots (a name of the same length class), as cameras and most drivers do; the
-    /// deleted entry is gone then (its clusters keep their data). Otherwise new entries always go after the existing
-    /// ones.
+    /// directory that needs exactly as many slots (a name of the same length class, as a camera's names are); the
+    /// deleted entry is gone then (its clusters keep their data). Real drivers take the first run of free slots large
+    /// enough (deleted or never used, adjacent deleted entries together, a larger one in part); this models only the
+    /// same-size case. Otherwise new entries always go after the existing ones.
     pub fn reuse_slots(&mut self, on: bool) -> &mut Self {
         self.reuse = on;
         self

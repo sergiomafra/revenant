@@ -1360,7 +1360,8 @@ fn twins(
 
 /// The own `moov` of video `f` (not `Intact`) as `(absolute start, declared size)`: the box header at the end of its
 /// `mdat` ([`Video::of`]), read through its finding's pieces, when the whole box lies inside them (ruling Q52). One
-/// 16-byte read.
+/// 16-byte read. The box is then loaded as contiguous from its start: when a piece boundary of the finding splits it,
+/// the load reads other bytes and fails, so such a video may miss its proof (never a false `Intact`).
 pub(crate) fn own_moov(source: &CachedSource, f: &Finding) -> Option<(u64, u64)> {
     if f.health == Health::Intact {
         return None;
