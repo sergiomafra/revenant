@@ -1087,6 +1087,9 @@ pub struct ArwOptions {
     pub aligned_tiles: Vec<usize>,
     /// Tiles of a flat image ([`lossless_jpeg_flat`]): their data is mostly zero bytes.
     pub flat_tiles: Vec<usize>,
+    /// With `align`: tiles whose coded data is tuned ([`lossless_jpeg_sized`], real codes, no fill bytes) so that they
+    /// end on a multiple of `align`.
+    pub sized_tiles: Vec<usize>,
 }
 
 impl Default for ArwOptions {
@@ -1105,6 +1108,7 @@ impl Default for ArwOptions {
             align: 0,
             aligned_tiles: Vec::new(),
             flat_tiles: Vec::new(),
+            sized_tiles: Vec::new(),
         }
     }
 }
@@ -1265,6 +1269,12 @@ pub fn arw(opts: &ArwOptions) -> TiffRaw {
                 let a = opts.align as usize;
                 let pad = (at + t.len()).div_ceil(a) * a - (at + t.len());
                 with_fill(t, pad)
+            } else if opts.align > 0 && opts.sized_tiles.contains(&k) {
+                let a = opts.align as usize;
+                let seed = opts.seed.wrapping_mul(0x9E37) ^ k as u64;
+                let want = (at + t.len()).div_ceil(a) * a - at;
+                lossless_jpeg_sized(opts.tile, opts.tile, 1, 14, seed, want)
+                    .expect("a tile size within reach of the grid")
             } else {
                 t.clone()
             };
@@ -1659,7 +1669,16 @@ pub fn lossless_jpeg_with_restarts(
     seed: u64,
     interval: u16,
 ) -> Vec<u8> {
-    lossless_jpeg_of(width, height, components, precision, seed, interval, false)
+    lossless_jpeg_of(
+        width,
+        height,
+        components,
+        precision,
+        seed,
+        interval,
+        false,
+        &[],
+    )
 }
 
 /// [`lossless_jpeg`] of a flat image (every sample the same, as in clipped highlights): after the first sample every
@@ -1671,9 +1690,68 @@ pub fn lossless_jpeg_flat(
     precision: u8,
     seed: u64,
 ) -> Vec<u8> {
-    lossless_jpeg_of(width, height, components, precision, seed, 0, true)
+    lossless_jpeg_of(width, height, components, precision, seed, 0, true, &[])
 }
 
+/// [`lossless_jpeg`] whose entropy-coded data is tuned to make the JPEG exactly `len` bytes long, without fill bytes:
+/// the differences of the last samples (as many as needed, up to all of them) are replaced by larger ones (real codes,
+/// more bits), the first changed ones sized to the byte. `None` when `len` is shorter than the plain JPEG or out of that reach. The differences
+/// no longer describe the seeded image (the samples wrap), which a structure check never sees.
+pub fn lossless_jpeg_sized(
+    width: u32,
+    height: u32,
+    components: u8,
+    precision: u8,
+    seed: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    let of =
+        |tail: &[i32]| lossless_jpeg_of(width, height, components, precision, seed, 0, false, tail);
+    let plain = of(&[]);
+    if plain.len() > len {
+        return None;
+    }
+    if plain.len() == len {
+        return Some(plain);
+    }
+    let total = width as usize * height as usize * usize::from(components);
+    let reach = total;
+    // The fewest samples of category 9 that reach the length (the length grows with their number): its code `11100` and
+    // value `100000000` never make an `FF` byte, so no stuffing upsets the count.
+    let big = 1 << 8;
+    let (mut lo, mut hi) = (1, reach);
+    if of(&vec![big; hi]).len() < len {
+        return None;
+    }
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if of(&vec![big; mid]).len() >= len {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    // Then the first of them, and the one after it, sized down until the length is exact.
+    let m = lo;
+    for c1 in (0..=15u32).rev() {
+        for c2 in (0..=15u32).rev() {
+            let mut tail = vec![big; m];
+            tail[0] = if c1 == 0 { 0 } else { 1 << (c1 - 1) };
+            if m > 1 {
+                tail[1] = if c2 == 0 { 0 } else { 1 << (c2 - 1) };
+            } else if c2 != 15 {
+                break;
+            }
+            let j = of(&tail);
+            if j.len() == len {
+                return Some(j);
+            }
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 fn lossless_jpeg_of(
     width: u32,
     height: u32,
@@ -1682,6 +1760,7 @@ fn lossless_jpeg_of(
     seed: u64,
     interval: u16,
     flat: bool,
+    tail: &[i32],
 ) -> Vec<u8> {
     assert!((1..=4).contains(&components) && (2..=16).contains(&precision));
     assert!((1..=65_535).contains(&width) && (1..=65_535).contains(&height));
@@ -1753,6 +1832,8 @@ fn lossless_jpeg_of(
     }
     let mut bw = BitWriter::default();
     let mut rst = 0u8;
+    // Differences of the last samples given by the caller (in coding order).
+    let forced_from = w * h * n - tail.len().min(w * h * n);
     for y in 0..h {
         for x in 0..w {
             let pixel = y * w + x;
@@ -1775,6 +1856,12 @@ fn lossless_jpeg_of(
                 let diff = (s.wrapping_sub(pred) & 0xFFFF) as u16 as i16 as i32;
                 let diff = if s.wrapping_sub(pred) & 0xFFFF == 0x8000 {
                     32768
+                } else {
+                    diff
+                };
+                let k = pixel * n + c;
+                let diff = if k >= forced_from {
+                    tail[k - forced_from]
                 } else {
                     diff
                 };

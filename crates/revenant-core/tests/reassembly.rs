@@ -1023,12 +1023,13 @@ fn lossless_arw(seed: u64) -> revenant_testkit::TiffRaw {
     })
 }
 
-/// [`lossless_arw`] whose tiles 2, 5 and 8 end on the 32 KiB cluster grid; the clusters (of the file) where they end.
+/// [`lossless_arw`] whose tiles 2, 5 and 8 end on the 32 KiB cluster grid, their coded data sized to it (no fill bytes:
+/// a padded tile proves nothing, Q46); the clusters (of the file) where they end.
 fn tile_aligned_arw(seed: u64) -> (revenant_testkit::TiffRaw, Vec<u32>) {
     let a = arw(&ArwOptions {
         seed,
         align: CLUSTER as u32,
-        aligned_tiles: vec![2, 5, 8],
+        sized_tiles: vec![2, 5, 8],
         ..ArwOptions::default()
     });
     let cuts = [2, 5, 8]
@@ -1320,4 +1321,129 @@ fn raw_preview_found_in_a_later_piece_is_its_own() {
             "{what} nested in the RAW"
         );
     }
+}
+
+// Ruling Q46, both sides of a seam: a tile padded with fill bytes before its FF D9 ends where it is declared to whatever
+// same-frame data fills it, so it anchors no seam, before or after it (the re-review's probes, as full scans).
+/// Tiles 2, 3, 5 and 8 padded with fill bytes to end on the cluster grid.
+fn padded(seed: u64) -> revenant_testkit::TiffRaw {
+    arw(&ArwOptions {
+        seed,
+        align: CLUSTER as u32,
+        aligned_tiles: vec![2, 3, 5, 8],
+        ..ArwOptions::default()
+    })
+}
+
+/// A with its tile 3 bytes replaced by B's (same padded length), A, and the tile-3 cluster bounds.
+fn a_with_b3() -> (Vec<u8>, Vec<u8>, u32, u32) {
+    let (a, b) = (padded(1), padded(2));
+    let (ta, tb) = (a.tiles[3].clone(), b.tiles[3].clone());
+    assert_eq!(ta, tb);
+    assert_eq!(ta.len() as u64, 2 * CLUSTER);
+    let mut x = a.bytes.clone();
+    x[ta.clone()].copy_from_slice(&b.bytes[tb]);
+    assert_ne!(x, a.bytes);
+    (
+        x,
+        a.bytes.clone(),
+        (ta.start as u64 / CLUSTER) as u32,
+        (ta.end as u64 / CLUSTER) as u32,
+    )
+}
+
+#[test]
+fn a_neighbours_padded_tile_alone_in_a_piece_is_not_intact() {
+    // Reviewer's probe: A1 | B's tile 3 alone | A from tile 4, each in its own run; A's true tile 3 gone.
+    let (x, _, s3, e3) = a_with_b3();
+    let n = clusters_for(x.len());
+    let clusters = cut_runs(&[300, 900, 500], &[s3, e3], n);
+    let (src, pieces) = raw_card(
+        &[deleted("DSC00020.ARW", &x, clusters)],
+        &[300 + s3, 900 + (e3 - s3)],
+        &[],
+    );
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_ne!(f.health, Health::Intact, "{f:#?}");
+}
+
+#[test]
+fn a_neighbours_padded_tile_ending_the_first_piece_is_not_intact() {
+    // Variant: B's padded tile 3 lies right after A's first run (contiguous), then A from tile 4 elsewhere. The seam is
+    // at the END of the foreign padded tile.
+    let (x, _, _, e3) = a_with_b3();
+    let n = clusters_for(x.len());
+    let clusters = cut_runs(&[300, 500], &[e3], n);
+    let (src, pieces) = raw_card(&[deleted("DSC00021.ARW", &x, clusters)], &[300 + e3], &[]);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_ne!(f.health, Health::Intact, "{f:#?}");
+}
+
+#[test]
+fn a_neighbours_padded_tile_ending_the_first_piece_is_not_intact_after_a_quick_format() {
+    // Same as B on a quick-formatted card (no entry size).
+    let (x, _, _, e3) = a_with_b3();
+    let n = clusters_for(x.len());
+    let clusters = cut_runs(&[300, 500], &[e3], n);
+    let (src, pieces) = raw_card_as(
+        &[deleted("DSC00022.ARW", &x, clusters)],
+        &[300 + e3],
+        &[],
+        true,
+    );
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_ne!(f.health, Health::Intact, "{f:#?}");
+}
+
+#[test]
+fn a_padded_tile_of_a_reported_neighbour_is_not_taken_intact() {
+    // B (deleted, FAT chain kept: placed by the file system, Intact, claimed) in two runs, its second run starting at
+    // its padded tile 3, right after A's first run (A[..tile 3]); A's tile 3 gone (noise), A from tile 4 elsewhere.
+    let (a, b) = (padded(1), padded(2));
+    let ta = a.tiles[3].clone();
+    let (s3, e3) = (
+        (ta.start as u64 / CLUSTER) as u32,
+        (ta.end as u64 / CLUSTER) as u32,
+    );
+    let (na, nb) = (clusters_for(a.bytes.len()), clusters_for(b.bytes.len()));
+    // A: [0, s3) at 300 - s3 .. 300 ; tile 3 at 1500 (overwritten below) ; rest at 500.
+    let ca = cut_runs(&[300 - s3, 1500, 500], &[s3, e3], na);
+    // B: [0, s3) at 800 ; [s3, ..) at 300.
+    let cb = cut_runs(&[800, 300], &[s3], nb);
+    let mut fs = exfat_card();
+    fs.add_at("DCIM/DSC00030.ARW", &a.bytes, &ca);
+    fs.add_at("DCIM/DSC00031.ARW", &b.bytes, &cb);
+    let pa = pieces_of(&fs, &ca, a.bytes.len() as u64);
+    let pb = pieces_of(&fs, &cb, b.bytes.len() as u64);
+    fs.delete("DCIM/DSC00030.ARW", DeleteStyle::ZeroChain);
+    fs.delete("DCIM/DSC00031.ARW", DeleteStyle::Camera);
+    let mut volume = fs.build();
+    let used: std::collections::HashSet<u32> = ca
+        .iter()
+        .chain(cb.iter())
+        .copied()
+        .filter(|c| !(1500..1502).contains(c))
+        .collect();
+    let noise = support::cards::noise(volume.len() as u64, 0xA5A5);
+    for c in 64..fs.cluster_count() + 2 {
+        if used.contains(&c) {
+            continue;
+        }
+        let at = fs.cluster_offset(c) as usize;
+        let end = (at + CLUSTER as usize).min(volume.len());
+        volume[at..end].copy_from_slice(&noise[at..end]);
+    }
+    let src = SimSource::new(on_disk(&volume));
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let fb = at(&view, pb[0].start);
+    let fa = at(&view, pa[0].start);
+    let _ = fb;
+    assert_ne!(fa.health, Health::Intact, "{fa:#?}");
 }

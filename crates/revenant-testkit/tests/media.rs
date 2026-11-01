@@ -525,3 +525,27 @@ fn arw_tiles_can_end_on_a_grid() {
     assert_ne!(a.bytes, b.bytes);
     assert_eq!(a.tiles.len(), b.tiles.len());
 }
+
+#[test]
+fn arw_tiles_can_end_on_a_grid_unpadded() {
+    // Sized tiles end on the grid with no fill byte before their EOI: their length is their data's.
+    use revenant_testkit::{ArwCompression, ArwOptions, arw};
+    let grid = 32 << 10;
+    let a = arw(&ArwOptions {
+        compression: ArwCompression::Lossless,
+        align: grid,
+        sized_tiles: vec![2, 5, 8],
+        ..ArwOptions::default()
+    });
+    for (k, t) in a.tiles.iter().enumerate() {
+        assert_eq!(
+            t.end % grid as usize == 0,
+            [2, 5, 8].contains(&k),
+            "tile {k}: {t:?}"
+        );
+        let tile = &a.bytes[t.clone()];
+        assert_ne!(tile[tile.len() - 3], 0xFF, "tile {k} has fill bytes");
+        let (count, _) = count_lossless_samples(tile, 256, 256, 1, 14);
+        assert_eq!(count, 256 * 256);
+    }
+}

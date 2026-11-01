@@ -1004,8 +1004,8 @@ a preview share those bytes and are the same file, nested (Q16).
 whole and are anchored at their declared places: a tile boundary where the next tile decodes whole and its `FF D9` ends
 exactly at its own declared end, an IFD table at its offset inside the first piece. The proof is the tile's exact
 compressed size: another tile of the same frame decodes whole too, and only its different length gives it away. So a
-tile padded with fill bytes before its `FF D9` (any same-frame tile whose data fits fills the same slot) never proves
-the seam before it (ruling Q46). Never:
+tile padded with fill bytes before its `FF D9` (any same-frame tile whose data fits fills the same slot) proves no
+seam, before or after it (ruling Q46). Never:
 
 - a seam inside a lossless tile (a piece of another tile of the same frame passes the check a few percent of the time,
   Q44);
@@ -1119,7 +1119,8 @@ A unit is free when it is inside the heap, no live file of the volume's listing 
 units stops at the first unit that is not free; a claimed range wholly covered by the file's own embedded files at their
 exact places (a RAW's preview found as its own `Intact` JPEG) does not stop it (coverage, not equality, since touching
 claimed ranges are merged); for the same reason a unit taken only by such files, were the piece to start there, is a
-candidate. Taken ranges are stepped over range by range, never cluster by cluster. The window bounds
+candidate. Taken ranges are stepped over range by range, never cluster by cluster, except a unit opened by such own
+files (stepped one unit, its check charged to the file's walks). The window bounds
 only the distance to a candidate, never a piece's length: a piece runs as far as its units are free, until its walk
 breaks, the known length ends or the read budget does.
 

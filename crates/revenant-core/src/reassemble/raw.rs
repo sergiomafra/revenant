@@ -76,10 +76,10 @@ struct Layout {
 
 /// How a unit's check ended.
 enum Check {
-    /// Whole and passed; `anchored` when its end is exactly its declared end, `informative` when that end is where its
-    /// own data ends (a tile padded with fill bytes ends where it is declared to whatever data fills it: its length
-    /// tells nothing, so it is no anchor for a seam before it, ruling Q46).
-    Pass { anchored: bool, informative: bool },
+    /// Whole and passed; `anchored` when its end is exactly its declared end and that is where its own data ends (a tile
+    /// padded with fill bytes ends where it is declared to whatever same-frame data fills it: its length tells nothing,
+    /// so it anchors no seam, before or after it, ruling Q46).
+    Pass { anchored: bool },
     /// It goes on past the walk's limit; `evident` when what is in view decodes.
     Open { evident: bool },
     /// Its bytes stop being this unit's at `at`.
@@ -427,10 +427,7 @@ fn check(r: &mut Reader, u: &Unit, limit: u64) -> Check {
     let whole = u.end <= limit;
     let to = u.end.min(limit);
     match u.kind {
-        Kind::Ifd if whole => Check::Pass {
-            anchored: true,
-            informative: true,
-        },
+        Kind::Ifd if whole => Check::Pass { anchored: true },
         Kind::Ifd => Check::Open { evident: false },
         Kind::Jpeg => check_jpeg(r, u, to, whole),
         Kind::Tile => check_tile(r, u, limit, None, &mut Vec::new()),
@@ -447,10 +444,7 @@ fn check_jpeg(r: &mut Reader, u: &Unit, to: u64, whole: bool) -> Check {
             (false, _) => Check::Open { evident: false },
             // A frame the entropy decoder does not cover: the strict decode decides.
             (true, true) if decode_health(r, u.start, u.end - u.start) == Health::Intact => {
-                Check::Pass {
-                    anchored: false,
-                    informative: false,
-                }
+                Check::Pass { anchored: false }
             }
             (true, _) => Check::Fail { at: u.start },
         };
@@ -458,7 +452,6 @@ fn check_jpeg(r: &mut Reader, u: &Unit, to: u64, whole: bool) -> Check {
     match jpeg_entropy::decode(r, &frame, frame.start(scan), to, false).end {
         End::Eoi { at } => Check::Pass {
             anchored: at + 2 == u.end,
-            informative: at + 2 == u.end,
         },
         End::Error { at } => Check::Fail { at },
         End::OutOfData if whole => Check::Fail { at: to },
@@ -488,15 +481,14 @@ fn check_tile(
     let run = decode_lossless(r, &frame, from, to);
     *rows = run.resume;
     match run.end {
-        // Only at the declared end, with the exact count (Q15); informative unless fill bytes pad it there (Q46).
+        // Only at the declared end, with the exact count (Q15); an anchor unless fill bytes pad it there (Q46).
         End::Eoi { at } => {
             let mut fill = 0;
             while fill < 2 && at > u.start + fill && r.byte(at - 1 - fill) == Some(0xFF) {
                 fill += 1;
             }
             Check::Pass {
-                anchored: true,
-                informative: fill <= 1,
+                anchored: fill <= 1,
             }
         }
         End::Error { at } => Check::Fail { at },
@@ -554,7 +546,7 @@ impl Seams for RawSeams {
         }
         let len = view.len();
         let mut r = Reader::with_window(view, UNIT_WINDOW);
-        // Units anchored at their declared ends, and those whose start is an anchor too (their length tells).
+        // The ends and starts of the units anchored at their declared places.
         let mut ends: Vec<u64> = Vec::new();
         let mut starts: Vec<u64> = Vec::new();
         // An IFD table anchors only inside the first piece: past it, any table that parses would (M-1).
@@ -565,14 +557,9 @@ impl Seams for RawSeams {
             }
             match check(&mut r, u, len) {
                 Check::Pass { anchored: true, .. } if u.kind == Kind::Ifd && u.end > first => {}
-                Check::Pass {
-                    anchored: true,
-                    informative,
-                } => {
+                Check::Pass { anchored: true } => {
                     ends.push(u.end);
-                    if informative {
-                        starts.push(u.start);
-                    }
+                    starts.push(u.start);
                 }
                 Check::Pass { .. } => {}
                 Check::Open { .. } => return Proof::Unproven,
@@ -664,7 +651,7 @@ impl Refutes for RawSeams {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Budget, Grid, Limits, Space, Taken, search};
+    use super::super::{Budget, Counted, Ctx, Grid, Limits, Space, Taken, search};
     use super::*;
     use crate::EngineError;
     use crate::cache::Runs;
@@ -684,12 +671,12 @@ mod tests {
         })
     }
 
-    /// Tiles 2, 5 and 8 end on a 32 KiB grid.
+    /// Tiles 2, 5 and 8 end on a 32 KiB grid, their coded data sized to it (no fill bytes).
     fn aligned(seed: u64) -> TiffRaw {
         arw(&ArwOptions {
             seed,
             align: C as u32,
-            aligned_tiles: vec![2, 5, 8],
+            sized_tiles: vec![2, 5, 8],
             ..ArwOptions::default()
         })
     }
@@ -1138,11 +1125,11 @@ mod tests {
         let s = find(&card, &runs, &a.bytes);
         assert_eq!(s.pieces, runs, "B's tile is the only one there");
         assert_ne!(s.proof, Proof::Proven, "{s:?}");
-        // A's own padded tile in its place is no proof either; the seam after it is (tile 4 is not padded).
+        // A's own padded tile in its place is no proof either, on either side (Q46).
         let mut whole = a.bytes.clone();
         whole.truncate(a.bytes.len());
         assert_eq!(proof(&whole, &[ta.start as u64]), Proof::Unproven);
-        assert_eq!(proof(&whole, &[ta.end as u64]), Proof::Proven);
+        assert_eq!(proof(&whole, &[ta.end as u64]), Proof::Unproven);
     }
 
     #[test]
@@ -1224,5 +1211,62 @@ mod tests {
         let mut s = seams_of(&a.bytes);
         let bad = (a.tiles[5].start as u64 + 2000) / 512 * 512;
         assert!(!s.refutes(&Unreadable(a.bytes.clone(), bad)));
+    }
+
+    #[test]
+    fn the_search_charges_own_file_listing_and_caps_own_files() {
+        // A RAW whose thumbnail starts its second piece (an own file at logical 32 KiB), 1000 claimed one-cluster
+        // ranges after its first piece: listing the seam's candidates checks the own files at each of them, and that
+        // work is charged (m-1). Past `Limits::own_files`, the search takes the file to have no own files.
+        let a = arw(&ArwOptions {
+            thumbnail: true,
+            jpegs_at: C as u32,
+            ..ArwOptions::default()
+        });
+        let card = noise((HEAP + 2100 * C) as usize, 3);
+        let src = Mem(card.clone());
+        let mut claimed = Runs::default();
+        for k in 0..1000u64 {
+            let at = HEAP + (4 + 2 * k) * C;
+            claimed.add(at, at + C, usize::MAX);
+        }
+        let taken = Taken::new(&[], &claimed);
+        let grids = [grid(&card)];
+        let first = Fragment {
+            start: HEAP,
+            len: C,
+        };
+        let run = |limits: &Limits| {
+            let mut seams = seams_of(&a.bytes);
+            let counted = Counted::new(&src);
+            let space = Space::new(&grids, HEAP, src.len(), &taken, &[], limits);
+            let cancel = CancelToken::default();
+            let mut ctx = Ctx::new(
+                &mut seams,
+                &counted,
+                &space,
+                limits,
+                &cancel,
+                (None, false),
+                (u64::MAX, u64::MAX),
+            );
+            let own = ctx.own.len();
+            let st = (C, RawState::at(C));
+            let _ = ctx.classify(&[first], &st, HEAP + C, C);
+            (own, ctx.listed, ctx.tries)
+        };
+        let (own, listed, tries) = run(&Limits::DEFAULT);
+        assert_eq!(own, 3, "thumbnail, preview, the tiles merged");
+        // About 2100 free units listed (forward, then from the heap start), plus one own-file check per claimed range.
+        assert!(
+            listed >= 2000 + 1000,
+            "{listed}: the listing's own-file checks are counted"
+        );
+        assert!(tries >= listed / 64, "{tries} tries for {listed} listed");
+        let few = Limits {
+            own_files: 2,
+            ..Limits::DEFAULT
+        };
+        assert_eq!(run(&few).0, 0, "past the cap, no own files");
     }
 }
