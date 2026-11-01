@@ -217,18 +217,6 @@ pub(crate) struct LlCursor {
 }
 
 impl LlCursor {
-    /// The same state, every position minus `by` (for decoding the same bytes through a view that starts `by` later);
-    /// `None` when the view would start after the cursor.
-    #[allow(dead_code)] // No walk starts a view inside a tile yet: tested, kept for one that does.
-    pub(crate) fn shifted_back(&self, by: u64) -> Option<LlCursor> {
-        let mut c = self.clone();
-        c.pos = c.pos.checked_sub(by)?;
-        for p in &mut c.byte_pos {
-            *p = p.saturating_sub(by);
-        }
-        Some(c)
-    }
-
     /// Position of the byte holding the next unconsumed bit.
     fn current_byte(&self) -> u64 {
         if self.nbits == 0 {
@@ -455,8 +443,17 @@ pub(crate) fn tiles_decode(r: &mut Reader, tiles: &[(u64, u64)]) -> bool {
     if lossless_frame(r, o, o.saturating_add(l)).is_none() {
         return true;
     }
-    tiles.iter().all(|&(o, l)| {
+    // In file order, a range overlapping one already checked skipped (a hostile list repeating one tile): the work
+    // stays within the file's bytes (I-2).
+    let mut sorted = tiles.to_vec();
+    sorted.sort_unstable();
+    let mut done = 0u64;
+    sorted.iter().all(|&(o, l)| {
         let end = o.saturating_add(l);
+        if o < done {
+            return true;
+        }
+        done = end;
         !super::cancelled()
             && lossless_frame(r, o, end).is_some_and(|(f, scan)| {
                 matches!(
@@ -679,13 +676,45 @@ mod tests {
         assert!(!matches!(run.end, End::Eoi { .. }), "{:?}", run.end);
     }
 
+    /// A source that counts the bytes read from it.
+    struct Counting(Vec<u8>, std::sync::atomic::AtomicU64);
+
+    impl crate::source::Source for Counting {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, crate::EngineError> {
+            let n = Mem(self.0.clone()).read_at(offset, buf)?;
+            self.1
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(n)
+        }
+        fn volume(&self) -> Option<crate::source::VolumeId> {
+            None
+        }
+    }
+
     #[test]
-    fn a_cursor_cannot_be_shifted_before_the_start() {
-        let j = testkit::lossless_jpeg(16, 16, 1, 12, 3);
-        let (f, scan) = parse(&j).unwrap();
-        let c = f.start(scan);
-        assert!(c.shifted_back(scan).is_some());
-        assert!(c.shifted_back(scan + 1).is_none());
+    fn a_tile_listed_many_times_is_decoded_once() {
+        // A hostile structure listing one tile 1000 times (I-2): the work stays bounded by the bytes of the file.
+        let j = testkit::lossless_jpeg(128, 96, 1, 14, 3);
+        let src = Counting(j.clone(), Default::default());
+        let len = j.len() as u64;
+        let tiles = vec![(0, len); 1000];
+        assert!(tiles_decode(&mut Reader::with_window(&src, 512), &tiles));
+        let read = src.1.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(read <= 3 * len, "{read} bytes read for a {len}-byte tile");
+        // Overlapping ranges are skipped too; ones after them are still checked.
+        let mut two = j.clone();
+        two.extend_from_slice(&j);
+        let src = Counting(two, Default::default());
+        let r = [(0, len), (10, len - 10), (len, len)];
+        assert!(tiles_decode(&mut Reader::with_window(&src, 512), &r));
+        let src = Counting(j.clone(), Default::default());
+        assert!(!tiles_decode(
+            &mut Reader::with_window(&src, 512),
+            &[(0, len), (len, len)]
+        ));
     }
 
     #[test]
@@ -701,18 +730,7 @@ mod tests {
         assert_eq!(first.end, End::OutOfData);
         let mid = first.resume.last().expect("row cursors").clone();
         assert!(mid.pos <= c && mid.sample > 0);
-        // Second piece placed elsewhere: bytes [mid.pos, ..) as a view starting `by` later.
-        let by = mid.pos;
-        let tail = Mem(j[by as usize..].to_vec());
-        let resumed = decode_lossless(
-            &mut Reader::new(&tail),
-            &f,
-            mid.shifted_back(by).unwrap(),
-            len - by,
-        );
-        assert_eq!(resumed.end, End::Eoi { at: len - 2 - by });
-        assert_eq!(resumed.samples, whole.samples);
-        // Unshifted resume gives the contiguous result exactly.
+        // Resumed from it over the whole: the contiguous result exactly.
         let src = Mem(j.clone());
         let again = decode_lossless(&mut Reader::new(&src), &f, mid, len);
         assert_eq!((again.end, again.samples), (whole.end, whole.samples));

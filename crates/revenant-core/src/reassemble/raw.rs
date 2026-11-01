@@ -76,8 +76,10 @@ struct Layout {
 
 /// How a unit's check ended.
 enum Check {
-    /// Whole and passed; `anchored` when its end is exactly its declared end.
-    Pass { anchored: bool },
+    /// Whole and passed; `anchored` when its end is exactly its declared end, `informative` when that end is where its
+    /// own data ends (a tile padded with fill bytes ends where it is declared to whatever data fills it: its length
+    /// tells nothing, so it is no anchor for a seam before it, ruling Q46).
+    Pass { anchored: bool, informative: bool },
     /// It goes on past the walk's limit; `evident` when what is in view decodes.
     Open { evident: bool },
     /// Its bytes stop being this unit's at `at`.
@@ -156,11 +158,27 @@ impl RawSeams {
             return None;
         }
         let coded: std::collections::HashSet<u64> = info.jpeg_data_starts.iter().copied().collect();
+        // The JPEG-coded strips/tiles merged where they touch or overlap (tiles follow each other: one range, I-3);
+        // the previews stay apart, their starts are those of findings.
+        let mut data: Vec<(u64, u64)> = info
+            .data
+            .iter()
+            .filter(|(o, l)| coded.contains(o) && *l > 0)
+            .copied()
+            .collect();
+        data.sort_unstable();
+        let mut merged: Vec<Fragment> = Vec::new();
+        for (o, l) in data {
+            match merged.last_mut() {
+                Some(m) if o <= m.start + m.len => m.len = m.len.max(o + l - m.start),
+                _ => merged.push(Fragment { start: o, len: l }),
+            }
+        }
         let own = info
             .jpegs
             .iter()
-            .chain(info.data.iter().filter(|(o, _)| coded.contains(o)))
             .map(|&(start, len)| Fragment { start, len })
+            .chain(merged)
             .collect();
         Some(RawSeams {
             len: info.end,
@@ -290,7 +308,9 @@ impl RawSeams {
             // A JPEG holding a seam must end exactly at its declared end: a burst neighbour's tail decodes on, to its own.
             let seamed = u.kind == Kind::Jpeg && newest(u.start + 1, u.end - 1).is_some();
             match got {
-                Check::Pass { anchored: false } if seamed => {
+                Check::Pass {
+                    anchored: false, ..
+                } if seamed => {
                     let end = WalkEnd::Broken {
                         at: newest(u.start + 1, u.end - 1).unwrap_or(u.start),
                     };
@@ -310,6 +330,8 @@ impl RawSeams {
                 }
                 Check::Fail { at } => {
                     let at = at.clamp(u.start, limit);
+                    // An unreadable byte refutes nothing (Q43): the content was not seen.
+                    let refuted = !r.bad_in(u.start, u.end.min(limit));
                     let end = match newest(u.start, at.saturating_add(LOOKAHEAD)) {
                         // Right after a seam: the continuation is not this unit's.
                         Some(s) if at < s.saturating_add(EVIDENCE) => {
@@ -319,7 +341,7 @@ impl RawSeams {
                                     checked,
                                     resume,
                                 },
-                                true,
+                                refuted,
                             );
                         }
                         // Evidence past the seam (the next seam lies further on, before the failure); the break points
@@ -341,7 +363,7 @@ impl RawSeams {
                             checked,
                             resume,
                         },
-                        true,
+                        refuted,
                     );
                 }
                 Check::Open { evident } => {
@@ -405,7 +427,10 @@ fn check(r: &mut Reader, u: &Unit, limit: u64) -> Check {
     let whole = u.end <= limit;
     let to = u.end.min(limit);
     match u.kind {
-        Kind::Ifd if whole => Check::Pass { anchored: true },
+        Kind::Ifd if whole => Check::Pass {
+            anchored: true,
+            informative: true,
+        },
         Kind::Ifd => Check::Open { evident: false },
         Kind::Jpeg => check_jpeg(r, u, to, whole),
         Kind::Tile => check_tile(r, u, limit, None, &mut Vec::new()),
@@ -422,7 +447,10 @@ fn check_jpeg(r: &mut Reader, u: &Unit, to: u64, whole: bool) -> Check {
             (false, _) => Check::Open { evident: false },
             // A frame the entropy decoder does not cover: the strict decode decides.
             (true, true) if decode_health(r, u.start, u.end - u.start) == Health::Intact => {
-                Check::Pass { anchored: false }
+                Check::Pass {
+                    anchored: false,
+                    informative: false,
+                }
             }
             (true, _) => Check::Fail { at: u.start },
         };
@@ -430,6 +458,7 @@ fn check_jpeg(r: &mut Reader, u: &Unit, to: u64, whole: bool) -> Check {
     match jpeg_entropy::decode(r, &frame, frame.start(scan), to, false).end {
         End::Eoi { at } => Check::Pass {
             anchored: at + 2 == u.end,
+            informative: at + 2 == u.end,
         },
         End::Error { at } => Check::Fail { at },
         End::OutOfData if whole => Check::Fail { at: to },
@@ -459,16 +488,26 @@ fn check_tile(
     let run = decode_lossless(r, &frame, from, to);
     *rows = run.resume;
     match run.end {
-        // Only at the declared end, with the exact count (Q15).
-        End::Eoi { .. } => Check::Pass { anchored: true },
+        // Only at the declared end, with the exact count (Q15); informative unless fill bytes pad it there (Q46).
+        End::Eoi { at } => {
+            let mut fill = 0;
+            while fill < 2 && at > u.start + fill && r.byte(at - 1 - fill) == Some(0xFF) {
+                fill += 1;
+            }
+            Check::Pass {
+                anchored: true,
+                informative: fill <= 1,
+            }
+        }
         End::Error { at } => Check::Fail { at },
         End::OutOfData if whole => Check::Fail { at: to },
         End::OutOfData => Check::Open { evident: true },
     }
 }
 
-/// Whether the `n` bytes at absolute `g` may be entropy-coded data (inside a tile): readable, not one repeated byte
-/// value (erased), and no `FF` followed by anything but `00` (stuffing), `D0`–`D7` (restart), `D9` (end) or `FF` (fill).
+/// Whether the `n` bytes at absolute `g` may be entropy-coded data (inside a tile): readable, and no `FF` followed by
+/// anything but `00` (stuffing), `D0`–`D7` (restart), `D9` (end) or `FF` (fill). A run of one byte value passes: a flat
+/// area (clipped highlights) codes as zeros when the shortest code is all zeros (I-4).
 fn may_be_entropy(r: &mut Reader, g: u64, n: u64) -> bool {
     let n = n.min(SECTOR) as usize;
     if n < 2 {
@@ -477,9 +516,6 @@ fn may_be_entropy(r: &mut Reader, g: u64, n: u64) -> bool {
     let mut buf = [0u8; SECTOR as usize];
     let buf = &mut buf[..n];
     if r.read(g, buf) < n || r.bad_in(g, g + n as u64) {
-        return false;
-    }
-    if buf[1..] == buf[..n - 1] {
         return false;
     }
     buf.windows(2)
@@ -518,14 +554,27 @@ impl Seams for RawSeams {
         }
         let len = view.len();
         let mut r = Reader::with_window(view, UNIT_WINDOW);
-        let mut anchored: Vec<Unit> = Vec::new();
+        // Units anchored at their declared ends, and those whose start is an anchor too (their length tells).
+        let mut ends: Vec<u64> = Vec::new();
+        let mut starts: Vec<u64> = Vec::new();
+        // An IFD table anchors only inside the first piece: past it, any table that parses would (M-1).
+        let first = seams.first().copied().unwrap_or(len);
         for u in &layout.units {
             if cancelled() {
                 return Proof::Unproven;
             }
             match check(&mut r, u, len) {
-                Check::Pass { anchored: true } => anchored.push(*u),
-                Check::Pass { anchored: false } => {}
+                Check::Pass { anchored: true, .. } if u.kind == Kind::Ifd && u.end > first => {}
+                Check::Pass {
+                    anchored: true,
+                    informative,
+                } => {
+                    ends.push(u.end);
+                    if informative {
+                        starts.push(u.start);
+                    }
+                }
+                Check::Pass { .. } => {}
                 Check::Open { .. } => return Proof::Unproven,
                 Check::Fail { .. } => return Proof::Failed,
             }
@@ -533,8 +582,7 @@ impl Seams for RawSeams {
         if layout.incomplete || len != self.len {
             return Proof::Unproven;
         }
-        let between =
-            |s: u64| anchored.iter().any(|u| u.end == s) && anchored.iter().any(|u| u.start == s);
+        let between = |s: u64| ends.contains(&s) && starts.contains(&s);
         if seams.iter().all(|&s| between(s)) {
             Proof::Proven
         } else {
@@ -618,10 +666,12 @@ impl Refutes for RawSeams {
 mod tests {
     use super::super::{Budget, Grid, Limits, Space, Taken, search};
     use super::*;
+    use crate::EngineError;
     use crate::cache::Runs;
     use crate::formats::tests::Mem;
     use crate::scan::CancelToken;
     use crate::source::Fragmented;
+    use crate::source::VolumeId;
     use revenant_testkit::{ArwCompression, ArwOptions, TiffRaw, arw};
 
     const C: u64 = 32 << 10;
@@ -699,7 +749,15 @@ mod tests {
                 len: p.len() as u64
             }
         );
-        assert_eq!(own.len(), 2 + a.tiles.len());
+        // The tiles follow each other: one own range for all of them (I-3), from the first tile's start.
+        assert_eq!(own.len(), 3, "{own:?}");
+        assert_eq!(
+            own[2],
+            Fragment {
+                start: a.tiles[0].start as u64,
+                len: (a.tiles.last().unwrap().end - a.tiles[0].start) as u64
+            }
+        );
         assert!(RawSeams::new(&Mem(vec![0; 4096]), 0).is_none());
     }
 
@@ -891,14 +949,15 @@ mod tests {
         let next = HEAP + a.tiles[3].start as u64;
         assert!(s.prefilter(&mut r, next, cut as u64), "a lossless header");
         assert!(!s.prefilter(&mut r, 4096, cut as u64), "noise");
-        // Inside a tile: entropy-coded data passes, a marker that cannot be there does not, nor an erased sector.
+        // Inside a tile: entropy-coded data passes, a marker that cannot be there does not. A run of one byte value
+        // passes (a flat area codes as zeros, I-4).
         let inside = a.tiles[4].start as u64 + 1000;
         assert!(s.prefilter(&mut r, HEAP + inside, inside));
-        let mut erased = vec![0u8; 4096];
-        erased.extend_from_slice(&[0xFF, 0xC4, 0, 0]);
-        let src = Mem(erased);
+        let mut flat = vec![0u8; 4096];
+        flat.extend_from_slice(&[0xFF, 0xC4, 0, 0]);
+        let src = Mem(flat);
         let mut r = Reader::new(&src);
-        assert!(!s.prefilter(&mut r, 0, inside));
+        assert!(s.prefilter(&mut r, 0, inside));
         assert!(!s.prefilter(&mut r, 4096 - 256, inside));
     }
 
@@ -1033,5 +1092,137 @@ mod tests {
             s.unique && s.exhaustive && s.proof == Proof::Proven,
             "{s:?}"
         );
+    }
+
+    /// `parts` (bytes) placed at clusters `at` of a card of noise; the runs.
+    fn place(parts: &[&[u8]], at: &[u64]) -> (Vec<u8>, Vec<Fragment>) {
+        let clusters = at.iter().max().unwrap() + 64;
+        let mut card = noise((HEAP + clusters * C) as usize, 0x5EED);
+        let runs = parts
+            .iter()
+            .zip(at)
+            .map(|(p, &c)| {
+                let pos = (HEAP + c * C) as usize;
+                card[pos..pos + p.len()].copy_from_slice(p);
+                Fragment {
+                    start: pos as u64,
+                    len: p.len() as u64,
+                }
+            })
+            .collect();
+        (card, runs)
+    }
+
+    #[test]
+    fn padded_tiles_never_prove_a_seam() {
+        // Ruling Q46, the review's probe: two burst RAWs whose tile 3 is padded with fill bytes to the same two
+        // clusters. A's tile 3 is gone; B's is free where the search looks: it decodes whole and ends at A's declared
+        // end, since the length carries nothing. Never a proof.
+        let opts = |seed| ArwOptions {
+            seed,
+            align: C as u32,
+            aligned_tiles: vec![2, 3, 5, 8],
+            ..ArwOptions::default()
+        };
+        let (a, b) = (arw(&opts(1)), arw(&opts(2)));
+        let (ta, tb) = (a.tiles[3].clone(), b.tiles[3].clone());
+        assert_eq!((ta.clone(), ta.len()), (tb.clone(), 2 * C as usize));
+        let (card, runs) = place(
+            &[
+                &a.bytes[..ta.start],
+                &b.bytes[tb.clone()],
+                &a.bytes[ta.end..],
+            ],
+            &[10, 60, 30],
+        );
+        let s = find(&card, &runs, &a.bytes);
+        assert_eq!(s.pieces, runs, "B's tile is the only one there");
+        assert_ne!(s.proof, Proof::Proven, "{s:?}");
+        // A's own padded tile in its place is no proof either; the seam after it is (tile 4 is not padded).
+        let mut whole = a.bytes.clone();
+        whole.truncate(a.bytes.len());
+        assert_eq!(proof(&whole, &[ta.start as u64]), Proof::Unproven);
+        assert_eq!(proof(&whole, &[ta.end as u64]), Proof::Proven);
+    }
+
+    #[test]
+    fn a_flat_tile_continuation_is_found() {
+        // The cut falls inside a flat tile (clipped highlights): the true continuation's first sector is all zeros.
+        let a = arw(&ArwOptions {
+            flat_tiles: vec![1, 2, 3],
+            ..ArwOptions::default()
+        });
+        let k = (1..)
+            .find(|&k| {
+                let at = (k * C) as usize;
+                a.tiles[1..4]
+                    .iter()
+                    .any(|t| t.start + 1024 < at && at + 1024 < t.end)
+            })
+            .unwrap();
+        let cut = (k * C) as usize;
+        assert!(a.bytes[cut..cut + 512].iter().all(|&x| x == 0));
+        let n = (a.bytes.len() as u64).div_ceil(C);
+        assert!(k + 6 < n, "{k} {n}");
+        let (card, runs) = scatter(&a.bytes, &[k, k + 3, k + 6], &[10, 60, 30, 90]);
+        let s = find(&card, &runs, &a.bytes);
+        assert_eq!(s.pieces, runs);
+        assert!(s.complete, "{s:?}");
+    }
+
+    #[test]
+    fn an_ifd_outside_the_first_piece_is_no_anchor() {
+        // A copy of the SubIFD table right after the last tile, IFD0 pointing at it (as writers that put structure
+        // after the image data do): a seam between the last tile and that table is not proven by the table (M-1).
+        let a = aligned(1);
+        let mut b = a.bytes.clone();
+        let le = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        let ifd0 = le(&b, 4) as usize;
+        let n = u16::from_le_bytes([b[ifd0], b[ifd0 + 1]]) as usize;
+        let e = (0..n)
+            .map(|i| ifd0 + 2 + 12 * i)
+            .find(|&e| u16::from_le_bytes([b[e], b[e + 1]]) == 0x014A)
+            .unwrap();
+        let sub = le(&b, e + 8) as usize;
+        let m = u16::from_le_bytes([b[sub], b[sub + 1]]) as usize;
+        let table = b[sub..sub + 2 + 12 * m + 4].to_vec();
+        let at = b.len();
+        b.extend_from_slice(&table);
+        b[e + 8..e + 12].copy_from_slice(&(at as u32).to_le_bytes());
+        assert_eq!(seams_of(&b).known_len(), Some(b.len() as u64));
+        assert_eq!(proof(&b, &[]), Proof::Proven);
+        assert_eq!(proof(&b, &[at as u64]), Proof::Unproven);
+        // At a tile boundary inside the file the tiles still prove it.
+        assert_eq!(proof(&b, &[a.tiles[2].end as u64]), Proof::Proven);
+    }
+
+    /// A source over bytes whose `[bad, bad + 512)` cannot be read.
+    struct Unreadable(Vec<u8>, u64);
+
+    impl Source for Unreadable {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+            if offset < self.1 + 512 && offset + buf.len() as u64 > self.1 {
+                return Err(EngineError::Read {
+                    offset,
+                    cause: std::io::Error::other("bad"),
+                });
+            }
+            Mem(self.0.clone()).read_at(offset, buf)
+        }
+        fn volume(&self) -> Option<VolumeId> {
+            None
+        }
+    }
+
+    #[test]
+    fn unreadable_bytes_refute_nothing() {
+        // Q43: a placement is refuted by its content, never by a sector that cannot be read (M-2).
+        let a = lossless(1);
+        let mut s = seams_of(&a.bytes);
+        let bad = (a.tiles[5].start as u64 + 2000) / 512 * 512;
+        assert!(!s.refutes(&Unreadable(a.bytes.clone(), bad)));
     }
 }

@@ -1085,6 +1085,8 @@ pub struct ArwOptions {
     /// includes them, as the JPEG syntax allows).
     pub align: u32,
     pub aligned_tiles: Vec<usize>,
+    /// Tiles of a flat image ([`lossless_jpeg_flat`]): their data is mostly zero bytes.
+    pub flat_tiles: Vec<usize>,
 }
 
 impl Default for ArwOptions {
@@ -1102,6 +1104,7 @@ impl Default for ArwOptions {
             jpegs_at: 0,
             align: 0,
             aligned_tiles: Vec::new(),
+            flat_tiles: Vec::new(),
         }
     }
 }
@@ -1147,13 +1150,12 @@ pub fn arw(opts: &ArwOptions) -> TiffRaw {
             let n = (opts.width / opts.tile) * (opts.height / opts.tile);
             tiles = (0..u64::from(n))
                 .map(|k| {
-                    lossless_jpeg(
-                        opts.tile,
-                        opts.tile,
-                        1,
-                        14,
-                        opts.seed.wrapping_mul(0x9E37) ^ k,
-                    )
+                    let seed = opts.seed.wrapping_mul(0x9E37) ^ k;
+                    if opts.flat_tiles.contains(&(k as usize)) {
+                        lossless_jpeg_flat(opts.tile, opts.tile, 1, 14, seed)
+                    } else {
+                        lossless_jpeg(opts.tile, opts.tile, 1, 14, seed)
+                    }
                 })
                 .collect();
         }
@@ -1657,6 +1659,30 @@ pub fn lossless_jpeg_with_restarts(
     seed: u64,
     interval: u16,
 ) -> Vec<u8> {
+    lossless_jpeg_of(width, height, components, precision, seed, interval, false)
+}
+
+/// [`lossless_jpeg`] of a flat image (every sample the same, as in clipped highlights): after the first sample every
+/// difference is 0, coded `000`, so the entropy-coded data is a long run of zero bytes.
+pub fn lossless_jpeg_flat(
+    width: u32,
+    height: u32,
+    components: u8,
+    precision: u8,
+    seed: u64,
+) -> Vec<u8> {
+    lossless_jpeg_of(width, height, components, precision, seed, 0, true)
+}
+
+fn lossless_jpeg_of(
+    width: u32,
+    height: u32,
+    components: u8,
+    precision: u8,
+    seed: u64,
+    interval: u16,
+    flat: bool,
+) -> Vec<u8> {
     assert!((1..=4).contains(&components) && (2..=16).contains(&precision));
     assert!((1..=65_535).contains(&width) && (1..=65_535).contains(&height));
     // Code lengths of SSSS 0..=16: 5 codes of length 3, 4 of 4, 3 of 5, then one each of 6..=10 (never all ones).
@@ -1717,6 +1743,9 @@ pub fn lossless_jpeg_with_restarts(
                 let mut v = i64::from(b) + (x as i64 * i64::from(slope)) / 8 + y as i64 / 3 + noise;
                 if precision >= 8 && rng.next().is_multiple_of(997) {
                     v = (rng.next() % (u64::from(max) + 1)) as i64;
+                }
+                if flat {
+                    v = i64::from(b);
                 }
                 samples[(y * w + x) * n + c] = v.rem_euclid(i64::from(max) + 1) as u32;
             }

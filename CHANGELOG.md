@@ -151,7 +151,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the image are checked where the structure puts them. Most come back with their bytes in place but reported partial:
   a cut inside the image data of an uncompressed or lossy RAW cannot be checked at all, and a cut inside a lossless
   block, a preview or anywhere else is placed by its content but never proven. A RAW is intact only when every cut lies
-  exactly between two whole lossless blocks that end where the structure says, and nothing else on the card fits.
+  exactly between two whole lossless blocks that end where the structure says (and whose size is their own data's, not
+  padding), and nothing else on the card fits.
 
 ### Changed
 

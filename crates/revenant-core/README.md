@@ -959,8 +959,12 @@ and
   decodes strictly and every lossless-JPEG tile or strip (`Compression 7`, SOF3) decodes to its declared end (the
   lossless JPEG check below, when the first tile's frame is one it covers; else the tiles are not checked): a tile that
   does not end where it is declared to is another file's data (a burst neighbour written right after a first piece),
-  so the RAW is `Partial`. That costs one walk of the tiles' difference codes per lossless RAW. There is no RAW
-  decoder, so uncompressed or lossy raw data is never verified, and a lossless tile that passes is evidence, not proof.
+  so the RAW is `Partial`. That costs one walk of the tiles' difference codes per lossless RAW (tiles in file order; a
+  range overlapping one already checked is skipped, so a structure listing one tile many times costs no more than the
+  file's bytes). There is no RAW decoder, so uncompressed or lossy raw data is never verified, and a lossless tile that
+  passes is evidence, not proof. A known limit (from 1.4): an uncompressed or lossy RAW whose first piece is followed by
+  other data with no file start in it is measured `Intact` from those contiguous bytes (only its structure and preview
+  are checked), so it is never a reassembly candidate; only a file system proving its placement can catch it.
 - Inside an `Intact` RAW the scan suppresses heads, so its embedded previews are not reported separately. A `Partial`
   RAW hides its own JPEGs too (`Format::own_files`: its previews and JPEG-coded strips/tiles, at most 64; ruling D12):
   a JPEG the scan finds at one of their starts, lying wholly inside the RAW, is not reported. A `Damaged` RAW hides
@@ -988,15 +992,20 @@ has evidence past a seam once a unit holding or following it decodes 4096 bytes 
 with nothing checked past the seam is blind, even when its free run reaches the known length: candidates are then taken
 in their order (next free first), so blind sensor data is placed by that order, a piece ending where its free run does.
 The prefilter reads the unit at the seam: a tile starting there must start with a lossless-JPEG header, a JPEG with
-`FF D8 FF`; a seam inside a tile needs entropy-coded data (no stray marker, not one repeated byte) up to the tile's end
-within the candidate's first sector. The previews and JPEG-coded tiles are the RAW's own files: found as photos of their
-own in a later piece and claimed, they neither stop its free run nor keep their unit from being a candidate when they
-lie exactly where the structure puts them (D10, a coverage test, Q7). They stay reported as photos too; the RAW and such
+`FF D8 FF`; a seam inside a tile needs entropy-coded data (no stray marker) up to the tile's end within the candidate's
+first sector; a run of one byte value passes (a flat area, such as clipped highlights, codes as zero bytes). The
+previews and JPEG-coded tiles are the RAW's own files (the tiles merged into one range where they follow each other; a
+file with more than 64 own ranges is taken to have none, conservatively): found as photos of their own in a later piece
+and claimed, they neither stop its free run nor keep their unit from being a candidate when they lie exactly where the
+structure puts them (D10, a coverage test, Q7); those checks are charged to the file's walks like the prefilter's. They stay reported as photos too; the RAW and such
 a preview share those bytes and are the same file, nested (Q16).
 
 **What is proven, and what is only placed.** `Proven` only when every seam lies exactly between two units that passed
 whole and are anchored at their declared places: a tile boundary where the next tile decodes whole and its `FF D9` ends
-exactly at its own declared end, an IFD table at its offset. Never:
+exactly at its own declared end, an IFD table at its offset inside the first piece. The proof is the tile's exact
+compressed size: another tile of the same frame decodes whole too, and only its different length gives it away. So a
+tile padded with fill bytes before its `FF D9` (any same-frame tile whose data fits fills the same slot) never proves
+the seam before it (ruling Q46). Never:
 
 - a seam inside a lossless tile (a piece of another tile of the same frame passes the check a few percent of the time,
   Q44);
@@ -1179,6 +1188,7 @@ file) must match the sum of the pieces exactly; when both are known and disagree
 | Bytes read                | 512 MiB per file, 16 GiB per scan |
 | Reassembly candidates     | 4096 findings per scan            |
 | Claimed runs              | 2^18 per scan                     |
+| Own embedded files        | 64 per file (past it: none)       |
 
 A file's budget is its own limits within what the scan has left; the prefilter's reads are charged to it (each
 prefilter call reads through its own one-sector reader, and a (start, seam) pair asked again is answered from memory,

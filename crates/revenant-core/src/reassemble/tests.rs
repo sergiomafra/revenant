@@ -479,7 +479,7 @@ fn a_unit_opened_by_an_own_file_at_its_place_is_a_candidate() {
     ];
     let list = |own: &[Fragment], seam: u64| {
         space
-            .candidates_with_own(g - 2 * U, &[], own, seam, 3, &mut |_| true)
+            .candidates_with_own(g - 2 * U, &[], own, seam, 3, &mut |_| true, &mut 0)
             .0
     };
     // The claimed photos fill the units g to g + 4U: only the first one is opened by them.
@@ -497,6 +497,48 @@ fn a_unit_opened_by_an_own_file_at_its_place_is_a_candidate() {
     assert_eq!(list(&off, 64 * K), after);
     // The plain listing is the one without own files.
     assert_eq!(space.candidates(g - 2 * U, &[], 3, &mut |_| true).0, after);
+}
+
+#[test]
+fn own_file_checks_while_listing_are_counted_and_capped() {
+    // 1000 claimed units, every other one: listing past them with own files checks each taken range once (I-3),
+    // counted as listing work (charged to the file's tries like prefilter calls), never once per unit.
+    let mut claimed = Runs::default();
+    for k in 0..1000u64 {
+        let at = 2 * MIB + 2 * k * U;
+        claimed.add(at, at + U, usize::MAX);
+    }
+    let taken = Taken::new(&[], &claimed);
+    let limits = Limits::DEFAULT;
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &[], &limits);
+    let own = [Fragment {
+        start: 64 * K,
+        len: 4 * K,
+    }];
+    let mut work = 0;
+    let (c, _) = space.candidates_with_own(
+        2 * MIB - U,
+        &[],
+        &own,
+        64 * K,
+        4096,
+        &mut |_| true,
+        &mut work,
+    );
+    assert_eq!(work, 1000);
+    assert!(c.len() >= 1000);
+    // Past the cap of own files, a file has none (conservative: its previews then stop its runs).
+    let many: Vec<Fragment> = (0..=limits.own_files as u64)
+        .map(|k| Fragment {
+            start: k * U,
+            len: U,
+        })
+        .collect();
+    assert!(super::own_within(many.clone(), &limits).is_empty());
+    assert_eq!(
+        super::own_within(many[1..].to_vec(), &limits).len(),
+        limits.own_files
+    );
 }
 
 #[test]

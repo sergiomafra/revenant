@@ -65,6 +65,9 @@ pub(crate) const SCAN_READ: u64 = 16 << 30;
 pub(crate) const MAX_CANDIDATES: usize = 4096;
 /// Runs of bytes claimed by `Intact` findings kept per scan.
 pub(crate) const MAX_CLAIMED_RUNS: usize = 1 << 18;
+/// A file's own embedded files the search takes into account (D10); past it, none (conservative: they then stop its
+/// free runs like any claimed file).
+pub(crate) const MAX_OWN: usize = 64;
 /// Candidate units listed (prefilter calls, answered from memory or not) per try charged to the file's budget.
 const LISTED_PER_TRY: u64 = 64;
 /// Prefilter answers remembered per file (past it they are asked again, and charged again).
@@ -86,6 +89,7 @@ pub(crate) struct Limits {
     pub scan_read: u64,
     pub candidates: usize,
     pub claimed_runs: usize,
+    pub own_files: usize,
 }
 
 impl Limits {
@@ -103,6 +107,7 @@ impl Limits {
         scan_read: SCAN_READ,
         candidates: MAX_CANDIDATES,
         claimed_runs: MAX_CLAIMED_RUNS,
+        own_files: MAX_OWN,
     };
 }
 
@@ -326,12 +331,14 @@ impl<'a> Space<'a> {
         cap: usize,
         keep: &mut dyn FnMut(u64) -> bool,
     ) -> (Vec<u64>, bool) {
-        self.candidates_with_own(end, used, &[], 0, cap, keep)
+        self.candidates_with_own(end, used, &[], 0, cap, keep, &mut 0)
     }
 
     /// [`Space::candidates`] for the seam at logical `seam` of a file whose own embedded files are `own` (logical, D10):
     /// a unit taken only by claimed ranges and finding starts that those files cover at their exact places, were the
-    /// piece to start there, is a candidate too (D9, Q7: a coverage test, as in [`Space::free_run`]).
+    /// piece to start there, is a candidate too (D9, Q7: a coverage test, as in [`Space::free_run`]). `work` counts those
+    /// checks (one per taken range met, never one per unit), for the caller to charge.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn candidates_with_own(
         &self,
         end: u64,
@@ -340,8 +347,8 @@ impl<'a> Space<'a> {
         seam: u64,
         cap: usize,
         keep: &mut dyn FnMut(u64) -> bool,
+        work: &mut u64,
     ) -> (Vec<u64>, bool) {
-        let own = (own, seam);
         let mut out = Vec::new();
         let forward_to = end.saturating_add(self.window).min(self.end);
         // The unit right at `end` would continue the piece contiguously: no seam, never a candidate.
@@ -350,12 +357,28 @@ impl<'a> Space<'a> {
         } else {
             self.ceil(end)
         };
-        if self.list(from, forward_to, used, own, cap, keep, &mut out) {
+        if self.list(
+            from,
+            forward_to,
+            used,
+            (own, seam, &mut *work),
+            cap,
+            keep,
+            &mut out,
+        ) {
             return (out, true);
         }
         if self.grid {
             let wrap_to = end.min(self.base.saturating_add(self.window));
-            if self.list(self.base, wrap_to, used, own, cap, keep, &mut out) {
+            if self.list(
+                self.base,
+                wrap_to,
+                used,
+                (own, seam, work),
+                cap,
+                keep,
+                &mut out,
+            ) {
                 return (out, true);
             }
         }
@@ -370,7 +393,7 @@ impl<'a> Space<'a> {
         from: u64,
         to: u64,
         used: &[Fragment],
-        (own, seam): (&[Fragment], u64),
+        (own, seam, work): (&[Fragment], u64, &mut u64),
         cap: usize,
         keep: &mut dyn FnMut(u64) -> bool,
         out: &mut Vec<u64>,
@@ -380,6 +403,9 @@ impl<'a> Space<'a> {
             let free_to = match self.next_block(u, used) {
                 Some((s, e)) if s < u.saturating_add(self.unit) => {
                     let mine = own_at(own, u, seam);
+                    if !mine.is_empty() {
+                        *work += 1;
+                    }
                     if !mine.is_empty() && self.free_run(u, used, &mine, 1) > 0 {
                         if keep(u) {
                             if out.len() == cap {
@@ -407,6 +433,15 @@ impl<'a> Space<'a> {
             }
         }
         false
+    }
+}
+
+/// A file's own embedded files as the search uses them: none past [`Limits::own_files`] (I-3).
+pub(crate) fn own_within(own: Vec<Fragment>, limits: &Limits) -> Vec<Fragment> {
+    if own.len() > limits.own_files {
+        Vec::new()
+    } else {
+        own
     }
 }
 
@@ -722,7 +757,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
         (max_tries, max_read): (u64, u64),
     ) -> Self {
         let anchor = seams.anchor();
-        let own = seams.own();
+        let own = own_within(seams.own(), limits);
         Ctx {
             seams,
             source,
@@ -1168,9 +1203,25 @@ impl<'c, S: Seams> Ctx<'c, S> {
         let mut used = pieces.to_vec();
         used.extend_from_slice(&self.excluded);
         let own = std::mem::take(&mut self.own);
-        let (listed, capped) =
-            space.candidates_with_own(end, &used, &own, b, cap, &mut |g2| self.keep(g2, b));
+        let mut work = 0;
+        let (listed, capped) = space.candidates_with_own(
+            end,
+            &used,
+            &own,
+            b,
+            cap,
+            &mut |g2| self.keep(g2, b),
+            &mut work,
+        );
         self.own = own;
+        // The own-file checks of the listing are listing work too (I-3): charged as the prefilter calls are.
+        let before = self.listed;
+        self.listed += work;
+        for _ in before / LISTED_PER_TRY..self.listed / LISTED_PER_TRY {
+            if !self.charge() {
+                break;
+            }
+        }
         if capped {
             self.cut_short();
         }
