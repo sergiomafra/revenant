@@ -138,7 +138,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from the rest, are put back together after the scan from the card's free space: the index says where every frame
   must lie, and every frame is checked there. Such a video is intact only when every cut between two pieces lies close
   enough to checked bytes that no other cut fits and nothing else on the card fits as well; otherwise it is partial
-  (videos with very large slices on small clusters, two copies of the index, or every frame the same size).
+  (videos with very large slices on small clusters, two copies of the index, or frames of one size around a cut).
+- Videos whose index comes first, whose media box has no size, fragmented MP4, and two copies of a video's start are
+  now put back together too: a video with its index first (in its first piece) or in fragments is checked frame by
+  frame where its index puts each frame, and is intact under the same rule; a fragmented one is intact only when its
+  recorded size (a deleted file's entry) or its closing index says where it ends, else partial. When two deleted videos
+  start with the same bytes and one index fits both, the one found first is put back and the copy is left as it was.
 
 ### Changed
 
@@ -182,6 +187,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A video whose index comes before its frames (`moov` first, or fragmented MP4) with other data written over part of
+  its frames was reported intact: such a video is now intact only when every frame it lists checks out in place, else
+  partial (and put back together when the rest of it is found).
 - A video in three pieces whose middle piece is tiny (a few frames placed elsewhere) is no longer put back together as
   two pieces and called intact: the pairing of a video with its index now checks every frame, not 32 of them per side.
 - A complete HEIC photo followed by an unreadable sector, or by a stray `moov` box, is now intact and stays a HEIC (it was

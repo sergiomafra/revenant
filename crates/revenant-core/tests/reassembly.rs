@@ -427,6 +427,15 @@ fn pieces_in(b: &FsBuilder, cluster: u64, clusters: &[u32], size: u64) -> Vec<Fr
 /// proof is D14, Task 9): here only the content can. Every other cluster from 64 on holds seeded noise (old data).
 /// Returns the disk image and each file's absolute pieces.
 fn video_image(cluster: u32, files: &[(&str, &[u8], Vec<u32>)]) -> (Vec<u8>, Vec<Vec<Fragment>>) {
+    video_image_as(cluster, files, false)
+}
+
+/// [`video_image`], after a quick format when `quick` (no entry is left: no name, no size).
+fn video_image_as(
+    cluster: u32,
+    files: &[(&str, &[u8], Vec<u32>)],
+    quick: bool,
+) -> (Vec<u8>, Vec<Vec<Fragment>>) {
     let mut b = FsBuilder::new(revenant_testkit::fs::FsType::Exfat, 64 * MIB, cluster);
     for (name, bytes, clusters) in files {
         b.add_at(&format!("DCIM/{name}"), bytes, clusters);
@@ -438,7 +447,11 @@ fn video_image(cluster: u32, files: &[(&str, &[u8], Vec<u32>)]) -> (Vec<u8>, Vec
     for (name, ..) in files {
         b.delete(&format!("DCIM/{name}"), DeleteStyle::ZeroChain);
     }
-    let mut volume = b.build();
+    let mut volume = if quick {
+        b.build_quick_formatted()
+    } else {
+        b.build()
+    };
     let used: std::collections::HashSet<u32> =
         files.iter().flat_map(|f| f.2.iter().copied()).collect();
     let noise = support::cards::noise(volume.len() as u64, 0xC1A5);
@@ -661,4 +674,136 @@ fn a_video_whose_last_piece_lies_twice_is_partial() {
         v.bytes,
         "either copy holds the same bytes"
     );
+}
+
+// The videos part 1.3 left out (Task 6): the index first, an open-ended `mdat`, fragmented MP4, two copies of a start.
+
+/// `v` in three runs of about a third each at clusters 300, 900 and 500.
+fn thirds(len: usize) -> Vec<u32> {
+    let n = clusters_for(len);
+    assert!(n >= 3, "{n}");
+    runs(&[300, 900, 500], &[n / 3, n / 3, n - 2 * (n / 3)])
+}
+
+#[test]
+fn moov_first_video_cut_into_three_is_intact() {
+    let v = camera_video(
+        &small_video(300, 11, true),
+        VideoCodec::Avc,
+        VideoLayout::MoovFirst,
+    );
+    let (src, pieces) = video_card(
+        CLUSTER as u32,
+        &[("C0011.MP4", &v.bytes, thirds(v.bytes.len()))],
+    );
+    assert_eq!(pieces[0].len(), 3);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_eq!(f.fragments, pieces[0], "{f:#?}");
+    assert_eq!(
+        (f.kind, f.health, f.len),
+        (FileKind::Mp4, Health::Intact, v.bytes.len() as u64)
+    );
+    assert!(updated(&events).iter().any(|u| u.id == f.id));
+    assert_eq!(extracted(&src, f), v.bytes);
+}
+
+#[test]
+fn mdat_size_zero_with_moov_first_is_reassembled() {
+    let v = camera_video(
+        &small_video(300, 12, true),
+        VideoCodec::Avc,
+        VideoLayout::MoovFirstMdatSizeZero,
+    );
+    let (src, pieces) = video_card(
+        CLUSTER as u32,
+        &[("C0012.MP4", &v.bytes, thirds(v.bytes.len()))],
+    );
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_eq!(f.len, v.bytes.len() as u64, "{f:#?}");
+    assert_eq!(
+        (f.health, &f.fragments),
+        (Health::Intact, &pieces[0]),
+        "{f:#?}"
+    );
+    assert_eq!(extracted(&src, f), v.bytes);
+}
+
+#[test]
+fn fragmented_mp4_in_three_pieces_is_reassembled() {
+    let v = camera_video(
+        &small_video(300, 13, true),
+        VideoCodec::Hevc,
+        VideoLayout::Fragmented {
+            samples_per_fragment: 16,
+        },
+    );
+    let files = [("C0013.MP4", v.bytes.as_slice(), thirds(v.bytes.len()))];
+    // The entry deleted (its size known): the chain of boxes reaches it.
+    let (src, pieces) = video_card(CLUSTER as u32, &files);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_eq!(
+        (f.health, &f.fragments),
+        (Health::Intact, &pieces[0]),
+        "{f:#?}"
+    );
+    assert!(updated(&events).iter().any(|u| u.id == f.id));
+    assert_eq!(extracted(&src, f), v.bytes);
+    // A quick-formatted card: no size and no `mfra`, nothing says where the chain ends.
+    let (image, pieces) = video_image_as(CLUSTER as u32, &files, true);
+    let src = SimSource::new(image);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert!(f.origin.is_none());
+    assert_eq!(
+        (f.health, &f.fragments),
+        (Health::Partial, &pieces[0]),
+        "{f:#?}"
+    );
+    assert_eq!(extracted(&src, f), v.bytes);
+}
+
+#[test]
+fn identical_first_pieces_reassemble_once() {
+    // On 2 KiB clusters (no grid: pieces lie on 512-byte sectors, forward only), a moov-less video in two runs and a
+    // second deleted entry of the same size whose first run is a copy of the video's (the rest written over), lying
+    // between the video's two runs: one orphan `moov`, two identical first pieces. Searched apart, the
+    // video could go on in the copy's bytes (not unique) and the `moov` would complete both; as one (D17) the lower id
+    // comes back whole and the other is left as it was.
+    const C: u64 = 2048;
+    let v = avc_video(&small_video(300, 14, true));
+    let n = (v.bytes.len() as u64).div_ceil(C) as u32;
+    let first = n / 3;
+    let split = (first as u64 * C) as usize;
+    let mut copy = v.bytes[..split].to_vec();
+    copy.extend(support::cards::noise((v.bytes.len() - split) as u64, 0xD17));
+    let (src, pieces) = video_card(
+        C as u32,
+        &[
+            (
+                "C0014.MP4",
+                &v.bytes,
+                runs(&[3000, 14000], &[first, n - first]),
+            ),
+            ("C0015.MP4", &copy, runs(&[6000], &[n])),
+        ],
+    );
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let (a, b) = (at(&view, pieces[0][0].start), at(&view, pieces[1][0].start));
+    assert!(a.id < b.id, "{a:#?} {b:#?}");
+    assert_eq!(
+        (a.health, &a.fragments),
+        (Health::Intact, &pieces[0]),
+        "{a:#?}"
+    );
+    assert_eq!(extracted(&src, a), v.bytes);
+    assert_eq!(b.health, Health::Damaged, "{b:#?}");
+    assert!(updated(&events).iter().all(|u| u.id != b.id), "{b:#?}");
 }

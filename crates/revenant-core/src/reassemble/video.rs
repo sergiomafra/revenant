@@ -1,26 +1,42 @@
-//! The seams of an MP4/MOV video whose `moov` index lies away from its `mdat` (part 1.6, D12): the index places every
-//! sample in the file, so each piece's content is checked where the file needs it.
+//! The seams of an MP4/MOV video (part 1.6, D12): its index places every sample in the file, so each piece's content is
+//! checked where the file needs it. Three layouts:
 //!
-//! The file lives in "file offsets": logical 0 is the `ftyp` at the video's start, the samples sit at the offsets the
-//! orphan `moov` lists, and the `moov` itself goes at `P`, the end of `mdat`, where it must be the box found at `q` (the
-//! anchor). Each checkable sample (H.264/HEVC NAL units, Motion-JPEG frames) is walked by the pairing's structural check
-//! ([`crate::formats::isobmff::check_sample`]), through the view of the pieces chosen so far. Only the bytes the check reads are
-//! evidence (the NAL lengths and header bytes, a JPEG's SOI and EOI); the payloads are not, so a seam is proven only when
-//! checked bytes lie within one unit of it on both sides: a cut one unit earlier or later would then read a checked byte
-//! from another place.
+//! - **An orphan `moov`** ([`VideoSeams::with_orphan`]): a video found without its index (`ftyp`, `mdat`), whose `moov`
+//!   lies away from it. The `moov` goes at `P`, the end of `mdat`, where it must be the box found at `q` (the anchor).
+//! - **Its own `moov` first** ([`VideoSeams::with_own_moov`]): `ftyp, moov, mdat`, the index in the first piece. The
+//!   bytes before the `mdat` payload must lie in place; the known length is the end of `mdat` when its size is
+//!   declared, else (size 0) the highest sample end.
+//! - **Fragmented** ([`MoofSeams`]): `ftyp, moov (with mvex)`, then `moof`/`mdat` pairs (and `sidx styp free skip`),
+//!   each `moof`'s samples ([`crate::formats::isobmff::fragment_samples`]) checked in the `mdat` after it. Complete when
+//!   an `mfra` closes the chain or the known size (the file system's) is reached; else the walk ends at the last valid
+//!   box (at most `Partial`).
+//!
+//! The file lives in "file offsets": logical 0 is the `ftyp` at the video's start. Each checkable sample (H.264/HEVC
+//! NAL units, Motion-JPEG frames) is walked by the pairing's structural check
+//! ([`crate::formats::isobmff::check_sample`]), through the view of the pieces chosen so far. Only the bytes the checks
+//! read are evidence (the NAL lengths and header bytes, a JPEG's SOI and EOI, the boxes); the payloads are not, so a seam
+//! is proven only when checked bytes lie within one unit of it on both sides (a cut one unit earlier or later would then
+//! read a checked byte from another place), and not all of them belong to samples of one size (ruling Q39: a run of
+//! another clip of a constant-bitrate camera passes every check where frames of one size are expected).
 
+use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use super::{
-    Budget, Checks, Proof, Seams, Search, Space, Taken, WalkEnd, Walked, health, improves, search,
+    Budget, Checks, Counted, Proof, Seams, Search, Space, Taken, WalkEnd, Walked, health, improves,
+    search,
 };
 use crate::cache::CachedSource;
 use crate::filesystem::{FsState, Placement};
-use crate::formats::isobmff::{MAX_NAL_UNITS, SampleEnd, check_sample, index_health, walk_sample};
-use crate::formats::{FileKind, Health, Reader, SECTOR, cancelled};
-use crate::pairing::{self, Moov, Video, fits, load_moov};
+use crate::formats::isobmff::{
+    CheckedSample, FragTrack, MAX_BOXES, MAX_NAL_UNITS, MOOV_MAX_LEN, SampleEnd, be32,
+    check_sample, child, frag_track, fragment_samples, index_first_layout, index_health,
+    index_tracks, parse_header, walk_sample,
+};
+use crate::formats::{FileKind, Fragment, Health, Reader, SECTOR, cancelled};
+use crate::pairing::{self, Item, Moov, Video, fits, load_moov};
 use crate::scan::{CancelToken, Finding};
-use crate::source::Source;
+use crate::source::{Fragmented, Source};
 
 /// Sample-check steps (one per NAL unit or JPEG) per search (one orphan `moov` for one video), all its walks and its
 /// proof together: past it a walk cannot decide (the search is then not exhaustive) and the proof is `Unproven`. The
@@ -33,22 +49,69 @@ const WALK_WINDOW: usize = SECTOR as usize;
 const CANCEL_EVERY: usize = 1024;
 /// Most suspicious positions given per piece (the engine tries at most its break-point cap).
 const HINTS: usize = 64;
+/// Bytes compared per read when two first pieces are compared (D17).
+const COMPARE_CHUNK: usize = 64 << 10;
+/// Largest head (`ftyp` to the `mdat` payload or the first fragment) of an index-first video kept in memory.
+const HEAD_MAX: u64 = MOOV_MAX_LEN + (1 << 20);
+/// Most expected checks a fragmented video remembers for its prefilter (past it every candidate is kept).
+const MAX_EXPECT: usize = 1 << 18;
+/// Top-level boxes of a fragmented file, besides `moof` and `mdat`, that its chain may hold.
+const FRAGMENT_BOXES: [&[u8; 4]; 7] = [
+    b"moof", b"mdat", b"sidx", b"styp", b"free", b"skip", b"mfra",
+];
 
-/// A moov-less video's samples, as its orphan `moov` lists them, walked across seams.
+/// The state of a walk of a video with its own `moov`: its head is not checked yet.
+const HEAD: usize = usize::MAX;
+
+/// A video's samples, as its `moov` lists them, walked across seams.
 pub(crate) struct VideoSeams {
     moov: Rc<Moov>,
-    /// Where the `moov` goes, relative to the file (the end of `mdat`).
+    /// The end of `mdat`, relative to the file: where an orphan `moov` goes, or (own `moov`) the file's end.
     p: u64,
+    /// The `moov` is an orphan that goes at `P` (the anchor); else it is the video's own, in its first piece.
+    orphan: bool,
+    /// Own `moov`: the file's bytes before the `mdat` payload (`ftyp`, `moov`, `mdat` header), which the first piece
+    /// must hold as they were read.
+    head: Option<Rc<Vec<u8>>>,
     /// The `mdat` box header, relative to the file: checked where the video was found.
     mdat: (u64, u64),
     /// The space's unit (cluster or sector): a seam is proven only with checked bytes within one unit on both sides.
     unit: u64,
     /// Sample-check steps left.
     steps: u64,
-    /// Every checkable sample has the same size: another clip of the same format could pass every check in place.
-    uniform: bool,
     /// The gaps between checked bytes of the last view the re-check asked about: (view length, gaps by start).
     gaps: Option<(u64, Vec<(u64, u64)>)>,
+}
+
+/// How the bytes of a head compare with what lies in place.
+enum InPlace {
+    Same,
+    /// The first byte that differs is at `at - 1`.
+    Differs(u64),
+    /// A byte from `at` on could not be read (past the view, or a known-bad sector).
+    Unread(u64),
+}
+
+/// Whether the view holds `head` at logical 0, read within `limit`.
+fn head_in_place(r: &mut Reader, head: &[u8], limit: u64) -> InPlace {
+    let mut buf = vec![0u8; COMPARE_CHUNK.min(head.len())];
+    let mut done = 0usize;
+    while done < head.len() {
+        let n = buf.len().min(head.len() - done);
+        let at = done as u64;
+        if !read_in(r, at, &mut buf[..n], limit) {
+            return InPlace::Unread(at.min(limit));
+        }
+        if let Some(d) = buf[..n]
+            .iter()
+            .zip(&head[done..done + n])
+            .position(|(a, b)| a != b)
+        {
+            return InPlace::Differs(at + d as u64 + 1);
+        }
+        done += n;
+    }
+    InPlace::Same
 }
 
 impl VideoSeams {
@@ -82,13 +145,85 @@ impl VideoSeams {
         fits(&v, q, m.c_min, m.c_end).then(|| VideoSeams::new(&v, Rc::new(m)))
     }
 
+    /// A video whose `moov` is in its first piece (`ftyp, moov, mdat`): known length = the end of `mdat` when its size
+    /// is declared, else (size 0) the highest sample end; no anchor. `None` for another layout, a `moov` larger than
+    /// [`MOOV_MAX_LEN`], unreadable or garbled, without a checkable sample, or with samples outside the `mdat`.
+    pub(crate) fn with_own_moov(source: &dyn Source, start: u64) -> Option<VideoSeams> {
+        let cache = CachedSource::new(source, SECTOR, 1 << 20);
+        let mut r = Reader::new(&cache);
+        let l = index_first_layout(&mut r, start)?;
+        let (mdat_at, declared) = l.mdat?;
+        let (moov_at, hl, size) = l.moov;
+        let len = size.checked_sub(hl).filter(|&n| n <= MOOV_MAX_LEN)?;
+        if l.head_end - start > HEAD_MAX {
+            return None;
+        }
+        let payload = r.load_box(moov_at + hl, len);
+        if r.bad_in(moov_at, moov_at + size) || (payload.len() as u64) < len {
+            return None;
+        }
+        let tracks = index_tracks(&payload)?;
+        let mut bounds = (u64::MAX, 0u64);
+        let mut items: Vec<Item> = Vec::new();
+        for t in &tracks {
+            if t.count == 0 {
+                continue;
+            }
+            let (lo, hi) = t.bounds()?;
+            bounds = (bounds.0.min(lo), bounds.1.max(hi));
+            if let Some(check) = t.check {
+                items.extend(t.samples().iter().map(|s| Item {
+                    offset: s.offset,
+                    size: u32::try_from(s.size).unwrap_or(u32::MAX),
+                    check,
+                }));
+            }
+        }
+        if items.is_empty() {
+            return None;
+        }
+        items.sort_unstable_by_key(|i| i.offset);
+        drop(tracks);
+        let (c_min, c_end) = bounds;
+        let payload_at = l.head_end - start;
+        let p = match declared {
+            Some(d) => (mdat_at - start).checked_add(d)?,
+            None => c_end,
+        };
+        if c_min < payload_at || c_end > p {
+            return None;
+        }
+        let mut head = vec![0u8; payload_at as usize];
+        if r.read(start, &mut head) != head.len() || r.bad_in(start, l.head_end) {
+            return None;
+        }
+        let moov = Moov {
+            q: moov_at,
+            size,
+            payload,
+            items,
+            c_min,
+            c_end,
+        };
+        Some(VideoSeams {
+            moov: Rc::new(moov),
+            p,
+            orphan: false,
+            head: Some(Rc::new(head)),
+            mdat: (mdat_at - start, payload_at),
+            unit: SECTOR,
+            steps: SEARCH_STEPS,
+            gaps: None,
+        })
+    }
+
     /// Video `v` with the loaded `moov` `m` (the caller checked [`fits`]); sector units until [`VideoSeams::with_unit`].
     pub(crate) fn new(v: &Video, m: Rc<Moov>) -> VideoSeams {
-        let uniform = m.items.len() >= 2 && m.items.iter().all(|it| it.size == m.items[0].size);
         VideoSeams {
-            uniform,
             moov: m,
             p: v.p,
+            orphan: true,
+            head: None,
             mdat: (v.mdat, v.payload),
             unit: SECTOR,
             steps: SEARCH_STEPS,
@@ -103,7 +238,16 @@ impl VideoSeams {
     }
 
     fn len(&self) -> u64 {
-        self.p + self.moov.size
+        if self.orphan {
+            self.p + self.moov.size
+        } else {
+            self.p
+        }
+    }
+
+    /// The `moov` payload (the video's own, or the orphan).
+    pub(crate) fn moov_payload(&self) -> &[u8] {
+        &self.moov.payload
     }
 
     /// Whether the view holds, at `P`, the bytes of the `moov` box found at `q`; `None` when they cannot be read.
@@ -134,24 +278,25 @@ impl VideoSeams {
         Some(true)
     }
 
-    /// Walks every sample of a view of `len` bytes in file order, handing `checked` each range of checked bytes; the
-    /// first sample that does not pass ends it (a cancel ends it as `Spent`).
+    /// Walks every sample of a view of `len` bytes in file order, handing `checked` each range of checked bytes with
+    /// the size of its sample; the first sample that does not pass ends it (a cancel ends it as `Spent`).
     fn walk_all(
         &mut self,
         r: &mut Reader,
         len: u64,
-        checked: &mut dyn FnMut(u64, u64),
+        checked: &mut dyn FnMut(u64, u64, u64),
     ) -> Result<(), SampleEnd> {
         let moov = Rc::clone(&self.moov);
         for (i, it) in moov.items.iter().enumerate() {
             if i % CANCEL_EVERY == CANCEL_EVERY - 1 && cancelled() {
                 return Err(SampleEnd::Spent);
             }
+            let size = u64::from(it.size);
             let got = walk_sample(
                 &mut |off, buf| read_in(r, off, buf, len),
                 &it.sample(),
                 &mut self.steps,
-                checked,
+                &mut |a, b| checked(a, b, size),
             );
             if got != SampleEnd::Pass {
                 return Err(got);
@@ -168,17 +313,18 @@ fn read_in(r: &mut Reader, off: u64, buf: &mut [u8], limit: u64) -> bool {
 }
 
 impl Seams for VideoSeams {
-    /// The index of the next sample to check (in file order).
+    /// The index of the next sample to check (in file order); [`HEAD`] before the head of an own-`moov` video.
     type State = usize;
 
     fn begin(&mut self) -> usize {
-        0
+        if self.head.is_some() { HEAD } else { 0 }
     }
 
     /// The samples from `from` in file order, each one wholly inside the view checked: `checked` is the end of the
     /// last checked byte (a resume point after each passing sample), `Broken` at the first failing one (where the bytes
     /// it read stop fitting), or where the view ends; `Complete` when every sample passes and the view reaches the known
-    /// length with the `moov` bytes at `P` (the engine checks that `P` lies at the anchor).
+    /// length, with the `moov` bytes at `P` for an orphan (the engine checks that `P` lies at the anchor). An own-`moov`
+    /// video first checks its head in place (`Broken` past the first byte that differs).
     fn walk(
         &mut self,
         view: &dyn Source,
@@ -193,10 +339,31 @@ impl Seams for VideoSeams {
         let mut checked = 0u64;
         let mut resume = Vec::new();
         let mut i = *from;
+        if i == HEAD {
+            let head = Rc::clone(self.head.as_ref().expect("an own moov"));
+            match head_in_place(&mut r, &head, limit) {
+                InPlace::Same => {
+                    checked = head.len() as u64;
+                    resume.push((checked, 0));
+                    i = 0;
+                }
+                InPlace::Differs(at) | InPlace::Unread(at) => {
+                    return Walked {
+                        end: WalkEnd::Broken { at },
+                        checked,
+                        resume,
+                    };
+                }
+            }
+        }
+        let first = i;
         let end = loop {
             let Some(it) = moov.items.get(i) else {
                 if limit < self.len() {
                     break WalkEnd::Broken { at: limit };
+                }
+                if !self.orphan {
+                    break WalkEnd::Complete { len: self.len() };
                 }
                 break match self.moov_at_p(&mut r) {
                     Some(true) => WalkEnd::Complete { len: self.len() },
@@ -204,7 +371,7 @@ impl Seams for VideoSeams {
                     None => WalkEnd::Broken { at: self.p },
                 };
             };
-            if (i - *from) % CANCEL_EVERY == CANCEL_EVERY - 1 && cancelled() {
+            if (i - first) % CANCEL_EVERY == CANCEL_EVERY - 1 && cancelled() {
                 break WalkEnd::Stopped;
             }
             let mut last = None;
@@ -236,32 +403,45 @@ impl Seams for VideoSeams {
         }
     }
 
-    /// `Proven` iff the `mdat` header lies before every seam, every checkable sample passes over the view, the `moov`
-    /// bytes sit at `P`, and every seam has checked bytes within one unit before it and within one unit after it (a cut a
-    /// unit earlier or later would read one of them from elsewhere; the `mdat` header and the `moov` count as checked);
-    /// `Failed` when a sample does not pass or the `moov` is not at `P`; `Unproven` otherwise (a seam in a long
-    /// unchecked stretch, the steps spent, an unreadable byte), and always with a seam when every checkable sample has
-    /// the same size (the checks then tell nothing about which clip a run of the same format comes from).
+    /// `Proven` iff the `mdat` payload starts before every seam (an own `moov`'s head lying in place), every checkable
+    /// sample passes over the view, an orphan `moov`'s bytes sit at `P`, and every seam has checked bytes within one
+    /// unit before it and within one unit after it, not all of samples of one size ([`Near`]; the `mdat` header, an own
+    /// head and an orphan `moov` count as checked); `Failed` when a sample does not pass, the head is not in place or the
+    /// `moov` is not at `P`; `Unproven` otherwise (a seam in a long unchecked stretch or among frames of one size, the
+    /// steps spent, an unreadable byte).
     fn prove(&mut self, view: &dyn Source, seams: &[u64]) -> Proof {
         if seams.first().is_some_and(|&s| s < self.mdat.1) {
             return Proof::Unproven;
         }
-        let unit = self.unit;
-        let mut near = Near::new(seams, unit);
-        near.range(self.mdat.0, self.mdat.1);
+        let mut near = Near::new(seams, self.unit);
         let mut r = Reader::with_window(view, WALK_WINDOW);
-        match self.walk_all(&mut r, view.len(), &mut |a, b| near.range(a, b)) {
+        match &self.head {
+            Some(head) => {
+                match head_in_place(&mut r, head, view.len()) {
+                    InPlace::Same => {}
+                    InPlace::Differs(_) => return Proof::Failed,
+                    InPlace::Unread(_) => return Proof::Unproven,
+                }
+                near.range(0, self.mdat.1, None);
+            }
+            None => near.range(self.mdat.0, self.mdat.1, None),
+        }
+        match self.walk_all(&mut r, view.len(), &mut |a, b, size| {
+            near.range(a, b, Some(size))
+        }) {
             Ok(()) => {}
             Err(SampleEnd::Fail { .. }) => return Proof::Failed,
             Err(_) => return Proof::Unproven,
         }
-        match self.moov_at_p(&mut r) {
-            Some(true) => {}
-            Some(false) => return Proof::Failed,
-            None => return Proof::Unproven,
+        if self.orphan {
+            match self.moov_at_p(&mut r) {
+                Some(true) => {}
+                Some(false) => return Proof::Failed,
+                None => return Proof::Unproven,
+            }
+            near.range(self.p, self.len(), None);
         }
-        near.range(self.p, self.len());
-        if near.all_ok() && !(self.uniform && !seams.is_empty()) {
+        if near.finish() {
             Proof::Proven
         } else {
             Proof::Unproven
@@ -273,7 +453,7 @@ impl Seams for VideoSeams {
     }
 
     fn anchor(&self) -> Option<(u64, u64)> {
-        Some((self.p, self.moov.q))
+        self.orphan.then_some((self.p, self.moov.q))
     }
 
     /// The first sample that starts at or past the seam, read at its place in a piece starting at absolute `g`, passes
@@ -290,24 +470,7 @@ impl Seams for VideoSeams {
         if it.offset >= stop {
             return true;
         }
-        let mut beyond = false;
-        // One step per NAL unit, as many as a sample may hold: never spent.
-        let mut steps = MAX_NAL_UNITS as u64;
-        let passed = check_sample(
-            &mut |off, buf| {
-                let end = off + buf.len() as u64;
-                if end > stop {
-                    beyond = true;
-                    return false;
-                }
-                let at = g + (off - seam);
-                r.read(at, buf) == buf.len() && !r.bad_in(at, at + buf.len() as u64)
-            },
-            &it.sample(),
-            &mut steps,
-        );
-        // Stopped at the first byte past the unit: what was read fitted.
-        passed || beyond
+        within_unit(r, g, seam, stop, &it.sample())
     }
 
     /// Unit boundaries inside `(start, end)` that fall in a stretch the checks never read (a NAL unit's payload, a
@@ -323,7 +486,7 @@ impl Seams for VideoSeams {
             let mut prev = self.mdat.1;
             let mut r = Reader::with_window(view, WALK_WINDOW);
             let ok = self
-                .walk_all(&mut r, len, &mut |a, b| {
+                .walk_all(&mut r, len, &mut |a, b, _| {
                     if a > prev {
                         gaps.push((prev, a));
                     }
@@ -338,33 +501,67 @@ impl Seams for VideoSeams {
         let Some((_, gaps)) = &self.gaps else {
             return Vec::new();
         };
-        let unit = self.unit;
-        let mut inside: Vec<(u64, u64)> = gaps
-            .iter()
-            .filter_map(|&(a, b)| {
-                // The last unit boundary inside the stretch (logical boundaries are multiples of the unit: every piece
-                // starts on one and all but the last are whole units).
-                let x = (b.min(end) - 1) / unit * unit;
-                // Only where a seam would not be proven: no checked byte within one unit on some side.
-                let weak = a + unit <= x || b >= x + unit;
-                (x > a && x > start && x < end && weak).then_some((x, b - a))
-            })
-            .collect();
-        inside.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
-        inside.truncate(HINTS);
-        inside.into_iter().map(|(x, _)| x).collect()
+        weak_breaks(gaps, self.unit, start, end)
     }
 }
 
-/// For each seam, whether checked bytes lie within one unit before it and within one unit after it, fed with the
-/// checked ranges in file order.
+/// Whether sample `s` (at or past logical `seam`) passes its check read at its place in a piece starting at absolute `g`,
+/// as far as it lies before logical `stop` (bytes past it are not read, and what was read decides); an unreadable
+/// byte fails it.
+fn within_unit(r: &mut Reader, g: u64, seam: u64, stop: u64, s: &CheckedSample) -> bool {
+    let mut beyond = false;
+    // One step per NAL unit, as many as a sample may hold: never spent.
+    let mut steps = MAX_NAL_UNITS as u64;
+    let passed = check_sample(
+        &mut |off, buf| {
+            let end = off + buf.len() as u64;
+            if end > stop {
+                beyond = true;
+                return false;
+            }
+            let at = g + (off - seam);
+            r.read(at, buf) == buf.len() && !r.bad_in(at, at + buf.len() as u64)
+        },
+        s,
+        &mut steps,
+    );
+    // Stopped at the first byte past the unit: what was read fitted.
+    passed || beyond
+}
+
+/// The unit boundaries of `(start, end)` inside the unchecked `gaps` (by start) where a seam would not be proven (no
+/// checked byte within one unit on some side), longest gap first, at most [`HINTS`].
+fn weak_breaks(gaps: &[(u64, u64)], unit: u64, start: u64, end: u64) -> Vec<u64> {
+    let mut inside: Vec<(u64, u64)> = gaps
+        .iter()
+        .filter(|&&(a, b)| b > a && end > 0)
+        .filter_map(|&(a, b)| {
+            // The last unit boundary inside the stretch (logical boundaries are multiples of the unit: every piece
+            // starts on one and all but the last are whole units).
+            let x = (b.min(end) - 1) / unit * unit;
+            // Only where a seam would not be proven: no checked byte within one unit on some side.
+            let weak = a + unit <= x || b >= x + unit;
+            (x > a && x > start && x < end && weak).then_some((x, b - a))
+        })
+        .collect();
+    inside.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
+    inside.truncate(HINTS);
+    inside.into_iter().map(|(x, _)| x).collect()
+}
+
+/// For each seam, whether checked bytes lie within one unit before it and within one unit after it, and whether those
+/// within one unit on either side are not all of samples of one size (ruling Q39: frames of one size are what another
+/// clip of a constant-bitrate camera would show there too). Fed with the checked ranges in file order, each with its
+/// sample's size, or `None` for structure (box headers, a `moof`, the index), which is never another clip's.
 struct Near<'s> {
     seams: &'s [u64],
     unit: u64,
     /// Seams decided so far (the next one to look at).
     next: usize,
-    /// End of the checked bytes so far.
-    prev: Option<u64>,
+    /// The ranges that may lie within one unit of the next seam: (start, end, key).
+    recent: VecDeque<(u64, u64, u64)>,
+    /// Keys handed to structural ranges so far (each one its own).
+    structural: u64,
     ok: bool,
 }
 
@@ -374,34 +571,496 @@ impl<'s> Near<'s> {
             seams,
             unit,
             next: 0,
-            prev: None,
+            recent: VecDeque::new(),
+            structural: 0,
             ok: true,
         }
     }
 
-    /// The checked range `[a, b)`, after every earlier one.
-    fn range(&mut self, a: u64, b: u64) {
+    /// The checked range `[a, b)` (after every earlier one): of a sample of `size` bytes, or structure (`None`).
+    fn range(&mut self, a: u64, b: u64, size: Option<u64>) {
         if a >= b {
             return;
         }
+        let key = size.unwrap_or_else(|| {
+            self.structural += 1;
+            u64::MAX - self.structural
+        });
+        // No later range lies within one unit after a seam that ends a unit before `a`.
         while let Some(&s) = self.seams.get(self.next) {
-            if s >= b {
+            if s.saturating_add(self.unit) > a {
                 break;
             }
-            if a >= s {
-                // Checked bytes from `a` on after the seam, and the last one before it at `prev - 1`.
-                let after = a - s < self.unit;
-                let before = self.prev.is_some_and(|p| p + self.unit > s);
-                self.ok &= after && before;
-            }
+            self.decide(s);
             self.next += 1;
         }
-        self.prev = Some(self.prev.map_or(b, |p| p.max(b)));
+        let Some(&s) = self.seams.get(self.next) else {
+            self.recent.clear();
+            return;
+        };
+        while self
+            .recent
+            .front()
+            .is_some_and(|r| r.1.saturating_add(self.unit) <= s)
+        {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((a, b, key));
     }
 
-    /// Every seam decided and near checked bytes on both sides.
-    fn all_ok(&self) -> bool {
-        self.ok && self.next == self.seams.len()
+    fn decide(&mut self, s: u64) {
+        let u = self.unit;
+        let before = self
+            .recent
+            .iter()
+            .any(|r| r.0 < s && r.1.saturating_add(u) > s);
+        let after = self
+            .recent
+            .iter()
+            .any(|r| r.1 > s && r.0 < s.saturating_add(u));
+        let mut keys = self
+            .recent
+            .iter()
+            .filter(|r| r.0 < s.saturating_add(u) && r.1.saturating_add(u) > s)
+            .map(|r| r.2);
+        let first = keys.next();
+        let mixed = keys.any(|k| Some(k) != first);
+        self.ok &= before && after && mixed;
+    }
+
+    /// Every seam near checked bytes on both sides, not all of samples of one size.
+    fn finish(mut self) -> bool {
+        while let Some(&s) = self.seams.get(self.next) {
+            self.decide(s);
+            self.next += 1;
+        }
+        self.ok
+    }
+}
+
+/// A check a fragmented video's walk expects at a logical offset: a box header, or a sample.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Expect {
+    Header,
+    Sample { size: u64 },
+}
+
+/// The seams of a fragmented MP4/MOV (`moof`): its head (`ftyp` to the first fragment box) must lie in place, then the
+/// top-level boxes follow in order, each header checked (a valid size, a type of [`FRAGMENT_BOXES`]), each `moof`
+/// parsed ([`fragment_samples`]) and its samples checked in the `mdat` right after it. At most [`MAX_BOXES`] boxes per
+/// walk (C9). `Complete` when an `mfra` closes the chain (its `mfro` gives its size) or the known size is reached;
+/// else the walk ends at the last valid box (at most `Partial`).
+pub(crate) struct MoofSeams {
+    track: FragTrack,
+    head: Rc<Vec<u8>>,
+    /// The file-system entry's size, when one is known: where the chain must end.
+    known: Option<u64>,
+    unit: u64,
+    steps: u64,
+    /// The checks walks expected past where they stopped, for the prefilter (by logical offset); every walk's, as
+    /// different paths may expect different things at one offset (a candidate passing any of them is kept).
+    expect: BTreeSet<(u64, Expect)>,
+    /// More than [`MAX_EXPECT`] were met: the prefilter keeps every candidate.
+    expect_full: bool,
+}
+
+/// How a walk of a fragmented video ended.
+struct MoofRun {
+    end: WalkEnd,
+    checked: u64,
+    resume: Vec<(u64, (u64, usize))>,
+    /// A check refuted the bytes (not a cut by the view's end, an unreadable byte or a budget).
+    failed: bool,
+}
+
+impl MoofSeams {
+    /// A fragmented video at `start`: an `ftyp`, a `moov` with an `mvex` and a checkable video track ([`frag_track`]),
+    /// then a fragment box. `None` for any other layout, or a head larger than [`HEAD_MAX`] or unreadable.
+    pub(crate) fn new(source: &dyn Source, start: u64) -> Option<MoofSeams> {
+        let cache = CachedSource::new(source, SECTOR, 1 << 20);
+        let mut r = Reader::new(&cache);
+        let l = index_first_layout(&mut r, start)?;
+        if l.mdat.is_some() || l.head_end - start > HEAD_MAX {
+            return None;
+        }
+        let (moov_at, hl, size) = l.moov;
+        let len = size.checked_sub(hl).filter(|&n| n <= MOOV_MAX_LEN)?;
+        let payload = r.load_box(moov_at + hl, len);
+        let mut garbled = false;
+        child(&payload, b"mvex", &mut garbled)?;
+        let track = frag_track(&payload)?;
+        let mut head = vec![0u8; (l.head_end - start) as usize];
+        if r.read(start, &mut head) != head.len() || r.bad_in(start, l.head_end) {
+            return None;
+        }
+        Some(MoofSeams {
+            track,
+            head: Rc::new(head),
+            known: None,
+            unit: SECTOR,
+            steps: SEARCH_STEPS,
+            expect: BTreeSet::new(),
+            expect_full: false,
+        })
+    }
+
+    /// The space's unit (a seam must have checked bytes within it on both sides to be proven).
+    pub(crate) fn with_unit(mut self, unit: u64) -> MoofSeams {
+        self.unit = unit.max(1);
+        self
+    }
+
+    /// The file-system entry's size, when one is known (Q3): the chain is complete when it ends there.
+    pub(crate) fn with_known(mut self, known: Option<u64>) -> MoofSeams {
+        self.known = known;
+        self
+    }
+
+    fn remember(&mut self, at: u64, e: Expect) {
+        if self.expect.len() >= MAX_EXPECT {
+            self.expect_full = true;
+        } else {
+            self.expect.insert((at, e));
+        }
+    }
+
+    /// Walks the view from `from` up to `limit`, handing `on` each checked range (with its sample's size, or `None` for
+    /// structure); `record` keeps what it expected for the prefilter.
+    fn run(
+        &mut self,
+        view: &dyn Source,
+        from: &(u64, usize),
+        limit: u64,
+        record: bool,
+        on: &mut dyn FnMut(u64, u64, Option<u64>),
+    ) -> MoofRun {
+        let limit = limit.min(view.len());
+        let mut r = Reader::with_window(view, WALK_WINDOW);
+        let (mut pos, mut k) = *from;
+        let mut out = MoofRun {
+            end: WalkEnd::Stopped,
+            checked: 0,
+            resume: Vec::new(),
+            failed: false,
+        };
+        if pos == 0 {
+            let head = Rc::clone(&self.head);
+            match head_in_place(&mut r, &head, limit) {
+                InPlace::Same => {
+                    pos = head.len() as u64;
+                    on(0, pos, None);
+                    out.checked = pos;
+                    out.resume.push((pos, (pos, 0)));
+                }
+                InPlace::Differs(at) => {
+                    out.end = WalkEnd::Broken { at };
+                    out.failed = true;
+                    return out;
+                }
+                InPlace::Unread(at) => {
+                    out.end = WalkEnd::Broken { at };
+                    return out;
+                }
+            }
+        }
+        let mut boxes = 0usize;
+        out.end = 'walk: loop {
+            if self.known == Some(pos) {
+                break WalkEnd::Complete { len: pos };
+            }
+            if record {
+                self.remember(pos, Expect::Header);
+            }
+            if pos >= limit {
+                // The chain is valid up to the view's end.
+                out.checked = out.checked.max(pos);
+                break WalkEnd::Broken { at: limit };
+            }
+            boxes += 1;
+            if boxes > MAX_BOXES || (boxes.is_multiple_of(CANCEL_EVERY) && cancelled()) {
+                break WalkEnd::Stopped;
+            }
+            let Some(h) = self.header(&mut r, pos, limit) else {
+                break WalkEnd::Broken { at: limit };
+            };
+            let Some((kind, hl, end)) = h else {
+                // Not a box of the chain: the file ends at the last valid box (or another file's data is here).
+                out.checked = out.checked.max(pos);
+                out.failed = true;
+                break WalkEnd::Broken {
+                    at: (pos + 8).min(limit),
+                };
+            };
+            on(pos, pos + hl, None);
+            out.checked = out.checked.max(pos + hl);
+            match &kind {
+                b"mfra" => {
+                    if end > limit {
+                        break WalkEnd::Broken { at: limit };
+                    }
+                    // The last box of an `mfra` is its `mfro`: size 16, version and flags, the `mfra`'s size.
+                    let mut tail = [0u8; 16];
+                    if end < pos + hl + 16 || !read_in(&mut r, end - 16, &mut tail, limit) {
+                        out.failed = end < pos + hl + 16;
+                        break WalkEnd::Broken { at: end };
+                    }
+                    if be32(&tail) != 16
+                        || &tail[4..8] != b"mfro"
+                        || u64::from(be32(&tail[12..])) != end - pos
+                    {
+                        out.failed = true;
+                        break WalkEnd::Broken { at: end };
+                    }
+                    on(end - 16, end, None);
+                    out.checked = end;
+                    break WalkEnd::Complete { len: end };
+                }
+                b"moof" => {
+                    if end > limit {
+                        break WalkEnd::Broken { at: limit };
+                    }
+                    let mut payload = vec![0u8; (end - pos - hl) as usize];
+                    if !read_in(&mut r, pos + hl, &mut payload, limit) {
+                        break WalkEnd::Broken { at: pos + hl };
+                    }
+                    let Some(samples) = fragment_samples(pos, &payload, &self.track) else {
+                        out.failed = true;
+                        break WalkEnd::Broken { at: end };
+                    };
+                    if record {
+                        self.remember(end, Expect::Header);
+                        for s in samples.iter().skip(k) {
+                            self.remember(s.offset, Expect::Sample { size: s.size });
+                        }
+                    }
+                    // The `mdat` right after it holds its samples.
+                    let Some(m) = self.header(&mut r, end, limit) else {
+                        break WalkEnd::Broken { at: limit };
+                    };
+                    let Some((mkind, mhl, mend)) = m.filter(|m| &m.0 == b"mdat") else {
+                        out.failed = true;
+                        break WalkEnd::Broken {
+                            at: (end + 8).min(limit),
+                        };
+                    };
+                    let _ = mkind;
+                    if samples
+                        .iter()
+                        .any(|s| s.offset < end + mhl || s.offset.saturating_add(s.size) > mend)
+                    {
+                        out.failed = true;
+                        break WalkEnd::Broken { at: end + mhl };
+                    }
+                    on(pos + hl, end, None);
+                    on(end, end + mhl, None);
+                    out.checked = out.checked.max(end + mhl);
+                    if record {
+                        self.remember(mend, Expect::Header);
+                    }
+                    for (j, s) in samples.iter().enumerate().skip(k) {
+                        if j % CANCEL_EVERY == CANCEL_EVERY - 1 && cancelled() {
+                            break 'walk WalkEnd::Stopped;
+                        }
+                        let mut last = None;
+                        let got = walk_sample(
+                            &mut |off, buf| read_in(&mut r, off, buf, limit),
+                            s,
+                            &mut self.steps,
+                            &mut |a, b| {
+                                on(a, b, Some(s.size));
+                                last = Some(b);
+                            },
+                        );
+                        if let Some(to) = last {
+                            out.checked = out.checked.max(to);
+                        }
+                        match got {
+                            SampleEnd::Pass => {
+                                let prev = out.resume.last().map_or(0, |r| r.0);
+                                out.resume
+                                    .push((last.unwrap_or(s.offset).max(prev), (pos, j + 1)));
+                            }
+                            SampleEnd::Fail { at } => {
+                                out.failed = true;
+                                break 'walk WalkEnd::Broken { at };
+                            }
+                            SampleEnd::Unread { at } => {
+                                break 'walk WalkEnd::Broken { at: at.min(limit) };
+                            }
+                            SampleEnd::Spent => break 'walk WalkEnd::Stopped,
+                        }
+                    }
+                    pos = mend;
+                }
+                _ => pos = end,
+            }
+            k = 0;
+            let prev = out.resume.last().map_or(0, |r| r.0);
+            out.resume.push((pos.max(prev), (pos, 0)));
+        };
+        out
+    }
+
+    /// The top-level box header at `pos`: `None` when it cannot be read within `limit` (cut by the view, or
+    /// unreadable); `Some(None)` when it is not a box of the chain (an invalid size or type, a size 0, past the known
+    /// size); else its type, header length and end.
+    fn header(&self, r: &mut Reader, pos: u64, limit: u64) -> Option<Option<([u8; 4], u64, u64)>> {
+        let mut b = [0u8; 16];
+        let n = (limit.saturating_sub(pos)).min(16) as usize;
+        if n < 8 || !read_in(r, pos, &mut b[..n], limit) {
+            return None;
+        }
+        let Some(h) = parse_header(&b[..n]) else {
+            // A 64-bit size cut by the view is undecided; anything else is no box.
+            return if n < 16 && be32(&b) == 1 {
+                None
+            } else {
+                Some(None)
+            };
+        };
+        let ok = FRAGMENT_BOXES.contains(&&h.kind)
+            && h.size.is_some_and(|s| s >= h.header_len)
+            && pos.checked_add(h.size.unwrap_or(0)).is_some();
+        let end = pos.saturating_add(h.size.unwrap_or(0));
+        Some((ok && self.known.is_none_or(|k| end <= k)).then_some((h.kind, h.header_len, end)))
+    }
+
+    /// Whether the chain of the view is valid to its very end (every box whole, every sample passing): a fragmented
+    /// video with no known size and no `mfra` that came out this way is as complete as can be told.
+    pub(crate) fn clean(&mut self, view: &dyn Source) -> bool {
+        let len = view.len();
+        let run = self.run(view, &(0, 0), len, false, &mut |_, _, _| {});
+        matches!(run.end, WalkEnd::Broken { at } if at == len) && run.checked == len
+    }
+}
+
+impl Seams for MoofSeams {
+    /// (Logical offset of the box to read next, or of the `moof` whose samples are being checked; samples of it already
+    /// checked). `(0, 0)`: the head is not checked yet.
+    type State = (u64, usize);
+
+    fn begin(&mut self) -> (u64, usize) {
+        (0, 0)
+    }
+
+    /// The boxes from `from` in order: `checked` is the end of the last checked byte (the end of the last valid box when
+    /// the chain stops there), a resume point after each passing sample and each box; `Broken` where the bytes stop
+    /// fitting (an invalid header, a garbled `moof`, a failing sample) or where the view ends; `Complete` at an `mfra`
+    /// or the known size.
+    fn walk(
+        &mut self,
+        view: &dyn Source,
+        seams: &[u64],
+        from: &(u64, usize),
+        limit: u64,
+    ) -> Walked<(u64, usize)> {
+        let _ = seams;
+        let run = self.run(view, from, limit, true, &mut |_, _, _| {});
+        Walked {
+            end: run.end,
+            checked: run.checked,
+            resume: run.resume,
+        }
+    }
+
+    /// `Proven` iff no seam falls in the head, the whole view walks `Complete` to its end, and every seam is near
+    /// checked bytes on both sides, not all of samples of one size ([`Near`]; box headers and `moof`s count as
+    /// structure); `Failed` when a check refutes the bytes; `Unproven` otherwise.
+    fn prove(&mut self, view: &dyn Source, seams: &[u64]) -> Proof {
+        if seams.first().is_some_and(|&s| s < self.head.len() as u64) {
+            return Proof::Unproven;
+        }
+        let mut near = Near::new(seams, self.unit);
+        let len = view.len();
+        let run = self.run(view, &(0, 0), len, false, &mut |a, b, size| {
+            near.range(a, b, size)
+        });
+        match run.end {
+            WalkEnd::Complete { len: l } if l == len => {
+                if near.finish() {
+                    Proof::Proven
+                } else {
+                    Proof::Unproven
+                }
+            }
+            _ if run.failed => Proof::Failed,
+            _ => Proof::Unproven,
+        }
+    }
+
+    fn known_len(&self) -> Option<u64> {
+        self.known
+    }
+
+    /// Its answers depend on what earlier walks expected (the paths before a seam may differ): never remembered.
+    fn memo_prefilter(&self) -> bool {
+        false
+    }
+
+    /// Keeps candidate `g` for the seam when one of the checks a walk expected within one unit after the seam (a box
+    /// header, a sample) passes read at its place in a piece starting at `g`, as far as it lies within that unit; when
+    /// none is expected there (or too many were remembered), blind: kept (Q2).
+    fn prefilter(&mut self, r: &mut Reader, g: u64, seam: u64) -> bool {
+        if self.expect_full {
+            return true;
+        }
+        let stop = seam.saturating_add(self.unit);
+        let mut any = false;
+        let wanted: Vec<(u64, Expect)> = self
+            .expect
+            .range((seam, Expect::Header)..(stop, Expect::Header))
+            .copied()
+            .collect();
+        for (off, e) in wanted {
+            any = true;
+            let pass = match e {
+                Expect::Header => {
+                    if off + 8 > stop {
+                        true
+                    } else {
+                        let mut b = [0u8; 8];
+                        let at = g + (off - seam);
+                        r.read(at, &mut b) == 8
+                            && !r.bad_in(at, at + 8)
+                            && parse_header(&b).is_some_and(|h| {
+                                FRAGMENT_BOXES.contains(&&h.kind) && h.size.is_some()
+                            })
+                    }
+                }
+                Expect::Sample { size } => within_unit(
+                    r,
+                    g,
+                    seam,
+                    stop,
+                    &CheckedSample {
+                        offset: off,
+                        size,
+                        check: self.track.check,
+                    },
+                ),
+            };
+            if pass {
+                return true;
+            }
+        }
+        !any
+    }
+
+    /// As [`VideoSeams::suspicious_breaks`], over the checked ranges of the boxes and samples.
+    fn suspicious_breaks(&mut self, view: &dyn Source, start: u64, end: u64) -> Vec<u64> {
+        let mut gaps = Vec::new();
+        let mut prev = self.head.len() as u64;
+        let len = view.len();
+        let run = self.run(view, &(0, 0), len, false, &mut |a, b, _| {
+            if a > prev {
+                gaps.push((prev, a));
+            }
+            prev = prev.max(b);
+        });
+        if matches!(run.end, WalkEnd::Complete { .. }) && len > prev {
+            gaps.push((prev, len));
+        }
+        weak_breaks(&gaps, self.unit, start, end)
     }
 }
 
@@ -446,6 +1105,111 @@ impl<'f> Moovs<'f> {
     }
 }
 
+/// The length of the first piece of video `v` under `moov` `m`: where its samples stop passing over the free run from
+/// its start (the end of its last checked byte), read through `counted`; `None` when the run is empty, the walk is
+/// complete (no piece to compare) or undecided.
+fn first_piece(
+    counted: &Counted,
+    v: &Video,
+    m: &Rc<Moov>,
+    ctx: &super::Context,
+    taken: &Taken,
+) -> Option<(u64, u64)> {
+    let start = v.finding.start;
+    let space = Space::new(
+        ctx.grids,
+        start,
+        counted.len(),
+        taken,
+        ctx.starts,
+        ctx.limits,
+    );
+    let run = space.free_run(start, &[], &[], v.p.saturating_add(m.size));
+    if run == 0 {
+        return None;
+    }
+    let mut seams = VideoSeams::new(v, Rc::clone(m)).with_unit(space.unit());
+    let view = Fragmented::new(counted, vec![Fragment { start, len: run }]);
+    let w = seams.walk(&view, &[], &0, run);
+    matches!(w.end, WalkEnd::Broken { .. }).then_some((w.checked, run))
+}
+
+/// How many bytes from `a` and from `b` are equal in a row, at most `max`, read through `counted` (`None` when a read
+/// fails, the budget among them).
+fn equal_run(counted: &Counted, a: u64, b: u64, max: u64) -> Option<u64> {
+    let mut x = vec![0u8; COMPARE_CHUNK];
+    let mut y = vec![0u8; COMPARE_CHUNK];
+    let mut done = 0u64;
+    while done < max {
+        let n = (max - done).min(COMPARE_CHUNK as u64) as usize;
+        if counted.read_at(a + done, &mut x[..n]).ok()? != n
+            || counted.read_at(b + done, &mut y[..n]).ok()? != n
+        {
+            return None;
+        }
+        if let Some(d) = x[..n].iter().zip(&y[..n]).position(|(p, q)| p != q) {
+            return Some(done + d as u64);
+        }
+        done += n as u64;
+    }
+    Some(done)
+}
+
+/// The other candidate videos that `m` fits and whose first piece is the same as `v`'s (D17): the same length (where
+/// the samples stop passing) and the same bytes, compared through the cache within the file's read budget. Each one
+/// with the run of its bytes equal to `v`'s from its start (no piece of `v` is taken from there: those bytes are `v`'s
+/// own). Nothing when `v`'s first piece cannot be told.
+fn twins(
+    source: &CachedSource,
+    videos: &[Video],
+    v: &Video,
+    m: &Rc<Moov>,
+    ctx: &super::Context,
+    taken: &Taken,
+    file: &mut Budget,
+) -> Vec<(u64, Fragment)> {
+    let others: Vec<&Video> = videos
+        .iter()
+        .filter(|o| {
+            o.finding.id != v.finding.id
+                && o.p == v.p
+                && o.mdat == v.mdat
+                && fits(o, m.q, m.c_min, m.c_end)
+        })
+        .collect();
+    if others.is_empty() {
+        return Vec::new();
+    }
+    let counted = Counted::new(source);
+    counted.set_limit(file.read);
+    let mut out = Vec::new();
+    if let Some((len, run)) = first_piece(&counted, v, m, ctx, taken) {
+        for o in others {
+            let Some((olen, orun)) = first_piece(&counted, o, m, ctx, taken) else {
+                continue;
+            };
+            if olen != len || len == 0 {
+                continue;
+            }
+            let Some(same) = equal_run(&counted, v.finding.start, o.finding.start, run.min(orun))
+            else {
+                continue;
+            };
+            if same >= len {
+                out.push((
+                    o.finding.id,
+                    Fragment {
+                        start: o.finding.start,
+                        len: same,
+                    },
+                ));
+            }
+        }
+    }
+    file.charge(0, counted.read());
+    out
+}
+
 /// What the search of one video gave.
 pub(crate) struct Searched {
     /// The finding it becomes, when that improves it.
@@ -456,7 +1220,9 @@ pub(crate) struct Searched {
 
 /// The moov-less video `f` searched with every orphan `moov` that fits it (each one a search, all within the file's
 /// budget); `old` is what it is so far (the pairing's result, or `f`). Only a complete solution (the `moov` in place)
-/// can improve it; two or more `moov`s giving one make it not unique.
+/// can improve it; two or more `moov`s giving one make it not unique. D17: a `moov` that also fits another candidate
+/// video with the same first piece (a copy of it) is searched only for the lowest id of them, with the copies' bytes
+/// kept out of its pieces; the others are not searched with it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reassemble_video(
     source: &CachedSource,
@@ -514,9 +1280,23 @@ pub(crate) fn reassemble_video(
             short = true;
             break;
         }
+        let copies = twins(source, &moovs.videos, &v, &m, ctx, taken, &mut file);
+        if copies.iter().any(|(id, _)| *id < f.id) {
+            // The lowest id of the copies is searched with this `moov`.
+            continue;
+        }
+        let kept = (!copies.is_empty()).then(|| {
+            let mut t = taken.clone();
+            t.claim(&copies.iter().map(|c| c.1).collect::<Vec<_>>());
+            t
+        });
+        let apart = kept
+            .as_ref()
+            .map(|t| Space::new(ctx.grids, f.start, source.len(), t, ctx.starts, ctx.limits));
+        let space = apart.as_ref().unwrap_or(&space);
         let mut seams = VideoSeams::new(&v, Rc::clone(&m)).with_unit(space.unit());
         let found = search(
-            &mut seams, source, &space, f.start, known, limits, &mut file, cancel,
+            &mut seams, source, space, f.start, known, limits, &mut file, cancel,
         );
         if let Some(found) =
             found.filter(|s| s.complete && s.pieces.first().map(|p| p.start) == Some(f.start))
@@ -541,7 +1321,26 @@ pub(crate) fn reassemble_video(
     found.unique &= !several;
     found.exhaustive &= !short && moovs.budget.complete;
     let len = found.len;
-    let checks = Checks {
+    let checks = checks(
+        ctx,
+        source,
+        &found,
+        known,
+        index_health(&m.payload, len, false) == Health::Intact,
+    );
+    out.new = finding(f, &found, v.kind, &checks).filter(|new| improves(old, new, found.complete));
+    out
+}
+
+/// The scan's checks of a video reassembly (D6): `own_ok` is the format's own check over the pieces.
+fn checks(
+    ctx: &super::Context,
+    source: &CachedSource,
+    found: &Search,
+    known: Option<u64>,
+    own_ok: bool,
+) -> Checks {
+    Checks {
         capped: ctx.capped,
         frags_capped: ctx.frags_capped,
         claimed_capped: ctx.claimed_capped,
@@ -550,17 +1349,21 @@ pub(crate) fn reassemble_video(
             .pieces
             .iter()
             .any(|p| !source.bad_runs(p.start, p.start + p.len).is_empty()),
-        size_ok: known.is_none_or(|k| k == len),
-        own_ok: index_health(&m.payload, len, false) == Health::Intact,
+        size_ok: known.is_none_or(|k| k == found.len),
+        own_ok,
         restarts: false,
         content_only: true,
-    };
-    let new = Finding {
+    }
+}
+
+/// The finding `f` becomes with the pieces of `found`.
+fn finding(f: &Finding, found: &Search, kind: FileKind, checks: &Checks) -> Option<Finding> {
+    Some(Finding {
         id: f.id,
         start: f.start,
-        len,
-        kind: v.kind,
-        health: health(&found, v.kind, &checks),
+        len: found.len,
+        kind,
+        health: health(found, kind, checks),
         fragments: if found.pieces.len() > 1 {
             found.pieces.clone()
         } else {
@@ -570,9 +1373,70 @@ pub(crate) fn reassemble_video(
             o.placement = Placement::Carved;
             o
         }),
+    })
+}
+
+/// A video whose index comes before its media data (its own `moov` first, or fragments) searched; `None` when `f` has
+/// no such layout (the caller then tries the orphan `moov`s), else the finding it becomes when that improves it. Its
+/// head (`ftyp` to the media data) is read within the file's read budget. A fragmented video with no known size comes
+/// out at most `Partial`; one whose chain of boxes is valid to the end of its pieces counts as complete for
+/// [`improves`].
+pub(crate) fn reassemble_index_first(
+    source: &CachedSource,
+    f: &Finding,
+    taken: &Taken,
+    ctx: &super::Context,
+    budget: &mut Budget,
+    cancel: &CancelToken,
+) -> Option<Option<Finding>> {
+    let layout = index_first_layout(&mut Reader::new(source), f.start)?;
+    let limits = ctx.limits;
+    if budget.spent() {
+        return Some(None);
+    }
+    let known = f
+        .origin
+        .as_ref()
+        .filter(|o| o.state == FsState::Deleted)
+        .map(|o| o.size);
+    let space = Space::new(ctx.grids, f.start, source.len(), taken, ctx.starts, limits);
+    let counted = Counted::new(source);
+    counted.set_limit(limits.file_read.min(budget.read));
+    let (found, own_ok, clean) = if layout.mdat.is_some() {
+        let seams = VideoSeams::with_own_moov(&counted, f.start);
+        budget.charge(0, counted.read());
+        let mut seams = seams?.with_unit(space.unit());
+        let found = search(
+            &mut seams, source, &space, f.start, known, limits, budget, cancel,
+        );
+        let Some(found) = found else {
+            return Some(None);
+        };
+        let own = index_health(seams.moov_payload(), found.len, false) == Health::Intact;
+        (found, own, false)
+    } else {
+        let seams = MoofSeams::new(&counted, f.start);
+        budget.charge(0, counted.read());
+        let mut seams = seams?.with_unit(space.unit()).with_known(known);
+        let found = search(
+            &mut seams, source, &space, f.start, known, limits, budget, cancel,
+        );
+        let Some(found) = found else {
+            return Some(None);
+        };
+        let clean = !found.complete
+            && known.is_none()
+            && seams.clean(&Fragmented::new(source, found.pieces.clone()));
+        (found, true, clean)
     };
-    out.new = improves(old, &new, found.complete).then_some(new);
-    out
+    if cancel.is_cancelled() || found.pieces.first().map(|p| p.start) != Some(f.start) {
+        return Some(None);
+    }
+    let checks = checks(ctx, source, &found, known, own_ok);
+    Some(
+        finding(f, &found, layout.kind, &checks)
+            .filter(|new| improves(f, new, found.complete || clean)),
+    )
 }
 
 #[cfg(test)]
@@ -642,9 +1506,9 @@ mod tests {
             .collect()
     }
 
-    fn find(
+    fn find<S: Seams>(
         src: &Mem,
-        seams: &mut VideoSeams,
+        seams: &mut S,
         grid: Grid,
         start: u64,
         limits: &Limits,
@@ -746,7 +1610,7 @@ mod tests {
         let mut r = Reader::new(&src);
         let mut out = Vec::new();
         seams
-            .walk_all(&mut r, src.len(), &mut |a, b| out.push((a, b)))
+            .walk_all(&mut r, src.len(), &mut |a, b, _| out.push((a, b)))
             .unwrap();
         out
     }
@@ -855,7 +1719,6 @@ mod tests {
         let mut seams = VideoSeams::with_orphan(&src, 0, q as u64, moov.len() as u64)
             .expect("a moov-less video and its moov")
             .with_unit(4096);
-        assert!(seams.uniform);
         let pieces = vec![
             Fragment {
                 start: 0,
@@ -871,8 +1734,6 @@ mod tests {
         let seam = data_at + 20 * S + 8;
         assert_eq!(seams.prove(&view, &[]), Proof::Proven);
         assert_eq!(seams.prove(&view, &[seam]), Proof::Unproven);
-        seams.uniform = false;
-        assert_eq!(seams.prove(&view, &[seam]), Proof::Proven);
     }
 
     #[test]
@@ -960,5 +1821,267 @@ mod tests {
         let (src, runs, mut seams) = three_runs(&video(300, 7, true));
         let view = Fragmented::new(&src, runs);
         assert!(seams.suspicious_breaks(&view, 0, view.len()).is_empty());
+    }
+
+    /// `v` with every byte its checks do not read (outside the checked ranges, the header before the `mdat` payload
+    /// and the `moov`) re-randomised from `seed`: another clip with the same NAL layout, sample by sample.
+    fn donor_of(v: &AvcVideo, seams: &mut VideoSeams, seed: u64) -> Vec<u8> {
+        let mut keep = vec![false; v.bytes.len()];
+        keep[..v.mdat_payload.start].fill(true);
+        keep[v.moov.clone()].fill(true);
+        for (a, b) in checked_ranges(v, seams) {
+            keep[a as usize..b as usize].fill(true);
+        }
+        let mut x = seed;
+        v.bytes
+            .iter()
+            .zip(&keep)
+            .map(|(&b, &k)| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                if k { b } else { (x >> 56) as u8 }
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "Q39 residual risk: a donor with the clip's exact NAL layout, sample by sample, shows the very bytes \
+                the checks read where the clip's own run would; see the core README (video residual risks)"]
+    fn a_donor_with_the_exact_nal_layout_is_not_intact() {
+        // Ruling Q39, the Task 5 reviewer's probe: A's middle run is lost (written over), and a donor clip with A's NAL
+        // lengths and headers but other payload holds the matching range at cluster 100.
+        const C: u64 = 32 << 10;
+        let v = video(300, 7, true);
+        let (Mem(mut card), runs, mut seams) = three_runs(&v);
+        let donor = donor_of(&v, &mut seams, 0xD0D0);
+        assert_ne!(donor, v.bytes);
+        let mid = runs[1];
+        let noise = noise_card(400, C);
+        card[mid.start as usize..(mid.start + mid.len) as usize]
+            .copy_from_slice(&noise[mid.start as usize..(mid.start + mid.len) as usize]);
+        let from = runs[0].len as usize;
+        let at = (HEAP + 100 * C) as usize;
+        card[at..at + mid.len as usize].copy_from_slice(&donor[from..from + mid.len as usize]);
+        let src = Mem(card);
+        let found = find(
+            &src,
+            &mut seams,
+            (HEAP, C, src.len()),
+            runs[0].start,
+            &Limits::DEFAULT,
+        );
+        if let Some(f) = &found {
+            assert!(
+                !(f.complete && f.unique && f.exhaustive && f.proof == Proof::Proven),
+                "{f:?}"
+            );
+        }
+    }
+
+    /// The 300-sample testkit clip of `seed` with its samples rewritten to `sizes` (one NAL unit each, seeded payload
+    /// from `payload_seed`) and its index patched to match: a constant-bitrate camera when the sizes repeat.
+    fn sized(sizes: &[u32], seed: u64, payload_seed: u64) -> AvcVideo {
+        let v = video(sizes.len(), seed, true);
+        let mut payload = Vec::new();
+        let mut x = payload_seed;
+        for (i, &size) in sizes.iter().enumerate() {
+            payload.extend_from_slice(&(size - 4).to_be_bytes());
+            payload.push(if i % 4 == 0 { 0x65 } else { 0x41 });
+            for _ in 0..size - 5 {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                payload.push((x >> 56) as u8);
+            }
+        }
+        let mut moov = v.bytes[v.moov.clone()].to_vec();
+        let at = |m: &[u8], kind: &[u8; 4]| m.windows(4).position(|w| w == kind).unwrap() + 4;
+        let stsz = at(&moov, b"stsz");
+        for (i, &size) in sizes.iter().enumerate() {
+            moov[stsz + 12 + 4 * i..stsz + 16 + 4 * i].copy_from_slice(&size.to_be_bytes());
+        }
+        let stco = at(&moov, b"stco");
+        let data_at = v.mdat_payload.start as u32;
+        let mut off = data_at;
+        for (i, &size) in sizes.iter().enumerate() {
+            if i % 4 == 0 {
+                let e = stco + 8 + 4 * (i / 4);
+                moov[e..e + 4].copy_from_slice(&off.to_be_bytes());
+            }
+            off += size;
+        }
+        let mut bytes = v.bytes[..v.mdat_payload.start - 8].to_vec();
+        bytes.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+        bytes.extend_from_slice(b"mdat");
+        bytes.extend_from_slice(&payload);
+        let moov_at = bytes.len();
+        bytes.extend_from_slice(&moov);
+        AvcVideo {
+            mdat_payload: v.mdat_payload.start..moov_at,
+            moov: moov_at..bytes.len(),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn a_constant_bitrate_donor_is_not_intact() {
+        // Ruling Q39: a clip whose frames are all 1000 bytes but its first ten (so the clip is not uniform as a whole),
+        // its middle run lost, and the same run of another clip of the same constant-bitrate camera at cluster 100:
+        // every check passes there, so the seams around it must not be proven.
+        const C: u64 = 32 << 10;
+        let sizes: Vec<u32> = (0..300)
+            .map(|i| if i < 10 { 600 + 70 * i } else { 1000 })
+            .collect();
+        let v = sized(&sizes, 7, 1);
+        let donor = sized(&sizes, 7, 2);
+        assert_eq!(v.moov, donor.moov);
+        let (Mem(mut card), runs, mut seams) = three_runs(&v);
+        assert!(!seams.moov.items.iter().all(|it| it.size == 1000));
+        let mid = runs[1];
+        let noise = noise_card(400, C);
+        card[mid.start as usize..(mid.start + mid.len) as usize]
+            .copy_from_slice(&noise[mid.start as usize..(mid.start + mid.len) as usize]);
+        let from = runs[0].len as usize;
+        let at = (HEAP + 100 * C) as usize;
+        card[at..at + mid.len as usize]
+            .copy_from_slice(&donor.bytes[from..from + mid.len as usize]);
+        let src = Mem(card);
+        let found = find(
+            &src,
+            &mut seams,
+            (HEAP, C, src.len()),
+            runs[0].start,
+            &Limits::DEFAULT,
+        );
+        let f = found.expect("the donor's run fits");
+        assert!(f.complete, "{f:?}");
+        assert_ne!(f.proof, Proof::Proven, "{f:?}");
+    }
+
+    /// A fragmented clip (H.265, 16 samples per fragment) on a 32 KiB-cluster noise card in 3 runs; the image, the runs
+    /// and its seams (no known size).
+    fn moof_runs() -> (Mem, Vec<Fragment>, MoofSeams, Vec<u8>) {
+        use revenant_testkit::{VideoCodec, VideoLayout, camera_video};
+        const C: u64 = 32 << 10;
+        let v = camera_video(
+            &AvcOptions {
+                samples: 300,
+                seed: 13,
+                mov: false,
+                mdat_pad: 0,
+                small_nals: true,
+            },
+            VideoCodec::Hevc,
+            VideoLayout::Fragmented {
+                samples_per_fragment: 16,
+            },
+        );
+        let n = (v.bytes.len() as u64).div_ceil(C);
+        let mut card = noise_card(400, C);
+        let runs = scatter(&mut card, &v.bytes, C, &[300, 20, 150], &[n / 3, n / 3, 0]);
+        let src = Mem(card);
+        let seams = MoofSeams::new(&src, runs[0].start)
+            .expect("a fragmented video")
+            .with_unit(C);
+        (src, runs, seams, v.bytes)
+    }
+
+    #[test]
+    fn moof_video_in_three_pieces_is_found_and_proven_with_its_size() {
+        const C: u64 = 32 << 10;
+        let (src, runs, seams, bytes) = moof_runs();
+        let mut seams = seams.with_known(Some(bytes.len() as u64));
+        let found = find(
+            &src,
+            &mut seams,
+            (HEAP, C, src.len()),
+            runs[0].start,
+            &Limits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(found.pieces, runs);
+        assert!(
+            found.complete && found.unique && found.exhaustive,
+            "{found:?}"
+        );
+        assert_eq!(found.proof, Proof::Proven);
+        // Without a size the chain has no end to reach: the true pieces, never complete.
+        let (src, runs, mut seams, _) = moof_runs();
+        let found = find(
+            &src,
+            &mut seams,
+            (HEAP, C, src.len()),
+            runs[0].start,
+            &Limits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(found.pieces, runs);
+        assert!(!found.complete, "{found:?}");
+        assert!(seams.clean(&Fragmented::new(&src, found.pieces)));
+        // The runs out of order: a sample fails.
+        let view = Fragmented::new(&src, vec![runs[0], runs[2], runs[1]]);
+        let mut seams = seams.with_known(Some(bytes.len() as u64));
+        assert_eq!(
+            seams.prove(&view, &[runs[0].len, runs[0].len + runs[2].len]),
+            Proof::Failed
+        );
+    }
+
+    #[test]
+    fn moof_prefilter_checks_what_the_walk_expected_past_the_seam() {
+        let (src, runs, mut seams, _) = moof_runs();
+        let seam = runs[0].len;
+        // The walk of the first piece learns what comes next (the samples of the fragment it was in).
+        let view = Fragmented::new(&src, vec![runs[0]]);
+        let w = seams.walk(&view, &[], &(0, 0), seam);
+        assert!(matches!(w.end, WalkEnd::Broken { at } if at == seam));
+        let mut r = Reader::with_window(&src, SECTOR as usize);
+        assert!(
+            seams.prefilter(&mut r, runs[1].start, seam),
+            "the true continuation"
+        );
+        assert!(
+            !seams.prefilter(&mut r, HEAP + 100 * (32 << 10), seam),
+            "noise"
+        );
+        assert!(
+            !seams.prefilter(&mut r, runs[2].start, seam),
+            "the third run"
+        );
+        // Nothing expected that far: blind, kept.
+        assert!(seams.prefilter(&mut r, HEAP + 100 * (32 << 10), seam + (1 << 30)));
+        assert!(!seams.memo_prefilter());
+    }
+
+    #[test]
+    fn moof_walk_is_bounded_by_box_count() {
+        // C9: the head of a fragmented clip, then more tiny `free` boxes than the cap: the walk stops undecided, after
+        // at most `MAX_BOXES` headers.
+        let (src, runs, _, bytes) = moof_runs();
+        let _ = (src, runs);
+        let seams = MoofSeams::new(&Mem(bytes.clone()), 0).unwrap();
+        let head = seams.head.len();
+        let mut file = bytes[..head].to_vec();
+        file.extend_from_slice(&8u32.to_be_bytes());
+        file.extend_from_slice(b"styp");
+        for _ in 0..MAX_BOXES + 100 {
+            file.extend_from_slice(&8u32.to_be_bytes());
+            file.extend_from_slice(b"free");
+        }
+        let src = Mem(file);
+        let mut seams = MoofSeams::new(&src, 0).unwrap();
+        let w = seams.walk(&src, &[], &(0, 0), src.len());
+        assert!(matches!(w.end, WalkEnd::Stopped));
+        assert!(w.checked <= (head + 8 * (MAX_BOXES + 1)) as u64);
+        // A garbled `moof` (a size past it, a trun past its box) never panics: the walk breaks there.
+        let mut file = bytes.clone();
+        let moof = file[head..].windows(4).position(|w| w == b"moof").unwrap() + head;
+        let traf = file[moof..].windows(4).position(|w| w == b"traf").unwrap() + moof;
+        file[traf - 4..traf].copy_from_slice(&u32::MAX.to_be_bytes());
+        let src = Mem(file);
+        let mut seams = MoofSeams::new(&src, 0).unwrap();
+        let w = seams.walk(&src, &[], &(0, 0), src.len());
+        assert!(matches!(w.end, WalkEnd::Broken { .. }));
     }
 }

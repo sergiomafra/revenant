@@ -1218,3 +1218,54 @@ fn camera_videos_parse_in_every_layout() {
         }
     }
 }
+
+#[test]
+fn index_first_videos_check_their_samples() {
+    // With the index before the media data (moov first, an open-ended mdat, fragments), nothing but the samples tells
+    // whether the bytes after the first piece are the video's: foreign data in the middle makes the file `Partial`.
+    use testkit::{AvcOptions, VideoCodec, VideoLayout};
+    let o = AvcOptions {
+        samples: 120,
+        seed: 21,
+        mov: false,
+        mdat_pad: 0,
+        small_nals: true,
+    };
+    for codec in [VideoCodec::Avc, VideoCodec::Hevc] {
+        for layout in [
+            VideoLayout::MoovFirst,
+            VideoLayout::MoovFirstMdatSizeZero,
+            VideoLayout::Fragmented {
+                samples_per_fragment: 8,
+            },
+        ] {
+            let v = testkit::camera_video(&o, codec, layout);
+            let whole = Counting {
+                bytes: v.bytes.clone(),
+                read: Default::default(),
+            };
+            let m = IsoBmff.measure(&whole, 0).unwrap();
+            assert_eq!(
+                (m.len, m.health),
+                (v.bytes.len() as u64, Health::Intact),
+                "{codec:?} {layout:?}"
+            );
+            // 4 KiB of other data (seeded noise) in the middle of the media data.
+            let mut bytes = v.bytes.clone();
+            let mid = (v.mdat_payload.start + bytes.len()) / 2;
+            let mut x = 0x0DDu64;
+            for b in &mut bytes[mid..mid + 4096] {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (x >> 56) as u8;
+            }
+            let cut = Counting {
+                bytes,
+                read: Default::default(),
+            };
+            let m = IsoBmff.measure(&cut, 0).unwrap();
+            assert_ne!(m.health, Health::Intact, "{codec:?} {layout:?}");
+        }
+    }
+}

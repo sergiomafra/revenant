@@ -8,7 +8,10 @@
 //!   table and `stsz` in a non-fragmented file) -> `Damaged`;
 //! - otherwise, for each `trak`, from its `stco`/`co64` and `stsz` tables: any chunk offset at or past the measured end,
 //!   or `first chunk offset + total sample size` past the measured end (a lower bound on where the track's data ends)
-//!   -> `Partial`; else `Intact`.
+//!   -> `Partial`; else `Intact`;
+//! - a video whose index comes before its media data (`moov` before the first `mdat`, or fragmented) is `Intact` only
+//!   when every checkable sample passes [`check_sample`] in place (each `moof`'s samples, from [`fragment_samples`], in
+//!   a fragmented one); else `Partial` (part 1.6: nothing else tells another file's data in a later piece's place).
 //!
 //! Chunk offsets are relative to the start of the file (the `ftyp`), not to the source. The walk accepts `ftyp` only as the
 //! first box; once `moov` and `mdat` are both seen it continues only through trailing `free skip wide uuid meta udta mfra`
@@ -78,11 +81,11 @@ const ACCEPTED: [&[u8; 4]; 14] = [
 
 pub struct IsoBmff;
 
-struct BoxHeader {
-    kind: [u8; 4],
-    header_len: u64,
+pub(crate) struct BoxHeader {
+    pub kind: [u8; 4],
+    pub header_len: u64,
     /// Declared total size; `None` when the box runs to the end of the source (size 0).
-    size: Option<u64>,
+    pub size: Option<u64>,
 }
 
 pub(crate) fn be32(b: &[u8]) -> u32 {
@@ -94,7 +97,7 @@ pub(crate) fn be64(b: &[u8]) -> u64 {
 }
 
 /// Parses a header from up to 16 bytes. `None` if the box is not valid at top level.
-fn parse_header(b: &[u8]) -> Option<BoxHeader> {
+pub(crate) fn parse_header(b: &[u8]) -> Option<BoxHeader> {
     if b.len() < 8 {
         return None;
     }
@@ -369,6 +372,8 @@ struct Walk {
     end: u64,
     kind: FileKind,
     has_mdat: bool,
+    /// Absolute offset of the first `mdat` box.
+    mdat_at: Option<u64>,
     has_moof: bool,
     truncated: bool,
     unreadable_header: bool,
@@ -411,6 +416,7 @@ fn walk_boxes(
         end: start,
         kind: FileKind::Mp4,
         has_mdat: false,
+        mdat_at: None,
         has_moof: false,
         truncated: false,
         unreadable_header: false,
@@ -485,7 +491,10 @@ fn walk_boxes(
                     Brand::None => (false, false),
                 };
             }
-            b"mdat" => w.has_mdat = true,
+            b"mdat" => {
+                w.has_mdat = true;
+                w.mdat_at.get_or_insert(pos);
+            }
             b"moof" => w.has_moof = true,
             b"moov" if w.moov.is_none() => {
                 w.moov = Some((pos + h.header_len, size.saturating_sub(h.header_len)))
@@ -598,8 +607,96 @@ fn judge(r: &mut Reader, start: u64, w: &Walk) -> Option<Measurement> {
     match index_health(&data, len, w.has_moof) {
         Health::Intact if r.bad_in(start, pos) => measured(Health::Partial),
         Health::Intact if kind == FileKind::Cr3 => measured(cr3_preview_health(r, start, w)),
+        Health::Intact if !index_first_samples_fit(r, start, len, &data, w) => {
+            measured(Health::Partial)
+        }
         health => measured(health),
     }
+}
+
+/// Sample-check steps (one per NAL unit or JPEG) of one measurement: past it the samples are not all checked and the
+/// video is at most `Partial`.
+const MEASURE_STEPS: u64 = 1 << 24;
+/// Most top-level boxes walked by the fragment check of one measurement (part 1.6, C9): a hostile chain of tiny boxes
+/// is bounded by count, not only by bytes.
+pub(crate) const MAX_BOXES: usize = 1 << 16;
+
+/// For a video whose index comes before its media data (`moov` before the first `mdat`, or fragments), whether every
+/// checkable sample passes [`check_sample`] in place within the measured `len` bytes: a video stored in pieces with
+/// other data in the place of a later piece has no other sign (its `mdat` size, or its box chain, still fits). A
+/// `moov` at the end needs no check: it is found only where the media data really ends. A garbled `moof`, a sample
+/// outside the file, an unreadable byte or more than [`MEASURE_STEPS`] steps: `false`. Sample tables that cannot be
+/// listed ([`index_tracks`]) and tracks with no check: nothing to check, `true`.
+fn index_first_samples_fit(r: &mut Reader, start: u64, len: u64, moov: &[u8], w: &Walk) -> bool {
+    let mut steps = MEASURE_STEPS;
+    let mut check = |r: &mut Reader, s: &CheckedSample| {
+        s.offset.checked_add(s.size).is_some_and(|e| e <= len)
+            && check_sample(
+                &mut |off, buf| {
+                    let at = start + off;
+                    r.read(at, buf) == buf.len() && !r.bad_in(at, at + buf.len() as u64)
+                },
+                s,
+                &mut steps,
+            )
+    };
+    if w.has_moof {
+        let Some(track) = frag_track(moov) else {
+            return true;
+        };
+        let end = start + len;
+        let mut pos = start;
+        for _ in 0..MAX_BOXES {
+            if pos >= end {
+                return true;
+            }
+            let (head, n) = r.head(pos);
+            let Some(h) = parse_header(&head[..n]) else {
+                return true;
+            };
+            let size = h.size.unwrap_or(end - pos).min(end - pos);
+            if size < h.header_len {
+                return false;
+            }
+            if &h.kind == b"moof" {
+                let Some(payload) = load(r, pos + h.header_len, size - h.header_len) else {
+                    return false;
+                };
+                let Some(samples) = fragment_samples(pos - start, &payload, &track) else {
+                    return false;
+                };
+                if !samples.iter().all(|s| check(r, s)) {
+                    return false;
+                }
+            }
+            pos += size;
+        }
+        return false;
+    }
+    if w.moov
+        .is_none_or(|(at, _)| w.mdat_at.is_none_or(|m| m < at))
+    {
+        return true;
+    }
+    // Tables the sample listing cannot use (no `stsc`, say) are judged by `index_health` alone, as before.
+    let Some(tracks) = index_tracks(moov) else {
+        return true;
+    };
+    tracks
+        .iter()
+        .filter_map(|t| t.check.map(|c| (t, c)))
+        .all(|(t, c)| {
+            t.samples().iter().all(|s| {
+                check(
+                    r,
+                    &CheckedSample {
+                        offset: s.offset,
+                        size: s.size,
+                        check: c,
+                    },
+                )
+            })
+        })
 }
 
 /// Canon's top-level `uuid` that holds the `PRVW` preview.
@@ -761,6 +858,71 @@ pub(crate) fn moovless_layout(r: &mut Reader, start: u64) -> Option<MdatLayout> 
     None
 }
 
+/// Where a video whose index comes before its media data keeps them (part 1.6): `ftyp`, then a `moov`, then either an
+/// `mdat` (moov first) or the movie fragments (`moof`, or `sidx`/`styp` before them).
+pub(crate) struct IndexFirst {
+    /// From the `ftyp` (`Mov` for `qt  `, else `Mp4`).
+    pub kind: FileKind,
+    /// The `moov` box: absolute offset, header length, size.
+    pub moov: (u64, u64, u64),
+    /// Absolute end of what comes before the media data: the first `mdat`'s payload start (moov first), or the first
+    /// fragment box (fragmented).
+    pub head_end: u64,
+    /// Moov first: the `mdat` box (absolute offset, declared size or `None` for size 0); `None` when fragmented.
+    pub mdat: Option<(u64, Option<u64>)>,
+}
+
+/// Header-only walk from `start` (no payload reads), through at most [`CONFIRM_BOXES`] boxes: `Some` for an `ftyp`
+/// (not a CR3's) followed by a `moov` and, after it, an `mdat` or a fragment box (`moof sidx styp`). `None` with no
+/// `moov` before the media data, two `moov`s, or a garbled header on the way.
+pub(crate) fn index_first_layout(r: &mut Reader, start: u64) -> Option<IndexFirst> {
+    let (head, n) = r.head(start);
+    let h = parse_header(&head[..n])?;
+    let size = h.size?;
+    if &h.kind != b"ftyp" || !(12..=4096).contains(&size) {
+        return None;
+    }
+    let mut brand = [0u8; 4];
+    r.read(start + h.header_len, &mut brand);
+    let kind = match &brand {
+        b"qt  " => FileKind::Mov,
+        b"crx " => return None,
+        _ => FileKind::Mp4,
+    };
+    let mut moov = None;
+    let mut pos = start.checked_add(size)?;
+    for _ in 0..CONFIRM_BOXES {
+        let (head, n) = r.head(pos);
+        let h = parse_header(&head[..n])?;
+        match &h.kind {
+            b"moov" if moov.is_none() => {
+                let size = h.size?;
+                moov = Some((pos, h.header_len, size));
+                pos = pos.checked_add(size)?;
+            }
+            b"mdat" => {
+                return Some(IndexFirst {
+                    kind,
+                    moov: moov?,
+                    head_end: pos + h.header_len,
+                    mdat: Some((pos, h.size)),
+                });
+            }
+            b"moof" | b"sidx" | b"styp" => {
+                return Some(IndexFirst {
+                    kind,
+                    moov: moov?,
+                    head_end: pos,
+                    mdat: None,
+                });
+            }
+            b"moov" | b"ftyp" => return None,
+            _ => pos = pos.checked_add(h.size?)?,
+        }
+    }
+    None
+}
+
 /// One sample of a track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Sample {
@@ -909,6 +1071,148 @@ pub(crate) fn walk_sample(
 
 /// Most samples [`track_samples`] lists for one `moov` (all tracks together).
 pub(crate) const MAX_SAMPLES: usize = 4_000_000;
+
+/// The checkable video track of a fragmented file, as its `moov` describes it: the `trak` whose samples the `moof`s
+/// list (its `tkhd` track ID), its check, and the default sample size of its `mvex/trex` (0 when none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FragTrack {
+    pub id: u32,
+    pub check: Check,
+    pub default_size: u32,
+}
+
+/// The first video `trak` of a `moov` payload with a checkable sample entry (see [`Check`]), with its track ID and the
+/// default sample size its `mvex/trex` gives; `None` when there is none or the boxes are garbled.
+pub(crate) fn frag_track(moov: &[u8]) -> Option<FragTrack> {
+    let mut garbled = false;
+    let boxes = children(moov, &mut garbled);
+    let track = boxes
+        .iter()
+        .filter(|(k, _)| k == b"trak")
+        .find_map(|(_, trak)| {
+            let mut g = false;
+            let tkhd = child(trak, b"tkhd", &mut g)?;
+            // Version 0: version/flags, creation and modification (4 each), then the track ID; version 1: 8-byte times.
+            let id_at = if *tkhd.first()? == 1 { 20 } else { 12 };
+            let id = be32(tkhd.get(id_at..id_at + 4)?);
+            let mdia = child(trak, b"mdia", &mut g)?;
+            let video = child(mdia, b"hdlr", &mut g).is_some_and(|p| p.get(8..12) == Some(b"vide"));
+            let stbl = child(mdia, b"minf", &mut g).and_then(|m| child(m, b"stbl", &mut g))?;
+            let check = child(stbl, b"stsd", &mut g).and_then(sample_check)?;
+            (video && !g).then_some((id, check))
+        });
+    let (id, check) = track?;
+    // trex: version/flags, track ID, default sample description index, duration, size, flags.
+    let default_size = boxes
+        .iter()
+        .filter(|(k, _)| k == b"mvex")
+        .flat_map(|(_, mvex)| children(mvex, &mut garbled))
+        .filter(|(k, p)| k == b"trex" && p.get(4..8).map(be32) == Some(id))
+        .find_map(|(_, p)| p.get(16..20).map(be32))
+        .unwrap_or(0);
+    (!garbled).then_some(FragTrack {
+        id,
+        check,
+        default_size,
+    })
+}
+
+/// The samples of `track` that the `moof` box at file offset `moof_at` (its `payload`, after the header) describes,
+/// absolute in the file, in `trun` order: each `traf/tfhd` gives the base data offset (explicit, or the `moof` start
+/// when default-base-is-moof or for the first `traf`, else where the previous `traf`'s data ended) and the default
+/// sample size (else the `trex` one), each `trun` its data offset from that base (else where the previous `trun`
+/// ended) and its sample sizes. `None` when a box is garbled or truncated, an offset falls outside `u64`, or the
+/// `moof` lists more than [`MAX_SAMPLES`] samples (all tracks together): never more work than that.
+pub(crate) fn fragment_samples(
+    moof_at: u64,
+    payload: &[u8],
+    track: &FragTrack,
+) -> Option<Vec<CheckedSample>> {
+    let mut garbled = false;
+    let mut out = Vec::new();
+    let mut listed = 0usize;
+    let mut prev_end: Option<u64> = None;
+    for (_, traf) in children(payload, &mut garbled)
+        .into_iter()
+        .filter(|(k, _)| k == b"traf")
+    {
+        let tfhd = child(traf, b"tfhd", &mut garbled)?;
+        let flags = be32(tfhd.get(..4)?) & 0x00FF_FFFF;
+        let id = be32(tfhd.get(4..8)?);
+        let mut at = 8usize;
+        let mut field = |n: usize| {
+            let f = tfhd.get(at..at + n);
+            at += n;
+            f
+        };
+        let explicit = if flags & 0x1 != 0 {
+            Some(be64(field(8)?))
+        } else {
+            None
+        };
+        for bit in [0x2, 0x8] {
+            if flags & bit != 0 {
+                field(4)?;
+            }
+        }
+        let default_size = if flags & 0x10 != 0 {
+            u64::from(be32(field(4)?))
+        } else if id == track.id {
+            u64::from(track.default_size)
+        } else {
+            0
+        };
+        if flags & 0x20 != 0 {
+            field(4)?;
+        }
+        let base = match explicit {
+            Some(b) => b,
+            None if flags & 0x02_0000 != 0 => moof_at,
+            None => prev_end.unwrap_or(moof_at),
+        };
+        let mut data = base;
+        for (_, trun) in children(traf, &mut garbled)
+            .into_iter()
+            .filter(|(k, _)| k == b"trun")
+        {
+            let flags = be32(trun.get(..4)?) & 0x00FF_FFFF;
+            let count = be32(trun.get(4..8)?) as usize;
+            let mut at = 8usize;
+            if flags & 0x1 != 0 {
+                let off = i32::from_be_bytes(trun.get(8..12)?.try_into().ok()?);
+                data = base.checked_add_signed(i64::from(off))?;
+                at += 4;
+            }
+            if flags & 0x4 != 0 {
+                at += 4;
+            }
+            listed = listed.checked_add(count).filter(|&n| n <= MAX_SAMPLES)?;
+            let fields = [0x100, 0x200, 0x400, 0x800].map(|b| flags & b != 0);
+            let per = 4 * fields.iter().filter(|&&f| f).count();
+            let size_at = if fields[0] { 4 } else { 0 };
+            if at.checked_add(count.checked_mul(per)?)? > trun.len() {
+                return None;
+            }
+            for i in 0..count {
+                let size = if fields[1] {
+                    u64::from(be32(&trun[at + i * per + size_at..]))
+                } else {
+                    default_size
+                };
+                if id == track.id {
+                    out.push(CheckedSample {
+                        offset: data,
+                        size,
+                        check: track.check,
+                    });
+                }
+                data = data.checked_add(size)?;
+            }
+        }
+        prev_end = Some(data);
+    }
+    (!garbled).then_some(out)
+}
 
 /// The sample tables of one track, validated (present, not truncated, the chunks holding exactly the samples `stsz`
 /// lists) but not expanded: nothing here is allocated by a count read from the file.
@@ -1695,5 +1999,180 @@ mod tests {
         // Loading the payload twice would make 4.
         let hits = src.hits.load(Ordering::SeqCst);
         assert!(hits <= 3, "{hits} reads overlap the moov");
+    }
+
+    /// The top-level boxes of `bytes`: (kind, box start, box end).
+    fn top_boxes(bytes: &[u8]) -> Vec<([u8; 4], usize, usize)> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + 8 <= bytes.len() {
+            let size = be32(&bytes[pos..]) as usize;
+            out.push((
+                [
+                    bytes[pos + 4],
+                    bytes[pos + 5],
+                    bytes[pos + 6],
+                    bytes[pos + 7],
+                ],
+                pos,
+                pos + size,
+            ));
+            pos += size;
+        }
+        out
+    }
+
+    #[test]
+    fn fragment_samples_lists_the_trun() {
+        use revenant_testkit::{AvcOptions, VideoCodec, VideoLayout, camera_video};
+        let opts = AvcOptions {
+            samples: 30,
+            seed: 9,
+            mov: false,
+            mdat_pad: 0,
+            small_nals: true,
+        };
+        for codec in [VideoCodec::Avc, VideoCodec::Hevc] {
+            let v = camera_video(
+                &opts,
+                codec,
+                VideoLayout::Fragmented {
+                    samples_per_fragment: 8,
+                },
+            );
+            // The same samples, listed by the index of the non-fragmented layout.
+            let flat = camera_video(&opts, codec, VideoLayout::MoovAtEnd);
+            let sizes: Vec<u64> = checked(&flat).iter().map(|s| s.size).collect();
+            let track = frag_track(&v.bytes[v.moov.start + 8..v.moov.end])
+                .expect("a fragmented video track");
+            assert_eq!(track.id, 1);
+            let boxes = top_boxes(&v.bytes);
+            let mut listed = Vec::new();
+            for (i, &(kind, at, end)) in boxes.iter().enumerate() {
+                if &kind != b"moof" {
+                    continue;
+                }
+                let got =
+                    fragment_samples(at as u64, &v.bytes[at + 8..end], &track).expect("a moof");
+                // Back to back from the payload of the `mdat` right after it.
+                let (next, mdat_at, mdat_end) = boxes[i + 1];
+                assert_eq!(&next, b"mdat");
+                assert_eq!(got[0].offset, mdat_at as u64 + 8);
+                assert!(
+                    got.windows(2)
+                        .all(|w| w[0].offset + w[0].size == w[1].offset)
+                );
+                let last = got.last().unwrap();
+                assert_eq!(last.offset + last.size, mdat_end as u64);
+                assert!(got.iter().all(|s| s.check == track.check));
+                listed.extend(got.iter().map(|s| s.size));
+            }
+            assert_eq!(listed, sizes, "{codec:?}");
+            // Each one passes the sample check in place.
+            let bytes = &v.bytes;
+            let mut read = |at: u64, buf: &mut [u8]| {
+                let at = at as usize;
+                match bytes.get(at..at + buf.len()) {
+                    Some(b) => {
+                        buf.copy_from_slice(b);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            for &(kind, at, end) in &boxes {
+                if &kind == b"moof" {
+                    for s in fragment_samples(at as u64, &bytes[at + 8..end], &track).unwrap() {
+                        assert!(check_sample(&mut read, &s, &mut u64::MAX.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `moof` payload: one `traf` with a `tfhd` (`tf_flags`, track 1, then `tfhd_tail`) and a `trun` (`tr_flags`,
+    /// `count`, then `trun_tail`).
+    fn moof(
+        tf_flags: u32,
+        tfhd_tail: &[u8],
+        tr_flags: u32,
+        count: u32,
+        trun_tail: &[u8],
+    ) -> Vec<u8> {
+        let bx = |kind: &[u8; 4], body: &[u8]| {
+            let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+            b.extend_from_slice(kind);
+            b.extend_from_slice(body);
+            b
+        };
+        let mut tfhd = tf_flags.to_be_bytes().to_vec();
+        tfhd.extend_from_slice(&1u32.to_be_bytes());
+        tfhd.extend_from_slice(tfhd_tail);
+        let mut trun = tr_flags.to_be_bytes().to_vec();
+        trun.extend_from_slice(&count.to_be_bytes());
+        trun.extend_from_slice(trun_tail);
+        let traf = bx(b"traf", &[bx(b"tfhd", &tfhd), bx(b"trun", &trun)].concat());
+        [bx(b"mfhd", &[0, 0, 0, 0, 0, 0, 0, 1]), traf].concat()
+    }
+
+    #[test]
+    fn fragment_samples_rejects_garbled_moofs() {
+        let track = FragTrack {
+            id: 1,
+            check: Check::Nal {
+                length_size: 4,
+                hevc: false,
+            },
+            default_size: 0,
+        };
+        // Sizes present, data offset 100: two samples of 10 and 20 bytes from the moof start.
+        let sizes = [
+            100i32.to_be_bytes(),
+            10u32.to_be_bytes(),
+            20u32.to_be_bytes(),
+        ]
+        .concat();
+        let good = moof(0x02_0000, &[], 0x201, 2, &sizes);
+        let got = fragment_samples(1000, &good, &track).unwrap();
+        assert_eq!(
+            got.iter().map(|s| (s.offset, s.size)).collect::<Vec<_>>(),
+            [(1100, 10), (1110, 20)]
+        );
+        // The trun lists more samples than it holds.
+        assert!(fragment_samples(1000, &moof(0x02_0000, &[], 0x201, 3, &sizes), &track).is_none());
+        assert!(
+            fragment_samples(1000, &moof(0x02_0000, &[], 0x201, u32::MAX, &sizes), &track)
+                .is_none()
+        );
+        // A count past MAX_SAMPLES with no per-sample field (the default size).
+        let flat = moof(
+            0x02_0010,
+            &16u32.to_be_bytes(),
+            0x001,
+            MAX_SAMPLES as u32 + 1,
+            &0i32.to_be_bytes(),
+        );
+        assert!(fragment_samples(1000, &flat, &track).is_none());
+        // A base data offset near the end of u64: the data offset or the sample sizes run past it.
+        let base = [(u64::MAX - 15).to_be_bytes().as_slice()].concat();
+        assert!(fragment_samples(0, &moof(0x01, &base, 0x201, 2, &sizes), &track).is_none());
+        // A negative data offset before the file start.
+        let back = [
+            (-2000i32).to_be_bytes(),
+            10u32.to_be_bytes(),
+            20u32.to_be_bytes(),
+        ]
+        .concat();
+        assert!(fragment_samples(1000, &moof(0x02_0000, &[], 0x201, 2, &back), &track).is_none());
+        // A truncated tfhd (base data offset flag without the field), a box size past the payload, no trun count.
+        assert!(fragment_samples(1000, &moof(0x01, &[1, 2], 0x201, 2, &sizes), &track).is_none());
+        let mut bad = good.clone();
+        bad[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(fragment_samples(1000, &bad, &track).is_none());
+        assert!(fragment_samples(1000, &good[..good.len() - 12], &track).is_none());
+        // Every truncation of a valid moof: no panic.
+        for n in 0..good.len() {
+            let _ = fragment_samples(1000, &good[..n], &track);
+        }
     }
 }

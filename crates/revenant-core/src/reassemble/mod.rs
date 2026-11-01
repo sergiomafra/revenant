@@ -106,6 +106,7 @@ impl Limits {
 }
 
 /// Bytes no piece may use: `Listing.live` and the pieces of every `Intact` finding (and `Intact` reassembly so far).
+#[derive(Clone)]
 pub(crate) struct Taken {
     live: Runs,
     claimed: Runs,
@@ -439,6 +440,11 @@ pub(crate) trait Seams {
         let _ = (view, start, end);
         Vec::new()
     }
+    /// Whether [`Seams::prefilter`]'s answer depends only on the candidate and the seam, so the search may remember it
+    /// per file (default). A format whose answer depends on what its earlier walks met says no: it is asked every time.
+    fn memo_prefilter(&self) -> bool {
+        true
+    }
 }
 
 pub(crate) struct Walked<S> {
@@ -724,7 +730,8 @@ impl<'c, S: Seams> Ctx<'c, S> {
         if self.listed.is_multiple_of(LISTED_PER_TRY) && !self.charge() {
             return false;
         }
-        if let Some(&v) = self.memo.get(&(g, seam)) {
+        let memo = self.seams.memo_prefilter();
+        if let Some(&v) = self.memo.get(&(g, seam)).filter(|_| memo) {
             return v;
         }
         if self.stop.is_some() {
@@ -743,7 +750,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
             let mut r = Reader::with_window(self.source, SECTOR as usize);
             self.seams.prefilter(&mut r, g, seam)
         };
-        if self.memo.len() < PREFILTER_MEMO {
+        if memo && self.memo.len() < PREFILTER_MEMO {
             self.memo.insert((g, seam), v);
         }
         v
@@ -1360,10 +1367,10 @@ pub(crate) fn improves(old: &Finding, new: &Finding, complete: bool) -> bool {
 /// file keeps its origin with placement `Carved`, D15). For a candidate of origin `Deleted`, the search gets the entry's
 /// size as the known length (Q3): the pieces must sum to it. `paired`: the pairing's results, whose `Intact` pieces are
 /// claimed first; each `Intact` reassembly claims its pieces for the next candidates. Sequential and deterministic: it
-/// depends only on the source's bytes and its arguments. JPEGs and moov-less videos with a fitting orphan `moov` (in
-/// `ctx.moovs`) are searched (the RAWs keep their results until their format gets seams); a video the pairing made
-/// `Intact` is left alone, and one it paired otherwise must improve on the pairing's result. Stops early, returning
-/// what it has, when cancelled (the caller looks).
+/// depends only on the source's bytes and its arguments. JPEGs, videos with their index first or in fragments, and
+/// moov-less videos with a fitting orphan `moov` (in `ctx.moovs`) are searched (the RAWs keep their results until their
+/// format gets seams); a video the pairing made `Intact` is left alone, and one it paired otherwise must improve on the
+/// pairing's result. Stops early, returning what it has, when cancelled (the caller looks).
 pub(crate) fn reassemble(
     source: &CachedSource,
     candidates: &[Finding],
@@ -1397,7 +1404,14 @@ pub(crate) fn reassemble(
         if cancel.is_cancelled() || budget.spent() {
             break;
         }
+        // A video with its index before its media data (its own `moov` first, or fragments).
+        let index_first = if matches!(f.kind, FileKind::Mp4 | FileKind::Mov) && !done(f) {
+            video::reassemble_index_first(source, f, &taken, ctx, &mut budget, cancel)
+        } else {
+            None
+        };
         let new = match f.kind {
+            _ if index_first.is_some() => index_first.flatten(),
             FileKind::Jpeg => reassemble_jpeg(source, f, &taken, ctx, &mut budget, cancel),
             FileKind::Mp4 | FileKind::Mov if !done(f) && !ctx.moovs.is_empty() => {
                 let old = paired.iter().find(|p| p.id == f.id).unwrap_or(f);

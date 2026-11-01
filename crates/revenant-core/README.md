@@ -620,7 +620,18 @@ its frames is whole; a photo written over the video is not at a chunk offset, so
   `Damaged`.
 - Otherwise the `stco`/`co64` and `stsz` tables of each `trak` are checked: any chunk offset at or past the measured end, or
   `first chunk offset + total sample size` past it, gives `Partial`; else `Intact`. Fragmented files (`moof`) have no such
-  tables and are `Intact` when their boxes are complete.
+  tables and are `Intact` when their boxes are complete (and their samples pass, below).
+- Index first (part 1.6): when the `moov` comes before the first `mdat` (an `mdat` of size 0 included), or the file is
+  fragmented, nothing but the samples tells whether the bytes after the first piece of a video stored in pieces are its
+  own: its `mdat` size, or its chain of boxes, still fits. Such an otherwise `Intact` video is checked sample by sample
+  in place, within the measured length (the pairing's structural check, `isobmff::check_sample`: NAL lengths and header
+  bytes, or a Motion-JPEG frame's markers; at most 2^24 steps), and any failing sample makes it `Partial`. For a
+  fragmented file each `moof`'s samples of its first checkable video track (`traf/tfhd/trun`, see
+  `isobmff::fragment_samples`) are checked in the file, over at most 65,536 top-level boxes (`MAX_BOXES`); a garbled
+  `moof` is `Partial`. Tracks with no check (audio, other codecs) and sample tables the listing cannot use are not
+  checked, as before. A `moov` at the end needs none of this: it is found only where the media data really ends. The
+  cost: the walk reads a few bytes per NAL unit through the scan's cache, which loads whole 1 MiB windows, so an
+  index-first video is read about once more (the scan skips an `Intact` file's bytes).
 
 Unreadable sectors:
 
@@ -711,8 +722,9 @@ Cancellation is looked at before each `moov`, each pair and each break point; a 
 `Err(Cancelled)` without the remaining `Updated` events.
 
 A video in three or more pieces is not paired (some sample fails on either side); the reassembly step puts it back
-together (see "Video in three or more pieces"). Not covered: a `moov` before its `mdat`, an `mdat` of size 0, two
-videos whose first pieces are identical, and fragmented MP4 (`moof`).
+together (see "Video in three or more pieces"). So does it for the layouts the pairing leaves out: a `moov` before its
+`mdat`, an `mdat` of size 0, fragmented MP4 (`moof`), and two videos whose first pieces are identical (see "Videos with
+the index first, open-ended or fragmented").
 
 ### Video in three or more pieces
 
@@ -721,8 +733,12 @@ After the pairing, the reassembly step (see "Reassembly") searches every moov-le
 (step 4 above; the `moov`s are loaded once for the whole step, with the pairing's budgets, the filter judged against
 every candidate video, within what the pairing left of its 1 GiB load budget and its sample budget: one of each for
 both). Each such `moov` is one search; two or more giving a complete solution make the result not unique (`Partial`).
-As in the pairing, a `moov` that completes two videos (their first pieces are copies) puts back neither: the later
-one is not updated, and neither is the earlier one (which cannot be `Intact`: an `Intact` video claims its `moov`).
+Two candidate videos that a `moov` fits and whose first pieces are the same (D17: the same length, where the samples
+stop passing over the free run from each start, and the same bytes, compared through the cache within the file's read
+budget) are one video: only the lowest id is searched with that `moov`, with the copies' equal bytes kept out of its
+pieces (those bytes are its own), and the others are left as they are. Otherwise, as in the pairing, a `moov` that
+completes two videos puts back neither: the later one is not updated, and neither is the earlier one (which cannot be
+`Intact`: an `Intact` video claims its `moov`).
 
 - **The file.** Logical offsets are file offsets: 0 is the video's start, each checkable sample (the pairing's tracks:
   H.264, HEVC, Motion-JPEG) lies at the offset the index lists, and the `moov` goes at `P` (the end of `mdat`). The
@@ -739,14 +755,23 @@ one is not updated, and neither is the earlier one (which cannot be `Intact`: an
 - **The proof.** `Proven` only when every checkable sample passes in place, the `moov` sits at `P`, no seam lies
   before the `mdat` payload, and **every seam has checked bytes within one unit before it and within one unit after
   it**: a cut one unit earlier or later would then read a checked byte from elsewhere. The checks read lengths and
-  headers, never payloads, so a seam inside a long NAL unit (more than a unit from any header) is not proven. A video
-  whose checkable samples all have the same size is never proven across a seam (another clip of the same format would
-  pass every check in place).
+  headers, never payloads, so a seam inside a long NAL unit (more than a unit from any header) is not proven. Nor is a
+  seam where the checked bytes within one unit on either side all belong to samples of one size (ruling Q39, local:
+  another clip of a constant-bitrate camera would pass every check there; one frame of another size elsewhere in the
+  clip does not lift it). Structure (box headers, the index) counts as evidence of its own.
 - **Suspicious cuts.** For the uniqueness re-check, the unit boundaries inside unchecked stretches where a seam would
   not be proven, longest stretch first; none when every boundary has checked bytes around it.
 - **Health.** As for any reassembly (see "The reassembly step"), with the index judged against the length as for a
   contiguous file (`index_health`) as the format's own check. The positional proof makes `Intact` possible from content
   alone (unlike a JPEG, ruling Q37).
+
+Residual risks: the checks never read a payload, so a run of another clip whose NAL layout matches the clip's own
+sample by sample (the same sizes and NAL lengths, other payload) is indistinguishable from it; where the clip's own run
+was lost and such a run lies free, the video comes back `Intact` with that run in it. Two real clips match that way
+only with frames of one size, which the local guard above covers; the exact-layout case is kept as an ignored
+reproduction (`reassemble::video::tests::a_donor_with_the_exact_nal_layout_is_not_intact`). Off a cluster grid
+(512-byte sectors), a seam whose next sample starts in the last bytes of a sector is blind for every candidate, so the
+4096-candidate cap is hit there and a video in three or more pieces is seldom exhaustive (`Partial`).
 
 Outcomes measured on the synthetic cards (`tests/reassembly.rs`): H.264 in five one-cluster pieces and H.265 in four
 pieces on 32 KiB clusters, a middle piece of one cluster holding fewer than 1/32 of the samples, and two clips of one
@@ -760,6 +785,41 @@ search and what the pairing left of its `moov` load and sample budgets (a `moov`
 here, makes no video of the step `Intact`). A walk reads through one-sector windows (a few bytes per NAL unit), every byte asked charged to the file's
 read budget: a video much larger than the budget's 512 MiB of reads (counting the walks, the proof and the re-check)
 comes out `Partial` or as before.
+
+### Videos with the index first, open-ended or fragmented
+
+The reassembly step also searches an MP4/MOV candidate whose index comes before its media data (`reassemble/video.rs`;
+a header-only walk, `isobmff::index_first_layout`: an `ftyp` that is not a CR3's, a `moov`, then an `mdat` or a fragment
+box). Its head (the `ftyp` up to the `mdat` payload, or up to the first fragment box; at most 17 MiB) is read within
+the file's read budget and must lie in place in the first piece: no seam falls in it.
+
+- **Its own `moov` first** (`ftyp, moov, mdat`; `VideoSeams::with_own_moov`): the walk, prefilter, proof and suspicious
+  cuts of "Video in three or more pieces", without an anchor. The known length is the end of `mdat` when its size is
+  declared, else (size 0) the highest sample end of any track (padding after the last sample is then left out, and a
+  deleted file's entry size that says otherwise leaves nothing complete). The index must list a checkable sample and no
+  sample outside the `mdat`.
+- **Fragmented** (`ftyp, moov` with an `mvex`, then `moof`/`mdat` pairs; `MoofSeams`): the walk reads the top-level
+  boxes in order, each header checked (a declared size, a type of `moof mdat sidx styp free skip mfra`, within the
+  known size), each `moof` parsed (`fragment_samples`: the base data offset explicit, the `moof` start when
+  default-base-is-moof or for the first `traf`, else where the previous `traf`'s data ended; each `trun`'s data offset
+  and sample sizes, else the `tfhd` or `trex` default; at most 4,000,000 samples per `moof`, checked arithmetic) and its
+  samples checked in the `mdat` right after it, which must hold them all. It resumes after each passing sample and at
+  each box end, and stops after `MAX_BOXES` (65,536) boxes per walk, undecided (C9). It completes when an `mfra` closes
+  the chain (its last box an `mfro` giving the `mfra`'s size) or when the box chain ends exactly at the known size: a
+  deleted file's entry size (the format itself has none). Otherwise the walk ends at the last valid box (an invalid
+  header after it: the end of the file, or another file's data), and the result is at most `Partial`; one whose chain
+  is valid to the very end of its pieces counts as complete for `improves`, so it replaces a shorter earlier result.
+  The prefilter checks what the walks expected within one unit after the seam (the next box header, the samples of the
+  `moof` in progress): every walk's expectations are kept (at most 2^18; past that every candidate is kept), a candidate
+  passing any one of them is kept, and its answers are not remembered per file, as they depend on the path (the engine
+  asks the format, `Seams::memo_prefilter`). The proof counts box headers and `moof`s as structure.
+
+Outcomes on the synthetic cards: a moov-first H.264 clip in three pieces, the same with an `mdat` of size 0, and a
+fragmented H.265 clip in three pieces with its deleted entry's size come back `Intact`; the fragmented clip after a
+quick format (no size, no `mfra`) comes back `Partial` in its exact pieces. Two copies of a moov-less clip's first piece
+off the cluster grid with one `moov` (D17) give the lower id `Intact` and leave the copy `Damaged`; on a cluster grid
+the re-check never follows a copy back into the solution's own later runs, so the lower id is unique there in any
+case.
 
 ## Formats: CR3 and HEIC (ISO BMFF)
 
@@ -938,7 +998,8 @@ says where the content stops fitting
 a walk may resume in another piece; at the end it proves the whole file (`Proven`, `Unproven` or `Failed`). A format may
 also give the file's known length, an anchor (a logical offset that must sit at a given absolute place, such as a video's
 orphan `moov`), its own embedded files, and a cheap prefilter for candidates. The JPEG (see "Fragmented JPEG") and
-the MP4/MOV video with its index elsewhere (see "Video in three or more pieces") have seams.
+the MP4/MOV video (its index elsewhere, see "Video in three or more pieces"; its index first or in fragments, see
+"Videos with the index first, open-ended or fragmented") have seams.
 
 **The space.** A piece lies on the volume's cluster grid when the file starts at a cluster start of a volume with
 clusters of at least 4096 bytes; otherwise on 512-byte sectors, forward only, with a 64 MiB window and at most 4 pieces.
@@ -1016,7 +1077,8 @@ file) must match the sum of the pieces exactly; when both are known and disagree
 | Claimed runs              | 2^18 per scan                     |
 
 A file's budget is its own limits within what the scan has left; the prefilter's reads are charged to it (each
-prefilter call reads through its own one-sector reader, and a (start, seam) pair asked again is answered from memory),
+prefilter call reads through its own one-sector reader, and a (start, seam) pair asked again is answered from memory,
+unless the format's answers depend on its earlier walks: `Seams::memo_prefilter`),
 and so is the listing: every 64 candidate units listed cost one walk. Reads past the file's byte budget are refused,
 so one long walk cannot overrun it. A budget hit stops the file's search, which is then not exhaustive. The search looks at the scan's cancel flag before
 every walk and every prefilter read, and gives nothing when cancelled.
@@ -1031,9 +1093,10 @@ kept as each finding is emitted (ruling D2): never a live file's finding (its ch
 `Intact` whose first piece is at least 16 KiB (the 1.3 join's minimum), an MP4/MOV that is not `Intact`, a `Partial`
 TIFF RAW (ARW, CR2, NEF, DNG, ORF, RW2, TIFF), and any JPEG, MP4/MOV or TIFF RAW of a deleted file that came out
 `Partial`. At most 4096 are kept, the first by id; past that, no reassembly is `Intact` (a dropped one might compete for
-the same pieces). **JPEGs and videos are searched so far**: a video only when it has no `moov` of its own, the pairing
-did not make it `Intact`, and an orphan `moov` fits it (see "Video in three or more pieces"); only a complete solution
-(its `moov` in place) can replace a video's finding. RAWs keep their results until their format gets seams. The scan
+the same pieces). **JPEGs and videos are searched so far**: a video with its index first or in fragments (see "Videos
+with the index first, open-ended or fragmented"), or one with no `moov` of its own that the pairing did not make
+`Intact` and an orphan `moov` fits (see "Video in three or more pieces"; only a complete solution, its `moov` in place,
+can replace such a video's finding). RAWs keep their results until their format gets seams. The scan
 also keeps the ranges of every `Intact` finding it emits (at most 2^18 merged runs; past that, no reassembly is
 `Intact`): those, the listing's live ranges, the pairing's `Intact` results and every earlier `Intact` reassembly are
 taken (see "The space"). Only this bookkeeping, one push or a few run merges per finding emitted, happens during the

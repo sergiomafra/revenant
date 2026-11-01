@@ -264,15 +264,24 @@ fn moov_matching_two_videos_is_not_paired() {
         .put(5 * MIB, &v.bytes[..l1])
         .put(12 * MIB, &v.bytes[l1..]);
     let file = img.save();
-    let (summary, events) = run(&Src::new(&file));
-    assert!(updated(&events).is_empty(), "{events:?}");
-    assert_eq!(summary.updated, 0);
+    let src = Src::new(&file);
+    let (summary, events) = run(&src);
     let f = found(&events);
     assert_eq!(f.len(), 2);
     assert!(
         f.iter()
             .all(|f| f.health == Health::Damaged && f.kind == FileKind::Mp4)
     );
+    // The pairing takes neither; since part 1.6 the reassembly step sees the two first pieces are the same (D17) and
+    // puts back the lower id only, in its two pieces.
+    let u = updated(&events);
+    assert_eq!(u.len(), 1, "{events:?}");
+    assert_eq!(summary.updated, 1);
+    assert_eq!(u[0].id, f.iter().map(|f| f.id).min().unwrap());
+    let starts: Vec<u64> = u[0].fragments.iter().map(|p| p.start).collect();
+    assert_eq!(starts, [MIB, 12 * MIB].map(|x| x as u64), "{:?}", u[0]);
+    assert_eq!(u[0].health, Health::Intact);
+    assert_eq!(extracted(&src, &u[0]), v.bytes);
 }
 
 #[test]
