@@ -17,7 +17,8 @@
 //!
 //! The scan's reassembly step ([`reassemble`]) runs this search, after the pairing, for every candidate the scan kept
 //! ([`is_candidate`]), in id order, and turns each result that improves the finding into an `Updated` ([`improves`]),
-//! with the health of [`health`].
+//! with the health of [`health`]. A deleted file's own pieces from the file system are the search's first hypothesis
+//! ([`Space::with_hint`], D14), and [`content_checks`] is the whole-file check the scan runs for an old exFAT chain.
 // Some helpers serve the unit tests only (and the scan reads some limits through their constants).
 #![allow(dead_code)]
 
@@ -172,6 +173,8 @@ pub(crate) struct Space<'a> {
     grid: bool,
     window: u64,
     max_pieces: usize,
+    /// The file system's pieces of the file (absolute, file order), tried first ([`Space::with_hint`]).
+    hint: Vec<Fragment>,
 }
 
 impl<'a> Space<'a> {
@@ -196,6 +199,7 @@ impl<'a> Space<'a> {
                 grid: true,
                 window: limits.seam_window,
                 max_pieces: limits.pieces,
+                hint: Vec::new(),
             },
             None => Space {
                 taken,
@@ -206,8 +210,57 @@ impl<'a> Space<'a> {
                 grid: false,
                 window: limits.no_grid_window,
                 max_pieces: limits.pieces_no_grid,
+                hint: Vec::new(),
             },
         }
+    }
+
+    /// The listing's pieces as the first hypothesis (D14, G5): at each seam where the path so far agrees with them, the
+    /// start of their next piece (when free) is put at the head of the D4 order, and their seam at the head of the break
+    /// points of the piece. Only the order changes: what the search finds, unique or not, and its proof stay its own.
+    pub(crate) fn with_hint(mut self, pieces: &[Fragment]) -> Self {
+        self.hint = pieces.to_vec();
+        self
+    }
+
+    /// The hint's pieces as (logical start, piece), file order.
+    fn hint_logical(&self) -> impl Iterator<Item = (u64, Fragment)> + '_ {
+        self.hint.iter().scan(0u64, |l, p| {
+            let at = *l;
+            *l = l.saturating_add(p.len);
+            Some((at, *p))
+        })
+    }
+
+    /// The hint's seam in the piece starting at absolute `g`, logical `l`: the logical end of the hint's piece holding
+    /// `l` at `g`, when the hint has a piece after it.
+    fn hint_break(&self, g: u64, l: u64) -> Option<u64> {
+        let mut it = self.hint_logical().peekable();
+        while let Some((at, p)) = it.next() {
+            if (at..at.saturating_add(p.len)).contains(&l) {
+                let agrees = p.start.checked_add(l - at) == Some(g);
+                return (agrees && it.peek().is_some()).then(|| at + p.len);
+            }
+        }
+        None
+    }
+
+    /// The absolute start of the hint's piece at logical `b`, when the hint's piece before it ends at absolute `end`
+    /// (the path so far agrees with it there).
+    fn hint_next(&self, end: u64, b: u64) -> Option<u64> {
+        let mut prev: Option<Fragment> = None;
+        for (at, p) in self.hint_logical() {
+            if at == b {
+                return prev
+                    .filter(|q| q.start.saturating_add(q.len) == end)
+                    .map(|_| p.start);
+            }
+            if at > b {
+                return None;
+            }
+            prev = Some(p);
+        }
+        None
     }
 
     /// Cluster size, or [`SECTOR`].
@@ -994,7 +1047,14 @@ impl<'c, S: Seams> Ctx<'c, S> {
             .max()
             .unwrap_or(l)
             .max(l);
-        let breaks = self.breaks(g, l, floor, at.min(l + run), true);
+        let mut breaks = self.breaks(g, l, floor, at.min(l + run), true);
+        // The listing's seam in this piece first (D14).
+        if let Some(h) = self.space.hint_break(g, l)
+            && let Some(i) = breaks.iter().position(|&b| b == h)
+        {
+            let h = breaks.remove(i);
+            breaks.insert(0, h);
+        }
         self.try_breaks(pieces, from, g, l, w, breaks, blind);
     }
 
@@ -1228,6 +1288,26 @@ impl<'c, S: Seams> Ctx<'c, S> {
         let first = cands.first().copied();
         // The listing never holds the unit at `end` (no seam), nor does the anchored start.
         cands.extend(listed.into_iter().filter(|&g2| Some(g2) != first));
+        // The file system's next piece first, when free (D14): listed, or a free unit start past the cap.
+        if let Some(h) = space.hint_next(end, b) {
+            match cands.iter().position(|&g2| g2 == h) {
+                Some(i) => {
+                    cands.remove(i);
+                    cands.insert(0, h);
+                }
+                None if h != end
+                    && space.is_unit_start(h)
+                    && !self
+                        .excluded
+                        .iter()
+                        .any(|x| x.start <= h && h < x.start + x.len)
+                    && space.free_run(h, pieces, &self.own_at(h, b), 1) > 0 =>
+                {
+                    cands.insert(0, h)
+                }
+                None => {}
+            }
+        }
         let mut evident = Vec::new();
         let mut blinds = Vec::new();
         for g2 in cands {
@@ -1371,8 +1451,39 @@ pub(crate) fn search<S: Seams>(
             proof: Proof::Unproven,
         })
     };
+    // D14: the file system's pieces, in two or more, are a placement of their own: unless the content refutes them, a
+    // solution elsewhere is not the only one (a blind stretch, such as a RAW's sensor data, never refutes anything).
+    let mut found = found;
+    if let Some(f) = found.as_mut()
+        && f.complete
+        && f.unique
+        && space.hint.len() >= 2
+        && merged(&space.hint) != f.pieces
+        && !hint_refuted(seams, &counted, &space.hint)
+    {
+        f.unique = false;
+    }
     budget.charge(tries, counted.read());
     found
+}
+
+/// Whether the content of the file walked over the pieces `hint` (from its start, every seam of them in place) stops
+/// fitting before their end; an undecided walk refutes nothing.
+fn hint_refuted<S: Seams>(seams: &mut S, source: &dyn Source, hint: &[Fragment]) -> bool {
+    let total: u64 = hint.iter().map(|p| p.len).sum();
+    let cuts: Vec<u64> = hint[..hint.len() - 1]
+        .iter()
+        .scan(0u64, |end, p| {
+            *end += p.len;
+            Some(*end)
+        })
+        .collect();
+    let view = Fragmented::new(source, hint.to_vec());
+    let begin = seams.begin();
+    match seams.walk(&view, &cuts, &begin, total).end {
+        WalkEnd::Broken { at } => at < total,
+        WalkEnd::Complete { .. } | WalkEnd::Stopped => false,
+    }
 }
 
 /// Whether a finding the scan emits is a reassembly candidate (D2): never one of a live file (its chain says where it
@@ -1444,7 +1555,8 @@ pub(crate) struct Checks {
     /// A JPEG with restart markers (DRI > 0): at most `Partial` in 2 or more pieces (Q16).
     pub restarts: bool,
     /// The pieces were placed by their content alone, no file system proving where they lie (every result of
-    /// [`search`] so far; a JPEG in 2 or more pieces is then at most `Partial`, ruling Q37).
+    /// [`search`]: an old exFAT chain proves its placement in the scan's merge instead, D14; a JPEG in 2 or more pieces
+    /// is then at most `Partial`, ruling Q37).
     pub content_only: bool,
 }
 
@@ -1491,6 +1603,52 @@ pub(crate) fn improves(old: &Finding, new: &Finding, complete: bool) -> bool {
             && new.health == Health::Partial
             && complete
             && new.len > old.len)
+}
+
+/// Every content check the format has over the view of a whole file (D14): a JPEG decodes strictly; a video: its index
+/// `Intact` and every checkable sample passes in place, whatever its layout; a TIFF RAW: its structure, its previews
+/// strict, its lossless tiles whole (its sensor seams are not asked for: [`raw::whole_file_checks`]). Any other kind:
+/// `false`. `len` is the file's measured length in the view. Bounded by the per-file read budget
+/// ([`Limits::file_read`]): past it, `false`. It runs inside the scan, in the file-system jobs, only for the deleted
+/// files the listing placed `OldChain` (Q18, D20).
+pub(crate) fn content_checks(
+    view: &dyn Source,
+    kind: FileKind,
+    len: u64,
+    cancel: &CancelToken,
+) -> bool {
+    let _scope = CancelScope::enter(cancel);
+    let counted = Counted::new(view);
+    counted.set_limit(Limits::DEFAULT.file_read);
+    let ok = match kind {
+        FileKind::Jpeg => decode_health(&mut Reader::new(&counted), 0, len) == Health::Intact,
+        FileKind::Mp4 | FileKind::Mov => {
+            crate::formats::isobmff::every_sample_fits(&counted, 0, len)
+        }
+        FileKind::Arw
+        | FileKind::Cr2
+        | FileKind::Nef
+        | FileKind::Dng
+        | FileKind::Orf
+        | FileKind::Rw2
+        | FileKind::Tiff => raw::whole_file_checks(&counted),
+        _ => false,
+    };
+    ok && !counted.over() && !cancel.is_cancelled()
+}
+
+/// The pieces the file system gave a finding of a deleted file (its `fragments`, unless the carving placed it): the
+/// reassembly's first hypothesis ([`Space::with_hint`]).
+pub(crate) fn hint_of(f: &Finding) -> Vec<Fragment> {
+    let listed = f
+        .origin
+        .as_ref()
+        .is_some_and(|o| o.state == FsState::Deleted && o.placement != Placement::Carved);
+    if listed && f.fragments.first().is_some_and(|p| p.start == f.start) {
+        f.fragments.clone()
+    } else {
+        Vec::new()
+    }
 }
 
 /// A format whose walk can tell that a placement's bytes are not the file's.
@@ -1646,7 +1804,8 @@ fn reassemble_jpeg(
         taken,
         ctx.starts,
         ctx.limits,
-    );
+    )
+    .with_hint(&hint_of(f));
     let known = f
         .origin
         .as_ref()
@@ -1670,8 +1829,8 @@ fn reassemble_jpeg(
         size_ok: known.is_none_or(|k| k == found.len),
         own_ok: true,
         restarts: seams.restart_interval() > 0,
-        // Every result of the search is placed by content alone: an exFAT chain that proves a placement comes later
-        // (D14).
+        // Every result of the search is placed by content alone: an exFAT chain that proves a placement does so in the
+        // scan's merge (D14), and such a file is no candidate.
         content_only: true,
     };
     // The strict decode is the costliest check: only when nothing else keeps the file from `Intact`.
@@ -1695,7 +1854,8 @@ fn reassemble_jpeg(
             o
         }),
     };
-    improves(f, &new, found.complete).then_some(new)
+    (improves(f, &new, found.complete) || replaces(f, &new, found.complete, source, &mut seams))
+        .then_some(new)
 }
 
 /// The TIFF-based RAW `f` searched (D13); the finding it becomes when that improves it, or when it replaces a placement
@@ -1723,7 +1883,8 @@ fn reassemble_raw(
         taken,
         ctx.starts,
         ctx.limits,
-    );
+    )
+    .with_hint(&hint_of(f));
     let known = f
         .origin
         .as_ref()

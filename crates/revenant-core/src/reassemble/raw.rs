@@ -409,6 +409,22 @@ impl RawSeams {
     }
 }
 
+/// Every content check a TIFF RAW has over `view`, a whole file from its header at 0 (D14, ruling Q46): the structure
+/// read whole ([`RawSeams::own_ok`], the largest preview decoding strictly) and every unit passing in place, walked with
+/// no seam: each IFD table, each embedded JPEG decoding to its `FF D9`, each lossless tile whole with its exact sample
+/// count. Sensor data in no unit (uncompressed, lossy, CR2 slices) is not checked: this is a check of the whole file,
+/// not a proof of any seam.
+pub(crate) fn whole_file_checks(view: &dyn Source) -> bool {
+    let Some(mut seams) = RawSeams::new(view, 0) else {
+        return false;
+    };
+    if !seams.own_ok(view) {
+        return false;
+    }
+    let (w, failed) = seams.run(view, &[], &RawState::at(0), view.len());
+    !failed && matches!(w.end, WalkEnd::Complete { .. })
+}
+
 /// The lossless tiles of `view` worth checking: all of them when the first one's frame is one [`lossless_frame`]
 /// covers (as far as the view holds it), else none (they are blind).
 fn tiles_of<'a>(

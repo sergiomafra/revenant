@@ -153,8 +153,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   block, a preview or anywhere else is placed by its content but never proven. A RAW is intact only when every cut lies
   exactly between two whole lossless blocks that end where the structure says (and whose size is their own data's, not
   padding), and nothing else on the card fits.
+- Deleted photos and videos in pieces on FAT and exFAT cards come back in place, with their name, folder, dates and
+  recorded size (the pieces must add up to it): a camera's delete on FAT, or a computer's on exFAT, leaves only the
+  first cluster and the size, and the rest is found by content; a video is intact when its frames prove every cut, a
+  photo placed by its content alone stays partial. On exFAT a camera's delete keeps the cluster chain: a deleted photo
+  or video comes back intact through it when the chain is whole, nothing else on the card claims or overwrote its
+  clusters, and every check of its contents passes (for a RAW: its structure, preview and lossless blocks, the image
+  data being trusted to the chain); otherwise the chain is the first placement tried.
 
 ### Changed
+
+- A new file-system placement, `old_chain` (`revenant-dev`'s `placement` key): a deleted exFAT file placed and proven by
+  the cluster chain it left. A chain that cannot prove it is reported `guessed`.
+- A deleted RAW whose surviving exFAT chain says it was in pieces is no longer reported intact from the bytes that
+  follow its first piece (its image data cannot be checked): it is partial unless the chain proves it.
 
 - Sessions saved by an earlier version can no longer be resumed: scan the card again.
 - Extraction from a whole card or disk refuses a destination on any volume of that device (also an APFS volume whose

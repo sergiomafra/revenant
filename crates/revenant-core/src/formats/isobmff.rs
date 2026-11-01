@@ -629,8 +629,23 @@ pub(crate) const MAX_BOXES: usize = 1 << 16;
 /// [`MEASURE_STEPS`] steps (every sample a `moof` lists costs one, of any track): `false`. Sample tables that cannot be
 /// listed ([`index_tracks`]) and tracks with no check: nothing to check, `true`.
 fn index_first_samples_fit(r: &mut Reader, start: u64, len: u64, moov: &[u8], w: &Walk) -> bool {
+    samples_fit(r, start, len, moov, w, false, &mut 0)
+}
+
+/// [`index_first_samples_fit`]; with `every`, whatever the layout (a `moov` at the end too), and `checked` counts the
+/// samples checked.
+fn samples_fit(
+    r: &mut Reader,
+    start: u64,
+    len: u64,
+    moov: &[u8],
+    w: &Walk,
+    every: bool,
+    checked: &mut u64,
+) -> bool {
     let mut steps = MEASURE_STEPS;
-    let check = |r: &mut Reader, s: &CheckedSample, steps: &mut u64| {
+    let mut check = |r: &mut Reader, s: &CheckedSample, steps: &mut u64| {
+        *checked += 1;
         s.offset.checked_add(s.size).is_some_and(|e| e <= len)
             && check_sample(
                 &mut |off, buf| {
@@ -681,8 +696,9 @@ fn index_first_samples_fit(r: &mut Reader, start: u64, len: u64, moov: &[u8], w:
         }
         return false;
     }
-    if w.moov
-        .is_none_or(|(at, _)| w.mdat_at.is_none_or(|m| m < at))
+    if !every
+        && w.moov
+            .is_none_or(|(at, _)| w.mdat_at.is_none_or(|m| m < at))
     {
         return true;
     }
@@ -706,6 +722,30 @@ fn index_first_samples_fit(r: &mut Reader, start: u64, len: u64, moov: &[u8], w:
                 )
             })
         })
+}
+
+/// Every content check a video's index allows over the `len` bytes at `start` of `source`, whatever its layout (part
+/// 1.6, D14: the view of an exFAT old chain, whose `moov` lies where the chain puts it): its index `Intact` against
+/// `len` ([`index_health`]) and every checkable sample (or every sample each `moof` lists, the fragments following each
+/// other) passing [`check_sample`] in place, at least one of them checked; bounded by [`MEASURE_STEPS`]. `false` for a
+/// file that is no video with an index (a CR3, a HEIC).
+pub(crate) fn every_sample_fits(source: &dyn Source, start: u64, len: u64) -> bool {
+    let mut r = Reader::new(source);
+    let w = walk_boxes(&mut r, &[], start, false, &[], &mut OwnJpegs::default());
+    if !matches!(w.kind, FileKind::Mp4 | FileKind::Mov) || w.truncated {
+        return false;
+    }
+    let Some((at, moov_len)) = w.moov else {
+        return false;
+    };
+    let Some(moov) = load(&mut r, at, moov_len) else {
+        return false;
+    };
+    if r.bad_in(at, at + moov_len) || index_health(&moov, len, w.has_moof) != Health::Intact {
+        return false;
+    }
+    let mut checked = 0;
+    samples_fit(&mut r, start, len, &moov, &w, true, &mut checked) && checked > 0
 }
 
 /// Canon's top-level `uuid` that holds the `PRVW` preview.

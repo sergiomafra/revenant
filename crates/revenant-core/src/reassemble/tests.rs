@@ -1459,3 +1459,166 @@ fn a_reassembly_improves_only_on_better_health_or_a_longer_complete_file() {
     assert!(!improves(&f(p, 100), &f(p, 200), false));
     assert!(!improves(&f(p, 100), &f(p, 50), true));
 }
+
+/// [`search_on`] with the file system's pieces `hint` as the first hypothesis (D14).
+fn search_hinted(src: &dyn Source, toy: &mut Toy, start: u64, hint: &[Fragment]) -> Search {
+    let taken = Taken::new(&[], &Runs::default());
+    let starts = [start];
+    let limits = Limits::DEFAULT;
+    let space = Space::new(&[GRID], start, src.len(), &taken, &starts, &limits).with_hint(hint);
+    let mut budget = Budget::new(&limits);
+    search(
+        toy,
+        src,
+        &space,
+        start,
+        None,
+        &limits,
+        &mut budget,
+        &CancelToken::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn listing_pieces_are_tried_first() {
+    // As `toy_twin_continuations_are_ambiguous`: a copy of the third run at 6 MiB, the next free after the second run.
+    // With the true runs as the hint, the third piece taken is the true one; the copy still makes it not unique.
+    let mut card = Card::new();
+    let runs = runs_at(&mut card, 40, &FIVE);
+    card.put(6 * MIB, ID, 16..24, 40, 1);
+    card.noise(6 * MIB + units(8), 4);
+    let src = card.mem();
+    let s = search_hinted(&src, &mut toy(40), MIB, &runs);
+    assert!(s.complete);
+    assert!(!s.unique);
+    assert_eq!(s.pieces, runs);
+    // The seam the hint gives is the first break point tried: with units 8 and 9 blind, the first piece's walk breaks
+    // only at unit 10 (noise), and a cut at unit 10 followed by the true run's units 10.. would complete too.
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..8, 40, 1);
+    card.noise(MIB + units(8), 4);
+    let b = card.put(3 * MIB, ID, 8..40, 40, 1);
+    let src = card.mem();
+    let t = || Toy {
+        blind: 8..10,
+        ..toy(40)
+    };
+    let s = search_hinted(&src, &mut t(), MIB, &[a, b]);
+    assert!(s.complete);
+    assert_eq!(s.pieces, [a, b]);
+    let plain = search_hinted(&src, &mut t(), MIB, &[]);
+    assert_ne!(
+        plain.pieces,
+        [a, b],
+        "without the hint the cut at unit 10 comes first"
+    );
+}
+
+#[test]
+fn an_unrefuted_listing_placement_makes_another_solution_not_unique() {
+    // The file whole at 1 MiB, units 16.. blind (a RAW's sensor data): found in one piece, unique, unless the file
+    // system's pieces, elsewhere, are a placement its content cannot refute.
+    let mut card = Card::new();
+    let whole = card.put(MIB, ID, 0..40, 40, 1);
+    card.noise(5 * MIB, 40);
+    let src = card.mem();
+    let t = || Toy {
+        blind: 16..40,
+        ..toy(40)
+    };
+    let alone = search_hinted(&src, &mut t(), MIB, &[]);
+    assert_eq!((alone.pieces.clone(), alone.unique), (vec![whole], true));
+    // The second piece at 5 MiB holds other units where unit 8.. is checked: refuted, the solution stays unique.
+    let refuted = [
+        Fragment {
+            start: MIB,
+            len: units(8),
+        },
+        Fragment {
+            start: 5 * MIB,
+            len: units(32),
+        },
+    ];
+    let s = search_hinted(&src, &mut t(), MIB, &refuted);
+    assert_eq!((s.pieces.clone(), s.unique), (vec![whole], true));
+    // Cut at unit 24, inside the blind units: nothing refutes the file system's placement.
+    let blind = [
+        Fragment {
+            start: MIB,
+            len: units(24),
+        },
+        Fragment {
+            start: 5 * MIB,
+            len: units(16),
+        },
+    ];
+    let s = search_hinted(&src, &mut t(), MIB, &blind);
+    assert_eq!((s.pieces.clone(), s.unique), (vec![whole], false));
+}
+
+/// D14: the whole-file checks of each kind, over a view whose middle may hold other bytes.
+#[test]
+fn content_checks_per_kind() {
+    use revenant_testkit as tk;
+    let cancel = CancelToken::default();
+    let ok = |bytes: &[u8], kind: FileKind| {
+        content_checks(&Mem(bytes.to_vec()), kind, bytes.len() as u64, &cancel)
+    };
+    // `bytes` with `other`'s bytes over `[at, at + 4096)`.
+    let spliced = |bytes: &[u8], other: &[u8], at: usize| {
+        let mut b = bytes.to_vec();
+        b[at..at + 4096].copy_from_slice(&other[at..at + 4096]);
+        b
+    };
+    let j = tk::jpeg_smooth(640, 480, 1);
+    let j2 = tk::jpeg_smooth(640, 480, 2);
+    assert!(ok(&j, FileKind::Jpeg));
+    assert!(!ok(&spliced(&j, &j2, j.len() / 2), FileKind::Jpeg));
+    // A video with its index at the end: every sample checked in place (the scan's measure looks at its index only);
+    // what is checked is the samples' structure (NAL lengths and headers), so small NAL units, many per 4096 bytes.
+    let v = |seed| {
+        tk::avc_video(&tk::AvcOptions {
+            samples: 200,
+            seed,
+            mov: false,
+            mdat_pad: 0,
+            small_nals: true,
+        })
+        .bytes
+    };
+    let (a, b) = (v(1), v(2));
+    assert!(ok(&a, FileKind::Mp4));
+    assert!(!ok(&spliced(&a, &b, a.len() / 2), FileKind::Mp4));
+    // Lossless tiles must decode whole; uncompressed sensor data is not checked.
+    let raw = |compression, seed| {
+        tk::arw(&tk::ArwOptions {
+            compression,
+            seed,
+            ..tk::ArwOptions::default()
+        })
+        .bytes
+    };
+    let (l1, l2) = (
+        raw(tk::ArwCompression::Lossless, 1),
+        raw(tk::ArwCompression::Lossless, 2),
+    );
+    assert!(ok(&l1, FileKind::Arw));
+    let at = l1.len() - 64 * 1024;
+    assert!(!ok(&spliced(&l1, &l2, at), FileKind::Arw));
+    let u1 = raw(tk::ArwCompression::Uncompressed, 1);
+    let u2 = raw(tk::ArwCompression::Uncompressed, 2);
+    assert!(ok(&u1, FileKind::Arw));
+    assert!(ok(&spliced(&u1, &u2, u1.len() - 64 * 1024), FileKind::Arw));
+    // The preview is checked: a foreign middle in it fails.
+    let p = tk::arw(&tk::ArwOptions::default());
+    let preview = p.preview.clone().expect("a preview");
+    let mid = preview.start + preview.len() / 2;
+    let other = raw(tk::ArwCompression::Lossless, 9);
+    assert!(!ok(&spliced(&p.bytes, &other, mid), FileKind::Arw));
+    // No check for the other kinds.
+    assert!(!ok(
+        &tk::raf(50_000, 2, &tk::TestExif::default()),
+        FileKind::Raf
+    ));
+}

@@ -964,7 +964,12 @@ and
   file's bytes). There is no RAW decoder, so uncompressed or lossy raw data is never verified, and a lossless tile that
   passes is evidence, not proof. A known limit (from 1.4): an uncompressed or lossy RAW whose first piece is followed by
   other data with no file start in it is measured `Intact` from those contiguous bytes (only its structure and preview
-  are checked), so it is never a reassembly candidate; only a file system proving its placement can catch it.
+  are checked), so it is never a reassembly candidate; only a file system proving its placement can catch it. Part 1.6
+  narrows it for deleted exFAT files whose FAT chain survives (in two or more runs): the contiguous carving no longer
+  replaces the chain's placement, and the reassembly cannot make a contiguous solution unique against an unrefuted
+  chain (see [Deduplication](#deduplication) and [The reassembly step](#the-reassembly-step)). It still stands for a
+  RAW carved without a file system, and for a deleted FAT (or chain-zeroed exFAT) RAW whose guess, one run of free
+  clusters, is trusted by the 1.4 rule D3.
 - Inside an `Intact` RAW the scan suppresses heads, so its embedded previews are not reported separately. A `Partial`
   RAW hides its own JPEGs too (`Format::own_files`: its previews and JPEG-coded strips/tiles, at most 64; ruling D12):
   a JPEG the scan finds at one of their starts, lying wholly inside the RAW, is not reported. A `Damaged` RAW hides
@@ -1229,10 +1234,18 @@ decode, run only when nothing else stands in the way; a video: its index against
 restart markers in two or more pieces
 (Q16); otherwise `Partial`. A result in one piece is contiguous (`fragments` empty).
 
+A candidate of a deleted file whose file-system pieces (two or more, not a carving's) came with it gets them as its
+**first hypothesis** (part 1.6, D14, `Space::with_hint`): at a seam where the path so far agrees with them, their seam
+is the first break point tried and their next piece the first candidate (when free). And they are a placement of their
+own: a complete solution elsewhere is not unique unless the content refutes them (their walk stops fitting before
+their end); blind data (a RAW's sensor data) refutes nothing, so a RAW found contiguous where its old chain says it was
+in pieces stays `Partial`.
+
 A result replaces the finding only when it **improves** it: a strictly better health, or both `Partial` and the result
-is complete (its walk reached the file's end) and longer; for a video with its index first and for a TIFF RAW, also a
-complete `Partial` result of the same length with other pieces when the old finding's own pieces fail by content
-(Q43). It then comes out as an `Event::Updated` with the same id
+is complete (its walk reached the file's end) and longer; for a JPEG, a video with its index first and a TIFF RAW, also
+a complete `Partial` result of the same length with other pieces when the old finding's own pieces fail by content
+(Q43; a JPEG: its entropy-coded data does not decode through them, an unreadable sector refuting nothing), as a
+deleted file's guess over old data does. It then comes out as an `Event::Updated` with the same id
 (its pieces, length and health; a deleted file keeps its origin, with placement `Carved`, D15), merged with the
 pairing's and the old folders' updates for that id (the reassembly's pieces win over the pairing's). An `Intact` result
 claims its pieces for the candidates after it. A cancel stops the step (the scan returns `cancelled`, no `Updated`);
@@ -1333,8 +1346,9 @@ heads through a `Probe` over the raw source (see Deleted files); `read` uses the
   mov, cr2, cr3, nef nrw, arw, dng, orf ori, rw2, raf, heic heif hif, tif tiff; any case). Each is an `FsFile`:
   - `origin`: `volume` (the volume's index), `folder` (components joined by `/`, from the root, no leading `/`, `""`
     for the root; `None` when dropped, see Bounds; one string shared by the files of a folder), `name`, `state` (`live`,
-    or `deleted`), `placement` (`chain` for a live file, `guessed` for a deleted one; exFAT adds `recorded`; a scan
-    finding's origin may say `carved`, see [Deduplication](#deduplication)), `size` as
+    or `deleted`), `placement` (`chain` for a live file, `guessed` for a deleted one; exFAT adds `recorded` and
+    `old_chain`, see [File systems: exFAT](#file-systems-exfat); a scan finding's origin may say `carved`, see
+    [Deduplication](#deduplication)), `size` as
     recorded, `created` and `modified` as `FsTime` (local time
     `YYYY-MM-DDTHH:MM:SS`, no offset on FAT, exFAT's UTC offset when recorded; `Display` appends `+HH:MM`/`-HH:MM`
     then; `None` when a field is out of range: month, day for that month and year,
@@ -1417,6 +1431,12 @@ the deleted photos/videos wait, never more than the photo slots left (a later li
   ones stepped over, until `need` were taken, the heap ends, `2 × need + 1024` clusters were examined, or 4096 runs.
   Fewer than `need` (short): the pieces hold what was found. Stepping over a cluster, or more than one run, makes the
   file untrusted.
+- **In pieces (part 1.6, G5).** A FAT delete zeroes the chain, so the guess is the only placement the listing gives.
+  The scan measures the guess (and the carving at the first cluster); a photo or video that comes out `Partial`
+  (another file in the way, or pieces elsewhere) is then put back by its content (see [Reassembly](#reassembly)), the
+  entry's size as the known length: the pieces must sum to it. It keeps its name and dates (placement `carved`). A
+  photo placed so, by content alone, in two or more pieces is at most `Partial` (Q37, its exact bytes); a video can be
+  `Intact` (its sample table places every sample, within the video limits).
 - **FAT32 high word (ruling D10, C2, C3).** Windows zeroes a deleted FAT32 entry's high cluster word. On a FAT32
   volume with clusters past `0xFFFF`, a deleted file whose recorded high word is 0 has as candidates `lo` and every
   `h << 16 | lo` (`h ≥ 1`) inside the heap (at most `last >> 16`, ≤ 4096); a candidate counts when it is free today and
@@ -1565,6 +1585,15 @@ and File Name §7.7 entries).
   - FAT-chained: its old FAT chain (exFAT frees clusters in the bitmap only) when it has exactly
     `ceil(DataLength / cluster)` clusters, all free today, the last one's entry end-of-chain (`guessed`, trusted only
     when it is one run); otherwise the FAT rule D4 guess (`guessed`, trusted only when one run and not short);
+  - **an old chain as proof (part 1.6, D14, ruling Q6):** such an old chain in two or more runs is placed `old_chain`
+    when, besides the above, the bitmap is there, ValidDataLength equals DataLength, the listing dropped nothing (an
+    entry it never read could claim the clusters), no other deleted entry of the volume **claims** any of its
+    clusters (a NoFatChain entry its recorded run, a FAT-chained one its first cluster and its own whole old chain, a
+    deleted folder the runs it was read from), and none of them is a contested cluster. All the deleted entries are
+    located first, so every claim is known before one is judged (a sort of the claimed ranges and one binary search
+    per run). Otherwise it stays `guessed`: the chain is only the first hypothesis the reassembly tries. `old_chain` is
+    never trusted by itself: the scan decides (see [Deduplication](#deduplication)). Typical case: a camera's delete,
+    which keeps the FAT; a computer that zeroes the chain leaves the guess and the reassembly;
   - a first cluster outside the heap or in use today: not listed (overwritten);
   - ValidDataLength short of (or past) DataLength: not trusted.
 
@@ -1582,7 +1611,10 @@ directory instead of 2 MiB. The work is linear in what is read: each cluster is 
 counted 64 clusters at a time, and every deleted placement is paid from the step budget.
 
 Memory (on top of FAT's figures, which hold for the listing itself). The bitmap: one bit per cluster, ≤ 32 MiB at 2^28
-clusters, freed with the walk. A directory is read 128 KiB at a time and parsed entry by entry, holding one entry set
+clusters, freed with the walk. While the deleted photos/videos are placed (D14): each one's runs (8 B per run, at most
+4096 runs each, paid from the step budget like the clusters they hold) and the claimed ranges, 16 B each plus 16 B of
+prefix maxima (one per entry, one per run of an old chain, one per run of a deleted folder read), freed once they are
+placed. A directory is read 128 KiB at a time and parsed entry by entry, holding one entry set
 (≤ 608 B) besides the chunk, so a 256 MiB directory never sits in memory. The root's entries waiting for its bitmap
 entry (formatters write it first, so normally none) take 64 B each plus the name: at most 262,144 photos/videos
 (16 MiB; their names are the ones the listing keeps, not extra) and 65,536 directories (4 MiB plus names of
@@ -2049,11 +2081,27 @@ merge (rulings D3, D5, D6), from the measurement through the view of the file's 
 2. The health is at most `Partial` when the placement is not trusted (`FsFile::trusted`, ruling D3: a live chain that
    is incomplete, loops or crosses another, a deleted file not in one run of free clusters), when the tail is not
    coherent (D6, below) or when the view measurement is itself in pieces (a join inside the file's own pieces).
+   Exception (part 1.6, D14): a deleted file the listing placed `old_chain` keeps an `Intact` view, untrusted as it is,
+   when every content check its format has passes over the view (a JPEG: the strict decode; a video: its index
+   `Intact` and every checkable sample in place, whatever its layout, at least one checked; a TIFF RAW: its structure,
+   its largest preview strict, every IFD, embedded JPEG and lossless tile whole), its tail is coherent and its pieces
+   sum to the entry's size. The view's measure also stands for "no other file starts inside": every format ends a file
+   at a sector start where another header is recognized and confirmed (its own embedded files aside). These checks run
+   in the file's job (the measuring threads), only for `old_chain` files, read the view once more and are bounded by
+   512 MiB of reads per file (past it: no proof). An `old_chain` file that does not pass them comes out `guessed`
+   (`Partial`): its chain was a hypothesis, and the reassembly tries it first. When it is emitted, an `old_chain` file
+   that shares a byte with another `Intact` finding (one wholly inside its pieces aside: that is its own embedded file)
+   is lowered to `Partial` and `guessed` too: a file written over part of the chain, whose entry was lost, still comes
+   out `Intact` over those bytes. So `old_chain` in a finding always means a placement the chain and the content proved
+   together; uncompressed or lossy sensor data is then trusted to the chain, as a live chain's is.
 3. The pieces are the file system's: `len` their sum, `fragments` them when there are two or more.
 4. A deleted file takes the carving at its start instead (its length, kind, health and pieces; `placement` `carved`)
    when the carving is of the same kind, strictly healthier (`Intact` > `Partial` > `Damaged`) and exactly the
    recorded size (D5): the guess was wrong and the signature found the file. A live file never does: its chain is
-   where its bytes are. A carving of another length (a join to the tail of another photo of a burst) is not used.
+   where its bytes are. A carving of another length (a join to the tail of another photo of a burst) is not used, nor
+   (part 1.6) a carving in one piece when the file system placed the file in two or more (an old exFAT chain, a guess
+   around clusters in use): that is another placement, not a better one, and a RAW's sensor data measured contiguously
+   checks nothing (the reassembly decides between them).
 
 The tail (D6): the structure measured over the view ends at `L`, and the view (the recorded size, as far as the clusters
 and the source hold it) has `S` bytes. `L == S` is coherent. Otherwise, at most 8 times: the bytes `[L, S)` are all

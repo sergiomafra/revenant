@@ -1,6 +1,8 @@
 //! The scan with the file systems: `Volume` events, findings with their origin, one finding per file (the merge of the
 //! file system's placement with the carving, rulings D3, D5, D6, D7).
 
+mod support;
+
 use std::io::Write;
 
 use revenant_core::filesystem::FsKind;
@@ -12,9 +14,10 @@ use revenant_core::{
 };
 use revenant_testkit::fs::{DeleteStyle, FsBuilder, FsType, Partitioning, disk};
 use revenant_testkit::{
-    AvcOptions, AvcVideo, Mp4Options, TestExif, TiffRaw, TiffRawOptions, TiffVariant, avc_video,
-    jpeg, jpeg_smooth, mp4, tiff_raw,
+    ArwCompression, ArwOptions, AvcOptions, AvcVideo, Mp4Options, TestExif, TiffRaw,
+    TiffRawOptions, TiffVariant, arw, avc_video, jpeg, jpeg_smooth, mp4, tiff_raw,
 };
+use support::{SimSource, final_view};
 
 const MIB: usize = 1 << 20;
 /// Where every test volume starts (MBR entry at LBA 8192).
@@ -1197,4 +1200,504 @@ fn carving_at_a_skipped_start_is_not_merged() {
         (FsState::Deleted, Placement::Guessed),
         "{f:?}"
     );
+}
+
+// ---- Deleted files in pieces (part 1.6): put back by their content, or placed by a surviving exFAT chain (D14) ----
+
+/// FAT32 with 4 KiB clusters (the smallest FAT32 volume of that cluster size: a cluster grid, ruling D13 of 1.4).
+fn fat32_4k() -> FsBuilder {
+    FsBuilder::new(FsType::Fat32, 260 * MIB as u64, 4096)
+}
+
+/// exFAT, 64 MiB, `cluster`-byte clusters.
+fn exfat(cluster: u32) -> FsBuilder {
+    FsBuilder::new(FsType::Exfat, 64 * MIB as u64, cluster)
+}
+
+/// Clusters needed by `len` bytes.
+fn clusters_in(len: usize, cluster: u64) -> u32 {
+    (len as u64).div_ceil(cluster) as u32
+}
+
+/// The `n` clusters of a file in runs starting at `firsts`, of `n / firsts.len()` clusters each (the last one the rest).
+fn split(firsts: &[u32], n: u32) -> Vec<u32> {
+    let k = firsts.len() as u32;
+    let each = n / k;
+    assert!(each >= 1, "{n} clusters in {k} runs");
+    firsts
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &f)| {
+            let count = if i as u32 + 1 == k {
+                n - each * (k - 1)
+            } else {
+                each
+            };
+            f..f + count
+        })
+        .collect()
+}
+
+/// Seeded noise (old data) over every cluster of `range` of volume `v` but `keep`.
+fn old_data(b: &FsBuilder, v: &mut [u8], range: std::ops::Range<u32>, keep: &[u32], cluster: u64) {
+    let keep: std::collections::HashSet<u32> = keep.iter().copied().collect();
+    let noise = support::cards::noise(cluster * u64::from(range.end - range.start), 0x01D);
+    for (k, c) in range.enumerate() {
+        if keep.contains(&c) {
+            continue;
+        }
+        let at = b.cluster_offset(c) as usize;
+        let from = k * cluster as usize;
+        v[at..at + cluster as usize].copy_from_slice(&noise[from..from + cluster as usize]);
+    }
+}
+
+/// Volume `v` on its disk (LBA 8192), as a source, and the events of its scan.
+fn scanned(v: &[u8]) -> (SimSource, Vec<Event>) {
+    let len = v.len() + 8 * MIB;
+    let src = SimSource::new(disk(Partitioning::Mbr { first_lba: 8192 }, v, len));
+    let (r, events) = run_on(&src, &ScanOptions::default());
+    r.unwrap();
+    (src, events)
+}
+
+/// The final finding (its `Found`, or the `Updated` that replaced it) of the file named `path`.
+fn final_named(events: &[Event], path: &str) -> Finding {
+    let view = final_view(events);
+    let hits: Vec<&Finding> = view
+        .values()
+        .filter(|f| f.origin.as_ref().is_some_and(|o| o.path() == path))
+        .collect();
+    assert_eq!(hits.len(), 1, "{path}: {view:#?}");
+    hits[0].clone()
+}
+
+/// The bytes of `f`, extracted through the public API.
+fn extracted(src: &dyn Source, f: &Finding) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = revenant_core::extract(src, f, dir.path()).unwrap();
+    std::fs::read(path).unwrap()
+}
+
+/// `got == want`, reporting only where they first differ.
+fn same(got: &[u8], want: &[u8]) {
+    let first = got.iter().zip(want).position(|(x, y)| x != y);
+    assert!(
+        got.len() == want.len() && first.is_none(),
+        "lengths {} and {}, first difference at {first:?}",
+        got.len(),
+        want.len()
+    );
+}
+
+/// The exFAT SetChecksum of `set` (bytes 2–3 of the primary skipped, each type byte's InUse bit set first).
+fn exfat_set_checksum(set: &[[u8; 32]]) -> u16 {
+    let mut sum = 0u16;
+    for (k, e) in set.iter().enumerate() {
+        for (i, &byte) in e.iter().enumerate() {
+            if k == 0 && (i == 2 || i == 3) {
+                continue;
+            }
+            let byte = if i == 0 { byte | 0x80 } else { byte };
+            sum = sum.rotate_right(1).wrapping_add(byte as u16);
+        }
+    }
+    sum
+}
+
+/// Applies `f` to the entries of the exFAT set of `name` (ASCII) in the first cluster of `dir` of volume `v`, then
+/// recomputes its checksum (its InUse bits kept).
+fn patch_exfat_set(
+    v: &mut [u8],
+    b: &FsBuilder,
+    dir: &str,
+    name: &str,
+    f: impl FnOnce(&mut [[u8; 32]]),
+) {
+    let at = b.cluster_offset(b.clusters(dir)[0]) as usize;
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let mut k = at;
+    loop {
+        let e = &v[k..k + 96];
+        let named = e[0] & 0x7F == 0x05
+            && e[32] & 0x7F == 0x40
+            && e[35] as usize == units.len()
+            && (0..units.len().min(15))
+                .all(|i| u16::from_le_bytes([e[66 + 2 * i], e[67 + 2 * i]]) == units[i]);
+        if named {
+            let n = v[k + 1] as usize + 1;
+            let mut set: Vec<[u8; 32]> = (0..n)
+                .map(|i| v[k + 32 * i..k + 32 * i + 32].try_into().unwrap())
+                .collect();
+            f(&mut set);
+            let sum = exfat_set_checksum(&set);
+            set[0][2..4].copy_from_slice(&sum.to_le_bytes());
+            for (i, e) in set.iter().enumerate() {
+                v[k + 32 * i..k + 32 * i + 32].copy_from_slice(e);
+            }
+            return;
+        }
+        k += 32;
+        assert!(k < at + 64 * 1024, "no set {name} in {dir:?}");
+    }
+}
+
+fn uncompressed_arw() -> TiffRaw {
+    arw(&ArwOptions {
+        compression: ArwCompression::Uncompressed,
+        ..ArwOptions::default()
+    })
+}
+
+/// What the tests below look at in the final finding of a deleted file.
+fn deleted_as(f: &Finding) -> (FsState, Placement, u64) {
+    let o = f.origin.as_ref().expect("an origin");
+    (o.state, o.placement, o.size)
+}
+
+#[test]
+fn deleted_fragmented_fat32_jpeg_is_reassembled() {
+    // A 2048×1536 photo in 4 runs, deleted by a camera (FAT32 zeroes the chain): the file system only gives the first
+    // cluster and the size, its guess runs over old data. The content puts the 4 pieces back: Partial (placed by content
+    // alone, ruling Q37) with its exact bytes, its name and its size.
+    let cl = 4096u64;
+    let j = jpeg_smooth(2048, 1536, 41);
+    let n = clusters_in(j.len(), cl);
+    let clusters = split(&[3000, 5000, 7000, 9000], n);
+    let mut b = fat32_4k();
+    sibling(&mut b);
+    let path = format!("{DIR}/DSC00041.JPG");
+    b.add_at(&path, &j, &clusters);
+    let pieces = pieces_of(&b, &clusters, j.len() as u64, cl);
+    assert_eq!(pieces.len(), 4);
+    b.delete(&path, DeleteStyle::Camera);
+    let mut v = b.build();
+    old_data(&b, &mut v, 2900..11000, &clusters, cl);
+    let (src, ev) = scanned(&v);
+    let f = final_named(&ev, &path);
+    assert_eq!(f.fragments, pieces, "{f:#?}");
+    assert_eq!(
+        (f.kind, f.health, f.len),
+        (FileKind::Jpeg, Health::Partial, j.len() as u64)
+    );
+    assert_eq!(
+        deleted_as(&f),
+        (FsState::Deleted, Placement::Carved, j.len() as u64)
+    );
+    same(&extracted(&src, &f), &j);
+}
+
+#[test]
+fn fat32_windows_delete_fragmented_video_is_intact() {
+    // A video in 5 runs, the first one past cluster 65535, deleted by Windows (the high word of the first cluster zeroed,
+    // ruling D10 of 1.4, and the chain zeroed): its sample table places every sample, so the content proves each seam.
+    let cl = 4096u64;
+    let video = avc_video(&AvcOptions {
+        samples: 300,
+        seed: 1,
+        mov: false,
+        mdat_pad: 0,
+        small_nals: true,
+    });
+    let n = clusters_in(video.bytes.len(), cl);
+    let clusters = split(&[65_600, 3000, 4000, 5000, 6000], n);
+    let mut b = fat32_4k();
+    sibling(&mut b);
+    let path = format!("{DIR}/DSC00053.MP4");
+    b.add_at(&path, &video.bytes, &clusters);
+    let pieces = pieces_of(&b, &clusters, video.bytes.len() as u64, cl);
+    assert_eq!(pieces.len(), 5);
+    b.delete(&path, DeleteStyle::WindowsFat32);
+    let mut v = b.build();
+    old_data(&b, &mut v, 2900..7000, &clusters, cl);
+    old_data(&b, &mut v, 65_500..65_800, &clusters, cl);
+    let (src, ev) = scanned(&v);
+    let f = final_named(&ev, &path);
+    assert_eq!(f.fragments, pieces, "{f:#?}");
+    assert_eq!(
+        (f.kind, f.health, f.len),
+        (FileKind::Mp4, Health::Intact, video.bytes.len() as u64)
+    );
+    assert_eq!(
+        deleted_as(&f),
+        (
+            FsState::Deleted,
+            Placement::Carved,
+            video.bytes.len() as u64
+        )
+    );
+    same(&extracted(&src, &f), &video.bytes);
+}
+
+/// A 2048×1536 photo of `seed` in 3 runs (clusters 300, 700, 500 on) of exFAT card `b`, the clusters around them old
+/// data; returns the photo, its clusters and its pieces.
+fn photo_in_three(b: &mut FsBuilder, path: &str, seed: u64) -> (Vec<u8>, Vec<u32>, Vec<Fragment>) {
+    let cl = 32 * 1024;
+    let j = jpeg_smooth(2048, 1536, seed);
+    let n = clusters_in(j.len(), cl);
+    let clusters = split(&[300, 700, 500], n);
+    b.add_at(path, &j, &clusters);
+    let pieces = pieces_of(b, &clusters, j.len() as u64, cl);
+    assert_eq!(pieces.len(), 3);
+    (j, clusters, pieces)
+}
+
+#[test]
+fn exfat_computer_delete_zeroed_chain_is_reassembled() {
+    // A computer clears the chain (ZeroChain): the entry keeps the name and size, only the content can place the pieces:
+    // Partial with the exact pieces and bytes (Q37).
+    let mut b = exfat(32 * 1024);
+    let path = "DCIM/100MSDCF/DSC00043.JPG";
+    let (j, clusters, pieces) = photo_in_three(&mut b, path, 43);
+    b.delete(path, DeleteStyle::ZeroChain);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1200, &clusters, 32 * 1024);
+    let (src, ev) = scanned(&v);
+    let f = final_named(&ev, path);
+    assert_eq!(f.fragments, pieces, "{f:#?}");
+    assert_eq!(
+        (f.kind, f.health, f.len),
+        (FileKind::Jpeg, Health::Partial, j.len() as u64)
+    );
+    assert_eq!(
+        deleted_as(&f),
+        (FsState::Deleted, Placement::Carved, j.len() as u64)
+    );
+    same(&extracted(&src, &f), &j);
+}
+
+#[test]
+fn deleted_exfat_old_chain_is_proof_when_every_check_passes() {
+    // A camera's delete on exFAT keeps the FAT chain (only the bitmap frees the clusters): the chain has 3 runs, every
+    // cluster free, the size fits, no other entry claims a cluster, no other file starts inside, the photo decodes
+    // strictly and its tail is coherent: Intact, placed by its old chain.
+    let mut b = exfat(32 * 1024);
+    let path = "DCIM/100MSDCF/DSC00044.JPG";
+    let (j, clusters, pieces) = photo_in_three(&mut b, path, 44);
+    b.delete(path, DeleteStyle::Camera);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1200, &clusters, 32 * 1024);
+    let (src, ev) = scanned(&v);
+    let f = final_named(&ev, path);
+    assert_eq!(f.fragments, pieces, "{f:#?}");
+    assert_eq!(
+        (f.kind, f.health, f.len),
+        (FileKind::Jpeg, Health::Intact, j.len() as u64)
+    );
+    assert_eq!(
+        deleted_as(&f),
+        (FsState::Deleted, Placement::OldChain, j.len() as u64)
+    );
+    same(&extracted(&src, &f), &j);
+}
+
+/// An uncompressed ARW in 3 runs (clusters 300, 600, 900 on) of exFAT card `b` (32 KiB clusters); its clusters and
+/// pieces.
+fn arw_in_three(b: &mut FsBuilder, path: &str, a: &TiffRaw) -> (Vec<u32>, Vec<Fragment>) {
+    let cl = 32 * 1024;
+    let n = clusters_in(a.bytes.len(), cl);
+    let clusters = split(&[300, 600, 900], n);
+    assert!(n / 3 < 290, "{n} clusters");
+    b.add_at(path, &a.bytes, &clusters);
+    let pieces = pieces_of(b, &clusters, a.bytes.len() as u64, cl);
+    assert_eq!(pieces.len(), 3);
+    (clusters, pieces)
+}
+
+#[test]
+fn old_chain_of_an_uncompressed_arw_is_proof_with_structure_and_preview() {
+    // Uncompressed sensor data proves nothing by content, but the chain does (D14): the TIFF structure and the preview
+    // check, nothing else claims or starts inside the clusters.
+    let a = uncompressed_arw();
+    let mut b = exfat(32 * 1024);
+    let path = "DCIM/100MSDCF/DSC00045.ARW";
+    let (clusters, pieces) = arw_in_three(&mut b, path, &a);
+    b.delete(path, DeleteStyle::Camera);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1300, &clusters, 32 * 1024);
+    let (src, ev) = scanned(&v);
+    let f = final_named(&ev, path);
+    assert_eq!(f.fragments, pieces, "{f:#?}");
+    assert_eq!(
+        (f.kind, f.health, f.len),
+        (FileKind::Arw, Health::Intact, a.bytes.len() as u64)
+    );
+    assert_eq!(
+        deleted_as(&f),
+        (FsState::Deleted, Placement::OldChain, a.bytes.len() as u64)
+    );
+    same(&extracted(&src, &f), &a.bytes);
+}
+
+#[test]
+fn old_chain_reused_by_a_later_file_is_not_proof() {
+    // A (an uncompressed ARW, FAT-chained in 3 runs) deleted by a camera; then B written contiguous (NoFatChain) from the
+    // free cluster before A's second run over its first clusters, and deleted too. A's chain still reads whole in the
+    // FAT, and nothing checks A's sensor bytes: only B's recorded run, which claims those clusters, tells the chain is no
+    // proof. A is not Intact with B's bytes (its true clusters are gone: Partial); B is Intact by its own run.
+    let a = uncompressed_arw();
+    let mut b = exfat(32 * 1024);
+    let pa = "DCIM/100MSDCF/DSC00046.ARW";
+    let (clusters, _) = arw_in_three(&mut b, pa, &a);
+    b.delete(pa, DeleteStyle::Camera);
+    let later = jpeg(320, 240, 47, 100_000);
+    let m = clusters_in(later.len(), 32 * 1024);
+    assert!(m >= 3);
+    let bc: Vec<u32> = (599..599 + m).collect();
+    let pb = "DCIM/100MSDCF/DSC00047.JPG";
+    b.add_at(pb, &later, &bc);
+    b.delete(pb, DeleteStyle::Camera);
+    let mut keep = clusters.clone();
+    keep.extend(&bc);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1300, &keep, 32 * 1024);
+    let (_, ev) = scanned(&v);
+    let fa = final_named(&ev, pa);
+    assert_ne!(fa.health, Health::Intact, "{fa:#?}");
+    assert_ne!(deleted_as(&fa).1, Placement::OldChain, "{fa:#?}");
+    let fb = final_named(&ev, pb);
+    assert_eq!(fb.health, Health::Intact, "{fb:#?}");
+    assert_eq!(
+        deleted_as(&fb),
+        (FsState::Deleted, Placement::Recorded, later.len() as u64)
+    );
+}
+
+#[test]
+fn size_mismatch_is_never_intact() {
+    // The entry's size 4096 bytes larger than the photo. With 4 KiB clusters the chain is then one cluster short of the
+    // size: no old chain, a guess.
+    let mut b = exfat(4096);
+    let path = "DCIM/100MSDCF/DSC00048.JPG";
+    let j = jpeg_smooth(2048, 1536, 48);
+    let n = clusters_in(j.len(), 4096);
+    let clusters = split(&[3000, 6000, 4500], n);
+    b.add_at(path, &j, &clusters);
+    b.delete(path, DeleteStyle::Camera);
+    let mut v = b.build();
+    let size = j.len() as u64 + 4096;
+    let grow = |s: &mut [[u8; 32]]| {
+        s[1][8..16].copy_from_slice(&size.to_le_bytes());
+        s[1][24..32].copy_from_slice(&size.to_le_bytes());
+    };
+    patch_exfat_set(&mut v, &b, "DCIM/100MSDCF", "DSC00048.JPG", grow);
+    old_data(&b, &mut v, 2900..8000, &clusters, 4096);
+    let (_, ev) = scanned(&v);
+    let f = final_named(&ev, path);
+    assert_ne!(f.health, Health::Intact, "{f:#?}");
+    assert_ne!(deleted_as(&f).1, Placement::OldChain, "{f:#?}");
+    // With 32 KiB clusters the 4096 bytes fit in the last cluster: the chain fits the size, but those bytes are old
+    // data, neither padding nor whole files (ruling D6).
+    let mut b = exfat(32 * 1024);
+    let path = "DCIM/100MSDCF/DSC00049.JPG";
+    let (j, clusters, _) = (49..)
+        .map(|seed| {
+            let mut t = exfat(32 * 1024);
+            photo_in_three(&mut t, "X.JPG", seed)
+        })
+        .find(|(j, ..)| j.len() % (32 * 1024) + 4096 <= 32 * 1024)
+        .unwrap();
+    b.add_at(path, &j, &clusters);
+    b.delete(path, DeleteStyle::Camera);
+    let mut v = b.build();
+    let size = j.len() as u64 + 4096;
+    let grow = |s: &mut [[u8; 32]]| {
+        s[1][8..16].copy_from_slice(&size.to_le_bytes());
+        s[1][24..32].copy_from_slice(&size.to_le_bytes());
+    };
+    patch_exfat_set(&mut v, &b, "DCIM/100MSDCF", "DSC00049.JPG", grow);
+    old_data(&b, &mut v, 64..1200, &clusters, 32 * 1024);
+    let last = *clusters.last().unwrap();
+    let tail = b.cluster_offset(last) as usize + j.len() % (32 * 1024);
+    v[tail..tail + 4096].copy_from_slice(&support::cards::noise(4096, 0x7A11));
+    let (_, ev) = scanned(&v);
+    let f = final_named(&ev, path);
+    assert_eq!(f.len, size);
+    assert_ne!(f.health, Health::Intact, "{f:#?}");
+}
+
+#[test]
+fn old_chain_without_a_bitmap_or_with_invalid_length_is_not_proof() {
+    // Ruling Q6: no allocation bitmap (every cluster reads free), or ValidDataLength short of the size: the chain is no
+    // proof, and the photo, placed by content alone, is not Intact.
+    for broken in ["bitmap", "valid"] {
+        let mut b = exfat(32 * 1024);
+        let path = "DCIM/100MSDCF/DSC00050.JPG";
+        let (_, clusters, _) = photo_in_three(&mut b, path, 50);
+        b.delete(path, DeleteStyle::Camera);
+        let mut v = b.build();
+        old_data(&b, &mut v, 64..1200, &clusters, 32 * 1024);
+        if broken == "bitmap" {
+            let root = b.cluster_offset(b.clusters("")[0]) as usize;
+            let e = (root..root + 32 * 1024)
+                .step_by(32)
+                .find(|&e| v[e] == 0x81)
+                .expect("the bitmap entry");
+            v[e] = 0x01;
+        } else {
+            patch_exfat_set(&mut v, &b, "DCIM/100MSDCF", "DSC00050.JPG", |s| {
+                let len = u64::from_le_bytes(s[1][24..32].try_into().unwrap());
+                s[1][8..16].copy_from_slice(&(len - 4096).to_le_bytes());
+            });
+        }
+        let (_, ev) = scanned(&v);
+        let f = final_named(&ev, path);
+        assert_ne!(f.health, Health::Intact, "{broken}: {f:#?}");
+        assert_ne!(deleted_as(&f).1, Placement::OldChain, "{broken}: {f:#?}");
+    }
+}
+
+#[test]
+fn old_chain_with_another_findings_start_inside_is_not_proof() {
+    // Ruling Q6: an uncompressed ARW whose second run was overwritten by a later clip whose entry slot was then reused
+    // (no entry claims those clusters): nothing checks the sensor bytes, but the clip's header starts inside the chain.
+    let a = uncompressed_arw();
+    let mut b = exfat(32 * 1024);
+    let path = "DCIM/100MSDCF/DSC00051.ARW";
+    let (clusters, _) = arw_in_three(&mut b, path, &a);
+    b.delete(path, DeleteStyle::Camera);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1300, &clusters, 32 * 1024);
+    let clip = mp4(&Mp4Options {
+        mdat_len: 100_000,
+        moov_at_end: true,
+        mov: false,
+        mdat_64bit: false,
+    });
+    let run2 = b.cluster_offset(600) as usize;
+    v[run2..run2 + clip.len()].copy_from_slice(&clip);
+    let (_, ev) = scanned(&v);
+    let f = final_named(&ev, path);
+    assert_ne!(f.health, Health::Intact, "{f:#?}");
+}
+
+#[test]
+fn old_chain_overlapped_by_an_intact_file_is_not_proof() {
+    // As above, the clip starting in the free cluster before the second run and written over its first clusters: no
+    // header inside the chain, but the clip comes out Intact over those bytes, and two Intact files never share a byte.
+    let a = uncompressed_arw();
+    let mut b = exfat(32 * 1024);
+    let path = "DCIM/100MSDCF/DSC00052.ARW";
+    let (clusters, _) = arw_in_three(&mut b, path, &a);
+    b.delete(path, DeleteStyle::Camera);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1300, &clusters, 32 * 1024);
+    let clip = mp4(&Mp4Options {
+        mdat_len: 100_000,
+        moov_at_end: true,
+        mov: false,
+        mdat_64bit: false,
+    });
+    assert!(clip.len() > 2 * 32 * 1024);
+    let from = b.cluster_offset(599) as usize;
+    v[from..from + clip.len()].copy_from_slice(&clip);
+    let (_, ev) = scanned(&v);
+    let f = final_named(&ev, path);
+    assert_ne!(f.health, Health::Intact, "{f:#?}");
+    let view = final_view(&ev);
+    let c = view
+        .values()
+        .find(|f| f.start == VOL + from as u64)
+        .expect("the clip");
+    assert_eq!((c.kind, c.health), (FileKind::Mp4, Health::Intact));
 }

@@ -445,8 +445,23 @@ impl Commit<'_, '_> {
         Ok(())
     }
 
-    fn emit_found(&mut self, p: Pending) -> Result<(), EngineError> {
+    fn emit_found(&mut self, mut p: Pending) -> Result<(), EngineError> {
         self.summary.found += 1;
+        // D14: a file proven by its old exFAT chain shares no byte with another `Intact` finding (one wholly inside its
+        // pieces is its own file: another file starting there would have kept the chain from proving it). Every finding
+        // starting before its end is known by now.
+        if p.finding.health == Health::Intact
+            && p.finding
+                .origin
+                .as_ref()
+                .is_some_and(|o| o.placement == Placement::OldChain)
+            && self.shares_intact(&p.ranges)
+        {
+            p.finding.health = Health::Partial;
+            if let Some(o) = p.finding.origin.as_mut() {
+                o.placement = Placement::Guessed;
+            }
+        }
         let f = &p.finding;
         if f.origin.is_none()
             && self.grids.iter().any(|&(heap, cluster, end)| {
@@ -490,6 +505,45 @@ impl Commit<'_, '_> {
             }
         }
         self.emit(Event::Found(p.finding))
+    }
+
+    /// Whether a byte of `ranges` (a pending finding's, disjoint) belongs to an `Intact` finding emitted (the claimed
+    /// ranges; any when some were dropped by their cap) or still pending, other than one lying wholly inside `ranges`.
+    fn shares_intact(&self, ranges: &[Fragment]) -> bool {
+        let inside = |s: u64, e: u64| {
+            ranges
+                .iter()
+                .any(|r| r.start <= s && e <= r.start.saturating_add(r.len))
+        };
+        let crossed = |s: u64, e: u64| {
+            ranges
+                .iter()
+                .any(|r| s < r.start.saturating_add(r.len) && r.start < e)
+                && !inside(s, e)
+        };
+        if self.claimed_capped {
+            return true;
+        }
+        for r in ranges {
+            let end = r.start.saturating_add(r.len);
+            let mut pos = r.start;
+            while let Some((s, e)) = self.claimed.first_ending_after(pos) {
+                if s >= end {
+                    break;
+                }
+                if !inside(s, e) {
+                    return true;
+                }
+                pos = e;
+            }
+        }
+        self.pending.iter().any(|q| {
+            q.finding.health == Health::Intact
+                && q.ranges.as_slice() != ranges
+                && q.ranges
+                    .iter()
+                    .any(|x| crossed(x.start, x.start.saturating_add(x.len)))
+        })
     }
 
     /// Keeps the `moov` candidates of a block just examined (each header ends in it, so every finding that could hold

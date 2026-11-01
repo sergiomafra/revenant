@@ -21,7 +21,7 @@ use crate::formats::jpeg_join::{
 use crate::formats::{Health, Reader, SECTOR, cancelled};
 use crate::source::Source;
 
-use super::{Proof, Seams, Search, WalkEnd, Walked};
+use super::{Proof, Refutes, Seams, Search, WalkEnd, Walked};
 
 /// Bytes a walk's readers load at a time while the walk is short (a candidate's foreign data usually fails within a
 /// few bytes of the seam, and every byte asked of the source is charged to the file's read budget), and once it is long.
@@ -773,6 +773,19 @@ fn may_be_data(r: &mut Reader, g: u64) -> bool {
         }
     }
     true
+}
+
+impl Refutes for JpegSeams {
+    /// The entropy-coded data of `view` decoded from its scan: a decode error refutes it, unless an unreadable sector
+    /// lies in the view (its bytes were not seen); an early end of the view refutes nothing.
+    fn refutes(&mut self, view: &dyn Source) -> bool {
+        let mut r = Reader::new(view);
+        let start = self.frame.start(self.scan_start);
+        match jpeg_entropy::decode(&mut r, &self.frame, start, view.len(), false).end {
+            End::Error { .. } => !r.bad_in(0, view.len()),
+            _ => false,
+        }
+    }
 }
 
 impl Seams for JpegSeams {

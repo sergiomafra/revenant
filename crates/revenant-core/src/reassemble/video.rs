@@ -24,7 +24,7 @@ use std::rc::Rc;
 
 use super::{
     Budget, Checks, Counted, Proof, Refutes, Seams, Search, Space, Taken, WalkEnd, Walked, health,
-    improves, replaces, search,
+    hint_of, improves, replaces, search,
 };
 use crate::cache::CachedSource;
 use crate::filesystem::{FsState, Placement};
@@ -1389,6 +1389,7 @@ pub(crate) fn reassemble_video(
     let Some(v) = Video::of(&mut Reader::new(source), f) else {
         return out;
     };
+    let hint = hint_of(f);
     let space = Space::new(
         ctx.grids,
         f.start,
@@ -1396,7 +1397,8 @@ pub(crate) fn reassemble_video(
         taken,
         ctx.starts,
         ctx.limits,
-    );
+    )
+    .with_hint(&hint);
     let known = f
         .origin
         .as_ref()
@@ -1438,9 +1440,9 @@ pub(crate) fn reassemble_video(
             t.claim(&copies.iter().map(|c| c.1).collect::<Vec<_>>());
             t
         });
-        let apart = kept
-            .as_ref()
-            .map(|t| Space::new(ctx.grids, f.start, source.len(), t, ctx.starts, ctx.limits));
+        let apart = kept.as_ref().map(|t| {
+            Space::new(ctx.grids, f.start, source.len(), t, ctx.starts, ctx.limits).with_hint(&hint)
+        });
         let space = apart.as_ref().unwrap_or(&space);
         let mut seams = VideoSeams::new(&v, Rc::clone(&m)).with_unit(space.unit());
         let found = search(
@@ -1570,7 +1572,8 @@ pub(crate) fn reassemble_index_first(
         .as_ref()
         .filter(|o| o.state == FsState::Deleted)
         .map(|o| o.size);
-    let space = Space::new(ctx.grids, f.start, source.len(), taken, ctx.starts, limits);
+    let space = Space::new(ctx.grids, f.start, source.len(), taken, ctx.starts, limits)
+        .with_hint(&hint_of(f));
     let counted = Counted::new(source);
     counted.set_limit(limits.file_read.min(budget.read));
     let (found, own_ok, clean, mut seams): (_, _, _, Box<dyn Refutes>) = if layout.mdat.is_some() {

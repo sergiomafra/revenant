@@ -93,8 +93,8 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   files (some may lack their name, folder or dates); it is the same on every `volume` line and in the summary.
 - A `found` (or `updated`) line for a file the file system lists also carries where it came from: `name`, `path`
   (`folder/name`, root-relative, `/`-separated; the name alone when the folder is unknown), `state` (`live`, `deleted` or
-  `orphaned`), `placement` (`chain`, `recorded`, `guessed` or `carved`: how its clusters were found), `volume` (the
-  `index` of its `volume` line), `fs_size` (the size the directory entry records) and, when the entry has them,
+  `orphaned`), `placement` (`chain`, `recorded`, `guessed`, `old_chain` or `carved`: how its clusters were found),
+  `volume` (the `index` of its `volume` line), `fs_size` (the size the directory entry records) and, when the entry has them,
   `created` and `modified` (`YYYY-MM-DDTHH:MM:SS` as recorded, with `+HH:MM`/`-HH:MM` when the volume stores the UTC
   offset):
 

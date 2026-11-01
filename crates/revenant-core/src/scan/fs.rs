@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use super::pipeline::{self, Measured};
 use crate::filesystem::{FsFile, FsOrigin, FsState, Listing, Placement};
 use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
+use crate::reassemble::content_checks;
 use crate::scan::{CancelToken, HEAD_LEN};
 use crate::source::{Fragmented, Source};
 
@@ -122,6 +123,13 @@ pub(crate) struct ViewMeasure {
     pub tail_ok: bool,
     /// The measured file's own files (ruling D12), absolute (mapped through the pieces).
     pub own: Vec<Fragment>,
+    /// Part 1.6, D14: for a deleted file the listing placed `OldChain` whose view measured `Intact` in one run with a
+    /// coherent tail, every content check of its format passes over the view ([`content_checks`]); `false` for every
+    /// other file. No other file starts inside it (ruling Q6): the view's measure already ends a file at a sector start
+    /// where some format recognizes and confirms another header (the file's own embedded files aside), so an `Intact`
+    /// view has none. The scan's finding starts cannot tell: those after the file are not known yet when it is merged,
+    /// and no head inside an `Intact` finding's pieces is examined.
+    pub checks: bool,
 }
 
 /// What a kept file's job computes: its view measurement and, for a deleted file, the carving at its start.
@@ -245,7 +253,8 @@ pub(crate) fn tail_fits(
     tail_ok(formats, &view, 0, cancel)
 }
 
-/// The detectors over `Fragmented(f.pieces)` at 0, then the D6 tail check.
+/// The detectors over `Fragmented(f.pieces)` at 0, then the D6 tail check; for a deleted file placed `OldChain` whose
+/// view is `Intact` with a coherent tail, the D14 checks too ([`ViewMeasure::checks`]).
 pub(crate) fn measure_view(
     formats: &[Box<dyn Format>],
     source: &dyn Source,
@@ -258,10 +267,19 @@ pub(crate) fn measure_view(
     let tail_ok = m
         .as_ref()
         .is_some_and(|m| tail_ok(formats, &view, m.len, cancel));
+    let old_chain = f.origin.state == FsState::Deleted && f.origin.placement == Placement::OldChain;
+    let checks = old_chain
+        && tail_ok
+        && m.as_ref().is_some_and(|m| {
+            m.health == Health::Intact
+                && m.fragments.is_empty()
+                && content_checks(&view, m.kind, m.len, cancel)
+        });
     ViewMeasure {
         m,
         tail_ok,
         own: absolute(&f.pieces, own),
+        checks,
     }
 }
 
@@ -299,6 +317,7 @@ pub(crate) fn fs_job(
                 m: Some(c.clone()),
                 tail_ok,
                 own: carved_own.clone(),
+                checks: false,
             },
             carved,
             carved_own,
@@ -332,20 +351,31 @@ pub(crate) fn rank(h: Health) -> u8 {
 
 /// The finding of `f` (rulings D3, D5, D6): the view's kind and health (else the extension's kind, `Damaged`), at most
 /// `Partial` when the placement is not trusted, the tail is not coherent or the view measurement joined pieces of its
-/// own; the file system's pieces. A deleted file takes `carved` instead when it is of the same kind, strictly better
-/// and exactly the recorded size (placement `Carved`).
+/// own; the file system's pieces. A deleted file placed `OldChain` (D14) keeps an `Intact` view when its checks pass
+/// ([`ViewMeasure::checks`]), its tail is coherent and its pieces sum to the entry's size; otherwise its old chain was
+/// only a hypothesis (placement `Guessed`). A deleted file takes `carved` instead when it is of the same kind, strictly
+/// better and exactly the recorded size (placement `Carved`), unless the carving is one piece and the file system put
+/// the file in two or more: two placements, neither proven better (the reassembly decides).
 pub(crate) fn merge(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement>) -> Merged {
     let kind = view.m.as_ref().map_or(f.kind, |m| m.kind);
     let mut health = view.m.as_ref().map_or(Health::Damaged, |m| m.health);
     let joined = view.m.as_ref().is_some_and(|m| !m.fragments.is_empty());
-    if (!f.trusted || !view.tail_ok || joined) && health == Health::Intact {
+    let len: u64 = f.pieces.iter().map(|p| p.len).sum();
+    let old_chain = f.origin.state == FsState::Deleted && f.origin.placement == Placement::OldChain;
+    let proven = old_chain && view.checks && view.tail_ok && !joined && len == f.origin.size;
+    if ((!f.trusted && !proven) || !view.tail_ok || joined) && health == Health::Intact {
         health = Health::Partial;
+    }
+    let mut origin = f.origin.clone();
+    if old_chain && !(proven && health == Health::Intact) {
+        origin.placement = Placement::Guessed;
     }
     if f.origin.state == FsState::Deleted
         && let Some(c) = carved
         && c.kind == kind
         && rank(c.health) > rank(health)
         && c.len == f.origin.size
+        && !(c.fragments.is_empty() && f.pieces.len() > 1)
     {
         let mut origin = f.origin.clone();
         origin.placement = Placement::Carved;
@@ -363,11 +393,11 @@ pub(crate) fn merge(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement>
         Vec::new()
     };
     Merged {
-        len: f.pieces.iter().map(|p| p.len).sum(),
+        len,
         kind,
         health,
         fragments,
-        origin: f.origin.clone(),
+        origin,
     }
 }
 
@@ -424,6 +454,7 @@ mod tests {
             m,
             tail_ok,
             own: Vec::new(),
+            checks: false,
         }
     }
 
@@ -516,6 +547,64 @@ mod tests {
 
         assert!(rank(Health::Intact) > rank(Health::Partial));
         assert!(rank(Health::Partial) > rank(Health::Damaged));
+    }
+
+    /// D14: a deleted file placed by its old exFAT chain keeps an `Intact` view only with its checks, a coherent tail
+    /// and its pieces summing to the entry's size; otherwise the chain was a hypothesis (`Guessed`, `Partial`). A
+    /// contiguous carving never replaces a placement in two or more pieces.
+    #[test]
+    fn merge_keeps_intact_for_a_checked_old_chain() {
+        let mut chain = file(FsState::Deleted, false, &[(4096, 600), (65536, 400)]);
+        chain.origin.placement = Placement::OldChain;
+        let checked = |checks, tail_ok| ViewMeasure {
+            checks,
+            ..view(Some(m(1000, Health::Intact)), tail_ok)
+        };
+        let r = merge(&chain, &checked(true, true), None);
+        assert_eq!(
+            (r.health, r.origin.placement, r.fragments.clone()),
+            (Health::Intact, Placement::OldChain, chain.pieces.clone())
+        );
+        for (what, v) in [
+            ("no checks", checked(false, true)),
+            ("tail", checked(true, false)),
+        ] {
+            let r = merge(&chain, &v, None);
+            assert_eq!(
+                (r.health, r.origin.placement),
+                (Health::Partial, Placement::Guessed),
+                "{what}"
+            );
+        }
+        // The pieces short of the entry's size (cut at the source's end).
+        let mut short = chain.clone();
+        short.origin.size = 1500;
+        assert_eq!(
+            merge(&short, &checked(true, true), None).health,
+            Health::Partial
+        );
+        // Another placement never keeps an Intact view through the checks.
+        let mut guessed = chain.clone();
+        guessed.origin.placement = Placement::Guessed;
+        assert_eq!(
+            merge(&guessed, &checked(true, true), None).health,
+            Health::Partial
+        );
+        // A contiguous carving of the size, Intact, is another placement, not a better one; a carving in the same pieces
+        // still is.
+        let carved = m(1000, Health::Intact);
+        let r = merge(&chain, &checked(false, true), Some(&carved));
+        assert_eq!(
+            (r.health, r.origin.placement),
+            (Health::Partial, Placement::Guessed)
+        );
+        let mut same = carved.clone();
+        same.fragments = chain.pieces.clone();
+        let r = merge(&chain, &checked(false, true), Some(&same));
+        assert_eq!(
+            (r.health, r.origin.placement),
+            (Health::Intact, Placement::Carved)
+        );
     }
 
     #[test]
