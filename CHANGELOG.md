@@ -157,9 +157,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   recorded size (the pieces must add up to it): a camera's delete on FAT, or a computer's on exFAT, leaves only the
   first cluster and the size, and the rest is found by content; a video is intact when its frames prove every cut, a
   photo placed by its content alone stays partial. On exFAT a camera's delete keeps the cluster chain: a deleted photo
-  or video comes back intact through it when the chain is whole, nothing else on the card claims or overwrote its
-  clusters, and every check of its contents passes (for a RAW: its structure, preview and lossless blocks, the image
-  data being trusted to the chain); otherwise the chain is the first placement tried.
+  or video comes back intact through it when the chain is whole, nothing on the card shows it was overwritten (no other
+  file's record, of any kind, claims its clusters, and no file found on the card runs into them) and every check of its
+  contents passes; otherwise the chain is the first placement tried. A RAW's uncompressed or lossy image data cannot be
+  checked and is trusted to the chain: data written over it that left no record, no file start and no file found (old
+  noise) is not detected.
 
 ### Changed
 

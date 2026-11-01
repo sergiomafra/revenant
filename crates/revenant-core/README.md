@@ -1587,9 +1587,13 @@ and File Name §7.7 entries).
     when it is one run); otherwise the FAT rule D4 guess (`guessed`, trusted only when one run and not short);
   - **an old chain as proof (part 1.6, D14, ruling Q6):** such an old chain in two or more runs is placed `old_chain`
     when, besides the above, the bitmap is there, ValidDataLength equals DataLength, the listing dropped nothing (an
-    entry it never read could claim the clusters), no other deleted entry of the volume **claims** any of its
-    clusters (a NoFatChain entry its recorded run, a FAT-chained one its first cluster and its own whole old chain, a
-    deleted folder the runs it was read from), and none of them is a contested cluster. All the deleted entries are
+    entry it never read could claim the clusters), no other deleted entry of the volume, **of any kind** (a sidecar
+    `.XML`, a `.THM`, a `.BIN` as much as a photo; ruling Q49), **claims** any of its clusters (a NoFatChain entry its
+    recorded run, a FAT-chained one its first cluster and its own whole old chain, a deleted folder the runs it was read
+    from; a live entry's clusters are claimed by the live walk, so never free), and none of them is a contested
+    cluster. The deleted files of kinds that are not listed keep only (first cluster, size, NoFatChain), 16 B each, at
+    most 2^20 per volume (past it the listing is truncated: no old chain is proof); their old chains are followed from
+    the step budget. All the deleted entries are
     located first, so every claim is known before one is judged (a sort of the claimed ranges and one binary search
     per run). Otherwise it stays `guessed`: the chain is only the first hypothesis the reassembly tries. `old_chain` is
     never trusted by itself: the scan decides (see [Deduplication](#deduplication)). Typical case: a camera's delete,
@@ -2085,15 +2089,20 @@ merge (rulings D3, D5, D6), from the measurement through the view of the file's 
    when every content check its format has passes over the view (a JPEG: the strict decode; a video: its index
    `Intact` and every checkable sample in place, whatever its layout, at least one checked; a TIFF RAW: its structure,
    its largest preview strict, every IFD, embedded JPEG and lossless tile whole), its tail is coherent and its pieces
-   sum to the entry's size. The view's measure also stands for "no other file starts inside": every format ends a file
-   at a sector start where another header is recognized and confirmed (its own embedded files aside). These checks run
+   sum to the entry's size. The view's measure also stands for "no other file starts inside" where it looks: every
+   format ends a file at a sector start where another header is recognized and confirmed (its own embedded files
+   aside); a video's boxes other than `mdat` are not looked at. These checks run
    in the file's job (the measuring threads), only for `old_chain` files, read the view once more and are bounded by
    512 MiB of reads per file (past it: no proof). An `old_chain` file that does not pass them comes out `guessed`
    (`Partial`): its chain was a hypothesis, and the reassembly tries it first. When it is emitted, an `old_chain` file
-   that shares a byte with another `Intact` finding (one wholly inside its pieces aside: that is its own embedded file)
-   is lowered to `Partial` and `guessed` too: a file written over part of the chain, whose entry was lost, still comes
-   out `Intact` over those bytes. So `old_chain` in a finding always means a placement the chain and the content proved
-   together; uncompressed or lossy sensor data is then trusted to the chain, as a live chain's is.
+   that shares a byte with another finding of any health (ruling Q49: an `Intact` one emitted, one emitted without
+   origin on a cluster grid, or one still pending; one wholly inside its pieces aside, that is its own embedded file)
+   is lowered to `Partial` and `guessed` too: a file written over part of the chain from before it, whose entry was
+   lost, is found there, whole or cut. So `old_chain` in a finding always means a placement the chain and the content
+   proved together; uncompressed or lossy sensor data is then trusted to the chain, as a live chain's is. **The limit
+   (D14):** bytes written over such sensor data inside a surviving chain that left no directory record, no file start
+   and no finding (old noise, a file whose start lies off every cluster grid and whose entry is gone) are not detected:
+   the file comes out `Intact`, `old_chain`, with them.
 3. The pieces are the file system's: `len` their sum, `fragments` them when there are two or more.
 4. A deleted file takes the carving at its start instead (its length, kind, health and pieces; `placement` `carved`)
    when the carving is of the same kind, strictly healthier (`Intact` > `Partial` > `Damaged`) and exactly the

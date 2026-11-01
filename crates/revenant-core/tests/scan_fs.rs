@@ -1533,8 +1533,10 @@ fn old_chain_of_an_uncompressed_arw_is_proof_with_structure_and_preview() {
 fn old_chain_reused_by_a_later_file_is_not_proof() {
     // A (an uncompressed ARW, FAT-chained in 3 runs) deleted by a camera; then B written contiguous (NoFatChain) from the
     // free cluster before A's second run over its first clusters, and deleted too. A's chain still reads whole in the
-    // FAT, and nothing checks A's sensor bytes: only B's recorded run, which claims those clusters, tells the chain is no
-    // proof. A is not Intact with B's bytes (its true clusters are gone: Partial); B is Intact by its own run.
+    // FAT, and nothing checks A's sensor bytes: B's recorded run claims those clusters, and B's finding runs into A's
+    // pieces (either keeps the chain from proving A; `old_chain_claimed_by_a_deleted_file_of_another_kind_is_not_proof`
+    // has the claim alone). A is not Intact with B's bytes (its true clusters are gone: Partial); B is Intact by its own
+    // run.
     let a = uncompressed_arw();
     let mut b = exfat(32 * 1024);
     let pa = "DCIM/100MSDCF/DSC00046.ARW";
@@ -1700,4 +1702,58 @@ fn old_chain_overlapped_by_an_intact_file_is_not_proof() {
         .find(|f| f.start == VOL + from as u64)
         .expect("the clip");
     assert_eq!((c.kind, c.health), (FileKind::Mp4, Health::Intact));
+}
+
+#[test]
+fn old_chain_claimed_by_a_deleted_file_of_another_kind_is_not_proof() {
+    // Ruling Q49: every deleted entry claims its clusters, whatever its kind. A camera's sidecar (an .XML, contiguous:
+    // NoFatChain, the FAT untouched, so A's chain still reads whole) written over A's second run, then deleted: its
+    // entry is the only sign that A's sensor bytes there are not A's (it is no finding, starts no header, and nothing
+    // checks sensor data). A is not Intact.
+    let a = uncompressed_arw();
+    let mut b = exfat(32 * 1024);
+    let pa = "DCIM/100MSDCF/DSC00054.ARW";
+    let (clusters, _) = arw_in_three(&mut b, pa, &a);
+    b.delete(pa, DeleteStyle::Camera);
+    let sidecar = support::cards::noise(3 * 32 * 1024 - 100, 0xBEEF);
+    let sc: Vec<u32> = (600..603).collect();
+    let ps = "DCIM/100MSDCF/C0054.XML";
+    b.add_at(ps, &sidecar, &sc);
+    b.delete(ps, DeleteStyle::Camera);
+    let mut keep = clusters.clone();
+    keep.extend(&sc);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1300, &keep, 32 * 1024);
+    let (_, ev) = scanned(&v);
+    let f = final_named(&ev, pa);
+    assert_ne!(f.health, Health::Intact, "{f:#?}");
+    assert_ne!(deleted_as(&f).1, Placement::OldChain, "{f:#?}");
+}
+
+#[test]
+fn old_chain_run_into_by_a_partial_file_is_not_proof() {
+    // Ruling Q49: a photo with no entry, cut short (not Intact), starting in the free cluster before A's second run and
+    // written over its first clusters: no header inside the chain, but a finding whose bytes run into A's pieces.
+    let a = uncompressed_arw();
+    let mut b = exfat(32 * 1024);
+    let pa = "DCIM/100MSDCF/DSC00055.ARW";
+    let (clusters, _) = arw_in_three(&mut b, pa, &a);
+    b.delete(pa, DeleteStyle::Camera);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1300, &clusters, 32 * 1024);
+    let j = jpeg_smooth(1024, 768, 77);
+    let from = b.cluster_offset(599) as usize;
+    let n = (j.len() * 7 / 10).min(3 * 32 * 1024);
+    assert!(n > 32 * 1024);
+    v[from..from + n].copy_from_slice(&j[..n]);
+    let (_, ev) = scanned(&v);
+    let view = final_view(&ev);
+    let c = view
+        .values()
+        .find(|f| f.start == VOL + from as u64)
+        .expect("the cut photo");
+    assert_eq!(c.kind, FileKind::Jpeg);
+    assert_ne!(c.health, Health::Intact);
+    let f = final_named(&ev, pa);
+    assert_ne!(f.health, Health::Intact, "{f:#?}");
 }

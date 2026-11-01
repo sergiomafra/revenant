@@ -447,15 +447,15 @@ impl Commit<'_, '_> {
 
     fn emit_found(&mut self, mut p: Pending) -> Result<(), EngineError> {
         self.summary.found += 1;
-        // D14: a file proven by its old exFAT chain shares no byte with another `Intact` finding (one wholly inside its
-        // pieces is its own file: another file starting there would have kept the chain from proving it). Every finding
-        // starting before its end is known by now.
+        // D14, Q49: a file proven by its old exFAT chain shares no byte with another finding, of any health (one wholly
+        // inside its pieces is its own file: another file starting there would have kept the chain from proving it).
+        // Every finding starting before its end is known by now.
         if p.finding.health == Health::Intact
             && p.finding
                 .origin
                 .as_ref()
                 .is_some_and(|o| o.placement == Placement::OldChain)
-            && self.shares_intact(&p.ranges)
+            && self.shares_bytes(&p.ranges)
         {
             p.finding.health = Health::Partial;
             if let Some(o) = p.finding.origin.as_mut() {
@@ -507,9 +507,12 @@ impl Commit<'_, '_> {
         self.emit(Event::Found(p.finding))
     }
 
-    /// Whether a byte of `ranges` (a pending finding's, disjoint) belongs to an `Intact` finding emitted (the claimed
-    /// ranges; any when some were dropped by their cap) or still pending, other than one lying wholly inside `ranges`.
-    fn shares_intact(&self, ranges: &[Fragment]) -> bool {
+    /// Whether a byte of `ranges` (a pending finding's, disjoint) belongs to another finding of any health (ruling Q49):
+    /// an `Intact` one emitted (the claimed ranges; any when some were dropped by their cap), one emitted without origin
+    /// on a cluster grid (the old-directory list, any when it is full), or one still pending; other than one lying
+    /// wholly inside `ranges` (the file's own embedded file). Not seen: an emitted finding off every cluster grid or of a
+    /// listed file (whose entry is a claim of the listing, D14).
+    fn shares_bytes(&self, ranges: &[Fragment]) -> bool {
         let inside = |s: u64, e: u64| {
             ranges
                 .iter()
@@ -521,7 +524,12 @@ impl Commit<'_, '_> {
                 .any(|r| s < r.start.saturating_add(r.len) && r.start < e)
                 && !inside(s, e)
         };
-        if self.claimed_capped {
+        let crosses = |pieces: &[Fragment]| {
+            pieces
+                .iter()
+                .any(|x| crossed(x.start, x.start.saturating_add(x.len)))
+        };
+        if self.claimed_capped || self.carved.len() >= MAX_FILES {
             return true;
         }
         for r in ranges {
@@ -537,13 +545,19 @@ impl Commit<'_, '_> {
                 pos = e;
             }
         }
-        self.pending.iter().any(|q| {
-            q.finding.health == Health::Intact
-                && q.ranges.as_slice() != ranges
-                && q.ranges
-                    .iter()
-                    .any(|x| crossed(x.start, x.start.saturating_add(x.len)))
-        })
+        let end = ranges
+            .iter()
+            .map(|r| r.start.saturating_add(r.len))
+            .max()
+            .unwrap_or(0);
+        self.carved
+            .iter()
+            .take_while(|c| c.start < end)
+            .any(|c| crosses(&self::ranges(c.start, c.len, &c.fragments)))
+            || self
+                .pending
+                .iter()
+                .any(|q| q.ranges.as_slice() != ranges && crosses(&q.ranges))
     }
 
     /// Keeps the `moov` candidates of a block just examined (each header ends in it, so every finding that could hold

@@ -31,6 +31,8 @@ const MIN_SECONDARY: usize = 2;
 const MAX_SECONDARY: usize = 18;
 /// Deleted placements between two cancel checks.
 const CANCEL_EVERY: usize = 1024;
+/// Deleted files of other kinds whose claims a volume keeps (16 B each, ≤ 16 MiB).
+const MAX_OTHER_CLAIMS: usize = 1 << 20;
 
 /// Lists the files and directories of exFAT volume `v` into `out`, live and deleted.
 ///
@@ -82,6 +84,7 @@ pub(super) fn walk(
         seen: BTreeSet::new(),
         walked: Vec::new(),
         deleted_runs: Vec::new(),
+        other_claims: Vec::new(),
     };
     let root = w.root_chain(root);
     if w.live(root) {
@@ -135,6 +138,8 @@ struct Walk<'a, 'b> {
     walked: Vec<Fragment>,
     /// The runs of the deleted directories read (claims on the clusters, D14).
     deleted_runs: Vec<(u32, u32)>,
+    /// The deleted files of kinds the listing does not list: (first cluster, DataLength, NoFatChain), for their claims.
+    other_claims: Vec<(u32, u64, bool)>,
 }
 
 /// A deleted photo/video waiting to be placed.
@@ -289,9 +294,9 @@ impl<'a> Walk<'a, '_> {
     ///
     /// Part 1.6, D14: a FAT-chained one whose old chain is whole ([`old_chain`]) in more than one run is placed
     /// `OldChain` when the bitmap is there, ValidDataLength equals DataLength, the listing dropped nothing (else an
-    /// unseen entry could claim the clusters) and no other deleted entry claims any of its clusters (its recorded run,
-    /// its own old chain, its first cluster, or a deleted directory read there, ruling Q6); otherwise `Guessed`, the
-    /// chain only a hypothesis. All of them are located first, so every claim is known before one is judged.
+    /// unseen entry could claim the clusters) and no other deleted entry, of any kind, claims any of its clusters (its
+    /// recorded run, its own old chain, its first cluster, or a deleted directory read there, rulings Q6, Q49; a live
+    /// entry's clusters are claimed, so never free); otherwise `Guessed`, the chain only a hypothesis. All of them are located first, so every claim is known before one is judged.
     fn place(&mut self) {
         let later = std::mem::take(&mut self.later);
         let cs = self.v.cluster_size;
@@ -316,7 +321,38 @@ impl<'a> Walk<'a, '_> {
                 }
             }
         }
-        let claims = OldClaims::new(&later, &found, &self.deleted_runs, cs, self.last);
+        // The other deleted files' claims: a recorded run, or a first cluster and its whole old chain (paid from the
+        // step budget like the photos').
+        let mut others = self.deleted_runs.clone();
+        for (k, &(first, len, nofat)) in self.other_claims.iter().enumerate() {
+            if k % CANCEL_EVERY == 0 && self.cancel.is_cancelled() {
+                return;
+            }
+            let last = self.last;
+            if first < 2 || first > last {
+                continue;
+            }
+            let need = len.div_ceil(cs);
+            if nofat {
+                let n = need.min(u64::from(last - first) + 1) as u32;
+                others.push((first, n));
+                continue;
+            }
+            others.push((first, 1));
+            let mut map = Unclaimed {
+                map: &mut self.map,
+                claims: &self.claims,
+            };
+            match old_chain(&mut map, &mut self.steps, first, need, last) {
+                Ok(Some(runs)) => others.extend(runs),
+                Ok(None) => {}
+                Err(()) => {
+                    self.budget.truncated = true;
+                    break;
+                }
+            }
+        }
+        let claims = OldClaims::new(&later, &found, &others, cs, self.last);
         let trust = self.map.bits.is_some();
         for (k, (f, at)) in later.into_iter().zip(found).enumerate() {
             let Some((runs, placement, ok, chain)) = at else {
@@ -667,6 +703,13 @@ impl<'a> Walk<'a, '_> {
             return;
         }
         let Some(kind) = extension(&ch.name).and_then(FileKind::from_extension) else {
+            // A deleted file of another kind is not listed, but its record claims its clusters all the same (D14,
+            // ruling Q49): kept compactly, at most `MAX_OTHER_CLAIMS` (past it no old chain of the volume is proof).
+            if self.other_claims.len() >= MAX_OTHER_CLAIMS {
+                self.budget.truncated = true;
+            } else {
+                self.other_claims.push((ch.first, ch.len, ch.nofat));
+            }
             return;
         };
         // Placed once the live walk is done (ruling R10): never more waiting than photo slots are left.
@@ -707,7 +750,7 @@ type Placed = (Vec<(u32, u32)>, Placement, bool, bool);
 
 /// The clusters each deleted entry of a volume claims (D14, ruling Q6): a NoFatChain entry its recorded run, a
 /// FAT-chained one its first cluster and its whole old chain (when [`old_chain`] found one); the deleted directories
-/// read, their runs. Sorted by start, with, for each prefix, the two farthest ends of distinct owners: whether another
+/// read and the deleted files of other kinds, their runs (`dirs`, owner `usize::MAX`). Sorted by start, with, for each prefix, the two farthest ends of distinct owners: whether another
 /// owner's claim meets a run is one binary search.
 struct OldClaims {
     /// `[start, end)` cluster ranges and their owner (an index in `later`; `usize::MAX` for a directory), by start.
@@ -1213,6 +1256,16 @@ mod tests {
         // F, and a deleted FAT-chained G whose first cluster is F's last (its own chain is not whole: no chain claim).
         b.add_at("DCIM/F.JPG", &data(5, 6), &[700, 701, 702, 800, 801]);
         b.delete("DCIM/F.JPG", DeleteStyle::Camera);
+        // K and L, each with a deleted file of a kind the listing does not list over one of their clusters (ruling Q49):
+        // a contiguous .XML (its recorded run), a FAT-chained .BIN (its own old chain, ending in L's last cluster).
+        b.add_at("DCIM/K.JPG", &data(5, 7), &[850, 851, 852, 880, 881]);
+        b.delete("DCIM/K.JPG", DeleteStyle::Camera);
+        b.add_at("DCIM/K.XML", &data(1, 8), &[880]);
+        b.delete("DCIM/K.XML", DeleteStyle::Camera);
+        b.add_at("DCIM/L.JPG", &data(5, 9), &[900, 901, 902, 950, 951]);
+        b.delete("DCIM/L.JPG", DeleteStyle::Camera);
+        b.add_at("DCIM/L.BIN", &data(2, 10), &[920, 951]);
+        b.delete("DCIM/L.BIN", DeleteStyle::Camera);
         let units: Vec<u16> = "G.JPG".encode_utf16().collect();
         let mut set = [[0u8; 32]; 3];
         set[0][0] = 0x05;
@@ -1261,6 +1314,8 @@ mod tests {
         assert_eq!(placement("E.JPG"), Placement::Recorded);
         assert_eq!(placement("F.JPG"), Placement::Guessed);
         assert_eq!(placement("G.JPG"), Placement::Guessed);
+        assert_eq!(placement("K.JPG"), Placement::Guessed);
+        assert_eq!(placement("L.JPG"), Placement::Guessed);
         // C's pieces are its chain.
         let c = l.files.iter().find(|f| f.origin.name() == "C.JPG").unwrap();
         assert_eq!(c.pieces.len(), 2);
