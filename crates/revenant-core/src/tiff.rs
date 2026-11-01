@@ -79,13 +79,16 @@ pub(crate) struct TiffInfo {
     /// Starts of the `data` ranges that are JPEG-coded and so may begin with FF D8: strips/tiles of an IFD whose
     /// Compression is JPEG-based (6, 7, 34892) and a JPEGInterchangeFormat range clamped to the limit.
     pub jpeg_data_starts: Vec<u64>,
-    /// The `data` ranges of strips/tiles whose IFD is Compression 7 and whose first SOF is SOF3 (lossless JPEG, as in CR2
-    /// raw slices and lossless DNG tiles): the ones a structure check can prove.
+    /// The `data` ranges of strips/tiles whose IFD is Compression 7 and whose first SOF is SOF3 (lossless JPEG, as in
+    /// lossless DNG tiles): the ones a structure check can examine (evidence, not proof). A CR2's raw IFD is Compression 6
+    /// and is not listed here.
     pub lossless: Vec<(u64, u64)>,
     /// Each IFD's entry table (`2 + 12 × count + 4` bytes: count, entries, next pointer), relative to the header.
     pub ifds: Vec<(u64, u64)>,
     /// The `data` ranges that are neither JPEG-coded nor lossless: uncompressed or vendor-compressed (lossy) sensor data,
-    /// which has no structure to check (a seam inside it is blind).
+    /// which has no structure to check (a seam inside it is blind). Data in neither `lossless` nor `sensor` (Compression
+    /// 34892, a JPEG-coded range whose SOF is not SOF3 or was not found, a frame `lossless_frame` rejects) is blind too:
+    /// never provable.
     pub sensor: Vec<(u64, u64)>,
     /// IFD entries processed (test observation of the entry cap).
     #[cfg(test)]

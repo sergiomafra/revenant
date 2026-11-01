@@ -971,9 +971,11 @@ included. `decode_lossless` then walks the difference codes (a Huffman category 
 none), without computing predictions, from a cursor, reading only below the tile's declared end (`TileOffsets` +
 `TileByteCounts`). It returns `Eoi` only when exactly width x height x components samples decode **and** the `FF D9`
 marker ends exactly at the declared end: a Huffman stream resynchronizes, so a count alone can be reached by chance on
-the tail of a neighbouring tile. Restart markers are checked when the frame has a restart interval, a cursor is kept at
+the tail of a neighbouring tile. Padding bits must be 1-bits. Restart markers are checked when the frame has a restart interval, a cursor is kept at
 every row of samples so a walk can resume over other bytes, and every length is checked arithmetic bounded by the
-declared sample count and the limit. The baseline decoder shares only the Huffman table builder and the byte reader, and
+declared sample count and the limit. `Eoi` is **evidence, not proof**: the walk reads no pixels, so a piece of another
+tile of the same frame (same header and table) still passes a few percent of the time (about 1% in the unit tests'
+fixed measurement of spliced tails), and a caller must not take it as proof of identity. The baseline decoder shares only the Huffman table builder and the byte reader, and
 still rejects categories over 11.
 
 ## TIFF reader (internal)
@@ -1002,11 +1004,12 @@ once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 
 `data`. `jpeg_data_starts` lists the `data` ranges that are JPEG-coded (an IFD with Compression 6, 7 or 34892, or a
 JPEGInterchangeFormat range clamped to the limit), the only ones that may begin with FF D8. Three more lists are
 additive (`data` is unchanged): `lossless` holds the `data` ranges of an IFD with Compression 7 whose first strip/tile
-starts with a SOF3 (lossless JPEG: CR2 slices, lossless DNG tiles), the ones the lossless JPEG check
-above can prove; `ifds` holds every visited IFD's entry table (`2 + 12 × count + 4` bytes, relative to the header), the
+starts with a SOF3 (lossless JPEG, as in lossless DNG tiles; a CR2's raw IFD is Compression 6 and is not listed),
+the ones the lossless JPEG check above can examine (evidence, not proof); `ifds` holds every visited IFD's entry table (`2 + 12 × count + 4` bytes, relative to the header), the
 bytes that must be the file's own; `sensor` holds the `data` ranges that are neither JPEG-coded nor lossless
 (uncompressed, or vendor/lossy such as Sony's Compression 32767, and Panasonic's raw data), which have no structure to
-check, so a seam inside them is blind.
+check, so a seam inside them is blind; so is data in neither list (Compression 34892, a JPEG-coded range whose SOF is
+not SOF3, a frame the lossless check rejects): never provable.
 
 Vendor data it reads: in an RW2 (`IIU\0`) IFD0, Panasonic's tags 0x0002/0x0003 (sensor size), 0x000A (bits per sample),
 0x002D (raw format), 0x002E (JpgFromRaw, a lossy JPEG goes to `jpegs`) and 0x0118 (raw data offset; the length is computed

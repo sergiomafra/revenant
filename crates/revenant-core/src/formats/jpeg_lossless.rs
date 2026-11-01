@@ -220,14 +220,15 @@ pub(crate) struct LlCursor {
 }
 
 impl LlCursor {
-    /// The same state, every position minus `by` (for decoding the same bytes through a view that starts `by` later).
-    pub(crate) fn shifted_back(&self, by: u64) -> LlCursor {
+    /// The same state, every position minus `by` (for decoding the same bytes through a view that starts `by` later);
+    /// `None` when the view would start after the cursor.
+    pub(crate) fn shifted_back(&self, by: u64) -> Option<LlCursor> {
         let mut c = self.clone();
-        c.pos -= by;
+        c.pos = c.pos.checked_sub(by)?;
         for p in &mut c.byte_pos {
             *p = p.saturating_sub(by);
         }
-        c
+        Some(c)
     }
 
     /// Position of the byte holding the next unconsumed bit.
@@ -357,10 +358,15 @@ fn difference(c: &mut LlCursor, src: &mut Bytes, t: &Huffman) -> Result<(), Fail
     Ok(())
 }
 
-/// At a boundary that must be followed by a marker: drops the padding bits of the current byte (whole bytes left in the
+/// At a boundary that must be followed by a marker: checks and drops the 1-bit padding of the current byte (whole bytes left in the
 /// buffer are data where there must be none), skips fill bytes and returns the position of the marker's `FF` and its code.
 fn marker_after_padding(c: &mut LlCursor, src: &mut Bytes) -> Result<(u64, u8), Fail> {
-    c.consume(c.nbits % 8);
+    let pad = c.nbits % 8;
+    // The padding of the last byte is 1-bits (T.81 F.1.2.3).
+    if pad > 0 && c.bits >> (64 - pad) != (1 << pad) - 1 {
+        return Err(Fail::Error(c.current_byte()));
+    }
+    c.consume(pad);
     if c.nbits > 0 {
         return Err(Fail::Error(c.current_byte()));
     }
@@ -381,7 +387,12 @@ fn marker_after_padding(c: &mut LlCursor, src: &mut Bytes) -> Result<(u64, u8), 
 /// (TileOffsets + TileByteCounts). The result is `End::Eoi` only when exactly width × height × components samples are
 /// decoded, then padding, optional fill bytes and an `FF D9` that ends exactly at `limit`: Huffman streams
 /// resynchronize, so a sample count alone can be reached by chance on a neighbour's tail. Restart markers are checked
-/// when the frame has a restart interval. A cursor is kept at every row of samples (at most [`RESUME_POINTS`]).
+/// when the frame has a restart interval, and padding bits must be 1-bits. A cursor is kept at every row of samples (at
+/// most [`RESUME_POINTS`]).
+///
+/// `Eoi` is evidence of structure, not proof of identity: the walk reads no pixels, and Huffman codes resynchronize, so
+/// a piece of another tile of the same frame (same header, same table) passes a few percent of the time (under 1% in the
+/// fixed measurement of the unit tests, more for shorter or smoother tiles). A caller must not treat it as a proof.
 pub(crate) fn decode_lossless(
     r: &mut Reader,
     f: &LosslessFrame,
@@ -559,25 +570,99 @@ mod tests {
         assert!(run.samples < f.samples());
     }
 
+    /// A 1x1 tile of `precision` bits with the header of `testkit::lossless_jpeg` and these exact scan bytes (no EOI).
+    fn tiny_tile(precision: u8, scan: &[u8]) -> Vec<u8> {
+        let j = testkit::lossless_jpeg(1, 1, 1, precision, 0);
+        let (_, start) = parse(&j).unwrap();
+        let mut v = j[..start as usize].to_vec();
+        v.extend_from_slice(scan);
+        v.extend_from_slice(&[0xFF, 0xD9]);
+        v
+    }
+
     #[test]
-    fn lossless_tail_of_another_tile_fails() {
-        let a = testkit::lossless_jpeg(128, 128, 1, 14, 3);
-        let b = testkit::lossless_jpeg(128, 128, 1, 14, 4);
-        let (_, scan) = parse(&a).unwrap();
-        assert_eq!(parse(&b).unwrap().1, scan, "same header");
-        for k in 1..8 {
-            let c = scan as usize + (a.len().min(b.len()) - scan as usize) * k / 8;
-            for (x, y) in [(&a, &b), (&b, &a)] {
-                let mut v = x[..c].to_vec();
-                v.extend_from_slice(&y[c..]);
-                let (_, run) = decode(&v, v.len() as u64);
-                assert!(
-                    !matches!(run.end, End::Eoi { .. }),
-                    "cut {c}: {:?}",
-                    run.end
-                );
+    fn padding_bits_must_be_ones() {
+        // One sample of category 0: the code 000, then five padding bits (T.81 F.1.2.3: 1-bits).
+        let good = tiny_tile(8, &[0b0001_1111]);
+        let (_, run) = decode(&good, good.len() as u64);
+        assert_eq!(run.end, eoi(good.len()));
+        for pad in [0b0001_1110u8, 0b0001_0111, 0b0000_0000] {
+            let bad = tiny_tile(8, &[pad]);
+            let (_, run) = decode(&bad, bad.len() as u64);
+            assert_eq!(run.samples, 1, "{pad:#b}");
+            assert_eq!(
+                run.end,
+                End::Error {
+                    at: parse(&bad).unwrap().1
+                },
+                "{pad:#b}"
+            );
+        }
+    }
+
+    #[test]
+    fn category_16_has_no_extra_bits() {
+        // Category 16 is the code 1111111110 (10 bits) and the difference 32768, with no extra bits: six 1-bits pad the
+        // second byte. FF is stuffed with 00.
+        let t = tiny_tile(16, &[0xFF, 0x00, 0b1011_1111]);
+        let (f, run) = decode(&t, t.len() as u64);
+        assert_eq!(f.precision, 16);
+        assert_eq!((run.samples, run.end), (1, eoi(t.len())));
+        // Category 15 (111111110) does take its 15 extra bits: 24 bits, no padding.
+        let t = tiny_tile(16, &[0xFF, 0x00, 0x00, 0x01]);
+        let (_, run) = decode(&t, t.len() as u64);
+        assert_eq!((run.samples, run.end), (1, eoi(t.len())));
+    }
+
+    #[test]
+    fn foreign_same_frame_pieces_rarely_pass() {
+        // A tile whose tail (or middle) belongs to another tile of the same frame is decoded as a stream of valid
+        // codes more often than one would hope: Huffman codes resynchronize. The guarantee is statistical, so it is
+        // measured over fixed pairs and bounded; an `Eoi` is evidence of structure, never proof of identity.
+        let (mut cases, mut passed) = (0u32, 0u32);
+        for seed in 0..40u64 {
+            let a = testkit::lossless_jpeg(128, 128, 1, 14, seed);
+            let b = testkit::lossless_jpeg(128, 128, 1, 14, seed + 100);
+            let (_, scan) = parse(&a).unwrap();
+            let shortest = a.len().min(b.len());
+            for k in 1..8 {
+                let c = scan as usize + (shortest - scan as usize) * k / 8;
+                for (x, y) in [(&a, &b), (&b, &a)] {
+                    let mut v = x[..c].to_vec();
+                    v.extend_from_slice(&y[c..]);
+                    let (_, run) = decode(&v, v.len() as u64);
+                    cases += 1;
+                    passed += u32::from(matches!(run.end, End::Eoi { .. }));
+                }
             }
         }
+        assert_eq!(cases, 560);
+        assert!(
+            passed * 100 < cases * 5,
+            "{passed} of {cases} spliced tiles passed"
+        );
+    }
+
+    #[test]
+    fn spliced_tiles_of_the_wrong_length_never_pass() {
+        // Deterministic rejections: a tail from a tile of another size cannot end where the declared end is.
+        let a = testkit::lossless_jpeg(64, 64, 1, 14, 3);
+        let b = testkit::lossless_jpeg(64, 65, 1, 14, 3);
+        let (_, scan) = parse(&a).unwrap();
+        let c = scan as usize + (a.len() - scan as usize) / 2;
+        let mut v = a[..c].to_vec();
+        v.extend_from_slice(&b[c..]);
+        let (_, run) = decode(&v, v.len() as u64);
+        assert!(!matches!(run.end, End::Eoi { .. }), "{:?}", run.end);
+    }
+
+    #[test]
+    fn a_cursor_cannot_be_shifted_before_the_start() {
+        let j = testkit::lossless_jpeg(16, 16, 1, 12, 3);
+        let (f, scan) = parse(&j).unwrap();
+        let c = f.start(scan);
+        assert!(c.shifted_back(scan).is_some());
+        assert!(c.shifted_back(scan + 1).is_none());
     }
 
     #[test]
@@ -596,7 +681,12 @@ mod tests {
         // Second piece placed elsewhere: bytes [mid.pos, ..) as a view starting `by` later.
         let by = mid.pos;
         let tail = Mem(j[by as usize..].to_vec());
-        let resumed = decode_lossless(&mut Reader::new(&tail), &f, mid.shifted_back(by), len - by);
+        let resumed = decode_lossless(
+            &mut Reader::new(&tail),
+            &f,
+            mid.shifted_back(by).unwrap(),
+            len - by,
+        );
         assert_eq!(resumed.end, End::Eoi { at: len - 2 - by });
         assert_eq!(resumed.samples, whole.samples);
         // Unshifted resume gives the contiguous result exactly.
