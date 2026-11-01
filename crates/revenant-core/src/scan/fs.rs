@@ -129,6 +129,9 @@ pub(crate) struct ViewMeasure {
     pub m: Option<Measurement>,
     /// Ruling D6: what lies between the structure's end and the recorded size is padding or whole files.
     pub tail_ok: bool,
+    /// The structure ends before the recorded size and only padding (`00`/`FF`) follows (ruling Q53: for a deleted
+    /// file, no proof the bytes are this entry's).
+    pub padded: bool,
     /// The measured file's own files (ruling D12), absolute (mapped through the pieces).
     pub own: Vec<Fragment>,
     /// Part 1.6, D14: for a deleted file the listing placed `OldChain` whose view measured `Intact` in one run with a
@@ -211,6 +214,11 @@ fn padding(view: &dyn Source, from: u64, to: u64) -> bool {
     true
 }
 
+/// Ruling Q53: the structure ends at `l`, before the end of `view`, and only padding follows.
+fn is_padded(view: &dyn Source, l: u64) -> bool {
+    l < view.len() && padding(view, l, view.len())
+}
+
 /// Ruling D6 over a view of `S` bytes whose structure ends at `l`: `l == S`, or the rest is padding, or up to
 /// [`MAX_TAIL_FILES`] files measured one after another (contiguous, not `Damaged`, inside the view), then padding.
 fn tail_ok(
@@ -275,6 +283,7 @@ pub(crate) fn measure_view(
     let tail_ok = m
         .as_ref()
         .is_some_and(|m| tail_ok(formats, &view, m.len, cancel));
+    let padded = m.as_ref().is_some_and(|m| is_padded(&view, m.len));
     let old_chain = f.origin.state == FsState::Deleted && f.origin.placement == Placement::OldChain;
     let checks = old_chain
         && tail_ok
@@ -286,6 +295,7 @@ pub(crate) fn measure_view(
     ViewMeasure {
         m,
         tail_ok,
+        padded,
         own: absolute(&f.pieces, own),
         checks,
     }
@@ -320,10 +330,12 @@ pub(crate) fn fs_job(
     {
         let view = Fragmented::new(source, f.pieces.clone());
         let tail_ok = tail_ok(formats, &view, c.len, cancel);
+        let padded = is_padded(&view, c.len);
         return FsJobResult {
             view: ViewMeasure {
                 m: Some(c.clone()),
                 tail_ok,
+                padded,
                 own: carved_own.clone(),
                 checks: false,
             },
@@ -336,6 +348,13 @@ pub(crate) fn fs_job(
         carved,
         carved_own,
     }
+}
+
+/// Ruling Q53: the kept file `f` is reported as the carving `carved` at its start, without its name: a deleted entry
+/// whose structure ends before its recorded size with only padding after it (the bytes may be another, shorter file
+/// written over its clusters, the rest of the last cluster zero-filled). Live files keep their name.
+pub(crate) fn nameless(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement>) -> bool {
+    f.origin.state == FsState::Deleted && view.padded && carved.is_some()
 }
 
 /// A kept file's finding.
@@ -371,7 +390,11 @@ pub(crate) fn merge(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement>
     let len: u64 = f.pieces.iter().map(|p| p.len).sum();
     let old_chain = f.origin.state == FsState::Deleted && f.origin.placement == Placement::OldChain;
     let proven = old_chain && view.checks && view.tail_ok && !joined && len == f.origin.size;
-    if ((!f.trusted && !proven) || !view.tail_ok || joined) && health == Health::Intact {
+    // Q53: a deleted entry whose structure ends before its size with only padding after it proves nothing about which
+    // file the bytes are (another, shorter one may have been written over its clusters); the scan reports the carving
+    // there without the entry's name instead ([`nameless`]); never `Intact` under the name.
+    let padded = f.origin.state == FsState::Deleted && view.padded;
+    if ((!f.trusted && !proven) || !view.tail_ok || joined || padded) && health == Health::Intact {
         health = Health::Partial;
     }
     let mut origin = f.origin.clone();
@@ -461,9 +484,33 @@ mod tests {
         ViewMeasure {
             m,
             tail_ok,
+            padded: false,
             own: Vec::new(),
             checks: false,
         }
+    }
+
+    /// Q53: a deleted entry whose structure ends before its size with only padding after it is never `Intact` under
+    /// its name (the scan reports the carving there, nameless, when there is one); a live one keeps the D6 rule.
+    #[test]
+    fn padded_tail_of_a_deleted_entry_is_no_proof() {
+        let padded = ViewMeasure {
+            padded: true,
+            ..view(Some(m(900, Health::Intact)), true)
+        };
+        let live = file(FsState::Live, true, &[(4096, 1000)]);
+        let deleted = file(FsState::Deleted, true, &[(4096, 1000)]);
+        assert_eq!(merge(&live, &padded, None).health, Health::Intact);
+        assert_eq!(merge(&deleted, &padded, None).health, Health::Partial);
+        let carved = m(900, Health::Intact);
+        assert!(nameless(&deleted, &padded, Some(&carved)));
+        assert!(!nameless(&deleted, &padded, None));
+        assert!(!nameless(&live, &padded, Some(&carved)));
+        assert!(!nameless(
+            &deleted,
+            &view(Some(m(900, Health::Intact)), true),
+            Some(&carved)
+        ));
     }
 
     #[test]

@@ -211,6 +211,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- An old deleted photo's entry whose spot on the card a newer, shorter photo took (the camera reusing the old entries'
+  slots, the newer entry gone since) gave the newer photo's bytes, plus the empty rest of the space, under the old name
+  and size, reported intact. The photo found there now comes out on its own, without the old name.
 - A deleted video in pieces whose place the card's file system already gave right (only other files between its
   pieces) came back with its exact bytes but only partial, and one whose piece ran into an old deleted entry's spot
   could not be put back at all: both now come back intact when every frame checks out across the seams.

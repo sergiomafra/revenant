@@ -1819,3 +1819,57 @@ fn deleted_entries_tied_at_one_start_name_neither() {
     );
     same(&extracted(&src, f), &b_photo);
 }
+
+#[test]
+fn stale_entry_over_a_shorter_photo_and_zeros_names_nothing() {
+    // The reviewer's probe (Q53): a camera reusing slots. D in slot s0, A in s1, both deleted; B shot: it
+    // takes s0 and A's clusters (shorter, as many clusters, the rest of its last cluster zero-filled); B deleted; C shot:
+    // it takes s0 again, its clusters elsewhere. A's entry stands alone over B's bytes and zeros: the structure ends
+    // before A's size with nothing but fill after it, which proves nothing about A. The photo there comes out as the
+    // carving, B's bytes, without a name.
+    let cl = 4096u64;
+    let a = jpeg_smooth(1024, 768, 1);
+    let need = clusters_in(a.len(), cl);
+    let b_photo = (2..64)
+        .map(|s| jpeg_smooth(1024, 768, s))
+        .find(|j| j.len() < a.len() && clusters_in(j.len(), cl) == need)
+        .expect("a shorter photo of as many clusters");
+    let clusters: Vec<u32> = (3000..3000 + need).collect();
+    let mut b = exfat(cl as u32);
+    b.reuse_slots(true);
+    let (pd, pa, pb, pc) = (
+        "DCIM/100MSDCF/DSC00000.JPG",
+        "DCIM/100MSDCF/DSC00001.JPG",
+        "DCIM/100MSDCF/DSC00002.JPG",
+        "DCIM/100MSDCF/DSC00003.JPG",
+    );
+    let (d, c) = (jpeg(64, 64, 9, 0), jpeg(64, 64, 10, 0));
+    let run = |from: u32, j: &[u8]| (from..from + clusters_in(j.len(), cl)).collect::<Vec<u32>>();
+    b.add_at(pd, &d, &run(2000, &d));
+    b.add_at(pa, &a, &clusters);
+    b.delete(pd, DeleteStyle::Camera);
+    b.delete(pa, DeleteStyle::Camera);
+    b.add_at(pb, &b_photo, &clusters);
+    b.delete(pb, DeleteStyle::Camera);
+    b.add_at(pc, &c, &run(2500, &c));
+    let mut v = b.build();
+    old_data(&b, &mut v, 2900..3200, &clusters, cl);
+    let (src, ev) = scanned(&v);
+    let start = VOL + b.cluster_offset(3000);
+    let view = final_view(&ev);
+    let f = view
+        .values()
+        .find(|f| f.start == start)
+        .unwrap_or_else(|| panic!("a finding at A's start: {view:#?}"));
+    assert_eq!(
+        (f.kind, f.health, f.len, f.origin.is_none()),
+        (FileKind::Jpeg, Health::Intact, b_photo.len() as u64, true),
+        "{f:#?}"
+    );
+    same(&extracted(&src, f), &b_photo);
+    assert!(
+        view.values()
+            .all(|f| f.origin.as_ref().is_none_or(|o| o.path() != pa)),
+        "A's name is given to nothing"
+    );
+}

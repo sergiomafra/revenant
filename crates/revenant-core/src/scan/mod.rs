@@ -23,7 +23,7 @@ use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
 use crate::rate::RateMeter;
 use crate::reassemble;
 use crate::source::Source;
-use fs::{FsJobResult, FsPlan, merge, tail_fits};
+use fs::{FsJobResult, FsPlan, merge, nameless, tail_fits};
 use pipeline::{Block, CloseQueue, Finders, Head, Measured, Outcome, Shared};
 pub(crate) use state::{Checkpoint, Resume, ScanState};
 
@@ -798,18 +798,26 @@ impl Commit<'_, '_> {
                 let carved = (!bad && !self.shared.skipped(at))
                     .then_some(r.carved.as_ref())
                     .flatten();
-                let m = merge(&self.shared.fs.kept[k], &r.view, carved);
-                // A file start only where a format recognizes a head: an old entry over clusters another file took
-                // since is reported, but it is no start that stops a piece (ruling Q52).
-                let head = r.view.m.is_some() || carved.is_some();
-                let own = r.own_of(&m);
-                let measurement = Measurement {
-                    len: m.len,
-                    kind: m.kind,
-                    health: m.health,
-                    fragments: m.fragments,
-                };
-                self.add(at, measurement, Some(m.origin), own, head);
+                if let Some(c) =
+                    carved.filter(|_| nameless(&self.shared.fs.kept[k], &r.view, carved))
+                {
+                    // Ruling Q53: the carving, without the entry's name.
+                    let c = c.clone();
+                    self.add(at, c, None, r.carved_own, true);
+                } else {
+                    let m = merge(&self.shared.fs.kept[k], &r.view, carved);
+                    // A file start only where a format recognizes a head: an old entry over clusters another file took
+                    // since is reported, but it is no start that stops a piece (ruling Q52).
+                    let head = r.view.m.is_some() || carved.is_some();
+                    let own = r.own_of(&m);
+                    let measurement = Measurement {
+                        len: m.len,
+                        kind: m.kind,
+                        health: m.health,
+                        fragments: m.fragments,
+                    };
+                    self.add(at, measurement, Some(m.origin), own, head);
+                }
             }
             if bad {
                 match &mut self.run {

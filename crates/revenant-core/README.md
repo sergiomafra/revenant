@@ -1819,6 +1819,13 @@ a probe over the raw source that refuses, without reading it, any range the cach
   clock, a re-shot within the 2-second resolution), which one the clusters hold cannot be told, so none is kept: the
   head there is carved like any other, without a name (ruling Q52). Before, the first in listing order was kept, and
   its size could place another photo's bytes with the slack after them as `Intact` under the wrong name.
+- **A deleted entry whose structure ends early over padding (ruling Q53).** When a deleted file's measurement through
+  its pieces ends before its recorded size and only padding (`00`/`FF`) follows up to that size, nothing shows the
+  bytes are that entry's: a camera reusing directory slots may have written another, shorter photo over its clusters
+  and zero-filled the rest of the last one, its own entry gone since. The finding there is then the carving at that
+  start (its length and health), without the entry's name or size; with no carving there (unreadable or skipped start)
+  the entry's finding is at most `Partial`. A live file keeps the D6 rule. Cost: a deleted photo that really was
+  zero-padded inside its recorded size loses its name (it is still recovered).
 - **Nothing is skipped because of the file system** (ruling R10): every head the signature rules examine is still
   examined, and only an `Intact` finding skips its pieces, as before.
 - **A listed file's finding** is added at the sector holding its first piece, always (whether a format recognizes the
