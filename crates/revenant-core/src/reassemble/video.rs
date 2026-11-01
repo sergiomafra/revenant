@@ -7,9 +7,9 @@
 //!   bytes before the `mdat` payload must lie in place; the known length is the end of `mdat` when its size is
 //!   declared, else (size 0) the highest sample end.
 //! - **Fragmented** ([`MoofSeams`]): `ftyp, moov (with mvex)`, then `moof`/`mdat` pairs (and `sidx styp free skip`),
-//!   each `moof`'s samples ([`crate::formats::isobmff::fragment_samples`]) checked in the `mdat` after it. Complete when
-//!   an `mfra` closes the chain or the known size (the file system's) is reached; else the walk ends at the last valid
-//!   box (at most `Partial`).
+//!   each `moof`'s samples ([`crate::formats::isobmff::fragment_samples`]) checked in the `mdat` after it, the fragments
+//!   in sequence (a whole fragment of another clip checks itself). Complete when an `mfra` closes the chain or the
+//!   known size (the file system's) is reached; else the walk ends at the last valid box (at most `Partial`).
 //!
 //! The file lives in "file offsets": logical 0 is the `ftyp` at the video's start. Each checkable sample (H.264/HEVC
 //! NAL units, Motion-JPEG frames) is walked by the pairing's structural check
@@ -29,9 +29,9 @@ use super::{
 use crate::cache::CachedSource;
 use crate::filesystem::{FsState, Placement};
 use crate::formats::isobmff::{
-    CheckedSample, FragTrack, MAX_BOXES, MAX_NAL_UNITS, MOOV_MAX_LEN, SampleEnd, be32,
+    Chain, CheckedSample, FragTrack, MAX_BOXES, MAX_NAL_UNITS, MOOV_MAX_LEN, SampleEnd, be32,
     check_sample, child, frag_track, fragment_samples, index_first_layout, index_health,
-    index_tracks, parse_header, walk_sample,
+    index_tracks, parse_header, tfra_offsets, walk_sample,
 };
 use crate::formats::{FileKind, Fragment, Health, Reader, SECTOR, cancelled};
 use crate::pairing::{self, Item, Moov, Video, fits, load_moov};
@@ -647,9 +647,11 @@ enum Expect {
 
 /// The seams of a fragmented MP4/MOV (`moof`): its head (`ftyp` to the first fragment box) must lie in place, then the
 /// top-level boxes follow in order, each header checked (a valid size, a type of [`FRAGMENT_BOXES`]), each `moof`
-/// parsed ([`fragment_samples`]) and its samples checked in the `mdat` right after it. At most [`MAX_BOXES`] boxes per
-/// walk (C9). `Complete` when an `mfra` closes the chain (its `mfro` gives its size) or the known size is reached;
-/// else the walk ends at the last valid box (at most `Partial`).
+/// parsed ([`fragment_samples`], each listed sample a step) and its samples checked in the `mdat` right after it, each
+/// fragment following the last ([`Chain::follows`]: sequence number, decode time, track). At most [`MAX_BOXES`] boxes
+/// per walk (C9). `Complete` when an `mfra` closes the chain (its `mfro` gives its size, its `tfra` lists no `moof`
+/// past the last one walked) or the known size is reached; else the walk ends at the last valid box (at most
+/// `Partial`).
 pub(crate) struct MoofSeams {
     track: FragTrack,
     head: Rc<Vec<u8>>,
@@ -664,13 +666,28 @@ pub(crate) struct MoofSeams {
     expect_full: bool,
 }
 
+/// Where a walk of a fragmented video stands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MoofState {
+    /// Logical offset of the box to read next, or of the `moof` whose samples are being checked; 0: the head is not
+    /// checked yet.
+    pos: u64,
+    /// Samples of that `moof` already checked.
+    k: usize,
+    /// The chain before the box at `pos` (`None` before the first fragment).
+    chain: Option<Chain>,
+}
+
 /// How a walk of a fragmented video ended.
 struct MoofRun {
     end: WalkEnd,
     checked: u64,
-    resume: Vec<(u64, (u64, usize))>,
+    resume: Vec<(u64, MoofState)>,
     /// A check refuted the bytes (not a cut by the view's end, an unreadable byte or a budget).
     failed: bool,
+    /// The `moof`s walked (logical offsets) and the payload of the `mfra` that completed the walk.
+    moofs: Vec<u64>,
+    mfra: Option<(u64, u64)>,
 }
 
 impl MoofSeams {
@@ -729,20 +746,23 @@ impl MoofSeams {
     fn run(
         &mut self,
         view: &dyn Source,
-        from: &(u64, usize),
+        from: &MoofState,
         limit: u64,
         record: bool,
         on: &mut dyn FnMut(u64, u64, Option<u64>),
     ) -> MoofRun {
         let limit = limit.min(view.len());
         let mut r = Reader::with_window(view, WALK_WINDOW);
-        let (mut pos, mut k) = *from;
+        let (mut pos, mut k, mut chain) = (from.pos, from.k, from.chain);
         let mut out = MoofRun {
             end: WalkEnd::Stopped,
             checked: 0,
             resume: Vec::new(),
             failed: false,
+            moofs: Vec::new(),
+            mfra: None,
         };
+        let at = |pos, k, chain| MoofState { pos, k, chain };
         if pos == 0 {
             let head = Rc::clone(&self.head);
             match head_in_place(&mut r, &head, limit) {
@@ -750,7 +770,7 @@ impl MoofSeams {
                     pos = head.len() as u64;
                     on(0, pos, None);
                     out.checked = pos;
-                    out.resume.push((pos, (pos, 0)));
+                    out.resume.push((pos, at(pos, 0, None)));
                 }
                 InPlace::Differs(at) => {
                     out.end = WalkEnd::Broken { at };
@@ -795,8 +815,26 @@ impl MoofSeams {
             out.checked = out.checked.max(pos + hl);
             match &kind {
                 b"mfra" => {
+                    if end - pos - hl > MOOV_MAX_LEN {
+                        out.failed = true;
+                        break WalkEnd::Broken { at: pos + hl };
+                    }
                     if end > limit {
                         break WalkEnd::Broken { at: limit };
+                    }
+                    // It closes this chain only when its `tfra` lists no `moof` past the last one walked (a jump from an
+                    // earlier fragment to the `mfra` would leave some out); without a `tfra` it tells nothing.
+                    let mut payload = vec![0u8; (end - pos - hl) as usize];
+                    if !read_in(&mut r, pos + hl, &mut payload, limit) {
+                        break WalkEnd::Broken { at: pos + hl };
+                    }
+                    match (tfra_offsets(&payload), chain) {
+                        (Some(o), Some(c)) if !o.is_empty() && o.iter().all(|&x| x <= c.at) => {}
+                        (Some(o), _) if o.is_empty() => break WalkEnd::Broken { at: end },
+                        _ => {
+                            out.failed = true;
+                            break WalkEnd::Broken { at: end };
+                        }
                     }
                     // The last box of an `mfra` is its `mfro`: size 16, version and flags, the `mfra`'s size.
                     let mut tail = [0u8; 16];
@@ -813,9 +851,15 @@ impl MoofSeams {
                     }
                     on(end - 16, end, None);
                     out.checked = end;
+                    out.mfra = Some((pos + hl, end));
                     break WalkEnd::Complete { len: end };
                 }
                 b"moof" => {
+                    // As the measure's `load`: a `moof` larger than an index may be is garbled, never loaded.
+                    if end - pos - hl > MOOV_MAX_LEN {
+                        out.failed = true;
+                        break WalkEnd::Broken { at: pos + hl };
+                    }
                     if end > limit {
                         break WalkEnd::Broken { at: limit };
                     }
@@ -823,10 +867,22 @@ impl MoofSeams {
                     if !read_in(&mut r, pos + hl, &mut payload, limit) {
                         break WalkEnd::Broken { at: pos + hl };
                     }
-                    let Some(samples) = fragment_samples(pos, &payload, &self.track) else {
+                    // Every sample listed costs a step; the fragment must follow the chain (its sequence number, its
+                    // decode time): a fragment of another clip checks itself, nothing else tells it apart.
+                    let Some(frag) = fragment_samples(pos, &payload, &self.track, &mut self.steps)
+                    else {
+                        if self.steps == 0 {
+                            break WalkEnd::Stopped;
+                        }
                         out.failed = true;
                         break WalkEnd::Broken { at: end };
                     };
+                    let Some(next) = Chain::follows(chain, &frag, pos) else {
+                        out.failed = true;
+                        break WalkEnd::Broken { at: end };
+                    };
+                    out.moofs.push(pos);
+                    let samples = frag.samples;
                     if record {
                         self.remember(end, Expect::Header);
                         for s in samples.iter().skip(k) {
@@ -877,8 +933,10 @@ impl MoofSeams {
                         match got {
                             SampleEnd::Pass => {
                                 let prev = out.resume.last().map_or(0, |r| r.0);
-                                out.resume
-                                    .push((last.unwrap_or(s.offset).max(prev), (pos, j + 1)));
+                                out.resume.push((
+                                    last.unwrap_or(s.offset).max(prev),
+                                    at(pos, j + 1, chain),
+                                ));
                             }
                             SampleEnd::Fail { at } => {
                                 out.failed = true;
@@ -891,12 +949,13 @@ impl MoofSeams {
                         }
                     }
                     pos = mend;
+                    chain = Some(next);
                 }
                 _ => pos = end,
             }
             k = 0;
             let prev = out.resume.last().map_or(0, |r| r.0);
-            out.resume.push((pos.max(prev), (pos, 0)));
+            out.resume.push((pos.max(prev), at(pos, 0, chain)));
         };
         out
     }
@@ -929,18 +988,16 @@ impl MoofSeams {
     /// video with no known size and no `mfra` that came out this way is as complete as can be told.
     pub(crate) fn clean(&mut self, view: &dyn Source) -> bool {
         let len = view.len();
-        let run = self.run(view, &(0, 0), len, false, &mut |_, _, _| {});
+        let run = self.run(view, &MoofState::default(), len, false, &mut |_, _, _| {});
         matches!(run.end, WalkEnd::Broken { at } if at == len) && run.checked == len
     }
 }
 
 impl Seams for MoofSeams {
-    /// (Logical offset of the box to read next, or of the `moof` whose samples are being checked; samples of it already
-    /// checked). `(0, 0)`: the head is not checked yet.
-    type State = (u64, usize);
+    type State = MoofState;
 
-    fn begin(&mut self) -> (u64, usize) {
-        (0, 0)
+    fn begin(&mut self) -> MoofState {
+        MoofState::default()
     }
 
     /// The boxes from `from` in order: `checked` is the end of the last checked byte (the end of the last valid box when
@@ -951,9 +1008,9 @@ impl Seams for MoofSeams {
         &mut self,
         view: &dyn Source,
         seams: &[u64],
-        from: &(u64, usize),
+        from: &MoofState,
         limit: u64,
-    ) -> Walked<(u64, usize)> {
+    ) -> Walked<MoofState> {
         let _ = seams;
         let run = self.run(view, from, limit, true, &mut |_, _, _| {});
         Walked {
@@ -972,11 +1029,33 @@ impl Seams for MoofSeams {
         }
         let mut near = Near::new(seams, self.unit);
         let len = view.len();
-        let run = self.run(view, &(0, 0), len, false, &mut |a, b, size| {
-            near.range(a, b, size)
-        });
+        let run = self.run(
+            view,
+            &MoofState::default(),
+            len,
+            false,
+            &mut |a, b, size| near.range(a, b, size),
+        );
         match run.end {
             WalkEnd::Complete { len: l } if l == len => {
+                // An `mfra` that lists where the fragments are (`tfra`): each listed `moof` must be one walked here.
+                if let Some((a, b)) = run.mfra {
+                    let mut r = Reader::with_window(view, WALK_WINDOW);
+                    if b - a > MOOV_MAX_LEN {
+                        return Proof::Unproven;
+                    }
+                    let mut payload = vec![0u8; (b - a) as usize];
+                    if !read_in(&mut r, a, &mut payload, len) {
+                        return Proof::Unproven;
+                    }
+                    match tfra_offsets(&payload) {
+                        None => return Proof::Unproven,
+                        Some(o) if o.iter().any(|x| !run.moofs.contains(x)) => {
+                            return Proof::Failed;
+                        }
+                        Some(_) => {}
+                    }
+                }
                 if near.finish() {
                     Proof::Proven
                 } else {
@@ -1051,7 +1130,7 @@ impl Seams for MoofSeams {
         let mut gaps = Vec::new();
         let mut prev = self.head.len() as u64;
         let len = view.len();
-        let run = self.run(view, &(0, 0), len, false, &mut |a, b, _| {
+        let run = self.run(view, &MoofState::default(), len, false, &mut |a, b, _| {
             if a > prev {
                 gaps.push((prev, a));
             }
@@ -2034,7 +2113,7 @@ mod tests {
         let seam = runs[0].len;
         // The walk of the first piece learns what comes next (the samples of the fragment it was in).
         let view = Fragmented::new(&src, vec![runs[0]]);
-        let w = seams.walk(&view, &[], &(0, 0), seam);
+        let w = seams.walk(&view, &[], &MoofState::default(), seam);
         assert!(matches!(w.end, WalkEnd::Broken { at } if at == seam));
         let mut r = Reader::with_window(&src, SECTOR as usize);
         assert!(
@@ -2071,7 +2150,7 @@ mod tests {
         }
         let src = Mem(file);
         let mut seams = MoofSeams::new(&src, 0).unwrap();
-        let w = seams.walk(&src, &[], &(0, 0), src.len());
+        let w = seams.walk(&src, &[], &MoofState::default(), src.len());
         assert!(matches!(w.end, WalkEnd::Stopped));
         assert!(w.checked <= (head + 8 * (MAX_BOXES + 1)) as u64);
         // A garbled `moof` (a size past it, a trun past its box) never panics: the walk breaks there.
@@ -2081,7 +2160,243 @@ mod tests {
         file[traf - 4..traf].copy_from_slice(&u32::MAX.to_be_bytes());
         let src = Mem(file);
         let mut seams = MoofSeams::new(&src, 0).unwrap();
-        let w = seams.walk(&src, &[], &(0, 0), src.len());
+        let w = seams.walk(&src, &[], &MoofState::default(), src.len());
         assert!(matches!(w.end, WalkEnd::Broken { .. }));
+    }
+
+    /// A box `kind` holding `body`.
+    fn bx(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        b.extend_from_slice(kind);
+        b.extend_from_slice(body);
+        b
+    }
+
+    /// `out` padded by a `free` box to a whole number of `c`-byte units.
+    fn pad_to(out: &mut Vec<u8>, c: usize) {
+        let r = out.len() % c;
+        if r != 0 {
+            let mut p = c - r;
+            if p < 8 {
+                p += c;
+            }
+            out.extend(bx(b"free", &vec![0u8; p - 8]));
+        }
+    }
+
+    /// A fragmented clip (H.265, 300 samples of seed `seed`, 16 per fragment) relaid as parts padded to whole 32 KiB
+    /// units: the head (`ftyp`, `moov`), then each fragment (`moof`, `mdat`); the parts and the `moof` offsets in the file.
+    fn padded_parts(seed: u64) -> (Vec<Vec<u8>>, Vec<u64>) {
+        use revenant_testkit::{VideoCodec, VideoLayout, camera_video};
+        const C: usize = 32 << 10;
+        let v = camera_video(
+            &AvcOptions {
+                samples: 300,
+                seed,
+                mov: false,
+                mdat_pad: 0,
+                small_nals: true,
+            },
+            VideoCodec::Hevc,
+            VideoLayout::Fragmented {
+                samples_per_fragment: 16,
+            },
+        );
+        let b = &v.bytes;
+        let mut boxes = Vec::new();
+        let mut pos = 0;
+        while pos + 8 <= b.len() {
+            let size = u32::from_be_bytes(b[pos..pos + 4].try_into().unwrap()) as usize;
+            boxes.push((b[pos + 4..pos + 8].to_vec(), pos, pos + size));
+            pos += size;
+        }
+        let first = boxes.iter().position(|x| x.0 == b"moof").unwrap();
+        let mut head = b[..boxes[first].1].to_vec();
+        pad_to(&mut head, C);
+        let mut parts = vec![head];
+        let mut moofs = Vec::new();
+        let mut at = parts[0].len() as u64;
+        for w in boxes[first..].chunks(2) {
+            let mut part = b[w[0].1..w[1].2].to_vec();
+            pad_to(&mut part, C);
+            moofs.push(at);
+            at += part.len() as u64;
+            parts.push(part);
+        }
+        (parts, moofs)
+    }
+
+    /// An `mfra` whose `tfra` (track 1, version 0) lists `moofs` (none: no `tfra`), then its `mfro`.
+    fn mfra(moofs: Option<&[u64]>) -> Vec<u8> {
+        let tfra = moofs.map(|m| {
+            let mut body = vec![0u8; 4];
+            body.extend_from_slice(&1u32.to_be_bytes());
+            body.extend_from_slice(&[0, 0, 0, 0]);
+            body.extend_from_slice(&(m.len() as u32).to_be_bytes());
+            for (i, &o) in m.iter().enumerate() {
+                body.extend_from_slice(&(i as u32 * 16).to_be_bytes());
+                body.extend_from_slice(&(o as u32).to_be_bytes());
+                body.extend_from_slice(&[1, 1, 1]);
+            }
+            bx(b"tfra", &body)
+        });
+        let tfra = tfra.unwrap_or_default();
+        let size = (8 + tfra.len() + 16) as u32;
+        let mut mfro = vec![0u8; 4];
+        mfro.extend_from_slice(&size.to_be_bytes());
+        bx(b"mfra", &[tfra, bx(b"mfro", &mfro)].concat())
+    }
+
+    /// Clip A of `parts` (each one unit; the last one followed by `tail`) on a 32 KiB-cluster noise card: the head and
+    /// fragments 0–3 at cluster 300, fragment 4 at cluster 20 when `own4`, the rest at cluster 150; `other` written at
+    /// cluster 100. The image and A's runs.
+    fn a_card(
+        parts: &[Vec<u8>],
+        tail: &[u8],
+        own4: bool,
+        other: Option<&[u8]>,
+    ) -> (Mem, Vec<Fragment>) {
+        const C: u64 = 32 << 10;
+        assert!(parts.iter().all(|p| p.len() as u64 == C));
+        let mut card = noise_card(400, C);
+        let mut put = |cluster: u64, bytes: &[u8]| {
+            let at = (HEAP + cluster * C) as usize;
+            card[at..at + bytes.len()].copy_from_slice(bytes);
+            Fragment {
+                start: at as u64,
+                len: bytes.len() as u64,
+            }
+        };
+        let r1 = put(300, &parts[..5].concat());
+        let r2 = if own4 { Some(put(20, &parts[5])) } else { None };
+        let r3 = put(150, &[parts[6..].concat(), tail.to_vec()].concat());
+        if let Some(o) = other {
+            put(100, o);
+        }
+        let runs = [Some(r1), r2, Some(r3)].into_iter().flatten().collect();
+        (Mem(card), runs)
+    }
+
+    #[test]
+    fn a_fragment_of_another_clip_on_box_boundaries_is_not_intact() {
+        // Two clips of one camera (seeds 13, 99), fragments padded to whole clusters, A closed by an `mfra`. A's
+        // fragment 4 is lost; B's fragment 0 (sequence 1 where 5 is due) lies at cluster 100: every seam on a box
+        // boundary, B's fragment checks itself.
+        const C: u64 = 32 << 10;
+        let (a, moofs) = padded_parts(13);
+        let (b, _) = padded_parts(99);
+        let (src, runs) = a_card(&a, &mfra(Some(&moofs)), false, Some(&b[1]));
+        let mut seams = MoofSeams::new(&src, runs[0].start).unwrap().with_unit(C);
+        let found = find(
+            &src,
+            &mut seams,
+            (HEAP, C, src.len()),
+            runs[0].start,
+            &Limits::DEFAULT,
+        );
+        if let Some(f) = &found {
+            assert!(
+                !(f.complete && f.unique && f.exhaustive && f.proof == Proof::Proven),
+                "{f:?}"
+            );
+        }
+        // A's own fragment in place: whole, and its `tfra` agrees with where the fragments lie.
+        let (src, runs) = a_card(&a, &mfra(Some(&moofs)), true, Some(&b[1]));
+        let mut seams = MoofSeams::new(&src, runs[0].start).unwrap().with_unit(C);
+        let found = find(
+            &src,
+            &mut seams,
+            (HEAP, C, src.len()),
+            runs[0].start,
+            &Limits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(found.pieces, runs);
+        assert!(
+            found.complete && found.unique && found.exhaustive,
+            "{found:?}"
+        );
+        assert_eq!(found.proof, Proof::Proven);
+        // A `tfra` that puts one `moof` where none is refutes the placement.
+        let mut wrong = moofs.clone();
+        wrong[5] += 8;
+        let (src, runs) = a_card(&a, &mfra(Some(&wrong)), true, None);
+        let view = Fragmented::new(&src, runs.clone());
+        let mut seams = MoofSeams::new(&src, runs[0].start).unwrap().with_unit(C);
+        let cuts = [runs[0].len, runs[0].len + runs[1].len];
+        assert_eq!(seams.prove(&view, &cuts), Proof::Failed);
+    }
+
+    /// A source of `head` then zeros up to `len`, counting the bytes read.
+    struct Zeros {
+        head: Vec<u8>,
+        len: u64,
+        read: std::sync::atomic::AtomicU64,
+    }
+
+    impl Source for Zeros {
+        fn len(&self) -> u64 {
+            self.len
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, crate::EngineError> {
+            let n = buf.len().min(self.len.saturating_sub(offset) as usize);
+            for (i, b) in buf[..n].iter_mut().enumerate() {
+                *b = self.head.get(offset as usize + i).copied().unwrap_or(0);
+            }
+            self.read
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            Ok(n)
+        }
+        fn volume(&self) -> Option<crate::source::VolumeId> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_huge_moof_is_never_loaded() {
+        // A `moof` declaring 1 GiB right after the head: refused as garbled at its header, far fewer bytes read.
+        let (a, _) = padded_parts(13);
+        let mut head = a[0].clone();
+        head.extend_from_slice(&(1u32 << 30).to_be_bytes());
+        head.extend_from_slice(b"moof");
+        let src = Zeros {
+            head,
+            len: 2 << 30,
+            read: Default::default(),
+        };
+        let mut seams = MoofSeams::new(&src, 0).unwrap();
+        let before = src.read.load(std::sync::atomic::Ordering::Relaxed);
+        let from = seams.begin();
+        let run = seams.run(&src, &from, src.len(), false, &mut |_, _, _| {});
+        let read = src.read.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(matches!(run.end, WalkEnd::Broken { .. }) && run.failed);
+        assert!(read < 1 << 20, "{read} bytes read");
+    }
+
+    #[test]
+    fn empty_samples_spend_the_walk_steps() {
+        // IMPORTANT 1: `moof`s listing millions of zero-size samples (default size 0, no per-sample field), each with an
+        // empty `mdat`: every listed sample costs a step, so a walk with few steps left stops undecided.
+        let (a, _) = padded_parts(13);
+        let mut file = a[0].clone();
+        for seq in 1..=4u32 {
+            let mut tfhd = 0x02_0000u32.to_be_bytes().to_vec();
+            tfhd.extend_from_slice(&1u32.to_be_bytes());
+            let mut trun = 0x1u32.to_be_bytes().to_vec();
+            trun.extend_from_slice(&3_999_999u32.to_be_bytes());
+            trun.extend_from_slice(&0i32.to_be_bytes());
+            let mut mfhd = vec![0u8; 4];
+            mfhd.extend_from_slice(&seq.to_be_bytes());
+            let traf = bx(b"traf", &[bx(b"tfhd", &tfhd), bx(b"trun", &trun)].concat());
+            file.extend(bx(b"moof", &[bx(b"mfhd", &mfhd), traf].concat()));
+            file.extend(bx(b"mdat", &[]));
+        }
+        let src = Mem(file);
+        let mut seams = MoofSeams::new(&src, 0).unwrap();
+        seams.steps = 1 << 20;
+        let from = seams.begin();
+        let w = seams.walk(&src, &[], &from, src.len());
+        assert!(matches!(w.end, WalkEnd::Stopped));
+        assert_eq!(seams.steps, 0);
     }
 }

@@ -1269,3 +1269,48 @@ fn index_first_videos_check_their_samples() {
         }
     }
 }
+
+#[test]
+fn hostile_empty_fragments_are_bounded() {
+    // A valid fragmented clip followed by `moof`s each listing 3,999,999 empty samples (default size 0, no per-sample
+    // field): every listed sample costs a step, so the measurement stops early and cannot call the file intact.
+    use testkit::{AvcOptions, VideoCodec, VideoLayout};
+    let o = AvcOptions {
+        samples: 30,
+        seed: 9,
+        mov: false,
+        mdat_pad: 0,
+        small_nals: true,
+    };
+    let v = testkit::camera_video(
+        &o,
+        VideoCodec::Avc,
+        VideoLayout::Fragmented {
+            samples_per_fragment: 8,
+        },
+    );
+    let bx = |kind: &[u8; 4], body: &[u8]| {
+        let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        b.extend_from_slice(kind);
+        b.extend_from_slice(body);
+        b
+    };
+    let mut bytes = v.bytes.clone();
+    for seq in 5..13u32 {
+        let mut tfhd = 0x02_0000u32.to_be_bytes().to_vec();
+        tfhd.extend_from_slice(&1u32.to_be_bytes());
+        let mut trun = 0u32.to_be_bytes().to_vec();
+        trun.extend_from_slice(&3_999_999u32.to_be_bytes());
+        let mut mfhd = vec![0u8; 4];
+        mfhd.extend_from_slice(&seq.to_be_bytes());
+        let traf = bx(b"traf", &[bx(b"tfhd", &tfhd), bx(b"trun", &trun)].concat());
+        bytes.extend(bx(b"moof", &[bx(b"mfhd", &mfhd), traf].concat()));
+    }
+    let src = Counting {
+        bytes,
+        read: Default::default(),
+    };
+    let m = IsoBmff.measure(&src, 0).unwrap();
+    assert_eq!(m.len, src.bytes.len() as u64);
+    assert_eq!(m.health, Health::Partial);
+}
