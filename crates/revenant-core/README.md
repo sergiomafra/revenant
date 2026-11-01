@@ -965,11 +965,12 @@ and
   passes is evidence, not proof. A known limit (from 1.4): an uncompressed or lossy RAW whose first piece is followed by
   other data with no file start in it is measured `Intact` from those contiguous bytes (only its structure and preview
   are checked), so it is never a reassembly candidate; only a file system proving its placement can catch it. Part 1.6
-  narrows it for deleted exFAT files whose FAT chain survives (in two or more runs): the contiguous carving no longer
-  replaces the chain's placement, and the reassembly cannot make a contiguous solution unique against an unrefuted
-  chain (see [Deduplication](#deduplication) and [The reassembly step](#the-reassembly-step)). It still stands for a
-  RAW carved without a file system, and for a deleted FAT (or chain-zeroed exFAT) RAW whose guess, one run of free
-  clusters, is trusted by the 1.4 rule D3.
+  narrows it for deleted exFAT files whose FAT chain survives whole (in two or more runs): the contiguous carving no
+  longer replaces the chain's placement, and the reassembly cannot make a contiguous solution unique against an
+  unrefuted chain (see [Deduplication](#deduplication) and [The reassembly step](#the-reassembly-step)). It still
+  stands for a RAW carved without a file system, and for a deleted RAW whose guess, one run of free clusters, is
+  trusted by the 1.4 rule D3: a FAT or chain-zeroed exFAT delete, and an exFAT chain that no longer reads whole (a
+  later FAT-chained file rewrote one of its FAT entries), whose old chain is then lost and gives way to the guess.
 - Inside an `Intact` RAW the scan suppresses heads, so its embedded previews are not reported separately. A `Partial`
   RAW hides its own JPEGs too (`Format::own_files`: its previews and JPEG-coded strips/tiles, at most 64; ruling D12):
   a JPEG the scan finds at one of their starts, lying wholly inside the RAW, is not reported. A `Damaged` RAW hides
@@ -2102,7 +2103,9 @@ merge (rulings D3, D5, D6), from the measurement through the view of the file's 
    proved together; uncompressed or lossy sensor data is then trusted to the chain, as a live chain's is. **The limit
    (D14):** bytes written over such sensor data inside a surviving chain that left no directory record, no file start
    and no finding (old noise, a file whose start lies off every cluster grid and whose entry is gone) are not detected:
-   the file comes out `Intact`, `old_chain`, with them.
+   the file comes out `Intact`, `old_chain`, with them. So with a damaged clip whose `mdat` size was never written (a
+   placeholder of 8 bytes, or 1 with a 64-bit size of 0: a recording cut by a power loss): it is measured only to its
+   header, so its frames written over the chain do not count as running into it.
 3. The pieces are the file system's: `len` their sum, `fragments` them when there are two or more.
 4. A deleted file takes the carving at its start instead (its length, kind, health and pieces; `placement` `carved`)
    when the carving is of the same kind, strictly healthier (`Intact` > `Partial` > `Damaged`) and exactly the

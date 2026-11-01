@@ -167,9 +167,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - A new file-system placement, `old_chain` (`revenant-dev`'s `placement` key): a deleted exFAT file placed and proven by
   the cluster chain it left. A chain that cannot prove it is reported `guessed`.
-- A deleted RAW whose surviving exFAT chain says it was in pieces is no longer reported intact from the bytes that
-  follow its first piece (its image data cannot be checked): it is partial unless the chain proves it.
-
+- A deleted RAW whose exFAT chain survives whole in two or more pieces is no longer reported intact from the bytes that
+  follow its first piece (its image data cannot be checked): it is partial unless the chain proves it. When the chain
+  no longer reads whole (another file rewrote part of it in the FAT), the RAW falls back to the guess of one run of free
+  clusters, which can still come out intact with the wrong image data (a known limit of deleted RAWs, as on FAT).
 - Sessions saved by an earlier version can no longer be resumed: scan the card again.
 - Extraction from a whole card or disk refuses a destination on any volume of that device (also an APFS volume whose
   container lives on it), and a destination whose disks cannot be determined (a network folder), so nothing is ever

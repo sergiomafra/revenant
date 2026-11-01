@@ -1757,3 +1757,28 @@ fn old_chain_run_into_by_a_partial_file_is_not_proof() {
     let f = final_named(&ev, pa);
     assert_ne!(f.health, Health::Intact, "{f:#?}");
 }
+
+#[test]
+fn old_chain_run_into_by_a_file_found_before_it_is_not_proof() {
+    // As above, A's runs out of order (600, 300, 900: a rotating allocator wrapped): the cut photo starts at the free
+    // cluster 299, before A's start, and runs into A's second piece (at 300). It is emitted before A, so only the list
+    // of findings already emitted shows it (ruling Q49).
+    let a = uncompressed_arw();
+    let mut b = exfat(32 * 1024);
+    let pa = "DCIM/100MSDCF/DSC00056.ARW";
+    let cl = 32 * 1024;
+    let n = clusters_in(a.bytes.len(), cl);
+    let clusters = split(&[600, 300, 900], n);
+    b.add_at(pa, &a.bytes, &clusters);
+    b.delete(pa, DeleteStyle::Camera);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1300, &clusters, cl);
+    let j = jpeg_smooth(1024, 768, 77);
+    let from = b.cluster_offset(299) as usize;
+    let cut = (j.len() * 7 / 10).min(3 * 32 * 1024);
+    v[from..from + cut].copy_from_slice(&j[..cut]);
+    let (_, ev) = scanned(&v);
+    let f = final_named(&ev, pa);
+    assert_ne!(f.health, Health::Intact, "{f:#?}");
+    assert_ne!(deleted_as(&f).1, Placement::OldChain, "{f:#?}");
+}

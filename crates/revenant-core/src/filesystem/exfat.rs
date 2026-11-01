@@ -296,7 +296,8 @@ impl<'a> Walk<'a, '_> {
     /// `OldChain` when the bitmap is there, ValidDataLength equals DataLength, the listing dropped nothing (else an
     /// unseen entry could claim the clusters) and no other deleted entry, of any kind, claims any of its clusters (its
     /// recorded run, its own old chain, its first cluster, or a deleted directory read there, rulings Q6, Q49; a live
-    /// entry's clusters are claimed, so never free); otherwise `Guessed`, the chain only a hypothesis. All of them are located first, so every claim is known before one is judged.
+    /// entry's clusters are claimed, so never free); otherwise `Guessed`, the chain only a hypothesis. All of them are
+    /// located first, so every claim is known before one is judged.
     fn place(&mut self) {
         let later = std::mem::take(&mut self.later);
         let cs = self.v.cluster_size;
@@ -750,10 +751,11 @@ type Placed = (Vec<(u32, u32)>, Placement, bool, bool);
 
 /// The clusters each deleted entry of a volume claims (D14, ruling Q6): a NoFatChain entry its recorded run, a
 /// FAT-chained one its first cluster and its whole old chain (when [`old_chain`] found one); the deleted directories
-/// read and the deleted files of other kinds, their runs (`dirs`, owner `usize::MAX`). Sorted by start, with, for each prefix, the two farthest ends of distinct owners: whether another
-/// owner's claim meets a run is one binary search.
+/// read and the deleted files of other kinds, their runs (`dirs`, owner `usize::MAX`). Sorted by start, with, for each
+/// prefix, the two farthest ends of distinct owners: whether another owner's claim meets a run is one binary search.
 struct OldClaims {
-    /// `[start, end)` cluster ranges and their owner (an index in `later`; `usize::MAX` for a directory), by start.
+    /// `[start, end)` cluster ranges and their owner, by start: an index in `later`, or `usize::MAX` for a deleted
+    /// directory or a deleted file of another kind (never the file judged).
     ranges: Vec<(u32, u32, usize)>,
     /// For each prefix `ranges[..=i]`: the farthest end and its owner, then the farthest end of any other owner.
     top: Vec<((u32, usize), (u32, usize))>,
