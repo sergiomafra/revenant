@@ -132,8 +132,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   volume found is reported at the start of the scan, with a flag when the listing hit one of its limits (some files may
   then lack their names); the file-system step can be turned off.
 - Photos split into three or more pieces on a card are put back together after the scan, from the card's free space,
-  never over another file; without file-system proof of their placement they are reported as partial, never as intact
-  (a near-identical photo of the same burst could have lent a piece).
+  never over a live file or another intact one; without file-system proof of their placement they are reported as
+  partial, never as intact (a near-identical photo of the same burst could have lent a piece).
+- Camera videos (MP4/MOV, H.264 and H.265) split into three or more pieces, their index (`moov`) written last away
+  from the rest, are put back together after the scan from the card's free space: the index says where every frame
+  must lie, and every frame is checked there. Such a video is intact only when every cut between two pieces lies close
+  enough to checked bytes that no other cut fits and nothing else on the card fits as well; otherwise it is partial
+  (videos with very large slices on small clusters, two copies of the index, or every frame the same size).
 
 ### Changed
 
@@ -177,6 +182,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A video in three pieces whose middle piece is tiny (a few frames placed elsewhere) is no longer put back together as
+  two pieces and called intact: the pairing of a video with its index now checks every frame, not 32 of them per side.
 - A complete HEIC photo followed by an unreadable sector, or by a stray `moov` box, is now intact and stays a HEIC (it was
   partial, or taken for a video).
 - An MP4 video that lists a HEIC brand and lost its `moov` index is now reported as a damaged MP4, not a damaged HEIC.

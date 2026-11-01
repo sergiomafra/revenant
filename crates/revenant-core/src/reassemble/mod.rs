@@ -18,7 +18,7 @@
 //! The scan's reassembly step ([`reassemble`]) runs this search, after the pairing, for every candidate the scan kept
 //! ([`is_candidate`]), in id order, and turns each result that improves the finding into an `Updated` ([`improves`]),
 //! with the health of [`health`].
-// Parts of the engine wait for the formats of later tasks (anchors and known lengths for videos, own files for RAWs).
+// Parts of the engine wait for the formats of later tasks (own files for RAWs).
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -36,6 +36,7 @@ use crate::scan::{CancelToken, Finding};
 use crate::source::{DiskId, Fragmented, Source, VolumeId};
 
 pub(crate) mod jpeg;
+pub(crate) mod video;
 
 /// Most pieces of a file on a cluster grid.
 pub(crate) const MAX_PIECES: usize = 16;
@@ -1239,8 +1240,8 @@ pub(crate) fn search<S: Seams>(
 
 /// Whether a finding the scan emits is a reassembly candidate (D2): never one of a live file (its chain says where it
 /// is); a JPEG that is not `Intact` with a first piece of at least 16 KiB (the 1.3 `MIN_FIRST_PIECE`), an MP4/MOV that
-/// is not `Intact`, a `Partial` TIFF RAW, and any photo or video of a deleted file that came out `Partial`. Only the
-/// JPEGs are searched so far; the others are kept for the formats that come next.
+/// is not `Intact`, a `Partial` TIFF RAW, and any JPEG, MP4/MOV or TIFF RAW of a deleted file that came out `Partial`.
+/// The JPEGs and the videos are searched so far; the RAWs are kept for the format that comes next.
 pub(crate) fn is_candidate(f: &Finding) -> bool {
     let origin = f.origin.as_ref().map(|o| o.state);
     if origin == Some(FsState::Live) {
@@ -1284,6 +1285,8 @@ pub(crate) struct Context<'a> {
     pub claimed_capped: bool,
     /// A volume listing dropped entries: live clusters may be unknown (Q5).
     pub listing_truncated: bool,
+    /// What the pairing left of its `moov` load and sample budgets: the videos' `moov`s are loaded within it.
+    pub moov_budget: crate::pairing::Budget,
     pub limits: &'a Limits,
 }
 
@@ -1298,7 +1301,8 @@ pub(crate) struct Checks {
     pub bad: bool,
     /// The pieces sum to the file-system entry's size, when one is known.
     pub size_ok: bool,
-    /// The format's own check of the whole file over its pieces is `Intact` (the JPEG: the strict decode).
+    /// The format's own check of the whole file over its pieces is `Intact` (the JPEG: the strict decode; a video: its
+    /// index against its length).
     pub own_ok: bool,
     /// A JPEG with restart markers (DRI > 0): at most `Partial` in 2 or more pieces (Q16).
     pub restarts: bool,
@@ -1356,8 +1360,10 @@ pub(crate) fn improves(old: &Finding, new: &Finding, complete: bool) -> bool {
 /// file keeps its origin with placement `Carved`, D15). For a candidate of origin `Deleted`, the search gets the entry's
 /// size as the known length (Q3): the pieces must sum to it. `paired`: the pairing's results, whose `Intact` pieces are
 /// claimed first; each `Intact` reassembly claims its pieces for the next candidates. Sequential and deterministic: it
-/// depends only on the source's bytes and its arguments. Only JPEGs are searched so far (videos and RAWs keep their
-/// results until their formats get seams). Stops early, returning what it has, when cancelled (the caller looks).
+/// depends only on the source's bytes and its arguments. JPEGs and moov-less videos with a fitting orphan `moov` (in
+/// `ctx.moovs`) are searched (the RAWs keep their results until their format gets seams); a video the pairing made
+/// `Intact` is left alone, and one it paired otherwise must improve on the pairing's result. Stops early, returning
+/// what it has, when cancelled (the caller looks).
 pub(crate) fn reassemble(
     source: &CachedSource,
     candidates: &[Finding],
@@ -1371,15 +1377,62 @@ pub(crate) fn reassemble(
         taken.claim(&f.ranges());
     }
     let mut budget = Budget::new(ctx.limits);
-    let mut out = Vec::new();
+    // The videos the pairing made `Intact` are done: neither searched nor counted for a `moov`'s filter.
+    let intact: std::collections::HashSet<u64> = paired
+        .iter()
+        .filter(|p| p.health == Health::Intact)
+        .map(|p| p.id)
+        .collect();
+    let done = |f: &Finding| intact.contains(&f.id);
+    let videos: Vec<Finding> = candidates
+        .iter()
+        .filter(|f| matches!(f.kind, FileKind::Mp4 | FileKind::Mov) && !done(f))
+        .cloned()
+        .collect();
+    let mut moovs = video::Moovs::new(source, &videos, ctx.moovs.len(), ctx.moov_budget);
+    // Which video first had a complete solution with each orphan `moov` (index in `ctx.moovs`).
+    let mut owner: HashMap<usize, u64> = HashMap::new();
+    let mut out: Vec<Finding> = Vec::new();
     for f in candidates {
         if cancel.is_cancelled() || budget.spent() {
             break;
         }
-        if f.kind != FileKind::Jpeg {
-            continue;
-        }
-        if let Some(new) = reassemble_jpeg(source, f, &taken, ctx, &mut budget, cancel) {
+        let new = match f.kind {
+            FileKind::Jpeg => reassemble_jpeg(source, f, &taken, ctx, &mut budget, cancel),
+            FileKind::Mp4 | FileKind::Mov if !done(f) && !ctx.moovs.is_empty() => {
+                let old = paired.iter().find(|p| p.id == f.id).unwrap_or(f);
+                let r = video::reassemble_video(
+                    source,
+                    f,
+                    old,
+                    &taken,
+                    ctx,
+                    &mut moovs,
+                    &mut budget,
+                    cancel,
+                );
+                // As in the pairing, a `moov` that completes two videos (their first pieces are copies) goes back
+                // together with neither: an earlier one, then not `Intact` (an `Intact` one claims its `moov`), is
+                // dropped too, and so is this one.
+                let rivals: Vec<u64> = r
+                    .moovs
+                    .iter()
+                    .filter_map(|i| owner.get(i))
+                    .copied()
+                    .collect();
+                for &i in &r.moovs {
+                    owner.entry(i).or_insert(f.id);
+                }
+                if rivals.is_empty() {
+                    r.new
+                } else {
+                    out.retain(|o| !rivals.contains(&o.id) || o.health == Health::Intact);
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(new) = new {
             if new.health == Health::Intact {
                 taken.claim(&new.ranges());
             }

@@ -13,7 +13,8 @@ use std::collections::HashSet;
 use crate::cache::{CACHE_WINDOW, CachedSource};
 use crate::filesystem::{FsState, Placement};
 use crate::formats::isobmff::{
-    Check, MOOV_MAX_LEN, child, index_health, index_tracks, moovless_layout,
+    Check, CheckedSample, MOOV_MAX_LEN, SampleEnd, child, index_health, index_tracks,
+    moovless_layout, walk_sample,
 };
 use crate::formats::{Fragment, Health, Reader, SECTOR};
 use crate::scan::{CancelToken, Finding};
@@ -30,12 +31,8 @@ const MAX_PAIRS: usize = 256;
 const MIN_SAMPLES: usize = 8;
 /// The index's first chunk must start within this many bytes of the start of the `mdat` payload.
 const FIRST_CHUNK_SLACK: u64 = 64 * 1024;
-/// Samples verified on each side of the break.
-const VERIFY: usize = 32;
 /// Most break points tried per pair.
 const MAX_BREAKS: u64 = 4096;
-/// Most NAL units walked per sample.
-const MAX_NAL_UNITS: usize = 512;
 /// Most NAL units (or JPEG marker checks) walked by one pairing run, all pairs together: past it no further pair is
 /// checked. Bounds the time a crafted index can cost.
 const MAX_STEPS: u64 = 1 << 24;
@@ -48,42 +45,63 @@ const MIN_GRID_CLUSTER: u64 = 4096;
 pub(crate) type Grid = (u64, u64, u64);
 
 /// A `Damaged` video without `moov`.
-struct Video<'f> {
-    finding: &'f Finding,
-    kind: crate::formats::FileKind,
+pub(crate) struct Video<'f> {
+    pub(crate) finding: &'f Finding,
+    pub(crate) kind: crate::formats::FileKind,
     /// Where `moov` would start, relative to the file: the end of `mdat`.
-    p: u64,
+    pub(crate) p: u64,
+    /// Start of the `mdat` box, relative to the file.
+    pub(crate) mdat: u64,
     /// Start of the `mdat` payload, relative to the file.
-    payload: u64,
+    pub(crate) payload: u64,
+}
+
+impl<'f> Video<'f> {
+    /// The video `f` when it has no `moov` ([`moovless_layout`] at its start).
+    pub(crate) fn of(r: &mut Reader, f: &'f Finding) -> Option<Video<'f>> {
+        let l = moovless_layout(r, f.start)?;
+        let rel = l.mdat_at.checked_sub(f.start)?;
+        Some(Video {
+            finding: f,
+            kind: l.kind,
+            p: rel.checked_add(l.declared)?,
+            mdat: rel,
+            payload: rel + l.header_len,
+        })
+    }
 }
 
 /// A checkable sample: its offset in the file, size (from `stsz`, 32-bit) and track check. 16 bytes.
 #[derive(Clone, Copy)]
-struct Item {
-    offset: u64,
-    size: u32,
-    check: Check,
+pub(crate) struct Item {
+    pub(crate) offset: u64,
+    pub(crate) size: u32,
+    pub(crate) check: Check,
 }
 
 impl Item {
-    fn len(&self) -> u64 {
-        u64::from(self.size)
+    pub(crate) fn sample(&self) -> CheckedSample {
+        CheckedSample {
+            offset: self.offset,
+            size: u64::from(self.size),
+            check: self.check,
+        }
     }
 }
 
 /// A loaded orphan `moov`.
-struct Moov {
+pub(crate) struct Moov {
     /// Absolute offset of the box.
-    q: u64,
+    pub(crate) q: u64,
     /// Box size (header included).
-    size: u64,
-    payload: std::rc::Rc<Vec<u8>>,
+    pub(crate) size: u64,
+    pub(crate) payload: std::rc::Rc<Vec<u8>>,
     /// Checkable samples, by offset.
-    items: Vec<Item>,
+    pub(crate) items: Vec<Item>,
     /// Lowest sample offset of any track.
-    c_min: u64,
+    pub(crate) c_min: u64,
     /// Highest sample end of any track.
-    c_end: u64,
+    pub(crate) c_end: u64,
 }
 
 /// A pair that passed.
@@ -118,23 +136,29 @@ struct Steps {
 }
 
 impl Steps {
-    /// Counts one step; `false` once the run's budget is spent.
-    fn take(&mut self) -> bool {
-        self.used += 1;
-        self.used <= self.max
-    }
-
     fn spent(&self) -> bool {
         self.used > self.max
     }
 }
 
 /// What one run has left of its budgets, and whether a bound was hit.
-struct Budget {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Budget {
     load: u64,
     samples: u64,
     /// No bound was hit: every candidate the filters let through was checked.
-    complete: bool,
+    pub(crate) complete: bool,
+}
+
+impl Budget {
+    /// The budgets of one pairing run, whole (the reassembly step's videos go on with what the pairing leaves).
+    pub(crate) fn new() -> Budget {
+        Budget {
+            load: LIMITS.load_budget,
+            samples: LIMITS.sample_budget,
+            complete: true,
+        }
+    }
 }
 
 /// Damaged moov-less videos × orphan `moov` boxes (start, declared size, as the scan saw them) → the reassembled findings (same ids, in the order of `videos`),
@@ -153,6 +177,9 @@ struct Budget {
 /// them. A reassembled video is `Intact` only when exactly one break point passed, no bound was hit (the load budget,
 /// the sample budget, the pair cap or the step budget: an unchecked pair might have passed too) and no other file starts
 /// inside its pieces; otherwise at most `Partial`.
+///
+/// `budget` starts as [`Budget::new`]; the `moov` loads and the samples listed are charged to it, and the reassembly
+/// step gets what it has left (one load budget and one sample budget for both).
 pub(crate) fn pair_videos(
     source: &CachedSource,
     videos: &[Finding],
@@ -160,11 +187,13 @@ pub(crate) fn pair_videos(
     starts: &[u64],
     grids: &[Grid],
     cancel: &CancelToken,
+    budget: &mut Budget,
 ) -> Vec<Finding> {
-    pair_with(source, videos, moovs, starts, grids, cancel, LIMITS).0
+    pair_in(source, videos, moovs, starts, grids, cancel, LIMITS, budget).0
 }
 
-/// [`pair_videos`] under `limits`; also returns the sample-check steps used.
+/// [`pair_videos`] under `limits` (budgets from them); also returns the sample-check steps used.
+#[cfg(test)]
 fn pair_with(
     source: &CachedSource,
     videos: &[Finding],
@@ -174,28 +203,43 @@ fn pair_with(
     cancel: &CancelToken,
     limits: Limits,
 ) -> (Vec<Finding>, u64) {
-    let mut r = Reader::new(source);
-    let vids: Vec<Video> = videos
-        .iter()
-        .filter(|f| f.origin.as_ref().is_none_or(|o| o.state != FsState::Live))
-        .filter_map(|f| {
-            let l = moovless_layout(&mut r, f.start)?;
-            let rel = l.mdat_at.checked_sub(f.start)?;
-            Some(Video {
-                finding: f,
-                kind: l.kind,
-                p: rel.checked_add(l.declared)?,
-                payload: rel + l.header_len,
-            })
-        })
-        .collect();
-    // `(q − P) ≡ 0 (mod 512)` needs only `q` and each video's `P`: candidates no video can take are never loaded.
-    let residues: HashSet<u64> = vids.iter().map(|v| v.p % SECTOR).collect();
     let mut budget = Budget {
         load: limits.load_budget,
         samples: limits.sample_budget,
         complete: true,
     };
+    pair_in(
+        source,
+        videos,
+        moovs,
+        starts,
+        grids,
+        cancel,
+        limits,
+        &mut budget,
+    )
+}
+
+/// [`pair_videos`] under `limits`, charging `budget`; also returns the sample-check steps used.
+#[allow(clippy::too_many_arguments)]
+fn pair_in(
+    source: &CachedSource,
+    videos: &[Finding],
+    moovs: &[(u64, u64)],
+    starts: &[u64],
+    grids: &[Grid],
+    cancel: &CancelToken,
+    limits: Limits,
+    budget: &mut Budget,
+) -> (Vec<Finding>, u64) {
+    let mut r = Reader::new(source);
+    let vids: Vec<Video> = videos
+        .iter()
+        .filter(|f| f.origin.as_ref().is_none_or(|o| o.state != FsState::Live))
+        .filter_map(|f| Video::of(&mut r, f))
+        .collect();
+    // `(q − P) ≡ 0 (mod 512)` needs only `q` and each video's `P`: candidates no video can take are never loaded.
+    let residues: HashSet<u64> = vids.iter().map(|v| v.p % SECTOR).collect();
     let mut pairs = 0usize;
     let mut steps = Steps {
         used: 0,
@@ -209,7 +253,7 @@ fn pair_with(
         if !residues.contains(&(q % SECTOR)) {
             continue;
         }
-        let Some(m) = load_moov(source, q, size, &vids, &mut budget) else {
+        let Some(m) = load_moov(source, q, size, &vids, budget) else {
             continue;
         };
         for (vi, v) in vids.iter().enumerate() {
@@ -266,7 +310,7 @@ fn pair_with(
 
 /// The arithmetic filter: the second piece starts on a sector boundary, the index's first sample sits within
 /// [`FIRST_CHUNK_SLACK`] of the start of the `mdat` payload and its last one ends by `P`.
-fn fits(v: &Video, q: u64, c_min: u64, c_end: u64) -> bool {
+pub(crate) fn fits(v: &Video, q: u64, c_min: u64, c_end: u64) -> bool {
     q.wrapping_sub(v.p).is_multiple_of(SECTOR)
         && v.payload <= c_min
         && c_min < v.payload + FIRST_CHUNK_SLACK
@@ -278,7 +322,7 @@ fn fits(v: &Video, q: u64, c_min: u64, c_end: u64) -> bool {
 /// listing a sample) the checkable tracks' sample counts to the sample budget; a candidate past either budget is dropped
 /// and clears `complete`. `None` when it is not a usable index: past the source, unreadable, garbled, without `mvhd` or
 /// `trak`, with an unusable sample table, with fewer than [`MIN_SAMPLES`] checkable samples, or that no video fits.
-fn load_moov(
+pub(crate) fn load_moov(
     source: &CachedSource,
     q: u64,
     size: u64,
@@ -396,70 +440,23 @@ impl Places<'_> {
             .is_some_and(|at| self.rb.read(at, buf) == buf.len())
     }
 
-    /// Whether the sample read on `side` passes its check.
+    /// Whether the sample read on `side` passes its check ([`check_sample`]: one step per NAL unit or JPEG).
     fn passes(&mut self, side: Side, it: &Item, steps: &mut Steps) -> bool {
-        match it.check {
-            Check::Mjpeg => {
-                let (mut soi, mut eoi) = ([0u8; 3], [0u8; 2]);
-                steps.take()
-                    && it.len() >= 5
-                    && self.read(side, it.offset, &mut soi)
-                    && self.read(side, it.offset + it.len() - 2, &mut eoi)
-                    && soi == [0xFF, 0xD8, 0xFF]
-                    && eoi == [0xFF, 0xD9]
-            }
-            Check::Nal { length_size, hevc } => {
-                let ls = u64::from(length_size);
-                let need = ls + if hevc { 2 } else { 1 };
-                let mut pos = 0u64;
-                for _ in 0..MAX_NAL_UNITS {
-                    if pos == it.len() {
-                        return true;
-                    }
-                    let mut h = [0u8; 6];
-                    let h = &mut h[..need as usize];
-                    if !steps.take()
-                        || pos + need > it.len()
-                        || !self.read(side, it.offset + pos, h)
-                    {
-                        return false;
-                    }
-                    let len = h[..ls as usize]
-                        .iter()
-                        .fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
-                    let header = h[ls as usize];
-                    let ok = header & 0x80 == 0
-                        && if hevc {
-                            len >= 2 && (header >> 1) & 0x3F <= 40 && h[ls as usize + 1] & 7 != 0
-                        } else {
-                            len >= 1 && (1..=23).contains(&(header & 0x1F))
-                        };
-                    if !ok {
-                        return false;
-                    }
-                    pos += ls + len;
-                    if pos > it.len() {
-                        return false;
-                    }
-                }
-                pos == it.len()
-            }
+        let mut left = steps.max.saturating_sub(steps.used);
+        let before = left;
+        let end = walk_sample(
+            &mut |off, buf| self.read(side, off, buf),
+            &it.sample(),
+            &mut left,
+            &mut |_, _| {},
+        );
+        steps.used += before - left;
+        if end == SampleEnd::Spent {
+            // The step that was refused counts: the run is spent.
+            steps.used = steps.max + 1;
         }
+        end == SampleEnd::Pass
     }
-}
-
-/// Up to [`VERIFY`] evenly spaced indices of `range`, both ends included.
-fn spaced(range: std::ops::Range<usize>) -> impl Iterator<Item = usize> {
-    let n = range.len();
-    let take = n.min(VERIFY);
-    (0..take).map(move |j| {
-        range.start
-            + if take < 2 {
-                0
-            } else {
-                j * (n - 1) / (take - 1)
-            }
-    })
 }
 
 /// Whether file offset `off` is where one of `m`'s Motion-JPEG samples starts (a JPEG the scan finds there is the
@@ -575,13 +572,14 @@ fn try_pair(
         }
         lo
     };
-    for i in spaced(0..k) {
-        if !at.passes(Side::A, &items[i], steps) {
+    // Every sample (C7 of part 1.3: a spaced subset misses a small middle piece placed elsewhere).
+    for it in &items[..k] {
+        if !at.passes(Side::A, it, steps) {
             return None;
         }
     }
-    for i in spaced(k + 1..n.max(k + 1)) {
-        if !at.passes(Side::B, &items[i], steps) {
+    for it in items.get(k + 1..).unwrap_or_default() {
+        if !at.passes(Side::B, it, steps) {
             return None;
         }
     }
@@ -921,14 +919,84 @@ mod tests {
         }
     }
 
+    /// C7 of part 1.3: a video cut in 3, its first piece `[0, 2/5)` at 1 MiB, the rest with its `moov` at 10 MiB, except
+    /// a middle piece of 4 samples of the rest placed elsewhere (at 18 MiB; its place in the rest holds other data). The
+    /// 4 samples lie between two of the 32 evenly spaced samples the 1.3 check verified after the break. Paired as two
+    /// pieces, the result is never `Intact`.
     #[test]
-    fn spaced_takes_both_ends_and_at_most_verify() {
-        assert_eq!(spaced(3..3).count(), 0);
-        assert_eq!(spaced(5..6).collect::<Vec<_>>(), vec![5]);
-        assert_eq!(spaced(0..4).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
-        let many: Vec<usize> = spaced(10..1010).collect();
-        assert_eq!(many.len(), VERIFY);
-        assert_eq!((many[0], many[VERIFY - 1]), (10, 1009));
-        assert!(many.windows(2).all(|w| w[0] < w[1]));
+    fn pairing_checks_every_sample() {
+        let v = avc_video(&AvcOptions {
+            samples: 256,
+            seed: 4,
+            mov: false,
+            mdat_pad: 0,
+            small_nals: true,
+        });
+        let samples =
+            &crate::formats::isobmff::track_samples(&v.bytes[v.moov.start + 8..v.moov.end])
+                .unwrap()[0]
+                .1;
+        let n = samples.len();
+        let pl = &v.mdat_payload;
+        let c1 = (pl.start + pl.len() * 2 / 5).div_ceil(512) * 512;
+        // k: the first sample not wholly in the first piece; the 1.3 check verified 32 evenly spaced samples of k + 1..n.
+        let k = samples
+            .iter()
+            .position(|s| s.offset + s.size > c1 as u64)
+            .unwrap();
+        let (from, m) = (k + 1, n - (k + 1));
+        let verified: Vec<usize> = (0..32).map(|j| from + j * (m - 1) / 31).collect();
+        let j = verified
+            .windows(2)
+            .position(|w| w[0] > k + 1 && w[1] - w[0] >= 5)
+            .expect("a gap of 4 unverified samples");
+        let (a, b) = (verified[j], verified[j + 1]);
+        assert!(
+            a > k + 1,
+            "the hole is past the samples read across the break"
+        );
+        // The middle piece: whole sectors strictly between the two verified samples (about 4 samples).
+        let lo = ((samples[a].offset + samples[a].size) as usize).div_ceil(512) * 512;
+        let hi = samples[b].offset as usize / 512 * 512;
+        assert!(hi >= lo + 1024, "{lo}..{hi}");
+        let mut image = vec![0u8; 24 * MIB];
+        let mut x = 7u64;
+        for byte in image.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *byte = x as u8;
+        }
+        let (first, rest, middle) = (MIB, 10 * MIB, 18 * MIB);
+        image[first..first + c1].copy_from_slice(&v.bytes[..c1]);
+        let rest_len = v.bytes.len() - c1;
+        image[rest..rest + rest_len].copy_from_slice(&v.bytes[c1..]);
+        // Other data where the middle piece would be in the rest.
+        for (i, byte) in image[rest + lo - c1..rest + hi - c1].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(31) ^ 0x5A;
+        }
+        image[middle..middle + hi - lo].copy_from_slice(&v.bytes[lo..hi]);
+        let mem = Mem(image);
+        let cache = CachedSource::new(&mem, 512, 64 * MIB);
+        let finding = Finding {
+            id: 1,
+            start: first as u64,
+            len: v.moov.start as u64,
+            kind: FileKind::Mp4,
+            health: Health::Damaged,
+            fragments: Vec::new(),
+            origin: None,
+        };
+        let q = (rest + v.moov.start - c1) as u64;
+        let (out, _) = pair_with(
+            &cache,
+            &[finding],
+            &[(q, v.moov.len() as u64)],
+            &[first as u64],
+            &[],
+            &CancelToken::default(),
+            LIMITS,
+        );
+        assert!(out.iter().all(|f| f.health != Health::Intact), "{out:#?}");
     }
 }

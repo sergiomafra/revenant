@@ -13,7 +13,9 @@ use revenant_core::{
     scan,
 };
 use revenant_testkit::fs::{DeleteStyle, FsBuilder};
-use revenant_testkit::{jpeg, jpeg_smooth};
+use revenant_testkit::{
+    AvcOptions, VideoCodec, VideoLayout, avc_video, camera_video, jpeg, jpeg_smooth,
+};
 use support::cards::{ThreePiece, live_in_three_runs, three_piece};
 use support::{SimSource, VOLUME_AT, exfat_card, final_view, on_disk};
 
@@ -390,4 +392,273 @@ fn live_files_are_never_candidates() {
     assert_eq!(found.health, Health::Partial);
     assert_eq!(found.fragments, pieces);
     assert!(updated(&events).is_empty(), "{:#?}", updated(&events));
+}
+
+// Videos in three or more pieces (Task 5): their index places every sample, so each seam is checked where it must lie.
+
+/// Clusters in file order for runs starting at `firsts` of `counts` clusters each.
+fn runs(firsts: &[u32], counts: &[u32]) -> Vec<u32> {
+    firsts
+        .iter()
+        .zip(counts)
+        .flat_map(|(&f, &n)| f..f + n)
+        .collect()
+}
+
+/// Absolute pieces of `clusters` (file order, `cluster` bytes each) holding `size` bytes, consecutive ones joined.
+fn pieces_in(b: &FsBuilder, cluster: u64, clusters: &[u32], size: u64) -> Vec<Fragment> {
+    let mut out: Vec<Fragment> = Vec::new();
+    let mut left = size;
+    for &c in clusters {
+        let len = cluster.min(left);
+        left -= len;
+        let start = VOLUME_AT + b.cluster_offset(c);
+        match out.last_mut() {
+            Some(p) if p.start + p.len == start => p.len += len,
+            _ => out.push(Fragment { start, len }),
+        }
+    }
+    out
+}
+
+/// An exFAT card (64 MiB, clusters of `cluster` bytes) holding `files` (name, bytes, clusters in file order), each
+/// deleted by a computer that clears the chain (`ZeroChain`: the entry keeps the name and size, the FAT and the bitmap
+/// forget the clusters). With a camera's delete the exFAT chain survives and places the file by itself (part 1.4; its
+/// proof is D14, Task 9): here only the content can. Every other cluster from 64 on holds seeded noise (old data).
+/// Returns the disk image and each file's absolute pieces.
+fn video_image(cluster: u32, files: &[(&str, &[u8], Vec<u32>)]) -> (Vec<u8>, Vec<Vec<Fragment>>) {
+    let mut b = FsBuilder::new(revenant_testkit::fs::FsType::Exfat, 64 * MIB, cluster);
+    for (name, bytes, clusters) in files {
+        b.add_at(&format!("DCIM/{name}"), bytes, clusters);
+    }
+    let pieces: Vec<Vec<Fragment>> = files
+        .iter()
+        .map(|(_, bytes, clusters)| pieces_in(&b, cluster as u64, clusters, bytes.len() as u64))
+        .collect();
+    for (name, ..) in files {
+        b.delete(&format!("DCIM/{name}"), DeleteStyle::ZeroChain);
+    }
+    let mut volume = b.build();
+    let used: std::collections::HashSet<u32> =
+        files.iter().flat_map(|f| f.2.iter().copied()).collect();
+    let noise = support::cards::noise(volume.len() as u64, 0xC1A5);
+    for c in 64..b.cluster_count() + 2 {
+        if used.contains(&c) {
+            continue;
+        }
+        let at = b.cluster_offset(c) as usize;
+        let end = (at + cluster as usize).min(volume.len());
+        volume[at..end].copy_from_slice(&noise[at..end]);
+    }
+    (on_disk(&volume), pieces)
+}
+
+/// [`video_image`] as a source.
+fn video_card(cluster: u32, files: &[(&str, &[u8], Vec<u32>)]) -> (SimSource, Vec<Vec<Fragment>>) {
+    let (image, pieces) = video_image(cluster, files);
+    (SimSource::new(image), pieces)
+}
+
+fn small_video(samples: usize, seed: u64, small_nals: bool) -> AvcOptions {
+    AvcOptions {
+        samples,
+        seed,
+        mov: false,
+        mdat_pad: 0,
+        small_nals,
+    }
+}
+
+/// The video findings of the final view, by start.
+fn videos(view: &std::collections::BTreeMap<u64, Finding>) -> Vec<&Finding> {
+    view.values()
+        .filter(|f| matches!(f.kind, FileKind::Mp4 | FileKind::Mov))
+        .collect()
+}
+
+#[test]
+fn h264_video_in_five_pieces_with_moov_at_end_is_intact() {
+    let v = avc_video(&small_video(300, 1, true));
+    let n = clusters_for(v.bytes.len());
+    assert_eq!(n, 5, "one cluster per piece");
+    let clusters = runs(&[300, 900, 500, 1500, 1100], &[1; 5]);
+    let (src, pieces) = video_card(CLUSTER as u32, &[("C0001.MP4", &v.bytes, clusters)]);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_eq!(f.fragments, pieces[0], "{f:#?}");
+    assert_eq!(
+        (f.kind, f.health, f.len),
+        (FileKind::Mp4, Health::Intact, v.bytes.len() as u64)
+    );
+    assert!(updated(&events).iter().any(|u| u.id == f.id));
+    assert_eq!(extracted(&src, f), v.bytes);
+}
+
+#[test]
+fn h265_video_in_four_pieces_is_intact() {
+    let v = camera_video(
+        &small_video(300, 2, true),
+        VideoCodec::Hevc,
+        VideoLayout::MoovAtEnd,
+    );
+    let n = clusters_for(v.bytes.len());
+    assert!(n >= 5, "{n}");
+    let clusters = runs(&[700, 200, 1300, 450], &[2, 1, 1, n - 4]);
+    let (src, pieces) = video_card(CLUSTER as u32, &[("C0002.MP4", &v.bytes, clusters)]);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_eq!(f.fragments, pieces[0], "{f:#?}");
+    assert_eq!(f.health, Health::Intact, "{f:#?}");
+    assert_eq!(extracted(&src, f), v.bytes);
+}
+
+#[test]
+fn tiny_middle_piece_is_found() {
+    // 256 samples of 2–24 KiB: the one-cluster middle piece holds fewer than 1/32 of them (C7 of part 1.3).
+    let v = avc_video(&small_video(256, 3, false));
+    let n = clusters_for(v.bytes.len());
+    let first = n / 2;
+    let clusters = runs(&[200, 1200, 600], &[first, 1, n - first - 1]);
+    let moov = &v.bytes[v.moov.start + 8..v.moov.end];
+    let index = revenant_testkit_samples(moov);
+    let (lo, hi) = (first as u64 * CLUSTER, (first as u64 + 1) * CLUSTER);
+    let inside = index.iter().filter(|&&(o, s)| o < hi && o + s > lo).count();
+    assert!(inside < 256 / 32, "{inside} samples in the middle piece");
+    let (src, pieces) = video_card(CLUSTER as u32, &[("C0003.MP4", &v.bytes, clusters)]);
+    assert_eq!(pieces[0].len(), 3);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_eq!(f.fragments, pieces[0], "{f:#?}");
+    assert_eq!(f.health, Health::Intact, "{f:#?}");
+    assert_eq!(extracted(&src, f), v.bytes);
+}
+
+/// The (offset, size) of every sample of a testkit video's `moov` payload (one track: `stsz`, 4 samples per chunk,
+/// `stco`), read the simple way the testkit writes them.
+fn revenant_testkit_samples(moov: &[u8]) -> Vec<(u64, u64)> {
+    let find = |kind: &[u8; 4]| moov.windows(4).position(|w| w == kind).unwrap() + 4;
+    let be = |b: &[u8]| u32::from_be_bytes(b[..4].try_into().unwrap()) as u64;
+    let stsz = find(b"stsz");
+    let count = be(&moov[stsz + 8..]) as usize;
+    let sizes: Vec<u64> = (0..count).map(|i| be(&moov[stsz + 12 + 4 * i..])).collect();
+    let stco = find(b"stco");
+    let chunks = be(&moov[stco + 4..]) as usize;
+    let mut out = Vec::new();
+    for c in 0..chunks {
+        let mut off = be(&moov[stco + 8 + 4 * c..]);
+        for &s in sizes.iter().skip(4 * c).take(4) {
+            out.push((off, s));
+            off += s;
+        }
+    }
+    out
+}
+
+#[test]
+fn two_clips_of_one_camera_interleaved_are_not_swapped() {
+    // Two clips of the same camera (same options, seeds 1 and 2), their mdats padded to the same length so that each
+    // moov fits either video by its arithmetic (the strongest case), written in alternating one-cluster runs as a
+    // camera writing both at once with a rotating pointer would, both deleted.
+    let bare = |seed| avc_video(&small_video(300, seed, true)).moov.start;
+    let p = bare(1).max(bare(2)) + 512;
+    let clip = |seed| {
+        avc_video(&AvcOptions {
+            mdat_pad: p - bare(seed),
+            ..small_video(300, seed, true)
+        })
+    };
+    let (a, b) = (clip(1), clip(2));
+    assert_eq!(a.moov.start, b.moov.start);
+    let (na, nb) = (clusters_for(a.bytes.len()), clusters_for(b.bytes.len()));
+    let ca: Vec<u32> = (0..na).map(|k| 400 + 2 * k).collect();
+    let cb: Vec<u32> = (0..nb).map(|k| 401 + 2 * k).collect();
+    let (src, pieces) = video_card(
+        CLUSTER as u32,
+        &[("C0001.MP4", &a.bytes, ca), ("C0002.MP4", &b.bytes, cb)],
+    );
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    for (clip, own, other) in [(&a, &pieces[0], &pieces[1]), (&b, &pieces[1], &pieces[0])] {
+        let f = at(&view, own[0].start);
+        if f.health == Health::Intact {
+            assert_eq!(extracted(&src, f), clip.bytes, "{f:#?}");
+            for p in f.ranges() {
+                for q in other {
+                    assert!(!overlap(&p, q), "{f:#?} holds the other clip's run {q:?}");
+                }
+            }
+        }
+    }
+    // Both come back whole: each clip's index refutes the other's runs at their first sample.
+    for (clip, own) in [(&a, &pieces[0]), (&b, &pieces[1])] {
+        let f = at(&view, own[0].start);
+        assert_eq!((f.health, &f.fragments), (Health::Intact, own), "{f:#?}");
+        assert_eq!(extracted(&src, f), clip.bytes);
+    }
+    assert_eq!(videos(&view).len(), 2);
+}
+
+#[test]
+fn large_nal_video_on_small_clusters_is_at_most_partial_when_ambiguous() {
+    // NAL units of 2–24 KiB on 4 KiB clusters: a seam inside one unit's payload has no checked byte within a cluster
+    // on one side, so another cut a cluster away may fit as well. Whatever comes out, an `Intact` one is the clip.
+    const C: u64 = 4096;
+    let v = avc_video(&small_video(64, 5, false));
+    let n = (v.bytes.len() as u64).div_ceil(C) as u32;
+    let q = n / 4;
+    let clusters = runs(&[3000, 9000, 6000, 12000], &[q, q, q, n - 3 * q]);
+    let (src, pieces) = video_card(C as u32, &[("C0005.MP4", &v.bytes, clusters)]);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    if f.health == Health::Intact {
+        assert_eq!(extracted(&src, f), v.bytes, "{f:#?}");
+    }
+    eprintln!(
+        "large NAL units on 4 KiB clusters: {:?}, {} pieces (true {}), its pieces {}, len {} of {}, bytes {}",
+        f.health,
+        f.fragments.len(),
+        pieces[0].len(),
+        if f.fragments == pieces[0] {
+            "the true ones"
+        } else {
+            "others"
+        },
+        f.len,
+        v.bytes.len(),
+        if extracted(&src, f) == v.bytes {
+            "the clip's"
+        } else {
+            "not the clip's"
+        },
+    );
+}
+
+#[test]
+fn a_video_whose_last_piece_lies_twice_is_partial() {
+    // The five-piece video with a copy of its last piece (the end of its mdat and its moov) in another free cluster:
+    // two orphan moovs each give a complete solution, so neither is unique.
+    let v = avc_video(&small_video(300, 1, true));
+    let clusters = runs(&[300, 900, 500, 1500, 1100], &[1; 5]);
+    let (mut bytes, pieces) = video_image(CLUSTER as u32, &[("C0001.MP4", &v.bytes, clusters)]);
+    let last = *pieces[0].last().unwrap();
+    let copy = last.start + 200 * CLUSTER;
+    bytes.copy_within(
+        last.start as usize..(last.start + last.len) as usize,
+        copy as usize,
+    );
+    let src = SimSource::new(bytes);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_eq!(f.health, Health::Partial, "{f:#?}");
+    assert_eq!(f.len, v.bytes.len() as u64);
+    assert_eq!(
+        extracted(&src, f),
+        v.bytes,
+        "either copy holds the same bytes"
+    );
 }

@@ -778,6 +778,135 @@ pub(crate) enum Check {
     Mjpeg,
 }
 
+/// A sample to check: its offset in the file, size (from `stsz`) and track check.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CheckedSample {
+    pub offset: u64,
+    pub size: u64,
+    pub check: Check,
+}
+
+/// Most NAL units walked per sample.
+pub(crate) const MAX_NAL_UNITS: usize = 512;
+
+/// How the check of one sample ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SampleEnd {
+    Pass,
+    /// The bytes read up to file offset `at` (exclusive) do not fit.
+    Fail {
+        at: u64,
+    },
+    /// A read of the bytes from file offset `at` was refused.
+    Unread {
+        at: u64,
+    },
+    /// The steps ran out.
+    Spent,
+}
+
+/// The 1.3 structural check of one sample (NAL lengths and header bytes with `length_size` from avcC/hvcC, or SOI/EOI
+/// for Motion-JPEG), reading through `read(file offset, buf) -> bool`; `steps` is charged per NAL unit, false when spent.
+pub(crate) fn check_sample(
+    read: &mut dyn FnMut(u64, &mut [u8]) -> bool,
+    s: &CheckedSample,
+    steps: &mut u64,
+) -> bool {
+    walk_sample(read, s, steps, &mut |_, _| {}) == SampleEnd::Pass
+}
+
+/// [`check_sample`], telling how it ended and handing `checked` each file range `[from, to)` whose bytes the check read
+/// and accepted (a NAL unit's length and header bytes, a JPEG's SOI and EOI), in file order. A failing check hands
+/// nothing for the read that failed; the bytes it read end at `SampleEnd::Fail::at`.
+pub(crate) fn walk_sample(
+    read: &mut dyn FnMut(u64, &mut [u8]) -> bool,
+    s: &CheckedSample,
+    steps: &mut u64,
+    checked: &mut dyn FnMut(u64, u64),
+) -> SampleEnd {
+    let mut take = || {
+        if *steps == 0 {
+            false
+        } else {
+            *steps -= 1;
+            true
+        }
+    };
+    let end = s.offset.saturating_add(s.size);
+    match s.check {
+        Check::Mjpeg => {
+            if !take() {
+                return SampleEnd::Spent;
+            }
+            if s.size < 5 {
+                return SampleEnd::Fail { at: end };
+            }
+            let (mut soi, mut eoi) = ([0u8; 3], [0u8; 2]);
+            if !read(s.offset, &mut soi) {
+                return SampleEnd::Unread { at: s.offset };
+            }
+            if soi != [0xFF, 0xD8, 0xFF] {
+                return SampleEnd::Fail { at: s.offset + 3 };
+            }
+            if !read(end - 2, &mut eoi) {
+                return SampleEnd::Unread { at: end - 2 };
+            }
+            if eoi != [0xFF, 0xD9] {
+                return SampleEnd::Fail { at: end };
+            }
+            checked(s.offset, s.offset + 3);
+            checked(end - 2, end);
+            SampleEnd::Pass
+        }
+        Check::Nal { length_size, hevc } => {
+            let ls = u64::from(length_size);
+            let need = ls + if hevc { 2 } else { 1 };
+            let mut pos = 0u64;
+            for _ in 0..MAX_NAL_UNITS {
+                if pos == s.size {
+                    return SampleEnd::Pass;
+                }
+                let at = s.offset + pos;
+                if !take() {
+                    return SampleEnd::Spent;
+                }
+                if pos + need > s.size {
+                    // The last length read was wrong: nothing past it was read.
+                    return SampleEnd::Fail { at };
+                }
+                let mut h = [0u8; 6];
+                let h = &mut h[..need as usize];
+                if !read(at, h) {
+                    return SampleEnd::Unread { at };
+                }
+                let len = h[..ls as usize]
+                    .iter()
+                    .fold(0u64, |acc, &b| (acc << 8) | u64::from(b));
+                let header = h[ls as usize];
+                let ok = header & 0x80 == 0
+                    && if hevc {
+                        len >= 2 && (header >> 1) & 0x3F <= 40 && h[ls as usize + 1] & 7 != 0
+                    } else {
+                        len >= 1 && (1..=23).contains(&(header & 0x1F))
+                    };
+                if !ok {
+                    return SampleEnd::Fail { at: at + need };
+                }
+                pos += ls + len;
+                if pos > s.size {
+                    return SampleEnd::Fail { at: at + need };
+                }
+                checked(at, at + need);
+            }
+            if pos == s.size {
+                SampleEnd::Pass
+            } else {
+                SampleEnd::Fail { at: s.offset + pos }
+            }
+        }
+    }
+}
+
 /// Most samples [`track_samples`] lists for one `moov` (all tracks together).
 pub(crate) const MAX_SAMPLES: usize = 4_000_000;
 
@@ -1362,6 +1491,111 @@ mod tests {
         let at = moov.windows(4).position(|w| w == kind).unwrap() + delta;
         moov[at..at + 4].copy_from_slice(&value.to_be_bytes());
         moov
+    }
+
+    /// Every sample of `v` (its only track) as a [`CheckedSample`].
+    fn checked(v: &revenant_testkit::AvcVideo) -> Vec<CheckedSample> {
+        let t = track_samples(&v.bytes[v.moov.start + 8..v.moov.end]).unwrap();
+        let check = t[0].0.expect("a checkable track");
+        t[0].1
+            .iter()
+            .map(|s| CheckedSample {
+                offset: s.offset,
+                size: s.size,
+                check,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn check_sample_matches_the_pairing_check() {
+        use revenant_testkit::{AvcOptions, VideoCodec, VideoLayout, camera_video};
+        for (codec, small_nals) in [
+            (VideoCodec::Avc, true),
+            (VideoCodec::Avc, false),
+            (VideoCodec::Hevc, true),
+            (VideoCodec::Hevc, false),
+        ] {
+            let opts = AvcOptions {
+                samples: 40,
+                seed: 9,
+                mov: false,
+                mdat_pad: 0,
+                small_nals,
+            };
+            let v = camera_video(&opts, codec, VideoLayout::MoovAtEnd);
+            let bytes = &v.bytes;
+            let mut read = |at: u64, buf: &mut [u8]| {
+                let at = at as usize;
+                match bytes.get(at..at + buf.len()) {
+                    Some(b) => {
+                        buf.copy_from_slice(b);
+                        true
+                    }
+                    None => false,
+                }
+            };
+            let samples = checked(&v);
+            assert_eq!(
+                samples[0].check,
+                Check::Nal {
+                    length_size: 4,
+                    hevc: codec == VideoCodec::Hevc
+                }
+            );
+            let mut steps = u64::MAX;
+            for s in &samples {
+                assert!(check_sample(&mut read, s, &mut steps), "{codec:?} {s:?}");
+            }
+            // Each sample read one sector off its place fails (its first NAL length is payload).
+            for s in &samples {
+                let off = CheckedSample {
+                    offset: s.offset + 512,
+                    ..*s
+                };
+                assert!(
+                    !check_sample(&mut read, &off, &mut steps),
+                    "{codec:?} {s:?}"
+                );
+            }
+            // Steps: one per NAL unit; none left, no check passes.
+            let mut none = 0;
+            assert!(!check_sample(&mut read, &samples[0], &mut none));
+            let mut one = 1;
+            let first = samples[0];
+            let units = {
+                let mut n = u64::MAX;
+                assert!(check_sample(&mut read, &first, &mut n));
+                u64::MAX - n
+            };
+            assert!((1..=3).contains(&units), "{units}");
+            assert_eq!(check_sample(&mut read, &first, &mut one), units == 1);
+        }
+        // Motion-JPEG: SOI at the start and EOI at the end, one step.
+        let jpeg = revenant_testkit::jpeg(32, 32, 5, 0);
+        let mut read = |at: u64, buf: &mut [u8]| {
+            let at = at as usize;
+            match jpeg.get(at..at + buf.len()) {
+                Some(b) => {
+                    buf.copy_from_slice(b);
+                    true
+                }
+                None => false,
+            }
+        };
+        let s = CheckedSample {
+            offset: 0,
+            size: jpeg.len() as u64,
+            check: Check::Mjpeg,
+        };
+        let mut steps = 1;
+        assert!(check_sample(&mut read, &s, &mut steps));
+        assert_eq!(steps, 0);
+        let short = CheckedSample {
+            size: s.size - 1,
+            ..s
+        };
+        assert!(!check_sample(&mut read, &short, &mut 8));
     }
 
     #[test]

@@ -673,7 +673,11 @@ fn resume_reads_nothing_below_the_checkpoint() {
             // it searches forward only; ruling D24, part 1.6), through the cache's aligned windows.
             let window = crate::cache::CACHE_WINDOW as u64;
             let first = state.frags.iter().map(|f| f.start).fold(pos, u64::min);
-            let floor = if first < pos { first / window * window } else { pos };
+            let floor = if first < pos {
+                first / window * window
+            } else {
+                pos
+            };
             for (at, len) in card.source.reads() {
                 assert!(at >= floor, "resumed at {pos}: read {at}+{len}");
             }

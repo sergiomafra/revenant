@@ -544,11 +544,13 @@ impl Commit<'_, '_> {
         }
     }
 
-    /// After the scan: pairs `Damaged` moov-less videos with orphan `moov`s; returns each video put back together.
-    fn pair(&mut self) -> Result<Vec<Finding>, EngineError> {
+    /// After the scan: pairs `Damaged` moov-less videos with orphan `moov`s; returns each video put back together, and
+    /// what the pairing left of its `moov` load and sample budgets (the reassembly step's videos spend the rest).
+    fn pair(&mut self) -> Result<(Vec<Finding>, crate::pairing::Budget), EngineError> {
         let mut out = Vec::new();
+        let mut budget = crate::pairing::Budget::new();
         if self.videos.is_empty() || self.moovs.is_empty() {
-            return Ok(out);
+            return Ok((out, budget));
         }
         let cancel = self.shared.cancel;
         let paired = crate::pairing::pair_videos(
@@ -558,6 +560,7 @@ impl Commit<'_, '_> {
             &self.starts,
             &self.grids,
             cancel,
+            &mut budget,
         );
         if cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
@@ -574,13 +577,17 @@ impl Commit<'_, '_> {
             }
             out.push(f);
         }
-        Ok(out)
+        Ok((out, budget))
     }
 
     /// After the pairing: the reassembly step (part 1.6), over the candidates kept, the ranges claimed and the pairing's
     /// results; returns each finding it improves. `Cancelled` when cancelled, `DeviceGone` when the source vanished
     /// meanwhile (what it read then may be wrong).
-    fn reassemble(&mut self, paired: &[Finding]) -> Result<Vec<Finding>, EngineError> {
+    fn reassemble(
+        &mut self,
+        paired: &[Finding],
+        moov_budget: crate::pairing::Budget,
+    ) -> Result<Vec<Finding>, EngineError> {
         if self.frags.is_empty() {
             return Ok(Vec::new());
         }
@@ -596,6 +603,7 @@ impl Commit<'_, '_> {
             claimed_capped: self.claimed_capped,
             // Only the listing's flag so far (the old folders come after): live clusters may be unknown (ruling Q5).
             listing_truncated: self.summary.listing_truncated,
+            moov_budget,
             limits: &reassemble::Limits::DEFAULT,
         };
         let out = reassemble::reassemble(&self.shared.cache, &self.frags, paired, &ctx, cancel);
@@ -1007,8 +1015,9 @@ impl Commit<'_, '_> {
 /// as findings are emitted (ruling D2: a JPEG not `Intact` with a first piece of at least 16 KiB, videos, `Partial` RAWs
 /// and deleted files' `Partial` photos and videos; never a live file's; at most 4096) are searched one by one in id
 /// order over the free units (not live, not claimed by an `Intact` finding emitted, by the pairing or by an earlier
-/// reassembly), JPEGs only so far. A result that improves its finding comes out as an `Updated` with the same id,
-/// merged with the pairing's and the old folders' (the reassembly's pieces win). It is `Intact` only under the rule of
+/// reassembly), JPEGs and moov-less videos with a fitting orphan `moov` so far (the videos within what the pairing left
+/// of its `moov` budgets). A result that improves its finding comes out as an `Updated` with the same id, merged with
+/// the pairing's and the old folders' (the reassembly's pieces win). It is `Intact` only under the rule of
 /// `reassemble::health` (a JPEG in two or more pieces placed by content alone never is, ruling Q37).
 ///
 /// After a quick format (ruling D11): every block read is also searched for old directories at the cluster starts of
@@ -1259,8 +1268,8 @@ pub(crate) fn scan_with(
                 })?;
             }
         }
-        let paired = commit.pair()?;
-        let reassembled = commit.reassemble(&paired)?;
+        let (paired, moov_budget) = commit.pair()?;
+        let reassembled = commit.reassemble(&paired, moov_budget)?;
         if let Some(h) = hook.as_mut() {
             // A source gone during the pairing or the reassembly: the last boundary stays the point to resume from.
             shared.check()?;

@@ -284,9 +284,21 @@ fn video_split_in_three_is_not_paired() {
         .put(6 * MIB, &v.bytes[c1..c2])
         .put(12 * MIB, &v.bytes[c2..]);
     let file = img.save();
-    let (_, events) = run(&Src::new(&file));
-    assert!(updated(&events).is_empty(), "{events:?}");
+    let src = Src::new(&file);
+    let (_, events) = run(&src);
     assert_eq!(found(&events).len(), 1);
+    // The pairing never takes it for two pieces; since part 1.6 the reassembly step puts it back in its three (every
+    // sample checked in place, see tests/reassembly.rs).
+    let u = updated(&events);
+    assert_eq!(u.len(), 1, "{events:?}");
+    let starts: Vec<u64> = u[0].fragments.iter().map(|p| p.start).collect();
+    assert_eq!(
+        starts,
+        [MIB, 6 * MIB, 12 * MIB].map(|x| x as u64),
+        "{:?}",
+        u[0]
+    );
+    assert_eq!(extracted(&src, &u[0]), v.bytes);
 }
 
 /// The split layout with other data written over some samples of the first piece (512 bytes at a tenth of the
