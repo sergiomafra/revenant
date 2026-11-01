@@ -732,16 +732,51 @@ fn mdat_size_zero_with_moov_first_is_reassembled() {
     assert_eq!(extracted(&src, f), v.bytes);
 }
 
+/// The top-level boxes of `bytes`: (type, start, end).
+fn top_boxes(bytes: &[u8]) -> Vec<([u8; 4], usize, usize)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 8 <= bytes.len() {
+        let size = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        out.push((bytes[pos + 4..pos + 8].try_into().unwrap(), pos, pos + size));
+        pos += size;
+    }
+    out
+}
+
 #[test]
 fn fragmented_mp4_in_three_pieces_is_reassembled() {
+    // Fragments of 64 large samples (about 850 KiB each): the cuts at a third and two thirds lie inside a fragment's
+    // media data, with samples of that fragment checked within a cluster on both sides and no fragment starting within a
+    // cluster after them (ruling Q42).
     let v = camera_video(
-        &small_video(300, 13, true),
+        &small_video(300, 13, false),
         VideoCodec::Hevc,
         VideoLayout::Fragmented {
-            samples_per_fragment: 16,
+            samples_per_fragment: 64,
         },
     );
-    let files = [("C0013.MP4", v.bytes.as_slice(), thirds(v.bytes.len()))];
+    let clusters = thirds(v.bytes.len());
+    let n = clusters_for(v.bytes.len());
+    let moofs: Vec<usize> = top_boxes(&v.bytes)
+        .iter()
+        .filter(|b| &b.0 == b"moof")
+        .map(|b| b.1)
+        .collect();
+    for cut in [n / 3, 2 * (n / 3)].map(|c| c as usize * CLUSTER as usize) {
+        let before = moofs.iter().rev().find(|&&m| m < cut).unwrap();
+        assert!(
+            *before + 2 * CLUSTER as usize <= cut,
+            "{cut}: a fragment starts just before"
+        );
+        assert!(
+            moofs
+                .iter()
+                .all(|&m| m <= cut || m >= cut + CLUSTER as usize),
+            "{cut}"
+        );
+    }
+    let files = [("C0013.MP4", v.bytes.as_slice(), clusters)];
     // The entry deleted (its size known): the chain of boxes reaches it.
     let (src, pieces) = video_card(CLUSTER as u32, &files);
     let events = events_of(&src, &ScanOptions::default());
@@ -767,6 +802,51 @@ fn fragmented_mp4_in_three_pieces_is_reassembled() {
         "{f:#?}"
     );
     assert_eq!(extracted(&src, f), v.bytes);
+}
+
+#[test]
+fn fragmented_mp4_cut_between_fragments_is_partial() {
+    // Every fragment padded with a `free` box to whole clusters, the clip cut in three runs between fragments: nothing
+    // on either side of such a seam belongs to one fragment, so another clip's fragment there could pass every check
+    // (ruling Q42). Put back in its exact pieces, at most `Partial`.
+    let v = camera_video(
+        &small_video(300, 13, true),
+        VideoCodec::Hevc,
+        VideoLayout::Fragmented {
+            samples_per_fragment: 16,
+        },
+    );
+    let c = CLUSTER as usize;
+    let pad = |out: &mut Vec<u8>| {
+        let r = out.len() % c;
+        if r != 0 {
+            let p = if c - r < 8 { 2 * c - r } else { c - r };
+            out.extend_from_slice(&(p as u32).to_be_bytes());
+            out.extend_from_slice(b"free");
+            out.resize(out.len() + p - 8, 0);
+        }
+    };
+    let boxes = top_boxes(&v.bytes);
+    let first = boxes.iter().position(|b| &b.0 == b"moof").unwrap();
+    let mut file = v.bytes[..boxes[first].1].to_vec();
+    pad(&mut file);
+    for w in boxes[first..].chunks(2) {
+        file.extend_from_slice(&v.bytes[w[0].1..w[1].2]);
+        pad(&mut file);
+    }
+    let n = clusters_for(file.len());
+    let clusters = runs(&[300, 900, 500], &[n / 3, n / 3, n - 2 * (n / 3)]);
+    let (src, pieces) = video_card(CLUSTER as u32, &[("C0016.MP4", &file, clusters)]);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = at(&view, pieces[0][0].start);
+    assert_eq!(
+        (f.health, &f.fragments),
+        (Health::Partial, &pieces[0]),
+        "{f:#?}"
+    );
+    assert!(updated(&events).iter().any(|u| u.id == f.id));
+    assert_eq!(extracted(&src, f), file);
 }
 
 #[test]

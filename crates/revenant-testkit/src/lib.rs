@@ -539,12 +539,18 @@ fn camera_moov(
     bmff_box(b"moov", &body)
 }
 
-/// One movie fragment: `moof(mfhd(seq), traf(tfhd(track 1, default-base-is-moof), trun(data offset, sample sizes)))`
-/// for samples whose data follows in the next `mdat`'s payload.
-fn movie_fragment(seq: u32, sizes: &[u32]) -> Vec<u8> {
+/// Decode-time units per sample of a fragmented [`camera_video`] (the `trex` default sample duration).
+pub const FRAGMENT_SAMPLE_DURATION: u32 = 1000;
+
+/// One movie fragment: `moof(mfhd(seq), traf(tfhd(track 1, default-base-is-moof), tfdt(version 1, `time`),
+/// trun(data offset, sample sizes)))` for samples whose data follows in the next `mdat`'s payload.
+fn movie_fragment(seq: u32, time: u64, sizes: &[u32]) -> Vec<u8> {
     let build = |data_offset: u32| {
         let mfhd = full_box(b"mfhd", 0, &seq.to_be_bytes());
         let tfhd = full_box(b"tfhd", 0x02_0000, &1u32.to_be_bytes());
+        let mut tfdt = 0x0100_0000u32.to_be_bytes().to_vec(); // version 1, flags 0
+        tfdt.extend_from_slice(&time.to_be_bytes());
+        let tfdt = bmff_box(b"tfdt", &tfdt);
         let mut trun = (sizes.len() as u32).to_be_bytes().to_vec();
         trun.extend_from_slice(&data_offset.to_be_bytes());
         sizes
@@ -552,7 +558,7 @@ fn movie_fragment(seq: u32, sizes: &[u32]) -> Vec<u8> {
             .for_each(|s| trun.extend_from_slice(&s.to_be_bytes()));
         // Flags: data-offset-present (0x1), sample-size-present (0x200).
         let trun = full_box(b"trun", 0x201, &trun);
-        let traf = bmff_box(b"traf", &[tfhd, trun].concat());
+        let traf = bmff_box(b"traf", &[tfhd, tfdt, trun].concat());
         bmff_box(b"moof", &[mfhd, traf].concat())
     };
     // The data offset is from the start of the moof to the first sample, the payload of the mdat right after it.
@@ -569,8 +575,9 @@ fn movie_fragment(seq: u32, sizes: &[u32]) -> Vec<u8> {
 /// fragmented. The NAL units are structurally valid and never decode as real video.
 ///
 /// Non-fragmented layouts list the samples in `stsz`/`stsc`/`stco` (chunks back to back in one `mdat`) with a `tkhd` of
-/// track ID 0; the fragmented one has empty sample tables, a `tkhd` of track ID 1, an `mvex/trex` for track 1 and one
-/// `moof` (sequence numbers from 1) and `mdat` per fragment. `AvcVideo::moov` is the `moov` box wherever it is;
+/// track ID 0; the fragmented one has empty sample tables, a `tkhd` of track ID 1, an `mvex/trex` for track 1 (default
+/// sample duration [`FRAGMENT_SAMPLE_DURATION`]) and one `moof` (sequence numbers from 1, a `tfdt` with the fragment's
+/// decode time) and `mdat` per fragment. `AvcVideo::moov` is the `moov` box wherever it is;
 /// `mdat_payload` the first `mdat`'s payload.
 pub fn camera_video(opts: &AvcOptions, codec: VideoCodec, layout: VideoLayout) -> AvcVideo {
     let key_every = match layout {
@@ -669,10 +676,11 @@ pub fn camera_video(opts: &AvcOptions, codec: VideoCodec, layout: VideoLayout) -
         VideoLayout::Fragmented {
             samples_per_fragment,
         } => {
-            // trex: track 1, sample description 1, default duration, size and flags 0.
+            // trex: track 1, sample description 1, default duration, then default size and flags 0.
             let mut trex = 1u32.to_be_bytes().to_vec();
             trex.extend_from_slice(&1u32.to_be_bytes());
-            trex.extend_from_slice(&[0; 12]);
+            trex.extend_from_slice(&FRAGMENT_SAMPLE_DURATION.to_be_bytes());
+            trex.extend_from_slice(&[0; 8]);
             let mvex = bmff_box(b"mvex", &full_box(b"trex", 0, &trex));
             let moov = camera_moov(codec, &[], &[], 1, Some(mvex));
             let moov_at = ftyp.len();
@@ -688,7 +696,8 @@ pub fn camera_video(opts: &AvcOptions, codec: VideoCodec, layout: VideoLayout) -
                 if f + 1 == fragments {
                     data.extend_from_slice(&pad);
                 }
-                bytes.extend(movie_fragment(f as u32 + 1, frag));
+                let time = (f * samples_per_fragment) as u64 * u64::from(FRAGMENT_SAMPLE_DURATION);
+                bytes.extend(movie_fragment(f as u32 + 1, time, frag));
                 let data_at = bytes.len() + 8;
                 first_payload.get_or_insert(data_at..data_at + data.len());
                 bytes.extend(bmff_box(b"mdat", &data));

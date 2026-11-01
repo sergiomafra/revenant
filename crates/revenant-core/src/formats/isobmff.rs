@@ -1162,15 +1162,24 @@ pub(crate) struct Chain {
 
 impl Chain {
     /// The chain after fragment `f` (its `moof` at file offset `at`) when `f` follows `prev` (the chain so far, `None`
-    /// before the first fragment): it holds the track, its `mfhd` sequence number is the previous one plus one (1 for
-    /// the first fragment, as a camera starts it), and its `tfdt` (when both are known) is where the previous fragment's
-    /// samples ended. `None` when it does not follow: a fragment of another clip, or one further on.
+    /// before the first fragment): its `mfhd` sequence number is the previous one plus one (1 for the first fragment, as
+    /// a camera starts it), and, when it holds the track, its `tfdt` (when both are known) is where the previous
+    /// fragment's samples ended; one without the track (a muxer writing one `moof` per track) leaves the time as it was.
+    /// `None` when it does not follow: a fragment of another clip, or one further on.
     pub(crate) fn follows(prev: Option<Chain>, f: &MovieFragment, at: u64) -> Option<Chain> {
-        let seq = f.seq.filter(|_| f.has_track)?;
+        let seq = f.seq?;
         if prev.map_or(1, |p| p.seq.wrapping_add(1)) != seq
             || prev.is_some_and(|p| p.seq == u32::MAX)
         {
             return None;
+        }
+        // A fragment of other tracks only (one `moof` per track) keeps the sequence going and the time where it was.
+        if !f.has_track {
+            return Some(Chain {
+                seq,
+                time: prev.and_then(|p| p.time),
+                at,
+            });
         }
         let expected = prev.and_then(|p| p.time);
         if let (Some(e), Some(t)) = (expected, f.start_time)
@@ -2182,6 +2191,7 @@ mod tests {
             let boxes = top_boxes(&v.bytes);
             let mut listed = Vec::new();
             let mut seqs = Vec::new();
+            let mut chain = None;
             for (i, &(kind, at, end)) in boxes.iter().enumerate() {
                 if &kind != b"moof" {
                     continue;
@@ -2194,6 +2204,9 @@ mod tests {
                 )
                 .expect("a moof");
                 assert!(f.has_track);
+                // The testkit's decode times: 1000 per sample, fragments of 8.
+                assert_eq!(f.start_time, Some(seqs.len() as u64 * 8 * 1000));
+                chain = Some(Chain::follows(chain, &f, at as u64).expect("in sequence and time"));
                 seqs.push(f.seq.unwrap());
                 let got = f.samples;
                 // Back to back from the payload of the `mdat` right after it.
@@ -2436,10 +2449,15 @@ mod tests {
         );
         let mut other = f(2, Some(140), 40);
         other.has_track = false;
+        // A `moof` of another track only: the sequence goes on, the time stays.
         assert_eq!(
             Chain::follows(Some(a), &other, 99),
-            None,
-            "no traf of the track"
+            Some(Chain {
+                seq: 2,
+                time: Some(140),
+                at: 99
+            }),
+            "a moof per track"
         );
         other = f(1, Some(140), 40);
         other.seq = None;

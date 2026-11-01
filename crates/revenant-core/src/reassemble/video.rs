@@ -552,14 +552,21 @@ fn weak_breaks(gaps: &[(u64, u64)], unit: u64, start: u64, end: u64) -> Vec<u64>
 /// For each seam, whether checked bytes lie within one unit before it and within one unit after it, and whether those
 /// within one unit on either side are not all of samples of one size (ruling Q39: frames of one size are what another
 /// clip of a constant-bitrate camera would show there too). Fed with the checked ranges in file order, each with its
-/// sample's size, or `None` for structure (box headers, a `moof`, the index), which is never another clip's.
+/// sample's size, or `None` for structure (box headers, the index), which is never another clip's.
+///
+/// Ruling Q42, for fragmented video: ranges come in groups (the samples of one fragment), and a seam needs checked bytes
+/// of one same group on both sides; a barrier (a fragment's start) within one unit after a seam, or on it, leaves it
+/// unproven: two clips of one camera share sequence numbers, times and positions, so nothing tells a whole fragment
+/// of the other clip from the clip's own.
 struct Near<'s> {
     seams: &'s [u64],
     unit: u64,
     /// Seams decided so far (the next one to look at).
     next: usize,
-    /// The ranges that may lie within one unit of the next seam: (start, end, key).
-    recent: VecDeque<(u64, u64, u64)>,
+    /// The ranges that may lie within one unit of the next seam: (start, end, key, group).
+    recent: VecDeque<(u64, u64, u64, u64)>,
+    /// The barriers at or after the next seam.
+    barriers: VecDeque<u64>,
     /// Keys handed to structural ranges so far (each one its own).
     structural: u64,
     ok: bool,
@@ -572,6 +579,7 @@ impl<'s> Near<'s> {
             unit,
             next: 0,
             recent: VecDeque::new(),
+            barriers: VecDeque::new(),
             structural: 0,
             ok: true,
         }
@@ -579,16 +587,31 @@ impl<'s> Near<'s> {
 
     /// The checked range `[a, b)` (after every earlier one): of a sample of `size` bytes, or structure (`None`).
     fn range(&mut self, a: u64, b: u64, size: Option<u64>) {
-        if a >= b {
-            return;
-        }
         let key = size.unwrap_or_else(|| {
             self.structural += 1;
             u64::MAX - self.structural
         });
-        // No later range lies within one unit after a seam that ends a unit before `a`.
+        self.push(a, b, key, 0);
+    }
+
+    /// The checked range `[a, b)` of a sample of `size` bytes of group `group` (a fragment).
+    fn sample(&mut self, a: u64, b: u64, size: u64, group: u64) {
+        self.push(a, b, size, group);
+    }
+
+    /// A fragment starts at `x`.
+    fn barrier(&mut self, x: u64) {
+        self.settle(x);
+        if self.next < self.seams.len() {
+            self.barriers.push_back(x);
+        }
+    }
+
+    /// Decides the seams that end a unit before `x` (nothing later can lie within one unit after them), drops what can
+    /// no longer matter for the next one.
+    fn settle(&mut self, x: u64) {
         while let Some(&s) = self.seams.get(self.next) {
-            if s.saturating_add(self.unit) > a {
+            if s.saturating_add(self.unit) > x {
                 break;
             }
             self.decide(s);
@@ -596,6 +619,7 @@ impl<'s> Near<'s> {
         }
         let Some(&s) = self.seams.get(self.next) else {
             self.recent.clear();
+            self.barriers.clear();
             return;
         };
         while self
@@ -605,19 +629,37 @@ impl<'s> Near<'s> {
         {
             self.recent.pop_front();
         }
-        self.recent.push_back((a, b, key));
+        while self.barriers.front().is_some_and(|&b| b < s) {
+            self.barriers.pop_front();
+        }
+    }
+
+    fn push(&mut self, a: u64, b: u64, key: u64, group: u64) {
+        if a >= b {
+            return;
+        }
+        self.settle(a);
+        if self.next < self.seams.len() {
+            self.recent.push_back((a, b, key, group));
+        }
     }
 
     fn decide(&mut self, s: u64) {
         let u = self.unit;
-        let before = self
+        let before: Vec<u64> = self
             .recent
             .iter()
-            .any(|r| r.0 < s && r.1.saturating_add(u) > s);
-        let after = self
+            .filter(|r| r.0 < s && r.1.saturating_add(u) > s)
+            .map(|r| r.3)
+            .collect();
+        let same = self
             .recent
             .iter()
-            .any(|r| r.1 > s && r.0 < s.saturating_add(u));
+            .any(|r| r.1 > s && r.0 < s.saturating_add(u) && before.contains(&r.3));
+        let barrier = self
+            .barriers
+            .iter()
+            .any(|&b| b >= s && b < s.saturating_add(u));
         let mut keys = self
             .recent
             .iter()
@@ -625,10 +667,11 @@ impl<'s> Near<'s> {
             .map(|r| r.2);
         let first = keys.next();
         let mixed = keys.any(|k| Some(k) != first);
-        self.ok &= before && after && mixed;
+        self.ok &= same && !barrier && mixed;
     }
 
-    /// Every seam near checked bytes on both sides, not all of samples of one size.
+    /// Every seam near checked bytes of one group on both sides, with no barrier within one unit after it, not all of
+    /// samples of one size.
     fn finish(mut self) -> bool {
         while let Some(&s) = self.seams.get(self.next) {
             self.decide(s);
@@ -636,6 +679,17 @@ impl<'s> Near<'s> {
         }
         self.ok
     }
+}
+
+/// What a fragmented video's walk tells about a checked range.
+#[derive(Clone, Copy)]
+enum Mark {
+    /// The head, a box header, a `moof`, an `mfro`.
+    Structure,
+    /// A sample's checked bytes, of the fragment whose `moof` is at `fragment`.
+    Sample { size: u64, fragment: u64 },
+    /// A fragment (its `moof`) starts here (an empty range).
+    Fragment,
 }
 
 /// A check a fragmented video's walk expects at a logical offset: a box header, or a sample.
@@ -749,7 +803,7 @@ impl MoofSeams {
         from: &MoofState,
         limit: u64,
         record: bool,
-        on: &mut dyn FnMut(u64, u64, Option<u64>),
+        on: &mut dyn FnMut(u64, u64, Mark),
     ) -> MoofRun {
         let limit = limit.min(view.len());
         let mut r = Reader::with_window(view, WALK_WINDOW);
@@ -768,7 +822,7 @@ impl MoofSeams {
             match head_in_place(&mut r, &head, limit) {
                 InPlace::Same => {
                     pos = head.len() as u64;
-                    on(0, pos, None);
+                    on(0, pos, Mark::Structure);
                     out.checked = pos;
                     out.resume.push((pos, at(pos, 0, None)));
                 }
@@ -811,7 +865,10 @@ impl MoofSeams {
                     at: (pos + 8).min(limit),
                 };
             };
-            on(pos, pos + hl, None);
+            if &kind == b"moof" {
+                on(pos, pos, Mark::Fragment);
+            }
+            on(pos, pos + hl, Mark::Structure);
             out.checked = out.checked.max(pos + hl);
             match &kind {
                 b"mfra" => {
@@ -849,7 +906,7 @@ impl MoofSeams {
                         out.failed = true;
                         break WalkEnd::Broken { at: end };
                     }
-                    on(end - 16, end, None);
+                    on(end - 16, end, Mark::Structure);
                     out.checked = end;
                     out.mfra = Some((pos + hl, end));
                     break WalkEnd::Complete { len: end };
@@ -907,8 +964,8 @@ impl MoofSeams {
                         out.failed = true;
                         break WalkEnd::Broken { at: end + mhl };
                     }
-                    on(pos + hl, end, None);
-                    on(end, end + mhl, None);
+                    on(pos + hl, end, Mark::Structure);
+                    on(end, end + mhl, Mark::Structure);
                     out.checked = out.checked.max(end + mhl);
                     if record {
                         self.remember(mend, Expect::Header);
@@ -923,7 +980,14 @@ impl MoofSeams {
                             s,
                             &mut self.steps,
                             &mut |a, b| {
-                                on(a, b, Some(s.size));
+                                on(
+                                    a,
+                                    b,
+                                    Mark::Sample {
+                                        size: s.size,
+                                        fragment: pos,
+                                    },
+                                );
                                 last = Some(b);
                             },
                         );
@@ -1034,7 +1098,12 @@ impl Seams for MoofSeams {
             &MoofState::default(),
             len,
             false,
-            &mut |a, b, size| near.range(a, b, size),
+            // Q42: only a fragment's own samples prove a seam; its boxes never do across one.
+            &mut |a, b, mark| match mark {
+                Mark::Structure => {}
+                Mark::Fragment => near.barrier(a),
+                Mark::Sample { size, fragment } => near.sample(a, b, size, fragment),
+            },
         );
         match run.end {
             WalkEnd::Complete { len: l } if l == len => {
@@ -1455,6 +1524,17 @@ fn finding(f: &Finding, found: &Search, kind: FileKind, checks: &Checks) -> Opti
     })
 }
 
+/// Whether `new`, complete but no better than `old` by [`improves`] (both `Partial`, no longer), still replaces it: it
+/// has the same length and other pieces (a deleted file guessed in one piece, its content refuted there, and put back
+/// in the pieces its content proves only up to `Partial`, such as a fragmented video cut between fragments, Q42).
+fn replaces(old: &Finding, new: &Finding, complete: bool) -> bool {
+    complete
+        && old.health == Health::Partial
+        && new.health == Health::Partial
+        && new.len == old.len
+        && new.fragments != old.fragments
+}
+
 /// A video whose index comes before its media data (its own `moov` first, or fragments) searched; `None` when `f` has
 /// no such layout (the caller then tries the orphan `moov`s), else the finding it becomes when that improves it. Its
 /// head (`ftyp` to the media data) is read within the file's read budget. A fragmented video with no known size comes
@@ -1512,10 +1592,9 @@ pub(crate) fn reassemble_index_first(
         return Some(None);
     }
     let checks = checks(ctx, source, &found, known, own_ok);
-    Some(
-        finding(f, &found, layout.kind, &checks)
-            .filter(|new| improves(f, new, found.complete || clean)),
-    )
+    Some(finding(f, &found, layout.kind, &checks).filter(|new| {
+        improves(f, new, found.complete || clean) || replaces(f, new, found.complete)
+    }))
 }
 
 #[cfg(test)]
@@ -2041,6 +2120,11 @@ mod tests {
     /// A fragmented clip (H.265, 16 samples per fragment) on a 32 KiB-cluster noise card in 3 runs; the image, the runs
     /// and its seams (no known size).
     fn moof_runs() -> (Mem, Vec<Fragment>, MoofSeams, Vec<u8>) {
+        moof_runs_of(true, 16)
+    }
+
+    /// [`moof_runs`] with samples of 2–24 KiB unless `small_nals`, `per` samples per fragment.
+    fn moof_runs_of(small_nals: bool, per: usize) -> (Mem, Vec<Fragment>, MoofSeams, Vec<u8>) {
         use revenant_testkit::{VideoCodec, VideoLayout, camera_video};
         const C: u64 = 32 << 10;
         let v = camera_video(
@@ -2049,11 +2133,11 @@ mod tests {
                 seed: 13,
                 mov: false,
                 mdat_pad: 0,
-                small_nals: true,
+                small_nals,
             },
             VideoCodec::Hevc,
             VideoLayout::Fragmented {
-                samples_per_fragment: 16,
+                samples_per_fragment: per,
             },
         );
         let n = (v.bytes.len() as u64).div_ceil(C);
@@ -2068,8 +2152,23 @@ mod tests {
 
     #[test]
     fn moof_video_in_three_pieces_is_found_and_proven_with_its_size() {
+        // With fragments of 16 small samples a cut always has a fragment start within a cluster: never proven (Q42).
         const C: u64 = 32 << 10;
         let (src, runs, seams, bytes) = moof_runs();
+        let mut seams = seams.with_known(Some(bytes.len() as u64));
+        let found = find(
+            &src,
+            &mut seams,
+            (HEAP, C, src.len()),
+            runs[0].start,
+            &Limits::DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(found.pieces, runs);
+        assert!(found.complete, "{found:?}");
+        assert_eq!(found.proof, Proof::Unproven);
+        // Fragments of 64 large samples (about 850 KiB): the cuts lie inside a fragment's media data, far from its boxes.
+        let (src, runs, seams, bytes) = moof_runs_of(false, 64);
         let mut seams = seams.with_known(Some(bytes.len() as u64));
         let found = find(
             &src,
@@ -2086,7 +2185,7 @@ mod tests {
         );
         assert_eq!(found.proof, Proof::Proven);
         // Without a size the chain has no end to reach: the true pieces, never complete.
-        let (src, runs, mut seams, _) = moof_runs();
+        let (src, runs, mut seams, _) = moof_runs_of(false, 64);
         let found = find(
             &src,
             &mut seams,
@@ -2300,7 +2399,8 @@ mod tests {
                 "{f:?}"
             );
         }
-        // A's own fragment in place: whole, and its `tfra` agrees with where the fragments lie.
+        // A's own fragment in place: the right pieces, its `tfra` agreeing; every seam on a fragment boundary, so never
+        // proven by content (Q42): at most `Partial`.
         let (src, runs) = a_card(&a, &mfra(Some(&moofs)), true, Some(&b[1]));
         let mut seams = MoofSeams::new(&src, runs[0].start).unwrap().with_unit(C);
         let found = find(
@@ -2316,7 +2416,7 @@ mod tests {
             found.complete && found.unique && found.exhaustive,
             "{found:?}"
         );
-        assert_eq!(found.proof, Proof::Proven);
+        assert_eq!(found.proof, Proof::Unproven);
         // A `tfra` that puts one `moof` where none is refutes the placement.
         let mut wrong = moofs.clone();
         wrong[5] += 8;
@@ -2398,5 +2498,30 @@ mod tests {
         let w = seams.walk(&src, &[], &from, src.len());
         assert!(matches!(w.end, WalkEnd::Stopped));
         assert_eq!(seams.steps, 0);
+    }
+
+    #[test]
+    fn another_clips_fragment_in_its_own_place_is_not_intact() {
+        // The Task 6 re-review's probe (ruling Q42): B's fragment 4 (sequence 5, the same decode time and size as A's,
+        // one cluster like every padded part) at cluster 100, A's own fragment 4 lost, A's `tfra` right. Sequence, time
+        // and position agree; only the seams tell, and they lie on fragment boundaries.
+        const C: u64 = 32 << 10;
+        let (a, moofs) = padded_parts(13);
+        let (b, _) = padded_parts(99);
+        let (src, runs) = a_card(&a, &mfra(Some(&moofs)), false, Some(&b[5]));
+        let mut seams = MoofSeams::new(&src, runs[0].start).unwrap().with_unit(C);
+        let found = find(
+            &src,
+            &mut seams,
+            (HEAP, C, src.len()),
+            runs[0].start,
+            &Limits::DEFAULT,
+        );
+        if let Some(f) = &found {
+            assert!(
+                !(f.complete && f.unique && f.exhaustive && f.proof == Proof::Proven),
+                "{f:?}"
+            );
+        }
     }
 }

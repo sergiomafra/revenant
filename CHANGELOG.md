@@ -142,8 +142,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Videos whose index comes first, whose media box has no size, fragmented MP4, and two copies of a video's start are
   now put back together too: a video with its index first (in its first piece) or in fragments is checked frame by
   frame where its index puts each frame, and is intact under the same rule; a fragmented one is intact only when its
-  recorded size (a deleted file's entry) or its closing index says where it ends, else partial, and its fragments must
-  follow each other in order (a fragment of another clip is never taken in). When two deleted videos
+  recorded size (a deleted file's entry) or its closing index says where it ends and every cut lies inside one of its
+  fragments (a cut between fragments cannot be told from another clip's fragment of the same camera), else partial;
+  its fragments must follow each other in order. When two deleted videos
   start with the same bytes and one index fits both, the one found first is put back and the copy is left as it was.
 
 ### Changed

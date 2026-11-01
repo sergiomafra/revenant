@@ -629,8 +629,8 @@ its frames is whole; a photo written over the video is not at a chunk offset, so
   fragmented file each `moof`'s samples of its first checkable video track (`traf/tfhd/trun`, see
   `isobmff::fragment_samples`) are checked in the file, over at most 65,536 top-level boxes (`MAX_BOXES`), and the
   fragments must follow each other (`isobmff::Chain`: `mfhd` sequence numbers 1, 2, 3…, each `tfdt`, when there is one,
-  where the previous fragment's samples ended, each `moof` holding a `traf` of the track); a garbled `moof` or one out of
-  sequence is `Partial`. Every sample a `moof` lists, of any track, costs one of the 2^24 steps, and an empty sample
+  where the previous fragment's samples ended; a `moof` of other tracks only, as muxers writing one `moof` per track do,
+  takes the next number and leaves the time as it was); a garbled `moof` or one out of sequence is `Partial`. Every sample a `moof` lists, of any track, costs one of the 2^24 steps, and an empty sample
   costs one too. Tracks with no check (audio, other codecs) and sample tables the listing cannot use are not
   checked, as before. A `moov` at the end needs none of this: it is found only where the media data really ends. The
   cost: the walk reads a few bytes per NAL unit through the scan's cache, which loads whole 1 MiB windows, so an
@@ -809,13 +809,22 @@ the file's read budget and must lie in place in the first piece: no seam falls i
   4,000,000 samples per `moof`, each listed sample of any track one of the search's 2^24 steps, checked arithmetic) and
   its samples checked in the `mdat` right after it, which must hold them all. A whole fragment of another clip checks
   itself, so the fragments must follow each other: the first one's `mfhd` sequence number is 1 and each next one's the
-  previous plus one, its `tfdt` (when there is one) is where the previous fragment's samples ended, and it holds a
-  `traf` of the video track; the state of a walk carries that chain across seams. It resumes after each passing sample
+  previous plus one, and its `tfdt` (when there is one) is where the previous fragment's samples ended (a `moof` of other
+  tracks only takes the next number and leaves the time); the state of a walk carries that chain across seams. These
+  are necessary, never enough: two clips of one camera number their fragments alike, and with a fixed frame rate and
+  fragment length carry the same times, so a whole fragment of the other clip at the same place passes them all. It resumes after each passing sample
   and at each box end, and stops after `MAX_BOXES` (65,536) boxes per walk, undecided (C9). It completes when an `mfra`
   closes the chain (its last box an `mfro` giving the `mfra`'s size, and a `tfra` listing no `moof` past the last one
   walked: a path jumping from an earlier fragment to the `mfra` leaves some out; an `mfra` without `tfra` completes
   nothing) or when the box chain ends exactly at the known size: a deleted file's entry size (the format itself has
-  none). The proof also checks that every `moof` the `tfra` lists is one of the chain's (positional proof). Otherwise the walk ends at the last valid box (an invalid
+  none). The proof also checks that every `moof` the `tfra` lists is one of the chain's.
+  **The proof (ruling Q42)**: a seam is `Proven` only when the bytes on both sides belong to one fragment: checked
+  samples of that same fragment within one unit before and after it, and no fragment starting on it or within one unit
+  after it. The boxes (a `moof`, an `mdat` header, the head, an `mfro`) never count as evidence across a seam. So a
+  seam on or near a fragment boundary is never proven by content, and the video is then at most `Partial` (until a
+  file system proves its placement, D14), as is any video whose fragments are smaller than about a unit (each cut then
+  has a fragment start within a unit after it). Such a result, complete and of the same length as a deleted file's
+  earlier one-piece guess, still replaces it (its pieces). Otherwise the walk ends at the last valid box (an invalid
   header after it: the end of the file, or another file's data), and the result is at most `Partial`; one whose chain
   is valid to the very end of its pieces counts as complete for `improves`, so it replaces a shorter earlier result.
   The prefilter checks what the walks expected within one unit after the seam (the next box header, the samples of the
@@ -825,9 +834,11 @@ the file's read budget and must lie in place in the first piece: no seam falls i
 
 Outcomes on the synthetic cards: a moov-first H.264 clip in three pieces, the same with an `mdat` of size 0, and a
 fragmented H.265 clip in three pieces with its deleted entry's size come back `Intact`; the fragmented clip after a
-quick format (no size, no `mfra`) comes back `Partial` in its exact pieces. Two clips of one camera with their
-fragments padded to whole clusters (every seam on a box boundary): a fragment of the other clip in place of a lost
-one is refused by its sequence number, and the clip with its own fragment comes back `Proven` and unique. Two copies of a moov-less clip's first piece
+quick format (no size, no `mfra`) comes back `Partial` in its exact pieces; there the clip has fragments of 64 large
+samples (about 850 KiB), so its cuts lie inside fragments. The same clip with fragments of 16 small samples, or with
+every fragment padded to whole clusters and cut between fragments, comes back in its exact pieces but `Partial`
+(Q42). With two clips of one camera padded that way, a fragment of the other clip in place of a lost one is never
+`Intact`: one numbered out of sequence is refused, and one with the right number, time and place is not proven. Two copies of a moov-less clip's first piece
 off the cluster grid with one `moov` (D17) give the lower id `Intact` and leave the copy `Damaged`; on a cluster grid
 the re-check never follows a copy back into the solution's own later runs, so the lower id is unique there in any
 case.

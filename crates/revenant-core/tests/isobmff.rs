@@ -1314,3 +1314,71 @@ fn hostile_empty_fragments_are_bounded() {
     assert_eq!(m.len, src.bytes.len() as u64);
     assert_eq!(m.health, Health::Partial);
 }
+
+#[test]
+fn a_moof_per_track_keeps_the_sequence() {
+    // Muxers that write one `moof` per track: an audio-only fragment (track 2) after each video one, each taking the
+    // next sequence number. Whole, the file is intact.
+    use testkit::{AvcOptions, VideoCodec, VideoLayout};
+    let o = AvcOptions {
+        samples: 40,
+        seed: 9,
+        mov: false,
+        mdat_pad: 0,
+        small_nals: true,
+    };
+    let v = testkit::camera_video(
+        &o,
+        VideoCodec::Avc,
+        VideoLayout::Fragmented {
+            samples_per_fragment: 8,
+        },
+    );
+    let bx = |kind: &[u8; 4], body: &[u8]| {
+        let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+        b.extend_from_slice(kind);
+        b.extend_from_slice(body);
+        b
+    };
+    let b = &v.bytes;
+    let be = |at: usize| u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let mut seq = 0u32;
+    while pos < b.len() {
+        let (size, kind) = (be(pos), &b[pos + 4..pos + 8]);
+        let mut bytes = b[pos..pos + size].to_vec();
+        if kind == b"moof" {
+            seq += 1;
+            // mfhd: its header (8) and version/flags (4), then the sequence number.
+            bytes[8 + 12..8 + 16].copy_from_slice(&seq.to_be_bytes());
+        }
+        out.extend_from_slice(&bytes);
+        if kind == b"mdat" {
+            // An audio fragment: track 2, one 100-byte sample at the start of its mdat.
+            seq += 1;
+            let mut mfhd = vec![0u8; 4];
+            mfhd.extend_from_slice(&seq.to_be_bytes());
+            let mut tfhd = 0x02_0000u32.to_be_bytes().to_vec();
+            tfhd.extend_from_slice(&2u32.to_be_bytes());
+            let build = |off: i32| {
+                let mut trun = 0x201u32.to_be_bytes().to_vec();
+                trun.extend_from_slice(&1u32.to_be_bytes());
+                trun.extend_from_slice(&off.to_be_bytes());
+                trun.extend_from_slice(&100u32.to_be_bytes());
+                let traf = bx(b"traf", &[bx(b"tfhd", &tfhd), bx(b"trun", &trun)].concat());
+                bx(b"moof", &[bx(b"mfhd", &mfhd), traf].concat())
+            };
+            let len = build(0).len() as i32;
+            out.extend(build(len + 8));
+            out.extend(bx(b"mdat", &[0x5A; 100]));
+        }
+        pos += size;
+    }
+    let src = Counting {
+        bytes: out,
+        read: Default::default(),
+    };
+    let m = IsoBmff.measure(&src, 0).unwrap();
+    assert_eq!((m.len, m.health), (src.bytes.len() as u64, Health::Intact));
+}
