@@ -13,6 +13,7 @@ use crate::cache::Runs;
 use crate::codec::{Codec, Dec, Enc};
 use crate::filesystem::{Listing, MAX_FILES, MAX_ORPHAN_DIRS, OrphanDir};
 use crate::formats::Fragment;
+use crate::reassemble::{MAX_CANDIDATES, MAX_CLAIMED_RUNS};
 use crate::scan::Finding;
 
 /// What a state is valid for: a scan of a source of `total` bytes, with these sector and block sizes (as the scan uses
@@ -53,6 +54,12 @@ pub(crate) struct ScanState {
     dirs: Vec<OrphanDir>,
     carved: Vec<Carved>,
     orphans_capped: bool,
+    /// The reassembly candidates (ruling D16).
+    frags: Vec<Finding>,
+    frags_capped: bool,
+    /// The ranges of the `Intact` findings emitted, `Runs` as `(start, end)`.
+    claimed: Vec<(u64, u64)>,
+    claimed_capped: bool,
     /// `Shared::skips`.
     skips: Vec<(u64, u64)>,
     /// The finders' tails as of `position`.
@@ -103,7 +110,8 @@ pub(crate) enum Checkpoint<'a> {
         state: &'a dyn Fn() -> ScanState,
         stopping: bool,
     },
-    /// After the pairing step, before the `Updated` events (a resume from it runs the pairing again; ruling D24).
+    /// After the pairing and the reassembly steps, before the `Updated` events (a resume from it runs both again: they
+    /// are deterministic; rulings D16, D24).
     Paired {
         events: u64,
         state: &'a dyn Fn() -> ScanState,
@@ -154,6 +162,10 @@ pub(super) fn capture(
         dirs,
         carved,
         orphans_capped,
+        frags,
+        frags_capped,
+        claimed,
+        claimed_capped,
     } = commit;
     let tails = ahead
         .front()
@@ -183,6 +195,10 @@ pub(super) fn capture(
         dirs: dirs.clone(),
         carved: carved.clone(),
         orphans_capped: *orphans_capped,
+        frags: frags.clone(),
+        frags_capped: *frags_capped,
+        claimed: claimed.to_vec(),
+        claimed_capped: *claimed_capped,
         skips: lock(&shared.skips).to_vec(),
         tails,
         bad,
@@ -226,6 +242,10 @@ impl ScanState {
             dirs,
             carved,
             orphans_capped,
+            frags,
+            frags_capped,
+            claimed,
+            claimed_capped,
             skips,
             tails,
             bad,
@@ -241,12 +261,16 @@ impl ScanState {
         if !own.windows(2).all(|w| w[0].0 < w[1].0) {
             return corrupt();
         }
-        let (Some(own_moovs), Some(skips)) = (
+        let (Some(own_moovs), Some(skips), Some(claimed)) = (
             Runs::from_vec(own_moovs, usize::MAX),
             Runs::from_vec(skips, usize::MAX),
+            Runs::from_vec(claimed, MAX_CLAIMED_RUNS),
         ) else {
             return corrupt();
         };
+        if frags.len() > MAX_CANDIDATES {
+            return corrupt();
+        }
         if shared.cache.restore(bad, coverage).is_none() || !finders.restore(tails) {
             return corrupt();
         }
@@ -272,6 +296,10 @@ impl ScanState {
         commit.dirs = dirs;
         commit.carved = carved;
         commit.orphans_capped = orphans_capped;
+        commit.frags = frags;
+        commit.frags_capped = frags_capped;
+        commit.claimed = claimed;
+        commit.claimed_capped = claimed_capped;
         Ok(position)
     }
 }
@@ -413,6 +441,10 @@ impl Codec for ScanState {
             dirs,
             carved,
             orphans_capped,
+            frags,
+            frags_capped,
+            claimed,
+            claimed_capped,
             skips,
             tails,
             bad,
@@ -438,6 +470,10 @@ impl Codec for ScanState {
         e.seq(dirs);
         e.seq(carved);
         e.bool(*orphans_capped);
+        e.seq(frags);
+        e.bool(*frags_capped);
+        e.seq(claimed);
+        e.bool(*claimed_capped);
         e.seq(skips);
         e.put(tails);
         e.seq(bad);
@@ -466,6 +502,10 @@ impl Codec for ScanState {
             dirs: d.seq()?,
             carved: d.seq()?,
             orphans_capped: d.bool()?,
+            frags: d.seq()?,
+            frags_capped: d.bool()?,
+            claimed: d.seq()?,
+            claimed_capped: d.bool()?,
             skips: d.seq()?,
             tails: d.get()?,
             bad: d.seq()?,
@@ -477,7 +517,9 @@ impl Codec for ScanState {
             && state.videos.len() <= MAX_VIDEOS
             && state.dirs.len() <= MAX_ORPHAN_DIRS
             && state.carved.len() <= MAX_FILES
-            && state.own_len <= MAX_OWN_STARTS as u64;
+            && state.own_len <= MAX_OWN_STARTS as u64
+            && state.frags.len() <= MAX_CANDIDATES
+            && state.claimed.len() <= MAX_CLAIMED_RUNS;
         if !within_caps || entries != state.own_len {
             return corrupt();
         }

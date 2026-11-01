@@ -224,6 +224,7 @@ fn all_cards() -> Vec<(&'static str, Card)> {
         ("D", cards::d()),
         ("E", cards::e()),
         ("failing", cards::failing()),
+        ("F", cards::f()),
     ]
 }
 
@@ -263,6 +264,52 @@ fn the_cards_exercise_what_a_state_carries() {
         })
         .expect("the video");
     assert_eq!(video.health, crate::formats::Health::Intact);
+    // F (Q11): the reassembly puts R back together in its 3 pieces, and the state at `Paired` carries the candidates
+    // and the claimed ranges it starts from.
+    let t = cards::three_piece();
+    let fr = record(&cards::f().source, &opts(8, 256 << 20));
+    let r = fr
+        .events
+        .iter()
+        .find_map(|ev| match ev {
+            Event::Updated(f) if f.start == t.r_pieces[0].start => Some(f.clone()),
+            _ => None,
+        })
+        .expect("R updated by the reassembly");
+    assert_eq!(r.fragments, t.r_pieces);
+    let paired = fr
+        .points
+        .iter()
+        .find(|p| p.read.is_none())
+        .expect("the Paired point");
+    let state: ScanState = from_bytes(&paired.state).unwrap();
+    assert!(!state.frags.is_empty() && !state.claimed.is_empty());
+    assert!(state.frags.iter().any(|f| f.start == t.r_pieces[0].start));
+}
+
+#[test]
+fn live_findings_are_never_kept_as_candidates() {
+    // The live photo is `Partial` (an unreadable sector) with a first piece of 64 KiB: a candidate but for being live
+    // (ruling D2). The state at `Paired` keeps no live finding.
+    let (card, pieces) = cards::live_in_three_runs();
+    let r = record(&card.source, &opts(8, 256 << 20));
+    let live = r
+        .events
+        .iter()
+        .find_map(|e| match e {
+            Event::Found(f) if f.start == pieces[0].start => Some(f.clone()),
+            _ => None,
+        })
+        .expect("the live photo");
+    assert_eq!(live.health, crate::formats::Health::Partial);
+    let paired = r.points.iter().find(|p| p.read.is_none()).unwrap();
+    let state: ScanState = from_bytes(&paired.state).unwrap();
+    assert!(
+        state.frags.iter().all(|f| f.id != live.id),
+        "{:#?}",
+        state.frags
+    );
+    assert!(!state.claimed.is_empty());
 }
 
 #[test]
@@ -322,6 +369,21 @@ fn resume_with_other_threads_and_cache() {
             for p in chosen(&r.points, 3, (n * 4 + k) as u64 + 1000) {
                 check_resume(name, &card.source, &r, &opts(threads, 1 << 20), &p);
             }
+        }
+    }
+}
+
+#[test]
+fn resume_with_reassembly_equals_the_whole_scan() {
+    let card = cards::f();
+    for (k, threads) in [1, 8].into_iter().enumerate() {
+        let o = opts(threads, 256 << 20);
+        let r = record(&card.source, &o);
+        assert!(r.events.iter().any(|e| matches!(e, Event::Updated(_))));
+        let points = chosen(&r.points, 4, 77 + k as u64);
+        assert!(points.iter().any(|p| p.read.is_none()), "the Paired point");
+        for p in points {
+            check_resume("F", &card.source, &r, &o, &p);
         }
     }
 }
@@ -607,8 +669,13 @@ fn resume_reads_nothing_below_the_checkpoint() {
             let (got, events) = resume(&card.source, &o, &r.listing, &p);
             got.unwrap();
             assert_eq!(events, r.events[p.events as usize..]);
+            // Below the position only the reassembly step reads, from its candidates' starts on (off a cluster grid
+            // it searches forward only; ruling D24, part 1.6), through the cache's aligned windows.
+            let window = crate::cache::CACHE_WINDOW as u64;
+            let first = state.frags.iter().map(|f| f.start).fold(pos, u64::min);
+            let floor = if first < pos { first / window * window } else { pos };
             for (at, len) in card.source.reads() {
-                assert!(at >= pos, "resumed at {pos}: read {at}+{len}");
+                assert!(at >= floor, "resumed at {pos}: read {at}+{len}");
             }
         }
     }
@@ -722,6 +789,11 @@ fn a_state_off_the_scan_is_corrupt() {
     );
     assert_eq!(bad(|s| s.position = 64 * MIB), "session_corrupt");
     assert_eq!(bad(|s| s.skips = vec![(10, 5)]), "session_corrupt");
+    assert_eq!(bad(|s| s.claimed = vec![(10, 5)]), "session_corrupt");
+    assert_eq!(
+        bad(|s| s.claimed = vec![(0, 512), (512, 1024)]),
+        "session_corrupt"
+    );
     assert_eq!(
         bad(|s| s.bad = vec![(0, 512), (512, 1024)]),
         "session_corrupt"
@@ -731,6 +803,34 @@ fn a_state_off_the_scan_is_corrupt() {
         bad(|s| s.tails.orphan = Some((Vec::new(), 0))),
         "session_corrupt"
     );
+    // The reassembly's caps (ruling D16): more candidates or claimed runs than the scan keeps.
+    let finding = Finding {
+        id: 1,
+        start: 0,
+        len: 1,
+        kind: crate::formats::FileKind::Jpeg,
+        health: crate::formats::Health::Partial,
+        fragments: Vec::new(),
+        origin: None,
+    };
+    let mut s = state.clone();
+    s.frags = vec![finding; crate::reassemble::MAX_CANDIDATES + 1];
+    assert!(matches!(
+        from_bytes::<ScanState>(&to_bytes(&s)),
+        Err(EngineError::SessionCorrupt)
+    ));
+    s.frags.pop();
+    assert!(from_bytes::<ScanState>(&to_bytes(&s)).is_ok());
+    let mut s = state.clone();
+    s.claimed = (0..=crate::reassemble::MAX_CLAIMED_RUNS as u64)
+        .map(|k| (k * 1024, k * 1024 + 512))
+        .collect();
+    assert!(matches!(
+        from_bytes::<ScanState>(&to_bytes(&s)),
+        Err(EngineError::SessionCorrupt)
+    ));
+    s.claimed.pop();
+    assert!(from_bytes::<ScanState>(&to_bytes(&s)).is_ok());
     // `own_len` must count `own`'s entries.
     let mut s = state.clone();
     s.own_len += 1;
@@ -749,8 +849,11 @@ fn the_caps_flags_come_back() {
     let r = record(&card.source, &o);
     let mut state: ScanState = from_bytes(&r.points[0].state).unwrap();
     assert!(!state.capped && !state.orphans_capped);
+    assert!(!state.frags_capped && !state.claimed_capped);
     state.capped = true;
     state.orphans_capped = true;
+    state.frags_capped = true;
+    state.claimed_capped = true;
     let p = Point {
         state: to_bytes(&state),
         ..r.points[0].clone()
@@ -759,4 +862,5 @@ fn the_caps_flags_come_back() {
     got.unwrap();
     let next: ScanState = from_bytes(&points[0].state).unwrap();
     assert!(next.capped && next.orphans_capped);
+    assert!(next.frags_capped && next.claimed_capped);
 }

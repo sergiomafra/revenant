@@ -131,9 +131,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   earlier on the card than its start, even when the check of its contents never reads that sector. A photo written over part of a deleted RAW is found. Each
   volume found is reported at the start of the scan, with a flag when the listing hit one of its limits (some files may
   then lack their names); the file-system step can be turned off.
+- Photos split into three or more pieces on a card are put back together after the scan, from the card's free space,
+  never over another file; without file-system proof of their placement they are reported as partial, never as intact
+  (a near-identical photo of the same burst could have lent a piece).
 
 ### Changed
 
+- Sessions saved by an earlier version can no longer be resumed: scan the card again.
 - Extraction from a whole card or disk refuses a destination on any volume of that device (also an APFS volume whose
   container lives on it), and a destination whose disks cannot be determined (a network folder), so nothing is ever
   written to the card being recovered.

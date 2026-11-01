@@ -309,10 +309,13 @@ fn session_issues_are_reported() {
     *b.last_mut().unwrap() ^= 1;
     std::fs::write(&manifest, &b).unwrap();
     assert_eq!(ask(&mine), [Issue::SessionCorrupt]);
-    let mut b = good.clone();
-    b[9] = 2;
-    std::fs::write(&manifest, &b).unwrap();
-    assert_eq!(ask(&mine), [Issue::SessionCorrupt]);
+    // Newer, and the 1.5 format (version 1, ruling Q10).
+    for version in [3u8, 1] {
+        let mut b = good.clone();
+        b[9] = version;
+        std::fs::write(&manifest, &b).unwrap();
+        assert_eq!(ask(&mine), [Issue::SessionCorrupt], "version {version}");
+    }
     // After the other checks, in order.
     std::fs::write(&manifest, &good).unwrap();
     s.fake.fail_unmount("disk4", &["disk4s1"]);

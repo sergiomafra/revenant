@@ -1260,3 +1260,115 @@ fn recheck_ignores_blind_alternatives() {
         );
     }
 }
+
+/// A search result that satisfies the whole D6 rule on its own: 3 pieces, complete, unique, exhaustive, `Proven`.
+fn good_search() -> Search {
+    let f = |start, len| Fragment { start, len };
+    Search {
+        pieces: vec![f(MIB, 2 * U), f(4 * MIB, 2 * U), f(2 * MIB, U)],
+        len: 5 * U,
+        complete: true,
+        unique: true,
+        exhaustive: true,
+        proof: Proof::Proven,
+    }
+}
+
+/// What the scan checks besides the search, every one of them passing (placement proven, not by content alone).
+fn good_checks() -> Checks {
+    Checks {
+        capped: false,
+        frags_capped: false,
+        claimed_capped: false,
+        listing_truncated: false,
+        bad: false,
+        size_ok: true,
+        own_ok: true,
+        restarts: false,
+        content_only: false,
+    }
+}
+
+#[test]
+fn health_needs_every_condition() {
+    use crate::formats::{FileKind, Health};
+    let jpeg = FileKind::Jpeg;
+    let s = good_search();
+    let c = good_checks();
+    // A JPEG in 3 pieces whose placement is proven: the whole rule holds.
+    assert_eq!(health(&s, jpeg, &c), Health::Intact);
+    type Mutation<T> = (&'static str, fn(&mut T));
+    let searches: [Mutation<Search>; 5] = [
+        ("unique", |s| s.unique = false),
+        ("exhaustive", |s| s.exhaustive = false),
+        ("complete", |s| s.complete = false),
+        ("unproven", |s| s.proof = Proof::Unproven),
+        ("failed", |s| s.proof = Proof::Failed),
+    ];
+    for (name, f) in searches {
+        let mut s = good_search();
+        f(&mut s);
+        assert_eq!(health(&s, jpeg, &c), Health::Partial, "{name}");
+        assert_eq!(health(&s, FileKind::Mp4, &c), Health::Partial, "{name}");
+    }
+    let checks: [Mutation<Checks>; 9] = [
+        ("capped", |c| c.capped = true),
+        ("frags_capped", |c| c.frags_capped = true),
+        ("claimed_capped", |c| c.claimed_capped = true),
+        ("listing_truncated", |c| c.listing_truncated = true),
+        ("bad run", |c| c.bad = true),
+        ("known size", |c| c.size_ok = false),
+        ("own check", |c| c.own_ok = false),
+        ("restarts (Q16)", |c| c.restarts = true),
+        ("content only (Q37)", |c| c.content_only = true),
+    ];
+    for (name, f) in checks {
+        let mut c = good_checks();
+        f(&mut c);
+        assert_eq!(health(&s, jpeg, &c), Health::Partial, "{name}");
+    }
+    // Q16 and Q37 bite only a JPEG in 2 or more pieces: one run placed by content keeps the 1.3 rule, and another
+    // format is not capped by them.
+    let mut one = good_search();
+    one.pieces = vec![Fragment {
+        start: MIB,
+        len: 5 * U,
+    }];
+    let lenient = Checks {
+        restarts: true,
+        content_only: true,
+        ..good_checks()
+    };
+    assert_eq!(health(&one, jpeg, &lenient), Health::Intact);
+    assert_eq!(health(&s, FileKind::Mp4, &lenient), Health::Intact);
+    for kind in [FileKind::Mp4, FileKind::Arw] {
+        let mut c = good_checks();
+        c.bad = true;
+        assert_eq!(health(&s, kind, &c), Health::Partial, "{kind:?}");
+    }
+}
+
+#[test]
+fn a_reassembly_improves_only_on_better_health_or_a_longer_complete_file() {
+    use crate::formats::{FileKind, Health};
+    use crate::scan::Finding;
+    let f = |health, len| Finding {
+        id: 7,
+        start: MIB,
+        len,
+        kind: FileKind::Jpeg,
+        health,
+        fragments: Vec::new(),
+        origin: None,
+    };
+    let (i, p, d) = (Health::Intact, Health::Partial, Health::Damaged);
+    assert!(improves(&f(p, 100), &f(i, 100), true));
+    assert!(improves(&f(d, 100), &f(p, 100), true));
+    assert!(!improves(&f(i, 100), &f(i, 200), true));
+    assert!(!improves(&f(p, 100), &f(d, 200), true));
+    // Both Partial: only a complete and longer one.
+    assert!(improves(&f(p, 100), &f(p, 101), true));
+    assert!(!improves(&f(p, 100), &f(p, 100), true));
+    assert!(!improves(&f(p, 100), &f(p, 200), false));
+    assert!(!improves(&f(p, 100), &f(p, 50), true));
+}

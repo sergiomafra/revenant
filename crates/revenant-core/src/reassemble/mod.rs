@@ -14,18 +14,25 @@
 //!
 //! Every read goes through the source the caller gives (the scan's `CachedSource`, which never reads a known-bad sector
 //! again), counted by a private wrapper so each file's reads are charged to its budget.
-// Wired into the scan by the reassembly step (part 1.6, task 4); until then most of it is used only by its tests.
+//!
+//! The scan's reassembly step ([`reassemble`]) runs this search, after the pairing, for every candidate the scan kept
+//! ([`is_candidate`]), in id order, and turns each result that improves the finding into an `Updated` ([`improves`]),
+//! with the health of [`health`].
+// Parts of the engine wait for the formats of later tasks (anchors and known lengths for videos, own files for RAWs).
 #![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::EngineError;
-use crate::cache::Runs;
-use crate::formats::{Fragment, Reader, SECTOR, cancelled};
+use crate::cache::{CachedSource, Runs};
+use crate::filesystem::{FsState, Placement};
+use crate::formats::jpeg::decode_health;
+use crate::formats::jpeg_join::MIN_FIRST_PIECE;
+use crate::formats::{CancelScope, FileKind, Fragment, Health, Reader, SECTOR, cancelled};
 pub(crate) use crate::pairing::Grid;
 use crate::pairing::grid_of;
-use crate::scan::CancelToken;
+use crate::scan::{CancelToken, Finding};
 use crate::source::{DiskId, Fragmented, Source, VolumeId};
 
 pub(crate) mod jpeg;
@@ -1228,6 +1235,227 @@ pub(crate) fn search<S: Seams>(
     };
     budget.charge(tries, counted.read());
     found
+}
+
+/// Whether a finding the scan emits is a reassembly candidate (D2): never one of a live file (its chain says where it
+/// is); a JPEG that is not `Intact` with a first piece of at least 16 KiB (the 1.3 `MIN_FIRST_PIECE`), an MP4/MOV that
+/// is not `Intact`, a `Partial` TIFF RAW, and any photo or video of a deleted file that came out `Partial`. Only the
+/// JPEGs are searched so far; the others are kept for the formats that come next.
+pub(crate) fn is_candidate(f: &Finding) -> bool {
+    let origin = f.origin.as_ref().map(|o| o.state);
+    if origin == Some(FsState::Live) {
+        return false;
+    }
+    let first = f.fragments.first().map_or(f.len, |p| p.len);
+    let raw = matches!(
+        f.kind,
+        FileKind::Arw
+            | FileKind::Cr2
+            | FileKind::Nef
+            | FileKind::Dng
+            | FileKind::Orf
+            | FileKind::Rw2
+            | FileKind::Tiff
+    );
+    let searched = matches!(f.kind, FileKind::Jpeg | FileKind::Mp4 | FileKind::Mov) || raw;
+    match f.health {
+        Health::Partial if searched && origin == Some(FsState::Deleted) => true,
+        Health::Intact => false,
+        _ if f.kind == FileKind::Jpeg => first >= MIN_FIRST_PIECE,
+        _ if matches!(f.kind, FileKind::Mp4 | FileKind::Mov) => true,
+        Health::Partial => raw,
+        Health::Damaged => false,
+    }
+}
+
+/// What the reassembly step starts from: the scan's grids, the listing's live ranges, the ranges of every `Intact`
+/// finding emitted, the start of every finding (ascending), the orphan `moov`s, the caps hit and the limits.
+pub(crate) struct Context<'a> {
+    pub grids: &'a [Grid],
+    pub live: &'a [Fragment],
+    pub claimed: &'a Runs,
+    pub starts: &'a [u64],
+    pub moovs: &'a [(u64, u64)],
+    /// A pairing candidate was dropped by a cap (C10: conservative, it blocks a JPEG's `Intact` too).
+    pub capped: bool,
+    /// More candidates than [`Limits::candidates`]: a dropped one might compete for the same pieces (D2).
+    pub frags_capped: bool,
+    /// More claimed runs than [`Limits::claimed_runs`]: some `Intact` pieces may read free (D18).
+    pub claimed_capped: bool,
+    /// A volume listing dropped entries: live clusters may be unknown (Q5).
+    pub listing_truncated: bool,
+    pub limits: &'a Limits,
+}
+
+/// What the scan checks besides the search for the health of a reassembly (D6).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Checks {
+    pub capped: bool,
+    pub frags_capped: bool,
+    pub claimed_capped: bool,
+    pub listing_truncated: bool,
+    /// An unreadable sector in a piece.
+    pub bad: bool,
+    /// The pieces sum to the file-system entry's size, when one is known.
+    pub size_ok: bool,
+    /// The format's own check of the whole file over its pieces is `Intact` (the JPEG: the strict decode).
+    pub own_ok: bool,
+    /// A JPEG with restart markers (DRI > 0): at most `Partial` in 2 or more pieces (Q16).
+    pub restarts: bool,
+    /// The pieces were placed by their content alone, no file system proving where they lie (every result of
+    /// [`search`] so far; a JPEG in 2 or more pieces is then at most `Partial`, ruling Q37).
+    pub content_only: bool,
+}
+
+/// The health of a reassembly of a file of `kind` (D6): `Intact` iff the search is complete, unique, exhaustive and
+/// `Proven`, no cap was hit, the listing is whole (Q5), no piece holds an unreadable sector, the known size matches, the
+/// format's own check passes, it is no JPEG with restart markers in 2 or more pieces (Q16) and, for a JPEG, the format's
+/// cap allows it ([`jpeg::jpeg_health_cap`]: placed by content alone, 2 or more pieces never are, Q37); else `Partial`.
+pub(crate) fn health(found: &Search, kind: FileKind, c: &Checks) -> Health {
+    let search = found.complete && found.unique && found.exhaustive && found.proof == Proof::Proven;
+    let many = found.pieces.len() >= 2;
+    let format = match kind {
+        FileKind::Jpeg => {
+            jpeg::jpeg_health_cap(found, c.content_only) == Health::Intact && !(c.restarts && many)
+        }
+        _ => true,
+    };
+    let scan = !c.capped
+        && !c.frags_capped
+        && !c.claimed_capped
+        && !c.listing_truncated
+        && !c.bad
+        && c.size_ok
+        && c.own_ok;
+    if search && format && scan {
+        Health::Intact
+    } else {
+        Health::Partial
+    }
+}
+
+fn rank(h: Health) -> u8 {
+    match h {
+        Health::Damaged => 0,
+        Health::Partial => 1,
+        Health::Intact => 2,
+    }
+}
+
+/// Whether `new` should replace `old` (D6): strictly better health, or both `Partial` and `new` is complete (its walk
+/// reached the file's end) and longer.
+pub(crate) fn improves(old: &Finding, new: &Finding, complete: bool) -> bool {
+    rank(new.health) > rank(old.health)
+        || (old.health == Health::Partial
+            && new.health == Health::Partial
+            && complete
+            && new.len > old.len)
+}
+
+/// The reassembly step: every candidate (id order) searched; returns the findings it improves (same id; a file-system
+/// file keeps its origin with placement `Carved`, D15). For a candidate of origin `Deleted`, the search gets the entry's
+/// size as the known length (Q3): the pieces must sum to it. `paired`: the pairing's results, whose `Intact` pieces are
+/// claimed first; each `Intact` reassembly claims its pieces for the next candidates. Sequential and deterministic: it
+/// depends only on the source's bytes and its arguments. Only JPEGs are searched so far (videos and RAWs keep their
+/// results until their formats get seams). Stops early, returning what it has, when cancelled (the caller looks).
+pub(crate) fn reassemble(
+    source: &CachedSource,
+    candidates: &[Finding],
+    paired: &[Finding],
+    ctx: &Context,
+    cancel: &CancelToken,
+) -> Vec<Finding> {
+    let _scope = CancelScope::enter(cancel);
+    let mut taken = Taken::new(ctx.live, ctx.claimed);
+    for f in paired.iter().filter(|f| f.health == Health::Intact) {
+        taken.claim(&f.ranges());
+    }
+    let mut budget = Budget::new(ctx.limits);
+    let mut out = Vec::new();
+    for f in candidates {
+        if cancel.is_cancelled() || budget.spent() {
+            break;
+        }
+        if f.kind != FileKind::Jpeg {
+            continue;
+        }
+        if let Some(new) = reassemble_jpeg(source, f, &taken, ctx, &mut budget, cancel) {
+            if new.health == Health::Intact {
+                taken.claim(&new.ranges());
+            }
+            out.push(new);
+        }
+    }
+    out
+}
+
+/// The JPEG `f` searched; the finding it becomes when that improves it.
+fn reassemble_jpeg(
+    source: &CachedSource,
+    f: &Finding,
+    taken: &Taken,
+    ctx: &Context,
+    budget: &mut Budget,
+    cancel: &CancelToken,
+) -> Option<Finding> {
+    let mut seams = jpeg::JpegSeams::new(source, f.start)?;
+    let space = Space::new(
+        ctx.grids,
+        f.start,
+        source.len(),
+        taken,
+        ctx.starts,
+        ctx.limits,
+    );
+    let known = f
+        .origin
+        .as_ref()
+        .filter(|o| o.state == FsState::Deleted)
+        .map(|o| o.size);
+    let found = search(
+        &mut seams, source, &space, f.start, known, ctx.limits, budget, cancel,
+    )?;
+    if cancel.is_cancelled() || found.pieces.first().map(|p| p.start) != Some(f.start) {
+        return None;
+    }
+    let mut checks = Checks {
+        capped: ctx.capped,
+        frags_capped: ctx.frags_capped,
+        claimed_capped: ctx.claimed_capped,
+        listing_truncated: ctx.listing_truncated,
+        bad: found
+            .pieces
+            .iter()
+            .any(|p| !source.bad_runs(p.start, p.start + p.len).is_empty()),
+        size_ok: known.is_none_or(|k| k == found.len),
+        own_ok: true,
+        restarts: seams.restart_interval() > 0,
+        // Every result of the search is placed by content alone: an exFAT chain that proves a placement comes later
+        // (D14).
+        content_only: true,
+    };
+    // The strict decode is the costliest check: only when nothing else keeps the file from `Intact`.
+    if health(&found, f.kind, &checks) == Health::Intact {
+        let view = Fragmented::new(source, found.pieces.clone());
+        checks.own_ok = decode_health(&mut Reader::new(&view), 0, found.len) == Health::Intact;
+    }
+    let new = Finding {
+        id: f.id,
+        start: f.start,
+        len: found.len,
+        kind: f.kind,
+        health: health(&found, f.kind, &checks),
+        fragments: if found.pieces.len() > 1 {
+            found.pieces.clone()
+        } else {
+            Vec::new()
+        },
+        origin: f.origin.clone().map(|mut o| {
+            o.placement = Placement::Carved;
+            o
+        }),
+    };
+    improves(f, &new, found.complete).then_some(new)
 }
 
 #[cfg(test)]

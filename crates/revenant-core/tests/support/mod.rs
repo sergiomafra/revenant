@@ -11,9 +11,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use revenant_core::EngineError;
 use revenant_core::device::{DestInfo, DeviceOps, DiskInfo, UnmountGuard};
 use revenant_core::source::{DiskId, Geometry, RawDevice, Source, VolumeId};
+use revenant_core::{EngineError, Event, Finding};
+use revenant_testkit::fs::{FsBuilder, FsType, Partitioning, disk};
 
 enum Data {
     Bytes(Vec<u8>),
@@ -673,6 +674,43 @@ pub fn disk_info(id: &str, size: u64) -> DiskInfo {
     }
 }
 
+/// The findings a scan ends with: each `Found` replaced by the `Updated` with its id, by id.
+pub fn final_view(events: &[Event]) -> BTreeMap<u64, Finding> {
+    let mut out = BTreeMap::new();
+    for e in events {
+        match e {
+            Event::Found(f) => {
+                assert!(out.insert(f.id, f.clone()).is_none(), "one Found per id");
+            }
+            Event::Updated(f) => {
+                assert!(
+                    out.insert(f.id, f.clone()).is_some(),
+                    "an Updated replaces a Found"
+                );
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A 64 MiB exFAT volume with 32 KiB clusters (put it on a disk with [`on_disk`]).
+pub fn exfat_card() -> FsBuilder {
+    FsBuilder::new(FsType::Exfat, 64 << 20, 32 << 10)
+}
+
+/// Where [`on_disk`] puts the volume: LBA 8192.
+pub const VOLUME_AT: u64 = 8192 * 512;
+
+/// `volume` at LBA 8192 (MBR) of a disk 8 MiB longer than it.
+pub fn on_disk(volume: &[u8]) -> Vec<u8> {
+    disk(
+        Partitioning::Mbr { first_lba: 8192 },
+        volume,
+        volume.len() + (8 << 20),
+    )
+}
+
 /// The cards of the resumable-scan tests (Task 9), built once here and shared with the session tests (Task 10). Each
 /// one is a [`SimSource`] in memory with its unreadable ranges set.
 pub mod cards {
@@ -946,6 +984,150 @@ pub mod cards {
         let mut c = card(img, Vec::new());
         c.file = Some((start, start + video.len() as u64));
         c
+    }
+
+    /// The quick-formatted exFAT card of the reassembly tests: what it holds and where.
+    pub struct ThreePiece {
+        /// The whole disk (the volume at [`super::VOLUME_AT`]).
+        pub bytes: Vec<u8>,
+        /// R: a smooth 2048×1536 photo in 3 runs of clusters, other photos between them.
+        pub r: Vec<u8>,
+        pub r_pieces: Vec<revenant_core::Fragment>,
+        /// Q: a smooth 2048×1536 photo in 2 runs.
+        pub q: Vec<u8>,
+        pub q_pieces: Vec<revenant_core::Fragment>,
+        /// P1..P6: contiguous noise photos, as `(start, end)`.
+        pub p: Vec<(u64, u64)>,
+    }
+
+    /// [`super::exfat_card`] holding, in cluster order, P1 P2 R1 P3 Q1 P4 R2 P5 P6 R3 Q2 (P1..P6: `jpeg(320, 240, k, 0)`,
+    /// contiguous; R: `jpeg_smooth(2048, 1536, 11)` in 3 runs of at least 2 clusters; Q: `jpeg_smooth(2048, 1536, 9)`
+    /// in 2 runs), all in the root, then quick-formatted: no name is left, every file is found by its signature. The
+    /// photos between the runs are small on purpose: with 1024×768 ones the card's reassembly takes about 8 s in a
+    /// release build (34 s in debug) and the resume tests scan it dozens of times.
+    pub fn three_piece() -> ThreePiece {
+        const CLUSTER: u64 = 32 * KIB;
+        let mut b = super::exfat_card();
+        let photos: Vec<Vec<u8>> = (1..=6).map(|k| jpeg(320, 240, k, 0)).collect();
+        let r = jpeg_smooth(2048, 1536, 11);
+        let q = jpeg_smooth(2048, 1536, 9);
+        let n = |len: usize| (len as u64).div_ceil(CLUSTER) as u32;
+        let (nr, nq) = (n(r.len()), n(q.len()));
+        let per = nr / 3;
+        assert!(per >= 2, "R's runs hold at least 2 clusters");
+        let r_runs = [per, per, nr - 2 * per];
+        let q_runs = [nq / 2, nq - nq / 2];
+        let first = b.add("P1.JPG", &photos[0]);
+        let mut next = *first.last().unwrap() + 1;
+        let mut take = |count: u32| {
+            let c: Vec<u32> = (next..next + count).collect();
+            next += count;
+            c
+        };
+        let mut p_clusters = vec![first];
+        p_clusters.push(take(n(photos[1].len())));
+        let mut r_clusters = take(r_runs[0]);
+        p_clusters.push(take(n(photos[2].len())));
+        let mut q_clusters = take(q_runs[0]);
+        p_clusters.push(take(n(photos[3].len())));
+        r_clusters.extend(take(r_runs[1]));
+        p_clusters.push(take(n(photos[4].len())));
+        p_clusters.push(take(n(photos[5].len())));
+        r_clusters.extend(take(r_runs[2]));
+        q_clusters.extend(take(q_runs[1]));
+        for (k, c) in p_clusters.iter().enumerate().skip(1) {
+            b.add_at(&format!("P{}.JPG", k + 1), &photos[k], c);
+        }
+        b.add_at("R.JPG", &r, &r_clusters);
+        b.add_at("Q.JPG", &q, &q_clusters);
+        let at = |c: u32| super::VOLUME_AT + b.cluster_offset(c);
+        let pieces = |clusters: &[u32], len: usize| {
+            let mut out: Vec<revenant_core::Fragment> = Vec::new();
+            let mut left = len as u64;
+            for &c in clusters {
+                let l = CLUSTER.min(left);
+                left -= l;
+                match out.last_mut() {
+                    Some(p) if p.start + p.len == at(c) => p.len += l,
+                    _ => out.push(revenant_core::Fragment {
+                        start: at(c),
+                        len: l,
+                    }),
+                }
+            }
+            out
+        };
+        let r_pieces = pieces(&r_clusters, r.len());
+        let q_pieces = pieces(&q_clusters, q.len());
+        assert_eq!((r_pieces.len(), q_pieces.len()), (3, 2));
+        let p = p_clusters
+            .iter()
+            .zip(&photos)
+            .map(|(c, ph)| (at(c[0]), at(c[0]) + ph.len() as u64))
+            .collect();
+        ThreePiece {
+            bytes: super::on_disk(&b.build_quick_formatted()),
+            r,
+            r_pieces,
+            q,
+            q_pieces,
+            p,
+        }
+    }
+
+    /// [`super::exfat_card`] with a live `jpeg_smooth(2048, 1536, 41)` in 3 FAT-chained runs, live photos between them,
+    /// and one unreadable sector in its second run (so the live photo is `Partial`, and would qualify as a reassembly
+    /// candidate but for being live). Returns the card and the live photo's pieces.
+    pub fn live_in_three_runs() -> (Card, Vec<revenant_core::Fragment>) {
+        const CLUSTER: u64 = 32 * KIB;
+        let mut b = super::exfat_card();
+        let photo = jpeg_smooth(2048, 1536, 41);
+        let n = |len: usize| (len as u64).div_ceil(CLUSTER) as u32;
+        let others: Vec<Vec<u8>> = (1..=2).map(|k| jpeg(512, 384, 50 + k, 0)).collect();
+        let first = b.add("A.JPG", &jpeg(256, 256, 49, 0));
+        let mut next = *first.last().unwrap() + 1;
+        let mut take = |count: u32| {
+            let c: Vec<u32> = (next..next + count).collect();
+            next += count;
+            c
+        };
+        let np = n(photo.len());
+        let mut pc = take(np / 3);
+        let o1 = take(n(others[0].len()));
+        pc.extend(take(np / 3));
+        let o2 = take(n(others[1].len()));
+        pc.extend(take(np - 2 * (np / 3)));
+        b.add_at("PHOTO.JPG", &photo, &pc);
+        b.add_at("B.JPG", &others[0], &o1);
+        b.add_at("C.JPG", &others[1], &o2);
+        let at = |c: u32| super::VOLUME_AT + b.cluster_offset(c);
+        let mut pieces: Vec<revenant_core::Fragment> = Vec::new();
+        let mut left = photo.len() as u64;
+        for &c in &pc {
+            let l = CLUSTER.min(left);
+            left -= l;
+            match pieces.last_mut() {
+                Some(p) if p.start + p.len == at(c) => p.len += l,
+                _ => pieces.push(revenant_core::Fragment {
+                    start: at(c),
+                    len: l,
+                }),
+            }
+        }
+        assert_eq!(pieces.len(), 3);
+        let bad = pieces[1].start + 2048;
+        (
+            card(super::on_disk(&b.build()), vec![(bad, bad + 512)]),
+            pieces,
+        )
+    }
+
+    /// F: [`three_piece`] with one unreadable sector inside P5 (R is put back together by the reassembly step).
+    pub fn f() -> Card {
+        let t = three_piece();
+        let (s, e) = t.p[4];
+        let bad = (s + (e - s) / 2) / 512 * 512;
+        card(t.bytes, vec![(bad, bad + 512)])
     }
 
     /// 16 MiB of noise with 20 isolated unreadable sectors 256 KiB apart from 1 MiB on (`DiskFailing` fires at a block

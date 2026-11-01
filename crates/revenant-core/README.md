@@ -573,7 +573,7 @@ candidate), or, from part 1.6 task 9 on, a surviving exFAT chain that meets the 
 reach the cap with `content_only = false`, or do not go through it at all. A photo found in one run keeps the 1.3 rule
 (`jpeg_health_cap` caps only two or more pieces), and the 1.3 two-piece join above is unchanged, with its known limit
 for a near-identical tail. The cost: a fragmented photo with no surviving chain comes back assembled, often perfect, but
-`Partial`. The reassembly step (part 1.6, task 4) applies `jpeg_health_cap` in its health rule, together with the
+`Partial`. The reassembly step (see "Reassembly") applies `jpeg_health_cap` in its health rule, together with the
 scan's own checks (restart markers, Q16; bad sectors; caps; the known size), which only lower it.
 
 For the uniqueness re-check (`Seams::suspicious_breaks`) the JPEG orders the cut positions by how much the DC grid jumps
@@ -880,8 +880,8 @@ its pieces (each rounded out to whole sectors), so files in the gaps between the
 
 ## Reassembly
 
-The seam search (`reassemble`, crate-internal; the scan does not call it yet: the reassembly step comes with the next
-task of part 1.6) puts back together a file found in more than two pieces. A **seam** is a logical position of the file
+The seam search (`reassemble`, crate-internal) puts back together a file found in more than two pieces; the scan runs
+it in its reassembly step, after the pairing (see "The reassembly step" below). A **seam** is a logical position of the file
 where one piece ends and the next begins. Each format describes its content through the `Seams` trait: it walks the
 file's logical bytes over a view of the pieces chosen so far plus a candidate run (told where the view's seams are),
 says where the content stops fitting
@@ -974,6 +974,42 @@ every walk and every prefilter read, and gives nothing when cancelled.
 
 **Reading.** The search reads through the scan's read cache, so a sector known to be unreadable is never read again;
 nothing is written and nothing is remembered per cluster during the scan.
+
+### The reassembly step
+
+After every `Found` and the pairing, before the `Updated` events, the scan runs the search for its **candidates**,
+kept as each finding is emitted (ruling D2): never a live file's finding (its chain says where it is); a JPEG that is not
+`Intact` whose first piece is at least 16 KiB (the 1.3 join's minimum), an MP4/MOV that is not `Intact`, a `Partial`
+TIFF RAW (ARW, CR2, NEF, DNG, ORF, RW2, TIFF), and any photo or video of a deleted file that came out `Partial`. At
+most 4096 are kept, the first by id; past that, no reassembly is `Intact` (a dropped one might compete for the same
+pieces). **Only JPEGs are searched so far**: videos and RAWs keep their results until their formats get seams. The scan
+also keeps the ranges of every `Intact` finding it emits (at most 2^18 merged runs; past that, no reassembly is
+`Intact`): those, the listing's live ranges, the pairing's `Intact` results and every earlier `Intact` reassembly are
+taken (see "The space"). Only this bookkeeping, one push or a few run merges per finding emitted, happens during the
+scan; nothing is added per sector.
+
+The candidates are searched one by one in id order, sequentially, through the scan's cache (one budget for the whole
+step, see "Budgets"), so the result depends only on the source's bytes and what the scan kept, never on `threads` or
+`cache_bytes`. A candidate of a deleted file gets its entry's size as the known length: its pieces must sum to it. The
+**health** of a result (D6): `Intact` only when the format's cap allows it (a JPEG placed by content alone in two or
+more pieces never does, Q37), the solution is complete, unique, exhaustive and `Proven`, no pairing candidate was
+dropped by a cap (conservative: that cap is about videos, but it blocks a JPEG's `Intact` too, C10), neither of the
+reassembly's caps was hit, the volume listing was not truncated (live clusters could be unknown, Q5), no piece holds a
+known unreadable sector, the known size matches, the format's own check of the whole file passes (the JPEG: the strict
+decode, run only when nothing else stands in the way) and it is no JPEG with restart markers in two or more pieces
+(Q16); otherwise `Partial`. A result in one piece is contiguous (`fragments` empty).
+
+A result replaces the finding only when it **improves** it: a strictly better health, or both `Partial` and the result
+is complete (its walk reached the file's end) and longer. It then comes out as an `Event::Updated` with the same id
+(its pieces, length and health; a deleted file keeps its origin, with placement `Carved`, D15), merged with the
+pairing's and the old folders' updates for that id (the reassembly's pieces win over the pairing's). An `Intact` result
+claims its pieces for the candidates after it. A cancel stops the step (the scan returns `cancelled`, no `Updated`);
+a source that vanishes during it stops the scan with `device_gone`.
+
+A known limit: a piece followed at once on the card by a run of another photo whose data decodes on smoothly (two
+similar photos with the same tables) can give the walk no break at that cluster boundary; the search then goes on
+through the other photo's run and may find no complete solution, and the photo keeps its earlier result (or comes out
+`Partial` with what fitted), never `Intact`.
 
 ## File systems: volumes
 
@@ -1431,6 +1467,12 @@ file never hides the rest of the disk; a damaged file may then overlap another f
 (not just the block), so files may cross block boundaries. Before the first block the scan reads the source's file
 systems (below), so the files they list come out with their name, folder and dates, once each.
 
+After the last block and every `Found`, three steps run in order, each over what the scan kept: the pairing of videos
+with their separated `moov` ("Video with a separated index"), the reassembly of files in three or more pieces
+([The reassembly step](#the-reassembly-step); JPEGs so far), then the names of the old folders of a quick-formatted
+card ([File systems: after a quick format](#file-systems-after-a-quick-format)). Their results come out merged, one
+`Updated` per id in id order, before `scan` returns.
+
 A `Partial` RAW's own JPEGs (rulings D12, R24): for every measurement that is not `Damaged`, the format that measured it
 also lists the embedded files it references in its own data (`Format::own_files`: a TIFF RAW's previews and JPEG-coded
 strips/tiles, a RAF's embedded JPEG, a CR3's `PRVW` and full-size JPEG; at most 64), in the same measuring step on every
@@ -1591,8 +1633,9 @@ Events:
 - `Updated(Finding)`: a better version of a finding already reported, which replaces the earlier `Found` with the same
   `id`. Emitted after every `Found` (and the last `Progress`), before `scan` returns, in id order; counted in
   `ScanSummary::updated`. Today: a video put back together with its separated `moov` (see "Video with a separated
-  index"), and a finding an old folder of a quick-formatted card names (see
-  [File systems: after a quick format](#file-systems-after-a-quick-format)); one event per id, both merged.
+  index"), a photo put back together from three or more pieces by the reassembly step (see
+  [The reassembly step](#the-reassembly-step)), and a finding an old folder of a quick-formatted card names (see
+  [File systems: after a quick format](#file-systems-after-a-quick-format)); one event per id, all merged.
 
 `CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block
 examined and each block read ahead, before and after every event and while waiting for a measurement. A block
@@ -1629,7 +1672,7 @@ The saved session ([Sessions](#sessions)) stores this on disk; inside the engine
   timing and never part of a saved scan (ruling P4). The state is built only when the hook asks for it. `stopping` says
   the scan was cancelled or the source vanished once the boundary's events were out: the state is still good
   (everything in it was committed before), and the scan returns that error right after the hook.
-- `Paired`, after the pairing step, before the `Updated` events.
+- `Paired`, after the pairing and the reassembly steps, before the `Updated` events.
 
 **What the state holds** (ruling D22): the shape of the scan it belongs to (the sector and block sizes as the scan
 uses them, file systems on or off, the source's length: a scan of another shape refuses it, ruling P44), the position
@@ -1638,7 +1681,8 @@ in-order half of the scan carries from block to block (the summary, the open unr
 whether `DiskFailing` was sent, the findings not yet emitted, the next id, the orphan `moov` candidates and the ranges of
 the ISO BMFF findings that rule some out, the `Damaged` videos kept for pairing, the caps' flags, the start of every
 finding, the next listed file, the own-file starts of `Partial` RAWs with their owners' ranges, the old-folder
-candidates and the findings on a cluster grid they may name); the skip ranges; the last bytes the `moov` and old-folder
+candidates and the findings on a cluster grid they may name, the reassembly candidates and the ranges of the `Intact`
+findings emitted, with their caps' flags); the skip ranges; the last bytes the `moov` and old-folder
 searches saw before the position (a header across the boundary is still found); the cache's **whole** bad map (ruling
 P5) and its coverage from the position on. The capture names every field of the commit loop, so a field added later
 does not compile until it is saved or rebuilt. Rebuilt on resume, not stored: the cluster grids, the volumes and what the
@@ -1654,15 +1698,17 @@ for any `threads` and `cache_bytes` on either side.
 
 **What a resume reads again** (ruling D24): the blocks the stopped scan had read ahead past the position (at most the
 read-ahead, `lookahead_blocks × block`, plus what was read since the last saved checkpoint), the pieces below the
-position of listed files that start after it, and what the pairing loads (a resume from `Paired` runs the pairing again).
+position of listed files that start after it, and what the pairing and the reassembly read (a resume from `Paired` runs
+both again: they are deterministic, so they give the same `Updated` events).
 Never: the listing (ruling D23: read again with a fuller bad map it could come out different), a sector of the saved bad
 map (the cache starts with it, including runs below the position that the pairing or a file's pieces may touch), or a
 block wholly inside an `Intact` finding across the position whose bytes the cache had already read (its coverage comes
 back with the state; for that the cache now keeps its coverage from the walk's position on, not from the read-ahead's).
-Starting from the position, a scan without file systems or pairing reads nothing below it.
+Starting from the position, a scan without file systems, pairing or reassembly candidates reads nothing below it.
 
 **Memory**: the state is bounded by the caps the scan already has (pending findings, 4096 + 4096 pairing candidates,
-65,536 own-file starts, 65,536 old-folder candidates, 262,144 grid findings and one start per finding), plus the bad map
+65,536 own-file starts, 65,536 old-folder candidates, 262,144 grid findings, one start per finding, 4096 reassembly
+candidates and 2^18 claimed runs, 16 bytes each in the saved form: 4 MiB), plus the bad map
 (at most 2^20 runs, 16 bytes each in the saved form: about 16 MiB) and at most 65,536 coverage runs. The listing is
 saved once, up to a few hundred MiB in the worst case of the listing's caps.
 
@@ -1716,7 +1762,9 @@ scan_session(&source, &identity, &formats, &opts, &mut session, &sopts, &cancel,
   no longer on the volume it was checked on), and the scan's own. On any error the session stays at its last checkpoint,
   ready to run again.
 
-**The folder** (ruling D25): every file starts with `RVNTSESS`, a kind byte and the format version (`u16`, 1).
+**The folder** (ruling D25): every file starts with `RVNTSESS`, a kind byte and the format version (`u16`, 2). The
+version is 2 since the reassembly's state joined the checkpoints (part 1.6): a session saved by an earlier version
+(1) is refused with `session_version`, like any version this engine does not write (ruling Q10); scan the card again.
 
 | File                                      | Holds                                                                                          |
 | ----------------------------------------- | ---------------------------------------------------------------------------------------------- |

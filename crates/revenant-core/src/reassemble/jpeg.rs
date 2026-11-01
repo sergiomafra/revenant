@@ -1447,8 +1447,9 @@ mod tests {
         }
     }
 
-    /// Whether a content-only search result is `Intact` through the JPEG health cap (Q37; Task 4 adds the scan's own
-    /// checks, which only lower it).
+    /// Whether a content-only search result is `Intact` through the JPEG health cap (Q37), before the scan's own checks
+    /// (which only lower it). The cap lowers every result in 2 or more pieces; a single run is left to the search
+    /// itself (its uniqueness re-check is what keeps a look-alike there from being `Intact`).
     fn intact(found: &Search) -> bool {
         jpeg_health_cap(found, true) == Health::Intact
     }

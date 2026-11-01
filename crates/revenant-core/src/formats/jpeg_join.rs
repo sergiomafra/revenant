@@ -33,7 +33,7 @@ pub(crate) const MAX_JOIN_TRIES: usize = 4096;
 const JOIN_BYTES_MAX: u64 = 64 << 20;
 /// Shortest first piece a search starts from: a few sectors of a photo hold too little of it to recover, and every head
 /// with a frame could otherwise start a search (ruling Q8).
-const MIN_FIRST_PIECE: u64 = 16 << 10;
+pub(crate) const MIN_FIRST_PIECE: u64 = 16 << 10;
 /// Bytes a try's reader loads at a time (most tries stop within a few rows).
 const TRY_WINDOW: usize = 64 << 10;
 /// Decoder states remembered from failed tries (see [`Memo`]).
