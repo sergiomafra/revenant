@@ -962,6 +962,20 @@ and
   a JPEG the scan finds at one of their starts, lying wholly inside the RAW, is not reported. A `Damaged` RAW hides
   nothing. See [Scan](#scan).
 
+### Lossless JPEG check (internal)
+
+`formats::jpeg_lossless` (written from ITU-T T.81 Annex H) tells whether the bytes of a RAW tile or strip are the lossless
+JPEG (SOF3) frame its header declares. `lossless_frame` reads the header (one DHT per component, one SOF3 of 2-16 bits and
+1-4 components, optional DRI, one scan with predictor 1-7) and returns `None` for anything else, a baseline JPEG
+included. `decode_lossless` then walks the difference codes (a Huffman category of 0-16 and that many extra bits; 16 has
+none), without computing predictions, from a cursor, reading only below the tile's declared end (`TileOffsets` +
+`TileByteCounts`). It returns `Eoi` only when exactly width x height x components samples decode **and** the `FF D9`
+marker ends exactly at the declared end: a Huffman stream resynchronizes, so a count alone can be reached by chance on
+the tail of a neighbouring tile. Restart markers are checked when the frame has a restart interval, a cursor is kept at
+every row of samples so a walk can resume over other bytes, and every length is checked arithmetic bounded by the
+declared sample count and the limit. The baseline decoder shares only the Huffman table builder and the byte reader, and
+still rejects categories over 11.
+
 ## TIFF reader (internal)
 
 `tiff::walk` (and `walk_exif_ifd`, for a TIFF whose IFD0 is itself an Exif IFD, as in a CR3's `CMT2`) is the crate-private reader the TIFF-based RAW formats (CR2, NEF, ARW, DNG, ORF, RW2) share. It takes a
@@ -986,7 +1000,13 @@ file). `truncated` is a size cap hit (the walk is incomplete, not malformed). Ca
 and treat `truncated` as at best `Partial`. First value wins for Make/Model/lens/serial/ISO/date. Each IFD is classified
 once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 go to `jpegs`; lossless JPEG (SOF3) is
 `data`. `jpeg_data_starts` lists the `data` ranges that are JPEG-coded (an IFD with Compression 6, 7 or 34892, or a
-JPEGInterchangeFormat range clamped to the limit), the only ones that may begin with FF D8.
+JPEGInterchangeFormat range clamped to the limit), the only ones that may begin with FF D8. Three more lists are
+additive (`data` is unchanged): `lossless` holds the `data` ranges of an IFD with Compression 7 whose first strip/tile
+starts with a SOF3 (lossless JPEG: CR2 slices, lossless DNG tiles), the ones the lossless JPEG check
+above can prove; `ifds` holds every visited IFD's entry table (`2 + 12 × count + 4` bytes, relative to the header), the
+bytes that must be the file's own; `sensor` holds the `data` ranges that are neither JPEG-coded nor lossless
+(uncompressed, or vendor/lossy such as Sony's Compression 32767, and Panasonic's raw data), which have no structure to
+check, so a seam inside them is blind.
 
 Vendor data it reads: in an RW2 (`IIU\0`) IFD0, Panasonic's tags 0x0002/0x0003 (sensor size), 0x000A (bits per sample),
 0x002D (raw format), 0x002E (JpgFromRaw, a lossy JPEG goes to `jpegs`) and 0x0118 (raw data offset; the length is computed

@@ -1365,6 +1365,138 @@ impl BitWriter {
     }
 }
 
+/// A lossless JPEG (SOF3, ITU-T T.81 Annex H): `components` (1–4) of `precision` bits (2–16), predictor 1, point
+/// transform 0, one DC Huffman table covering SSSS 0–16 shared by every component, no restart, seeded smooth samples.
+pub fn lossless_jpeg(width: u32, height: u32, components: u8, precision: u8, seed: u64) -> Vec<u8> {
+    lossless_jpeg_with_restarts(width, height, components, precision, seed, 0)
+}
+
+/// [`lossless_jpeg`] with a restart interval of `interval` samples rows' worth of pixels (MCUs): a DRI segment and an
+/// RSTn marker every `interval` pixels. `interval == 0` means none.
+pub fn lossless_jpeg_with_restarts(
+    width: u32,
+    height: u32,
+    components: u8,
+    precision: u8,
+    seed: u64,
+    interval: u16,
+) -> Vec<u8> {
+    assert!((1..=4).contains(&components) && (2..=16).contains(&precision));
+    assert!((1..=65_535).contains(&width) && (1..=65_535).contains(&height));
+    // Code lengths of SSSS 0..=16: 5 codes of length 3, 4 of 4, 3 of 5, then one each of 6..=10 (never all ones).
+    let counts: [u8; 16] = [0, 0, 5, 4, 3, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
+    let mut codes = [(0u32, 0u32); 17]; // (code, length) by symbol; symbols are 0..=16 in code order
+    let (mut code, mut sym) = (0u32, 0usize);
+    for len in 1..=16u32 {
+        for _ in 0..counts[len as usize - 1] {
+            codes[sym] = (code, len);
+            code += 1;
+            sym += 1;
+        }
+        code <<= 1;
+    }
+    let mut out = vec![0xFF, 0xD8];
+    // DHT: class 0, id 0.
+    out.extend_from_slice(&[0xFF, 0xC4]);
+    out.extend_from_slice(&(2u16 + 1 + 16 + 17).to_be_bytes());
+    out.push(0x00);
+    out.extend_from_slice(&counts);
+    out.extend(0u8..17);
+    // SOF3.
+    out.extend_from_slice(&[0xFF, 0xC3]);
+    out.extend_from_slice(&(8 + 3 * u16::from(components)).to_be_bytes());
+    out.push(precision);
+    out.extend_from_slice(&(height as u16).to_be_bytes());
+    out.extend_from_slice(&(width as u16).to_be_bytes());
+    out.push(components);
+    for c in 0..components {
+        out.extend_from_slice(&[c + 1, 0x11, 0]);
+    }
+    if interval > 0 {
+        out.extend_from_slice(&[0xFF, 0xDD, 0, 4]);
+        out.extend_from_slice(&interval.to_be_bytes());
+    }
+    // SOS: every component, table 0; predictor 1, no point transform.
+    out.extend_from_slice(&[0xFF, 0xDA]);
+    out.extend_from_slice(&(6 + 2 * u16::from(components)).to_be_bytes());
+    out.push(components);
+    for c in 0..components {
+        out.extend_from_slice(&[c + 1, 0x00]);
+    }
+    out.extend_from_slice(&[1, 0, 0]);
+
+    let mut rng = SplitMix64(seed);
+    let max = (1u32 << precision) - 1;
+    let (w, h, n) = (width as usize, height as usize, usize::from(components));
+    // Smooth samples: a seeded gradient plus small noise; a rare outlier exercises the large categories.
+    let base: Vec<(u32, u32)> = (0..n)
+        .map(|_| (rng.next() as u32 % (max + 1), rng.next() as u32 % 5))
+        .collect();
+    let mut samples = vec![0u32; w * h * n];
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..n {
+                let (b, slope) = base[c];
+                let noise = (rng.next() % 5) as i64 - 2;
+                let mut v = i64::from(b) + (x as i64 * i64::from(slope)) / 8 + y as i64 / 3 + noise;
+                if precision >= 8 && rng.next().is_multiple_of(997) {
+                    v = (rng.next() % (u64::from(max) + 1)) as i64;
+                }
+                samples[(y * w + x) * n + c] = v.rem_euclid(i64::from(max) + 1) as u32;
+            }
+        }
+    }
+    let mut bw = BitWriter::default();
+    let mut rst = 0u8;
+    for y in 0..h {
+        for x in 0..w {
+            let pixel = y * w + x;
+            if interval > 0 && pixel > 0 && pixel % usize::from(interval) == 0 {
+                bw.align();
+                bw.out.extend_from_slice(&[0xFF, 0xD0 + rst]);
+                rst = (rst + 1) % 8;
+            }
+            // After a restart, the first pixel is predicted as at the start of the scan.
+            let fresh = pixel == 0 || (interval > 0 && pixel % usize::from(interval) == 0);
+            for c in 0..n {
+                let s = samples[pixel * n + c];
+                let pred = if fresh {
+                    1u32 << (precision - 1)
+                } else if x == 0 {
+                    samples[(pixel - w) * n + c]
+                } else {
+                    samples[(pixel - 1) * n + c]
+                };
+                let diff = (s.wrapping_sub(pred) & 0xFFFF) as u16 as i16 as i32;
+                let diff = if s.wrapping_sub(pred) & 0xFFFF == 0x8000 {
+                    32768
+                } else {
+                    diff
+                };
+                let ssss = if diff == 32768 {
+                    16
+                } else {
+                    32 - diff.unsigned_abs().leading_zeros()
+                };
+                let (code, len) = codes[ssss as usize];
+                bw.bits(code, len);
+                if ssss > 0 && ssss < 16 {
+                    let v = if diff >= 0 {
+                        diff as u32
+                    } else {
+                        (diff + (1 << ssss) - 1) as u32
+                    };
+                    bw.bits(v, ssss);
+                }
+            }
+        }
+    }
+    bw.align();
+    out.extend(bw.out);
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
 /// Grayscale baseline JPEG of a flat gray image, standard luminance Huffman tables, DRI = `interval` MCUs, built
 /// byte by byte (every block: DC diff 0, EOB; RSTn every `interval` MCUs, byte-aligned with 1-bits). Strict-decodable.
 /// `interval == 0` means no DRI segment and no RST markers.

@@ -9,6 +9,7 @@ pub(crate) mod isobmff;
 pub(crate) mod jpeg;
 pub(crate) mod jpeg_entropy;
 pub(crate) mod jpeg_join;
+pub(crate) mod jpeg_lossless;
 pub(crate) mod raf;
 mod tiffraw;
 

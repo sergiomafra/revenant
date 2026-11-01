@@ -280,3 +280,105 @@ fn camera_video_layouts_hold_valid_samples() {
         }
     }
 }
+
+/// Counts the difference codes of the lossless JPEG `j` (one DHT, SOF3, no restart unless `restarts`) with a plain
+/// bit-by-bit canonical decoder, checking the segments on the way. Returns `(samples, largest SSSS)`.
+fn count_lossless_samples(j: &[u8], w: usize, h: usize, n: usize, p: u8) -> (usize, u32) {
+    assert_eq!(&j[..2], [0xFF, 0xD8]);
+    assert_eq!(&j[j.len() - 2..], [0xFF, 0xD9]);
+    let (mut at, mut counts, mut vals, mut seen_sof) = (2, [0u8; 16], Vec::new(), false);
+    let scan = loop {
+        assert_eq!(j[at], 0xFF);
+        let len = u16::from_be_bytes([j[at + 2], j[at + 3]]) as usize;
+        let body = &j[at + 4..at + 2 + len];
+        match j[at + 1] {
+            0xC4 => {
+                assert_eq!(body[0], 0x00);
+                counts.copy_from_slice(&body[1..17]);
+                vals = body[17..].to_vec();
+            }
+            0xC3 => {
+                seen_sof = true;
+                assert_eq!(body[0], p);
+                assert_eq!(u16::from_be_bytes([body[1], body[2]]) as usize, h);
+                assert_eq!(u16::from_be_bytes([body[3], body[4]]) as usize, w);
+                assert_eq!(body[5] as usize, n);
+                assert_eq!(body.len(), 6 + 3 * n);
+            }
+            0xDA => {
+                assert!(seen_sof);
+                assert_eq!(body[0] as usize, n);
+                assert_eq!(&body[1 + 2 * n..], [1, 0, 0]);
+                break at + 2 + len;
+            }
+            m => panic!("unexpected marker {m:#x}"),
+        }
+        at += 2 + len;
+    };
+    assert_eq!(vals.len(), 17);
+    // Entropy-coded bytes with the stuffed zeros removed.
+    let data = &j[scan..j.len() - 2];
+    let mut bits = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        if b == 0xFF {
+            assert_eq!(data[i + 1], 0, "only stuffed FF in the scan");
+            i += 1;
+        }
+        bits.extend((0..8).rev().map(|k| (b >> k) & 1));
+        i += 1;
+    }
+    let (mut pos, mut samples, mut big) = (0, 0, 0);
+    while samples < w * h * n {
+        let (mut code, mut first, mut index) = (0u32, 0u32, 0usize);
+        let mut sym = None;
+        for &count in &counts {
+            code = (code << 1) | u32::from(bits[pos]);
+            pos += 1;
+            let c = u32::from(count);
+            if code < first + c {
+                sym = Some(vals[index + (code - first) as usize]);
+                break;
+            }
+            index += c as usize;
+            first = (first + c) << 1;
+        }
+        let ssss = u32::from(sym.expect("a valid code"));
+        assert!(ssss <= 16);
+        if ssss < 16 {
+            pos += ssss as usize;
+        }
+        big = big.max(ssss);
+        samples += 1;
+    }
+    assert!(bits.len() - pos < 8, "only padding is left");
+    assert!(bits[pos..].iter().all(|&b| b == 1), "padding is 1-bits");
+    (samples, big)
+}
+
+#[test]
+fn lossless_jpeg_has_a_valid_frame_and_exact_codes() {
+    for (w, h, n, p) in [
+        (64, 48, 1u8, 14u8),
+        (33, 17, 2, 12),
+        (20, 20, 4, 16),
+        (9, 9, 3, 8),
+    ] {
+        let a = revenant_testkit::lossless_jpeg(w as u32, h as u32, n, p, 5);
+        let (count, _) = count_lossless_samples(&a, w, h, n as usize, p);
+        assert_eq!(count, w * h * n as usize);
+        // Deterministic per seed, different across seeds.
+        assert_eq!(
+            a,
+            revenant_testkit::lossless_jpeg(w as u32, h as u32, n, p, 5)
+        );
+        assert_ne!(
+            a,
+            revenant_testkit::lossless_jpeg(w as u32, h as u32, n, p, 6)
+        );
+    }
+    // A wide-precision image uses the large categories (rare outliers).
+    let j = revenant_testkit::lossless_jpeg(256, 256, 1, 16, 3);
+    assert!(count_lossless_samples(&j, 256, 256, 1, 16).1 >= 12);
+}
