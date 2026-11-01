@@ -595,6 +595,8 @@ pub struct FsBuilder {
     /// `Alloc::NextFree`'s pointer: the cluster after the last one allocated (2 past the end).
     next: u32,
     overrides: Vec<(u32, u32)>,
+    /// A new entry takes the slots of the first deleted entry of the same size ([`FsBuilder::reuse_slots`]).
+    reuse: bool,
 }
 
 const OWNER_META: u32 = u32::MAX;
@@ -619,6 +621,7 @@ impl FsBuilder {
             policy: Alloc::FirstFit,
             next: 2,
             overrides: Vec::new(),
+            reuse: false,
         };
         match fs {
             FsType::Fat12 | FsType::Fat16 => b.nodes[0].slots = 1,
@@ -834,8 +837,19 @@ impl FsBuilder {
         self.nodes.push(node);
         self.nodes[parent].live.insert(name, id);
         let k = self.slots_of(id);
-        self.reserve(parent, k);
-        self.nodes[parent].items.push(Item::Node(id));
+        let reused = self.reuse.then(|| {
+            self.nodes[parent].items.iter().position(|item| {
+                matches!(item, Item::Node(d) if self.nodes[*d].deleted.is_some() && self.slots_of(*d) == k)
+            })
+        });
+        match reused.flatten() {
+            // The deleted entry's slots now hold this one: its own entry is gone (its clusters keep their data).
+            Some(i) => self.nodes[parent].items[i] = Item::Node(id),
+            None => {
+                self.reserve(parent, k);
+                self.nodes[parent].items.push(Item::Node(id));
+            }
+        }
         if dir {
             let c = self.take_free();
             self.claim(id, &[c], true);
@@ -953,8 +967,8 @@ impl FsBuilder {
     /// contiguous file is NoFatChain (an empty file: flags 0x01, first cluster 0, length 0). A name that is not an
     /// upper-case 8.3 name gets LFN entries (FAT; SFN "XXXXXX~1.EXT"). That includes a lower-case 8.3 name such as
     /// `a.jpg`: real Windows would write the SFN `A       JPG` with the NT case flags (byte 12) and no LFN; this builder
-    /// always writes the LFN instead (byte 12 is always 0). New entries always go after the existing ones: slots of
-    /// deleted entries are never reused.
+    /// always writes the LFN instead (byte 12 is always 0). New entries go after the existing ones: slots of deleted
+    /// entries are reused only with [`FsBuilder::reuse_slots`].
     pub fn add(&mut self, path: &str, data: &[u8]) -> Vec<u32> {
         let (dir, name) = self.parent_of(path);
         self.add_file(dir, name, data, None)
@@ -981,6 +995,15 @@ impl FsBuilder {
         self
     }
 
+    /// When on (default off), every later file or directory entry takes the slots of the first deleted entry in its
+    /// directory that needs as many slots (a name of the same length class), as cameras and most drivers do; the
+    /// deleted entry is gone then (its clusters keep their data). Otherwise new entries always go after the existing
+    /// ones.
+    pub fn reuse_slots(&mut self, on: bool) -> &mut Self {
+        self.reuse = on;
+        self
+    }
+
     /// Default 2025-12-14 07:12:04 for both.
     pub fn stamp(&mut self, path: &str, created: FsStamp, modified: FsStamp) -> &mut Self {
         let id = self.find(path);
@@ -992,8 +1015,9 @@ impl FsBuilder {
     /// Camera: FAT ← 0xE5 on byte 0 of the SFN and its LFN entries, chain entries ← 0; exFAT ← InUse bits cleared,
     /// bitmap bits cleared, FAT entries kept. WindowsFat32: as Camera and the SFN's high cluster word ← 0. ZeroChain:
     /// as Camera, and on exFAT the FAT entries of the chain ← 0 too.
-    /// A directory: its entries first (recursively), then itself. The deleted entries keep their directory slots for
-    /// good (the builder never reuses them), and their freed clusters go back to the allocator.
+    /// A directory: its entries first (recursively), then itself. The deleted entries keep their directory slots until
+    /// a later entry takes them ([`FsBuilder::reuse_slots`]; never by default), and their freed clusters go back to the
+    /// allocator.
     pub fn delete(&mut self, path: &str, style: DeleteStyle) -> &mut Self {
         let id = self.find(path);
         assert!(id != 0, "the root cannot be deleted");

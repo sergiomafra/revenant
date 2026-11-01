@@ -1022,3 +1022,66 @@ fn zero_chain_on_fat_is_a_camera_delete() {
     };
     assert!(build(DeleteStyle::ZeroChain) == build(DeleteStyle::Camera));
 }
+
+#[test]
+fn reused_slots_take_the_first_deleted_entry_of_the_same_size() {
+    const CL: usize = 32 * 1024;
+    for fs in [FsType::Exfat, FsType::Fat32] {
+        let len = if fs == FsType::Exfat {
+            32 << 20
+        } else {
+            48 << 20
+        };
+        let cl = if fs == FsType::Exfat { CL as u32 } else { 512 };
+        let mut b = FsBuilder::new(fs, len, cl);
+        b.reuse_slots(true);
+        b.mkdir("DCIM");
+        b.add("DCIM/A.JPG", &[1u8; 100]);
+        b.add("DCIM/B.JPG", &[2u8; 100]);
+        b.add("DCIM/LONGNAME1.JPG", &[3u8; 100]);
+        b.delete("DCIM/A.JPG", DeleteStyle::Camera);
+        b.delete("DCIM/LONGNAME1.JPG", DeleteStyle::Camera);
+        // C takes A's slots (same size); D, a longer name, takes LONGNAME1's; E finds none left and goes at the end.
+        b.add("DCIM/C.JPG", &[4u8; 100]);
+        b.add("DCIM/LONGNAME2.JPG", &[5u8; 100]);
+        b.add("DCIM/E.JPG", &[6u8; 100]);
+        let v = b.build();
+        let dir = b.clusters("DCIM")[0];
+        let cluster_len = if fs == FsType::Exfat { CL } else { 512 };
+        let names: Vec<String> = entries(&v, &b, dir, cluster_len)
+            .iter()
+            .filter_map(|e| match fs {
+                // exFAT: the file name entry (0xC1), first 2 characters.
+                FsType::Exfat if e[0] & 0x7F == 0x41 => Some(
+                    String::from_utf16_lossy(&[u16_at(e, 2), u16_at(e, 4), u16_at(e, 6)])
+                        .trim_end_matches('\0')
+                        .to_string(),
+                ),
+                // FAT: the short entries (no LFN, no dot entries), live or deleted.
+                FsType::Fat32 if e[11] != 0x0F && e[0] != 0 && e[0] != b'.' => {
+                    Some(String::from_utf8_lossy(&e[..3]).to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        match fs {
+            FsType::Exfat => assert_eq!(names, ["C.J", "B.J", "LON", "E.J"], "{fs:?}"),
+            _ => assert_eq!(names, ["C  ", "B  ", "LON", "E  "], "{fs:?}"),
+        }
+        // Without reuse, every new entry goes at the end, the deleted ones stay.
+        let mut b = FsBuilder::new(fs, len, cl);
+        b.mkdir("DCIM");
+        b.add("DCIM/A.JPG", &[1u8; 100]);
+        b.delete("DCIM/A.JPG", DeleteStyle::Camera);
+        b.add("DCIM/C.JPG", &[4u8; 100]);
+        let v = b.build();
+        let n = entries(&v, &b, b.clusters("DCIM")[0], cluster_len)
+            .iter()
+            .filter(|e| match fs {
+                FsType::Exfat => e[0] & 0x7F == 0x41,
+                _ => e[11] != 0x0F && e[0] != 0 && e[0] != b'.',
+            })
+            .count();
+        assert_eq!(n, 2, "{fs:?}");
+    }
+}
