@@ -28,7 +28,7 @@ const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;
 const DIR: &str = "DCIM/100MSDCF";
 /// Shots numbered 1..=SHOTS (their files are encoded once).
-const SHOTS: usize = 32;
+const SHOTS: usize = 40;
 
 // ---- The files a camera writes (encoded once: a debug build encodes a 2048×1536 JPEG in about 2 s) ----
 
@@ -317,6 +317,43 @@ impl Cam {
         self.files.push(f);
     }
 
+    /// A lone file at `clusters` (where an allocator put it), written like a shot's.
+    fn add_at(
+        &mut self,
+        path: String,
+        kind: FileKind,
+        bytes: Cow<'static, [u8]>,
+        clusters: Vec<u32>,
+    ) {
+        self.b.add_at(&path, &bytes, &clusters);
+        self.stamp(&path);
+        self.entered(placed(path, kind, bytes, clusters));
+    }
+
+    /// The review's C-1 scenario (ruling Q53), with JPEG-only shots 28..=40: D and A shot, D then A deleted; B, shorter
+    /// than A in as many clusters, written over A's clusters (where a next-free pointer that wrapped would put it) takes
+    /// D's slots, the first deleted; B deleted; C shot takes B's slots. A's entry stands alone over B's bytes and the
+    /// zero-filled rest of its last cluster.
+    fn stale_entry_over_a_shorter_photo(&mut self) {
+        let need = |n: u32| self.need(jpeg_of(n).len());
+        let (a, b) = (28..41)
+            .flat_map(|a| (28..41).map(move |b| (a, b)))
+            .find(|&(a, b)| a != b && need(a) == need(b) && jpeg_of(b).len() < jpeg_of(a).len())
+            .expect("two photos of as many clusters, one shorter");
+        let mut rest = (28..41).filter(|&n| n != a && n != b);
+        let (d, c) = (rest.next().unwrap(), rest.next().unwrap());
+        self.shoot(&[Shot::Photo(d), Shot::Photo(a)]);
+        let path = |n: u32| format!("{DIR}/DSC0{n:04}.JPG");
+        self.delete(&path(d), DeleteStyle::Camera);
+        self.delete(&path(a), DeleteStyle::Camera);
+        let clusters = self.files[self.file(&path(a))].clusters.clone();
+        self.add_at(path(b), FileKind::Jpeg, Cow::Borrowed(jpeg_of(b)), clusters);
+        self.delete(&path(b), DeleteStyle::Camera);
+        self.shoot(&[Shot::Photo(c)]);
+        let gone = |n: u32| self.files[self.file(&path(n))].overwritten;
+        assert!(gone(b) && !gone(a), "B's slots taken again, A's left");
+    }
+
     /// New entries take the slots of deleted ones, as cameras do.
     fn reuse_slots(&mut self) {
         assert_eq!(self.fs, FsType::Exfat, "slots counted as exFAT sets");
@@ -354,6 +391,31 @@ impl Cam {
         self.b.delete(path, style);
         let k = self.file(path);
         self.files[k].deleted = Some(style);
+    }
+
+    /// The new shots `ns` (pairs) and clips 2 and 3, in the order they were taken, that have a file in pieces: each as
+    /// the paths of its files, at most `n` of them.
+    fn in_pieces(&self, ns: Range<u32>, n: usize) -> Vec<Vec<String>> {
+        let mut shots: Vec<Vec<String>> = ns
+            .map(|k| {
+                vec![
+                    format!("{DIR}/DSC0{k:04}.ARW"),
+                    format!("{DIR}/DSC0{k:04}.JPG"),
+                ]
+            })
+            .chain([2, 3].map(|k| vec![format!("{DIR}/C{k:04}.MP4")]))
+            .collect();
+        shots.sort_by_key(|paths| self.file(&paths[0]));
+        shots
+            .into_iter()
+            .filter(|paths| {
+                paths.iter().any(|p| {
+                    let f = &self.files[self.file(p)];
+                    f.deleted.is_none() && f.clusters.windows(2).any(|w| w[1] != w[0] + 1)
+                })
+            })
+            .take(n)
+            .collect()
     }
 
     /// Deletes both files of shot `n`.
@@ -723,11 +785,23 @@ fn scanned(mut card: Card) -> Outcome {
     let mut glued = Vec::new();
     for f in view.values().filter(|f| f.health == Health::Intact) {
         let got = bytes_of(f);
-        let equal = card
+        let matching: Vec<&File> = card
             .files
             .iter()
             .filter(|o| o.bytes.len() == got.len() && *o.bytes == got[..])
-            .count();
+            .collect();
+        let equal = matching.len();
+        // The name too (review M-1): a finding named by an entry that still stands is that entry's file.
+        if let ([o], Some(origin)) = (matching.as_slice(), &f.origin)
+            && o.entry != Entry::Gone
+            && origin.path() != o.path
+        {
+            glued.push(format!(
+                "{} (the bytes of {}, under another name)",
+                describe(f),
+                o.path
+            ));
+        }
         // A RAW's own preview, found at its place in the RAW (Q16): the same file.
         let nested = card.files.iter().any(|o| {
             o.preview.as_ref().is_some_and(|p| {
@@ -740,6 +814,18 @@ fn scanned(mut card: Card) -> Outcome {
     }
     let mut counts = [0; 3];
     let mut recovered = Vec::new();
+    // The reassembly must matter on every card (review I-1): at least 3 files whole on it, in pieces, whose entry no
+    // longer places them (deleted or gone).
+    let placed_by_content = card
+        .files
+        .iter()
+        .filter(|o| o.whole && o.pieces.len() > 1 && o.entry != Entry::Live)
+        .count();
+    if placed_by_content < 3 {
+        recovered.push(format!(
+            "only {placed_by_content} files whole in pieces without a live entry (3 wanted)"
+        ));
+    }
     let mut joined = Vec::new();
     for o in card.files.iter().filter(|o| o.whole) {
         let want = want(&card, o);
@@ -883,16 +969,15 @@ fn camera_life(
     cam
 }
 
-/// Shots 3, 6 and 9 of `pairs(1..13)`.
-fn three_six_nine(raw: ArwCompression) -> Vec<Shot> {
-    [3, 6, 9].iter().map(|&n| Shot::Pair(n, raw)).collect()
-}
-
 /// Shots 1..=18, the odd ones taken as JPEG only, with clips 4 to 8 after shots 2, 6, 9, 12 and 15, and what a user culled
 /// of them in camera: the JPEG-only shots and the clips (holes smaller than a RAW between holes larger than a shot, so
 /// most of the next shots fall into pieces).
 fn culled() -> (Vec<Shot>, Vec<Shot>) {
-    let raw = ArwCompression::Lossless;
+    culled_with(ArwCompression::Lossless)
+}
+
+/// [`culled`] with RAWs of `raw`.
+fn culled_with(raw: ArwCompression) -> (Vec<Shot>, Vec<Shot>) {
     let mut first = Vec::new();
     let mut deleted = Vec::new();
     for n in 1..19 {
@@ -936,15 +1021,29 @@ fn delete_in_camera_cards(raw: ArwCompression, variants: &[(u64, Alloc, Camera)]
                 cam.reuse_slots();
             }
             cam.stamps = how.stamps;
-            let first = pairs(1..13, raw);
-            let mut cam = camera_life(cam, raw, &first, &three_six_nine(raw), 8);
-            for n in [14, 18] {
-                cam.delete_shot(n, DeleteStyle::Camera);
+            let (first, deleted) = culled_with(raw);
+            let mut cam = camera_life(cam, raw, &first, &deleted, 8);
+            // The first new shots in pieces deleted in camera too (5 with reused slots: more shots follow).
+            let gone = cam.in_pieces(19..27, if how.reuse_slots { 5 } else { 3 });
+            assert!(gone.len() >= 3, "3 new shots in pieces");
+            for p in gone.iter().flatten() {
+                cam.delete(p, DeleteStyle::Camera);
+            }
+            if !how.stamps {
+                // Shot 19 went first into the first hole, its RAW from the very cluster the deleted photo 1 did:
+                // deleted too, the two entries start at one cluster with one stamp (Q52's tie).
+                for p in [format!("{DIR}/DSC00019.ARW"), format!("{DIR}/DSC00019.JPG")] {
+                    if cam.files[cam.file(&p)].deleted.is_none() {
+                        cam.delete(&p, DeleteStyle::Camera);
+                    }
+                }
             }
             if how.reuse_slots {
-                // One more shot: it takes shot 14's slots and clusters first, then whatever comes next (shot 18's
-                // clusters, whose entries stay: their old chain rewritten under them, Q50 N-1).
-                cam.shoot(&pairs(21..22, raw));
+                // One more shot: it takes the first deleted entry's slots and the first free clusters (a deleted shot's,
+                // whose entries may stay: their old chain rewritten under them, Q50 N-1), then the reviewer's lone stale
+                // entry (Q53).
+                cam.shoot(&pairs(27..28, raw));
+                cam.stale_entry_over_a_shorter_photo();
             }
             cam.card(format!(
                 "delete in camera, {raw:?}, {}{}{}",
@@ -1012,7 +1111,9 @@ fn delete_in_camera_uncompressed_cards() -> &'static [Outcome] {
     ALL.get_or_init(|| delete_in_camera_cards(ArwCompression::Uncompressed, &every_variant()))
 }
 
-/// [`camera_life`] up to 20 shots on the card, quick-formatted in camera, then 6 more shots over the start.
+/// [`camera_life`] with the [`culled`] holes (the new shots in pieces among them, up to 17 shots on the card),
+/// quick-formatted in camera, then 6 more shots over the start: they cover the first holes only, so old files in pieces
+/// stay whole further on, with no entry left (review I-1).
 fn format_in_camera() -> &'static [Outcome] {
     static ALL: OnceLock<Vec<Outcome>> = OnceLock::new();
     ALL.get_or_init(|| {
@@ -1021,11 +1122,10 @@ fn format_in_camera() -> &'static [Outcome] {
             for alloc in ALLOCS {
                 cards.push(Box::new(move || {
                     let raw = ArwCompression::Lossless;
-                    let first = pairs(1..13, raw);
-                    let cam =
-                        camera_life(exfat(cluster, alloc), raw, &first, &three_six_nine(raw), 11);
+                    let (first, deleted) = culled();
+                    let cam = camera_life(exfat(cluster, alloc), raw, &first, &deleted, 8);
                     cam.format_and_shoot(
-                        &pairs(24..30, ArwCompression::Lossless),
+                        &pairs(27..33, ArwCompression::Lossless),
                         format!("format in camera, {}", label(cluster, alloc)),
                     )
                 }));
@@ -1043,26 +1143,7 @@ fn delete_on_a_computer_cards() -> &'static [Outcome] {
         let mut cards: Vec<Box<dyn Fn() -> Card + Send + Sync>> = Vec::new();
         let computer = |mut cam: Cam, style: DeleteStyle, name: String| {
             // The first 5 new shots (a pair or a clip) with a file in pieces, in the order they were taken.
-            let mut shots: Vec<Vec<String>> = (19..27)
-                .map(|n| {
-                    vec![
-                        format!("{DIR}/DSC0{n:04}.ARW"),
-                        format!("{DIR}/DSC0{n:04}.JPG"),
-                    ]
-                })
-                .chain([2, 3].map(|n| vec![format!("{DIR}/C{n:04}.MP4")]))
-                .collect();
-            shots.sort_by_key(|paths| cam.file(&paths[0]));
-            let fragmented: Vec<Vec<String>> = shots
-                .into_iter()
-                .filter(|paths| {
-                    paths.iter().any(|p| {
-                        let f = &cam.files[cam.file(p)];
-                        f.clusters.windows(2).any(|w| w[1] != w[0] + 1)
-                    })
-                })
-                .take(5)
-                .collect();
+            let fragmented = cam.in_pieces(19..27, 5);
             assert_eq!(fragmented.len(), 5, "{name}: 5 shots in pieces");
             for p in fragmented.iter().flatten() {
                 cam.delete(p, style);
@@ -1107,13 +1188,21 @@ fn delete_on_a_computer_cards() -> &'static [Outcome] {
 /// Small photos of 1, 2, 3, 1, 2, 3, … clusters, every other one deleted in camera (holes of 1–3 clusters between live
 /// photos), a long clip after them filling the card, then the burst written next-free: the pointer wraps into the holes,
 /// each photo of the burst in pieces of 1–3 clusters, the next one where it stops. Then the burst is deleted (in camera,
-/// or on a computer clearing the chain).
+/// or on a computer clearing the chain), and on one card the photos between the holes too.
 fn burst_cards() -> &'static [Outcome] {
     static ALL: OnceLock<Vec<Outcome>> = OnceLock::new();
     ALL.get_or_init(|| {
         let mut cards: Vec<Box<dyn Fn() -> Card + Send + Sync>> = Vec::new();
-        for cluster in CLUSTERS {
-            for style in [DeleteStyle::Camera, DeleteStyle::ZeroChain] {
+        // The last: the photos left between the holes deleted on the computer too, so the file system's guess runs on
+        // into the deleted photos' clusters and the burst neighbours' pieces; the search chooses among look-alikes.
+        let variants = [
+            (32 * KIB, DeleteStyle::ZeroChain, true),
+            (128 * KIB, DeleteStyle::Camera, false),
+            (128 * KIB, DeleteStyle::ZeroChain, false),
+            (128 * KIB, DeleteStyle::ZeroChain, true),
+        ];
+        for (cluster, style, all) in variants {
+            {
                 cards.push(Box::new(move || {
                     let mut cam = Cam::new(FsType::Exfat, CARD_LEN, cluster, Alloc::NextFree);
                     let shots: Vec<Shot> = (0..6).map(Shot::Burst).collect();
@@ -1134,9 +1223,15 @@ fn burst_cards() -> &'static [Outcome] {
                     for k in 0..6 {
                         cam.delete(&format!("{DIR}/DSC1{k:04}.JPG"), style);
                     }
+                    if all {
+                        for i in (1..2 * count).step_by(2) {
+                            cam.delete(&format!("{DIR}/DSC2{i:04}.JPG"), style);
+                        }
+                    }
                     cam.card(format!(
-                        "burst of look-alikes, {} KiB, deleted {style:?}",
-                        cluster / KIB
+                        "burst of look-alikes, {} KiB, deleted {style:?}{}",
+                        cluster / KIB,
+                        if all { ", the photos between too" } else { "" }
                     ))
                 }));
             }

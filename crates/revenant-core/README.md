@@ -1271,22 +1271,28 @@ JPEG (DRI 0, sizes that differ from shot to shot); a long clip fills the card so
 every cluster no file took holds old data (noise); each file is a minute newer than the one before, except on one card
 whose clock was never set (every stamp equal).
 
-- **Delete in camera, shoot again**: 12 shots, shots 3, 6 and 9 deleted in camera, 8 more shots and 2 clips (in the
-  holes, or at the end and then in the holes), then 2 of the new shots deleted in camera too; lossless and uncompressed
-  RAWs. Two more cards (one per cluster size) with a camera that reuses the deleted entries' slots
-  (`FsBuilder::reuse_slots`), then one more shot written over a deleted shot's clusters whose entry stays (its old
-  chain rewritten under it, ruling Q50 N-1); and one with every stamp equal.
-- **Format in camera, shoot again**: the same life up to 20 shots, quick-formatted, then 6 shots over the start: the old
-  files have no entry left, they are carved and reassembled from content.
-- **Delete on a computer**: JPEG-only shots and clips culled in camera (holes smaller than a RAW next to larger ones),
-  8 more shots, then the first 5 new shots (or clips) in pieces deleted on a computer: exFAT clearing the chain
-  (`ZeroChain`), and FAT32 (260 MiB, 4 KiB clusters, the smallest FAT32 on a cluster grid) as Windows does.
+- **Delete in camera, shoot again**: 18 shots (the odd ones JPEG-only) with 5 clips, the JPEG-only shots and the clips
+  culled in camera (holes smaller than a RAW next to larger ones: whole shots fit a whole shot's hole exactly), 8 more
+  shots and 2 clips (in the holes, or at the end and then in the holes), then the first 3 new shots in pieces deleted
+  in camera too; lossless and uncompressed RAWs. Two more cards (one per cluster size) with a camera that reuses the
+  deleted entries' slots (`FsBuilder::reuse_slots`): 5 shots in pieces deleted, one more shot written over a deleted
+  shot's clusters whose entry stays (its old chain rewritten under it, ruling Q50 N-1), and the review's lone stale
+  entry: D and A shot and deleted, a shorter B over A's clusters takes D's slots, is deleted, and C takes them again,
+  so A's entry stands alone over B's bytes and zeros (Q53). And one whose clock was never set, the first new shot
+  (written from the very cluster of the first deleted photo) deleted too: two entries tie at one start (Q52).
+- **Format in camera, shoot again**: the same culled life, quick-formatted, then 6 shots over the start: they cover
+  the first holes only, so old files in pieces stay whole further on, with no entry left; carved and reassembled.
+- **Delete on a computer**: the same culled life, then the first 5 new shots (or clips) in pieces deleted on a
+  computer: exFAT clearing the chain (`ZeroChain`), and FAT32 (260 MiB, 4 KiB clusters, the smallest FAT32 on a
+  cluster grid) as Windows does.
 - **A burst of look-alikes**: `jpeg_burst(2048, 1536, 4, 6)` written next-free into holes of 1–3 clusters between live
-  photos, then deleted (in camera or on a computer).
+  photos, then deleted (in camera or on a computer); on one card the photos between the holes are deleted on the
+  computer too, so the file system's guess runs into other clusters and the search chooses among the neighbours'
+  pieces.
 
 Two oracles run over every card (ruling Q51). `no_intact_finding_is_glued`: the extracted bytes of every `Intact` final
-finding equal exactly one file ever written (a RAW's own preview found at its place in the RAW is the same file, Q16);
-never relaxed. `recovered`: every file still whole on the card comes back at its start with its exact bytes and the
+finding equal exactly one file ever written (a RAW's own preview found at its place in the RAW is the same file, Q16),
+and a finding with a name whose file still has an entry carries that file's name; never relaxed. `recovered`: every file still whole on the card comes back at its start with its exact bytes and the
 health its proof allows: `Intact` for one piece, a live chain, a surviving exFAT chain no other entry claims (D14), a
 video placed by content whose every seam its samples prove (a NAL unit starts within one cluster on each side; with
 4 KiB clusters and NAL units of up to 24 KiB that often fails, and the video is `Partial` with its exact bytes) and a
@@ -1294,11 +1300,13 @@ lossless RAW cut only at tile boundaries; `Partial` for a RAW cut inside a tile,
 for a JPEG in three or more pieces placed by content (Q37); a JPEG in two pieces may be `Intact` through the 1.3
 two-piece join (unchanged by Q37), with its exact bytes. A clip whose first piece ends the heap and goes on at its
 start (the next-free pointer wrapping) is put back like any other: the candidate order already looks from the heap
-start ("first hole").
+start ("first hole"). Every card holds at least 3 files whole on it, in pieces, with no live entry placing them: with
+the reassembly step disabled, every card test fails but `no_intact_finding_is_glued` (a guard: no reassembly makes
+fewer `Intact` findings).
 
 The allocation is an assumption (design D19): how Sony's firmware picks clusters is not known, so the cards may not
 cover the real pattern; the manual run on a real card (part 1.6, task 13) checks it. The cards are built and scanned
-once per test binary (the files encoded once, in parallel, at most 4 cards at a time); about 100 s in a debug build.
+once per test binary (the files encoded once, in parallel, at most 4 cards at a time); about 4 min in a debug build (the 32 KiB burst card alone, its search over look-alike pieces) and 35 s in a release one.
 
 ## File systems: volumes
 
