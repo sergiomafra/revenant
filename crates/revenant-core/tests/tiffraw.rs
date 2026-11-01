@@ -807,3 +807,101 @@ fn ifd_offset_past_the_cap_is_damaged_wherever_the_source_ends() {
         assert_eq!(m.health, Health::Damaged, "source of {len} bytes");
     }
 }
+
+/// A source over bytes in memory.
+struct Bytes(Vec<u8>);
+
+impl Source for Bytes {
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        let start = (offset as usize).min(self.0.len());
+        let n = buf.len().min(self.0.len() - start);
+        buf[..n].copy_from_slice(&self.0[start..start + n]);
+        Ok(n)
+    }
+
+    fn volume(&self) -> Option<VolumeId> {
+        None
+    }
+}
+
+#[test]
+fn lossless_tiles_of_another_file_make_the_raw_partial() {
+    // A lossless ARW whose tiles from the fifth on are another one's (a burst neighbour written right after the first
+    // piece): the structure and the preview are whole, the tiles do not end where they are declared to.
+    let opts = |seed| testkit::ArwOptions {
+        seed,
+        ..testkit::ArwOptions::default()
+    };
+    let (a, b) = (testkit::arw(&opts(1)), testkit::arw(&opts(2)));
+    let m = TiffRaw.measure(&Bytes(a.bytes.clone()), 0).unwrap();
+    assert_eq!(
+        (m.kind, m.health, m.len),
+        (FileKind::Arw, Health::Intact, a.bytes.len() as u64)
+    );
+    let cut = a.tiles[4].start + 100;
+    let mut glued = a.bytes[..cut].to_vec();
+    glued.extend_from_slice(&b.bytes[cut..]);
+    glued.resize(a.bytes.len(), 0);
+    let m = TiffRaw.measure(&Bytes(glued), 0).unwrap();
+    assert_eq!((m.kind, m.health), (FileKind::Arw, Health::Partial));
+    // Uncompressed sensor data cannot be checked: the same splice stays Intact (the 1.4 rule).
+    let opts = |seed| testkit::ArwOptions {
+        compression: testkit::ArwCompression::Uncompressed,
+        seed,
+        ..testkit::ArwOptions::default()
+    };
+    let (a, b) = (testkit::arw(&opts(1)), testkit::arw(&opts(2)));
+    let cut = a.raw.start + 100;
+    let mut glued = a.bytes[..cut].to_vec();
+    glued.extend_from_slice(&b.bytes[cut..]);
+    let m = TiffRaw.measure(&Bytes(glued), 0).unwrap();
+    assert_eq!(m.health, Health::Intact);
+}
+
+#[test]
+fn raw_preview_crossing_a_piece_is_not_reported_twice() {
+    // A live ARW in two runs on an exFAT card, its preview crossing from the first cluster into the second run (part 1.4,
+    // T9): the chain places the RAW, and its preview is not a second finding (D12 of part 1.4: its own files).
+    use testkit::fs::{FsBuilder, FsType, Partitioning, disk};
+    const C: usize = 32 << 10;
+    let a = testkit::arw(&testkit::ArwOptions {
+        compression: testkit::ArwCompression::Uncompressed,
+        ..testkit::ArwOptions::default()
+    });
+    let p = a.preview.clone().unwrap();
+    assert!(p.start < C && p.end > C);
+    let n = a.bytes.len().div_ceil(C) as u32;
+    let mut clusters = vec![300];
+    clusters.extend(310..310 + n - 1);
+    let mut b = FsBuilder::new(FsType::Exfat, 64 << 20, C as u32);
+    b.add_at("DCIM/DSC00009.ARW", &a.bytes, &clusters);
+    let first = b.cluster_offset(300);
+    let second = b.cluster_offset(310);
+    let volume = b.build();
+    let at = 8192 * 512u64;
+    let image = disk(
+        Partitioning::Mbr { first_lba: 8192 },
+        &volume,
+        volume.len() + (8 << 20),
+    );
+    let found = scan_all(&Bytes(image));
+    let raw: Vec<_> = found.iter().filter(|f| f.2 == FileKind::Arw).collect();
+    assert_eq!(raw.len(), 1, "{found:?}");
+    assert_eq!(
+        (raw[0].0, raw[0].1),
+        (at + first, a.bytes.len() as u64),
+        "{found:?}"
+    );
+    assert_eq!(raw[0].3, Health::Intact, "{found:?}");
+    let jpegs: Vec<_> = found
+        .iter()
+        .filter(|f| {
+            f.2 == FileKind::Jpeg && (f.0 == at + first + p.start as u64 || f.0 == at + second)
+        })
+        .collect();
+    assert!(jpegs.is_empty(), "{jpegs:?}");
+}

@@ -3,15 +3,18 @@
 //! The extent comes from [`crate::tiff::walk`] (the furthest byte any IFD, value or strip references). The file ends
 //! early where another file starts on a sector boundary inside that extent, or at the end of the source.
 //!
-//! Health. There is no RAW decoder here, so the raw image data itself can never be verified; the only content check is
-//! the largest embedded JPEG preview. `Intact` therefore means: structure complete, no unreadable sector, no size cap
-//! hit, and the largest preview decodes strictly. `Partial`: cut, unreadable sector, a size cap hit (`truncated`, e.g. a
-//! huge legitimate DNG), no preview, a preview that only decodes leniently or not at all (the raw data may still be fine).
+//! Health. There is no RAW decoder here, so the raw image data itself can never be verified; the content checks are the
+//! largest embedded JPEG preview and, for lossless-JPEG tiles (`Compression 7`, SOF3), their structure. `Intact`
+//! therefore means: structure complete, no unreadable sector, no size cap hit, the largest preview decodes strictly, and
+//! every lossless tile decodes to its declared end (when its frame is one the check covers). `Partial`: cut, unreadable
+//! sector, a size cap hit (`truncated`, e.g. a huge legitimate DNG), no preview, a preview that only decodes leniently or
+//! not at all (the raw data may still be fine), a lossless tile that does not end where it is declared to.
 //! `Damaged`: the IFD structure is malformed.
 
 use std::collections::HashSet;
 
 use super::jpeg::{OwnJpegs, preview_health};
+use super::jpeg_lossless::tiles_decode;
 use super::{
     FileKind, Format, Fragment, HEAD_LEN, Health, MAX_OWN_FILES, Measurement, Reader, SECTOR,
     builtin,
@@ -146,7 +149,13 @@ impl Format for TiffRaw {
         } else {
             let previews: Vec<(u64, u64)> =
                 info.jpegs.iter().map(|&(o, l)| (start + o, l)).collect();
-            preview_health(&mut r, &previews)
+            let tiles: Vec<(u64, u64)> =
+                info.lossless.iter().map(|&(o, l)| (start + o, l)).collect();
+            match preview_health(&mut r, &previews) {
+                // Lossless-JPEG tiles that do not end where they are declared to: another file's data (part 1.6).
+                Health::Intact if !tiles_decode(&mut r, &tiles) => Health::Partial,
+                h => h,
+            }
         };
         Some(Measurement {
             len,

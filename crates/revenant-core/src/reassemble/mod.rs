@@ -18,7 +18,7 @@
 //! The scan's reassembly step ([`reassemble`]) runs this search, after the pairing, for every candidate the scan kept
 //! ([`is_candidate`]), in id order, and turns each result that improves the finding into an `Updated` ([`improves`]),
 //! with the health of [`health`].
-// Parts of the engine wait for the formats of later tasks (own files for RAWs).
+// Some helpers serve the unit tests only (and the scan reads some limits through their constants).
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -36,6 +36,7 @@ use crate::scan::{CancelToken, Finding};
 use crate::source::{DiskId, Fragmented, Source, VolumeId};
 
 pub(crate) mod jpeg;
+pub(crate) mod raw;
 pub(crate) mod video;
 
 /// Most pieces of a file on a cluster grid.
@@ -325,6 +326,22 @@ impl<'a> Space<'a> {
         cap: usize,
         keep: &mut dyn FnMut(u64) -> bool,
     ) -> (Vec<u64>, bool) {
+        self.candidates_with_own(end, used, &[], 0, cap, keep)
+    }
+
+    /// [`Space::candidates`] for the seam at logical `seam` of a file whose own embedded files are `own` (logical, D10):
+    /// a unit taken only by claimed ranges and finding starts that those files cover at their exact places, were the
+    /// piece to start there, is a candidate too (D9, Q7: a coverage test, as in [`Space::free_run`]).
+    pub(crate) fn candidates_with_own(
+        &self,
+        end: u64,
+        used: &[Fragment],
+        own: &[Fragment],
+        seam: u64,
+        cap: usize,
+        keep: &mut dyn FnMut(u64) -> bool,
+    ) -> (Vec<u64>, bool) {
+        let own = (own, seam);
         let mut out = Vec::new();
         let forward_to = end.saturating_add(self.window).min(self.end);
         // The unit right at `end` would continue the piece contiguously: no seam, never a candidate.
@@ -333,24 +350,27 @@ impl<'a> Space<'a> {
         } else {
             self.ceil(end)
         };
-        if self.list(from, forward_to, used, cap, keep, &mut out) {
+        if self.list(from, forward_to, used, own, cap, keep, &mut out) {
             return (out, true);
         }
         if self.grid {
             let wrap_to = end.min(self.base.saturating_add(self.window));
-            if self.list(self.base, wrap_to, used, cap, keep, &mut out) {
+            if self.list(self.base, wrap_to, used, own, cap, keep, &mut out) {
                 return (out, true);
             }
         }
         (out, false)
     }
 
-    /// Appends the free unit starts in `[from, to)` that `keep` accepts; `true` on the first survivor past `cap`.
+    /// Appends the free unit starts in `[from, to)` that `keep` accepts; `true` on the first survivor past `cap`. A unit
+    /// taken only by the file's own files at their places (`own`: logical ranges and the seam) counts as free.
+    #[allow(clippy::too_many_arguments)]
     fn list(
         &self,
         from: u64,
         to: u64,
         used: &[Fragment],
+        (own, seam): (&[Fragment], u64),
         cap: usize,
         keep: &mut dyn FnMut(u64) -> bool,
         out: &mut Vec<u64>,
@@ -359,6 +379,17 @@ impl<'a> Space<'a> {
         while u < to {
             let free_to = match self.next_block(u, used) {
                 Some((s, e)) if s < u.saturating_add(self.unit) => {
+                    let mine = own_at(own, u, seam);
+                    if !mine.is_empty() && self.free_run(u, used, &mine, 1) > 0 {
+                        if keep(u) {
+                            if out.len() == cap {
+                                return true;
+                            }
+                            out.push(u);
+                        }
+                        u += self.unit;
+                        continue;
+                    }
                     u = self.ceil(e).max(u + self.unit);
                     continue;
                 }
@@ -377,6 +408,17 @@ impl<'a> Space<'a> {
         }
         false
     }
+}
+
+/// The embedded files `own` (logical) that would lie in a piece starting at absolute `g`, logical `l`.
+fn own_at(own: &[Fragment], g: u64, l: u64) -> Vec<Fragment> {
+    own.iter()
+        .filter(|o| o.start >= l)
+        .map(|o| Fragment {
+            start: g + (o.start - l),
+            len: o.len,
+        })
+        .collect()
 }
 
 /// Whether the ranges of `own` together hold every byte of `[start, end)`.
@@ -444,6 +486,14 @@ pub(crate) trait Seams {
     /// per file (default). A format whose answer depends on what its earlier walks met says no: it is asked every time.
     fn memo_prefilter(&self) -> bool {
         true
+    }
+    /// Whether the search may stop at its first complete solution when that solution is not `Proven` (default: no).
+    /// Its pieces are the result whatever comes after (the first solution in candidate order), and a second solution
+    /// or the re-check could only take uniqueness away from a result that is `Partial` anyway: for a format whose
+    /// seams are mostly unprovable (a RAW's sensor data), the rest of the search is work that cannot change anything.
+    /// The result is then reported neither unique nor exhaustive.
+    fn settles_unproven(&self) -> bool {
+        false
     }
 }
 
@@ -622,6 +672,8 @@ enum Stop {
     Budget,
     /// A second complete solution: the result cannot be unique, nothing more to learn.
     Ambiguous,
+    /// The first complete solution is not `Proven` and the format settles for it ([`Seams::settles_unproven`]).
+    Settled,
 }
 
 /// A complete solution: its pieces and whether some seam on its path had no content evidence.
@@ -655,6 +707,8 @@ struct Ctx<'c, S: Seams> {
     excluded: Vec<Fragment>,
     /// Set by [`Ctx::cut_short`]: the re-check's top-hinted cut was not walked to the end when it is set during it.
     short: bool,
+    /// The proof of the first solution, when it was taken as it was found ([`Seams::settles_unproven`]).
+    first_proof: Option<Proof>,
 }
 
 impl<'c, S: Seams> Ctx<'c, S> {
@@ -690,6 +744,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
             stop: None,
             excluded: Vec::new(),
             short: false,
+            first_proof: None,
         }
     }
 
@@ -768,14 +823,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
 
     /// The file's own embedded files that would lie in a piece starting at absolute `g`, logical `l`.
     fn own_at(&self, g: u64, l: u64) -> Vec<Fragment> {
-        self.own
-            .iter()
-            .filter(|o| o.start >= l)
-            .map(|o| Fragment {
-                start: g + (o.start - l),
-                len: o.len,
-            })
-            .collect()
+        own_at(&self.own, g, l)
     }
 
     /// Walks `pieces ++ [g, run]` from `from` up to `limit`, as one try.
@@ -835,6 +883,16 @@ impl<'c, S: Seams> Ctx<'c, S> {
         self.solutions.push((sol, blind));
         if self.solutions.len() >= 2 {
             self.stop = Some(Stop::Ambiguous);
+        } else if self.seams.settles_unproven() {
+            // As the final proof does: past the read limit (its reads are still charged to the file).
+            self.source.set_limit(u64::MAX);
+            let source: &dyn Source = self.source;
+            let proof = proof_of(&mut *self.seams, source, &self.solutions[0]);
+            self.source.set_limit(self.max_read);
+            self.first_proof = Some(proof);
+            if proof != Proof::Proven {
+                self.stop = Some(Stop::Settled);
+            }
         }
     }
 
@@ -954,8 +1012,8 @@ impl<'c, S: Seams> Ctx<'c, S> {
             });
             let (evident, blinds) = self.classify(pieces, &st, g + (b - l), b);
             // Q2: blind candidates are descended into too, after the evident ones, and count toward uniqueness.
-            for (g2, no_evidence) in evident {
-                self.dfs(pieces, &st, g2, b, blind || no_evidence);
+            for g2 in evident {
+                self.dfs(pieces, &st, g2, b, blind);
             }
             for g2 in blinds {
                 self.dfs(pieces, &st, g2, b, true);
@@ -1059,10 +1117,8 @@ impl<'c, S: Seams> Ctx<'c, S> {
                 let is_top = rank == 0 && top[i] == Some(b);
                 self.short = false;
                 let (evident, _) = self.classify(&pieces, &st, p.start + (b - starts[i]), b);
-                for (g2, no_evidence) in evident {
-                    if !no_evidence {
-                        self.dfs(&mut pieces, &st, g2, b, false);
-                    }
+                for g2 in evident {
+                    self.dfs(&mut pieces, &st, g2, b, false);
                 }
                 // Walked to the end: no candidate or break-point cap, budget or cancel cut it short (the piece cap may be
                 // hit: past it no alternative fits).
@@ -1096,21 +1152,25 @@ impl<'c, S: Seams> Ctx<'c, S> {
         ok.then_some(g2)
     }
 
-    /// The candidates after `pieces` (seam at logical `b`, absolute `end`), walked from `st`: the evident ones (with
-    /// whether the walk still had no content evidence past the seam) and the blind ones, each in D4 order.
+    /// The candidates after `pieces` (seam at logical `b`, absolute `end`), walked from `st`: the evident ones (content
+    /// evidence past the seam) and the blind ones (none: broken only further on, or complete through blind data), each
+    /// in D4 order.
     fn classify(
         &mut self,
         pieces: &[Fragment],
         st: &(u64, S::State),
         end: u64,
         b: u64,
-    ) -> (Vec<(u64, bool)>, Vec<u64>) {
+    ) -> (Vec<u64>, Vec<u64>) {
         let mut cands: Vec<u64> = self.anchored(pieces, end, b).into_iter().collect();
         let space = self.space;
         let cap = self.limits.seam_candidates;
         let mut used = pieces.to_vec();
         used.extend_from_slice(&self.excluded);
-        let (listed, capped) = space.candidates(end, &used, cap, &mut |g2| self.keep(g2, b));
+        let own = std::mem::take(&mut self.own);
+        let (listed, capped) =
+            space.candidates_with_own(end, &used, &own, b, cap, &mut |g2| self.keep(g2, b));
+        self.own = own;
         if capped {
             self.cut_short();
         }
@@ -1134,8 +1194,10 @@ impl<'c, S: Seams> Ctx<'c, S> {
                 break;
             };
             match w2.end {
-                WalkEnd::Complete { .. } => evident.push((g2, w2.checked <= b)),
-                WalkEnd::Broken { .. } if w2.checked > b => evident.push((g2, false)),
+                // Complete without evidence past the seam (blind data to the end): blind, in D4 order with the others.
+                WalkEnd::Complete { .. } if w2.checked <= b => blinds.push(g2),
+                WalkEnd::Complete { .. } => evident.push(g2),
+                WalkEnd::Broken { .. } if w2.checked > b => evident.push(g2),
                 // No evidence either way at the seam, broken only further on (even inside its own run: a blind
                 // cluster then foreign data): blind, descended. Only a candidate broken right at the seam is dropped.
                 WalkEnd::Broken { at } if at > b => blinds.push(g2),
@@ -1145,6 +1207,27 @@ impl<'c, S: Seams> Ctx<'c, S> {
         }
         (evident, blinds)
     }
+}
+
+/// The proof of a complete solution: the format's over its merged pieces, lowered to `Unproven` when a seam on its path
+/// had no content evidence (then without asking the format).
+fn proof_of<S: Seams + ?Sized>(
+    seams: &mut S,
+    source: &dyn Source,
+    (sol, blind): &Solution,
+) -> Proof {
+    if *blind {
+        return Proof::Unproven;
+    }
+    let pieces = merged(sol);
+    let mut cut = 0;
+    let mut cuts = Vec::new();
+    for p in &pieces[..pieces.len() - 1] {
+        cut += p.len;
+        cuts.push(cut);
+    }
+    let view = Fragmented::new(source, pieces);
+    seams.prove(&view, &cuts)
 }
 
 /// Adjacent pieces merged.
@@ -1204,30 +1287,26 @@ pub(crate) fn search<S: Seams>(
         best,
         exhaustive,
         stop,
+        first_proof,
         ..
     } = ctx;
-    let exhaustive = exhaustive && !refused;
+    // Settled on its first solution: the rest was not searched.
+    let settled = stop == Some(Stop::Settled);
+    let exhaustive = exhaustive && !refused && !settled;
     counted.set_limit(u64::MAX);
     let found = if stop == Some(Stop::Cancelled) {
         None
-    } else if let Some((sol, blind)) = solutions.first() {
-        let pieces = merged(sol);
-        let mut cut = 0;
-        let mut cuts = Vec::new();
-        for p in &pieces[..pieces.len() - 1] {
-            cut += p.len;
-            cuts.push(cut);
-        }
-        let view = Fragmented::new(&counted, pieces.clone());
-        let mut proof = seams.prove(&view, &cuts);
-        if *blind {
-            proof = proof.min(Proof::Unproven);
-        }
+    } else if let Some(first) = solutions.first() {
+        let pieces = merged(&first.0);
+        let proof = match first_proof {
+            Some(p) => p,
+            None => proof_of(seams, &counted, first),
+        };
         Some(Search {
             len: pieces.iter().map(|p| p.len).sum(),
             pieces,
             complete: true,
-            unique: solutions.len() == 1,
+            unique: solutions.len() == 1 && !settled,
             exhaustive,
             proof,
         })
@@ -1248,7 +1327,7 @@ pub(crate) fn search<S: Seams>(
 /// Whether a finding the scan emits is a reassembly candidate (D2): never one of a live file (its chain says where it
 /// is); a JPEG that is not `Intact` with a first piece of at least 16 KiB (the 1.3 `MIN_FIRST_PIECE`), an MP4/MOV that
 /// is not `Intact`, a `Partial` TIFF RAW, and any JPEG, MP4/MOV or TIFF RAW of a deleted file that came out `Partial`.
-/// The JPEGs and the videos are searched so far; the RAWs are kept for the format that comes next.
+/// All of them are searched.
 pub(crate) fn is_candidate(f: &Finding) -> bool {
     let origin = f.origin.as_ref().map(|o| o.state);
     if origin == Some(FsState::Live) {
@@ -1363,14 +1442,50 @@ pub(crate) fn improves(old: &Finding, new: &Finding, complete: bool) -> bool {
             && new.len > old.len)
 }
 
+/// A format whose walk can tell that a placement's bytes are not the file's.
+pub(crate) trait Refutes {
+    /// Whether the walk of `view` from the file's start fails before its end by content (a check refutes its bytes);
+    /// a cut by the view's end, an unreadable byte or spent steps refute nothing.
+    fn refutes(&mut self, view: &dyn Source) -> bool;
+}
+
+/// Whether `new`, complete but no better than `old` by [`improves`] (both `Partial`, the same length), still replaces
+/// it (ruling Q43): it has other pieces, and `old`'s own pieces (its `fragments`, else one piece of its length), walked
+/// by the same seams over `source`, fail before their end by content. Whatever placed `old` (a guess, a recorded run,
+/// a chain), a placement its content does not refute stays: otherwise [`improves`] is the only rule (D6).
+pub(crate) fn replaces(
+    old: &Finding,
+    new: &Finding,
+    complete: bool,
+    source: &dyn Source,
+    seams: &mut dyn Refutes,
+) -> bool {
+    if !(complete
+        && old.health == Health::Partial
+        && new.health == Health::Partial
+        && new.len == old.len
+        && new.fragments != old.fragments)
+    {
+        return false;
+    }
+    let pieces = if old.fragments.is_empty() {
+        vec![Fragment {
+            start: old.start,
+            len: old.len,
+        }]
+    } else {
+        old.fragments.clone()
+    };
+    seams.refutes(&Fragmented::new(source, pieces))
+}
+
 /// The reassembly step: every candidate (id order) searched; returns the findings it improves (same id; a file-system
 /// file keeps its origin with placement `Carved`, D15). For a candidate of origin `Deleted`, the search gets the entry's
 /// size as the known length (Q3): the pieces must sum to it. `paired`: the pairing's results, whose `Intact` pieces are
 /// claimed first; each `Intact` reassembly claims its pieces for the next candidates. Sequential and deterministic: it
-/// depends only on the source's bytes and its arguments. JPEGs, videos with their index first or in fragments, and
-/// moov-less videos with a fitting orphan `moov` (in `ctx.moovs`) are searched (the RAWs keep their results until their
-/// format gets seams); a video the pairing made `Intact` is left alone, and one it paired otherwise must improve on the
-/// pairing's result. Stops early, returning what it has, when cancelled (the caller looks).
+/// depends only on the source's bytes and its arguments. JPEGs, TIFF RAWs, videos with their index first or in
+/// fragments, and moov-less videos with a fitting orphan `moov` (in `ctx.moovs`) are searched; a video the pairing made
+/// `Intact` is left alone, and one it paired otherwise must improve on the pairing's result. Stops early, returning what it has, when cancelled (the caller looks).
 pub(crate) fn reassemble(
     source: &CachedSource,
     candidates: &[Finding],
@@ -1413,6 +1528,13 @@ pub(crate) fn reassemble(
         let new = match f.kind {
             _ if index_first.is_some() => index_first.flatten(),
             FileKind::Jpeg => reassemble_jpeg(source, f, &taken, ctx, &mut budget, cancel),
+            FileKind::Arw
+            | FileKind::Cr2
+            | FileKind::Nef
+            | FileKind::Dng
+            | FileKind::Orf
+            | FileKind::Rw2
+            | FileKind::Tiff => reassemble_raw(source, f, &taken, ctx, &mut budget, cancel),
             FileKind::Mp4 | FileKind::Mov if !done(f) && !ctx.moovs.is_empty() => {
                 let old = paired.iter().find(|p| p.id == f.id).unwrap_or(f);
                 let r = video::reassemble_video(
@@ -1523,6 +1645,82 @@ fn reassemble_jpeg(
         }),
     };
     improves(f, &new, found.complete).then_some(new)
+}
+
+/// The TIFF-based RAW `f` searched (D13); the finding it becomes when that improves it, or when it replaces a placement
+/// its content refutes (Q43). The structure of its first piece is read within the file's read budget.
+fn reassemble_raw(
+    source: &CachedSource,
+    f: &Finding,
+    taken: &Taken,
+    ctx: &Context,
+    budget: &mut Budget,
+    cancel: &CancelToken,
+) -> Option<Finding> {
+    if budget.spent() {
+        return None;
+    }
+    let counted = Counted::new(source);
+    counted.set_limit(ctx.limits.file_read.min(budget.read));
+    let seams = raw::RawSeams::new(&counted, f.start);
+    budget.charge(0, counted.read());
+    let mut seams = seams?;
+    let space = Space::new(
+        ctx.grids,
+        f.start,
+        source.len(),
+        taken,
+        ctx.starts,
+        ctx.limits,
+    );
+    let known = f
+        .origin
+        .as_ref()
+        .filter(|o| o.state == FsState::Deleted)
+        .map(|o| o.size);
+    let found = search(
+        &mut seams, source, &space, f.start, known, ctx.limits, budget, cancel,
+    )?;
+    if cancel.is_cancelled() || found.pieces.first().map(|p| p.start) != Some(f.start) {
+        return None;
+    }
+    let mut checks = Checks {
+        capped: ctx.capped,
+        frags_capped: ctx.frags_capped,
+        claimed_capped: ctx.claimed_capped,
+        listing_truncated: ctx.listing_truncated,
+        bad: found
+            .pieces
+            .iter()
+            .any(|p| !source.bad_runs(p.start, p.start + p.len).is_empty()),
+        size_ok: known.is_none_or(|k| k == found.len),
+        own_ok: true,
+        restarts: false,
+        content_only: true,
+    };
+    // The preview's strict decode: only when nothing else keeps the file from `Intact`.
+    if health(&found, f.kind, &checks) == Health::Intact {
+        let view = Fragmented::new(source, found.pieces.clone());
+        checks.own_ok = seams.own_ok(&view);
+    }
+    let new = Finding {
+        id: f.id,
+        start: f.start,
+        len: found.len,
+        kind: f.kind,
+        health: health(&found, f.kind, &checks),
+        fragments: if found.pieces.len() > 1 {
+            found.pieces.clone()
+        } else {
+            Vec::new()
+        },
+        origin: f.origin.clone().map(|mut o| {
+            o.placement = Placement::Carved;
+            o
+        }),
+    };
+    (improves(f, &new, found.complete) || replaces(f, &new, found.complete, source, &mut seams))
+        .then_some(new)
 }
 
 #[cfg(test)]

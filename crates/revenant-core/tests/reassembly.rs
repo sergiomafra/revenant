@@ -14,7 +14,8 @@ use revenant_core::{
 };
 use revenant_testkit::fs::{DeleteStyle, FsBuilder};
 use revenant_testkit::{
-    AvcOptions, VideoCodec, VideoLayout, avc_video, camera_video, jpeg, jpeg_smooth,
+    ArwCompression, ArwOptions, AvcOptions, TestExif, TiffRawOptions, TiffVariant, VideoCodec,
+    VideoLayout, arw, avc_video, camera_video, jpeg, jpeg_smooth, tiff_raw,
 };
 use support::cards::{ThreePiece, live_in_three_runs, three_piece};
 use support::{SimSource, VOLUME_AT, exfat_card, final_view, on_disk};
@@ -886,4 +887,437 @@ fn identical_first_pieces_reassemble_once() {
     assert_eq!(extracted(&src, a), v.bytes);
     assert_eq!(b.health, Health::Damaged, "{b:#?}");
     assert!(updated(&events).iter().all(|u| u.id != b.id), "{b:#?}");
+}
+
+// TIFF-based RAW photos in pieces (Task 8): the TIFF structure, the previews and lossless-JPEG tiles are checked;
+// uncompressed or lossy sensor data is blind. A seam is proven only exactly between two checked units anchored at
+// their declared places (ruling Q45): tile boundaries, never inside a tile, a preview or sensor data.
+
+/// `got == want`, reporting only where they first differ.
+fn same(got: &[u8], want: &[u8]) {
+    let first = got.iter().zip(want).position(|(x, y)| x != y);
+    assert!(
+        got.len() == want.len() && first.is_none(),
+        "lengths {} and {}, first difference at {first:?}",
+        got.len(),
+        want.len()
+    );
+}
+
+/// A file of an exFAT card on a disk (see [`raw_card`]): name, bytes, clusters in file order, kept live or deleted.
+struct OnCard<'a> {
+    name: String,
+    bytes: &'a [u8],
+    clusters: Vec<u32>,
+    live: bool,
+}
+
+fn deleted<'a>(name: &str, bytes: &'a [u8], clusters: Vec<u32>) -> OnCard<'a> {
+    OnCard {
+        name: name.into(),
+        bytes,
+        clusters,
+        live: false,
+    }
+}
+
+/// A small live photo in the one cluster `c`: it takes the cluster, and its start is a finding start.
+fn filler(c: u32, jpegs: &mut Vec<Vec<u8>>) -> (String, u32) {
+    jpegs.push(jpeg(96, 96, 4000 + u64::from(c), 0));
+    assert!(jpegs.last().unwrap().len() as u64 <= CLUSTER);
+    (format!("L{c}.JPG"), c)
+}
+
+/// An exFAT card (64 MiB, 32 KiB clusters) holding `files` and a one-cluster live photo at each of `fillers`, the
+/// deleted files deleted by a computer that clears the chain (`ZeroChain`: the entry keeps the name and size, the FAT
+/// and the bitmap forget the clusters), so only the content can place them; every other cluster from 64 on holds
+/// seeded noise (old data). `extra`: bytes written over free clusters afterwards (old data of a known kind). Returns the
+/// source and each file's absolute pieces.
+fn raw_card(
+    files: &[OnCard],
+    fillers: &[u32],
+    extra: &[(u32, &[u8])],
+) -> (SimSource, Vec<Vec<Fragment>>) {
+    raw_card_as(files, fillers, extra, false)
+}
+
+/// [`raw_card`], quick-formatted afterwards when `quick` (no entry is left: no name, no size; the fillers' clusters are
+/// free too, but their photos still start there).
+fn raw_card_as(
+    files: &[OnCard],
+    fillers: &[u32],
+    extra: &[(u32, &[u8])],
+    quick: bool,
+) -> (SimSource, Vec<Vec<Fragment>>) {
+    let mut b = exfat_card();
+    let mut jpegs = Vec::new();
+    let fill: Vec<(String, u32)> = fillers.iter().map(|&c| filler(c, &mut jpegs)).collect();
+    for f in files {
+        b.add_at(&format!("DCIM/{}", f.name), f.bytes, &f.clusters);
+    }
+    for ((name, c), j) in fill.iter().zip(&jpegs) {
+        b.add_at(&format!("DCIM/{name}"), j, &[*c]);
+    }
+    let pieces: Vec<Vec<Fragment>> = files
+        .iter()
+        .map(|f| pieces_of(&b, &f.clusters, f.bytes.len() as u64))
+        .collect();
+    for f in files.iter().filter(|f| !f.live) {
+        b.delete(&format!("DCIM/{}", f.name), DeleteStyle::ZeroChain);
+    }
+    let mut volume = if quick {
+        b.build_quick_formatted()
+    } else {
+        b.build()
+    };
+    let used: std::collections::HashSet<u32> = files
+        .iter()
+        .flat_map(|f| f.clusters.iter().copied())
+        .chain(fillers.iter().copied())
+        .collect();
+    let noise = support::cards::noise(volume.len() as u64, 0xA5A5);
+    for c in 64..b.cluster_count() + 2 {
+        if used.contains(&c) {
+            continue;
+        }
+        let at = b.cluster_offset(c) as usize;
+        let end = (at + CLUSTER as usize).min(volume.len());
+        volume[at..end].copy_from_slice(&noise[at..end]);
+    }
+    for &(c, bytes) in extra {
+        assert!(!used.contains(&c));
+        let at = b.cluster_offset(c) as usize;
+        volume[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+    (SimSource::new(on_disk(&volume)), pieces)
+}
+
+/// Clusters (file order) of runs at `firsts` of the `cuts` (in clusters of the file; the last run takes the rest).
+fn cut_runs(firsts: &[u32], cuts: &[u32], total: u32) -> Vec<u32> {
+    let mut counts = Vec::new();
+    let mut prev = 0;
+    for &c in cuts.iter().chain(std::iter::once(&total)) {
+        counts.push(c - prev);
+        prev = c;
+    }
+    assert_eq!(counts.len(), firsts.len());
+    runs(firsts, &counts)
+}
+
+/// The final finding at `start`, which must be a RAW of `kind` with `len` bytes.
+fn raw_at(
+    view: &std::collections::BTreeMap<u64, Finding>,
+    start: u64,
+    kind: FileKind,
+    len: usize,
+) -> &Finding {
+    let f = at(view, start);
+    assert_eq!((f.kind, f.len), (kind, len as u64), "{f:#?}");
+    f
+}
+
+fn lossless_arw(seed: u64) -> revenant_testkit::TiffRaw {
+    arw(&ArwOptions {
+        seed,
+        ..ArwOptions::default()
+    })
+}
+
+/// [`lossless_arw`] whose tiles 2, 5 and 8 end on the 32 KiB cluster grid; the clusters (of the file) where they end.
+fn tile_aligned_arw(seed: u64) -> (revenant_testkit::TiffRaw, Vec<u32>) {
+    let a = arw(&ArwOptions {
+        seed,
+        align: CLUSTER as u32,
+        aligned_tiles: vec![2, 5, 8],
+        ..ArwOptions::default()
+    });
+    let cuts = [2, 5, 8]
+        .iter()
+        .map(|&k| (a.tiles[k].end as u64 / CLUSTER) as u32)
+        .collect();
+    (a, cuts)
+}
+
+#[test]
+fn lossless_arw_in_four_pieces_is_reassembled() {
+    // Cuts at cluster boundaries inside tiles: each continuation decodes its tile to the end, but a lossless-JPEG check
+    // is evidence, not proof (Q44): Partial, with the exact pieces and bytes.
+    let a = lossless_arw(1);
+    let n = clusters_for(a.bytes.len());
+    assert!(
+        a.tiles
+            .iter()
+            .all(|t| !(t.start as u64).is_multiple_of(CLUSTER))
+    );
+    let clusters = cut_runs(&[300, 900, 500, 1500], &[4, 8, 12], n);
+    let (src, pieces) = raw_card(
+        &[deleted("DSC00001.ARW", &a.bytes, clusters)],
+        &[304, 904, 504],
+        &[],
+    );
+    assert_eq!(pieces[0].len(), 4);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = raw_at(&view, pieces[0][0].start, FileKind::Arw, a.bytes.len());
+    assert_eq!(f.fragments, pieces[0], "{f:#?}");
+    assert_eq!(f.health, Health::Partial);
+    assert!(updated(&events).iter().any(|u| u.id == f.id));
+    same(&extracted(&src, f), &a.bytes);
+}
+
+#[test]
+fn lossless_arw_cut_at_tile_boundaries_is_intact() {
+    // Every seam lies exactly between two whole tiles, each decoding to its FF D9 at its own declared end: proven.
+    let (a, cuts) = tile_aligned_arw(1);
+    let n = clusters_for(a.bytes.len());
+    let clusters = cut_runs(&[300, 900, 500, 1500], &cuts, n);
+    let (src, pieces) = raw_card(
+        &[deleted("DSC00002.ARW", &a.bytes, clusters)],
+        &[
+            300 + cuts[0],
+            900 + cuts[1] - cuts[0],
+            500 + cuts[2] - cuts[1],
+        ],
+        &[],
+    );
+    assert_eq!(pieces[0].len(), 4);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = raw_at(&view, pieces[0][0].start, FileKind::Arw, a.bytes.len());
+    assert_eq!(f.fragments, pieces[0], "{f:#?}");
+    assert_eq!(f.health, Health::Intact, "{f:#?}");
+    assert!(updated(&events).iter().any(|u| u.id == f.id));
+    same(&extracted(&src, f), &a.bytes);
+}
+
+/// `bytes` in three runs from cluster 300, each run but the last followed by a one-cluster photo, on a quick-formatted
+/// card: "nothing in between" (Q14), the free run of each piece ends where the next photo starts. (With the deleted
+/// entry left, the file system's guess, contiguous over the free clusters, is already these pieces.)
+fn blind_in_three(name: &str, bytes: &[u8], kind: FileKind) {
+    let n = clusters_for(bytes.len());
+    let (k1, k2) = (n / 3, n / 3);
+    let firsts = [300, 300 + k1 + 1, 300 + k1 + k2 + 2];
+    let clusters = cut_runs(&firsts, &[k1, k1 + k2], n);
+    let (src, pieces) = raw_card_as(
+        &[deleted(name, bytes, clusters)],
+        &[300 + k1, 301 + k1 + k2],
+        &[],
+        true,
+    );
+    assert_eq!(pieces[0].len(), 3);
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = raw_at(&view, pieces[0][0].start, kind, bytes.len());
+    // Placed by the D4 order (the next free cluster), never proven: Partial.
+    assert_eq!(f.fragments, pieces[0], "{f:#?}");
+    assert_eq!(f.health, Health::Partial);
+    assert!(updated(&events).iter().any(|u| u.id == f.id));
+    same(&extracted(&src, f), bytes);
+}
+
+#[test]
+fn uncompressed_arw_in_three_pieces_is_partial_with_bytes_in_place() {
+    let a = arw(&ArwOptions {
+        compression: ArwCompression::Uncompressed,
+        ..ArwOptions::default()
+    });
+    blind_in_three("DSC00003.ARW", &a.bytes, FileKind::Arw);
+    // The other TIFF RAWs go through the same seams.
+    let nef = tiff_raw(&TiffRawOptions {
+        variant: TiffVariant::Nef,
+        big_endian: true,
+        raw_len: 1 << 20,
+        seed: 3,
+        preview: Some((320, 240)),
+        preview_sector_aligned: false,
+        exif: TestExif::default(),
+    });
+    blind_in_three("DSC00004.NEF", &nef.bytes, FileKind::Nef);
+}
+
+#[test]
+fn lossy_arw_is_never_intact_when_split_in_sensor_data() {
+    let a = arw(&ArwOptions {
+        compression: ArwCompression::Lossy,
+        ..ArwOptions::default()
+    });
+    let n = clusters_for(a.bytes.len());
+    let k = n / 2;
+    assert!(k as u64 * CLUSTER > a.raw.start as u64);
+    let clusters = cut_runs(&[300, 301 + k], &[k], n);
+    // Quick-formatted: no entry is left to guess from, only the content places the second piece.
+    let (src, pieces) = raw_card_as(
+        &[deleted("DSC00005.ARW", &a.bytes, clusters)],
+        &[300 + k],
+        &[],
+        true,
+    );
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = raw_at(&view, pieces[0][0].start, FileKind::Arw, a.bytes.len());
+    assert_eq!(f.fragments, pieces[0], "{f:#?}");
+    assert_eq!(f.health, Health::Partial);
+    assert!(updated(&events).iter().any(|u| u.id == f.id));
+    same(&extracted(&src, f), &a.bytes);
+}
+
+#[test]
+fn preview_split_across_a_seam_is_validated() {
+    // The first cluster ends inside the preview. Right after the live photo that follows it lies the second cluster of
+    // a burst neighbour (the same scene shifted by a pixel): its preview tail and sensor data. It is the first
+    // candidate; the preview decoded across the seam refutes it, and the true continuation follows.
+    let opts = |seed| ArwOptions {
+        compression: ArwCompression::Uncompressed,
+        seed,
+        ..ArwOptions::default()
+    };
+    let (a, b) = (arw(&opts(1)), arw(&opts(2)));
+    let p = a.preview.clone().unwrap();
+    assert!(p.start < CLUSTER as usize && p.end > CLUSTER as usize);
+    let n = clusters_for(a.bytes.len());
+    let clusters = cut_runs(&[300, 303], &[1], n);
+    let tail = &b.bytes[CLUSTER as usize..2 * CLUSTER as usize];
+    let (src, pieces) = raw_card(
+        &[deleted("DSC00006.ARW", &a.bytes, clusters)],
+        &[301],
+        &[(302, tail)],
+    );
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = raw_at(&view, pieces[0][0].start, FileKind::Arw, a.bytes.len());
+    assert_eq!(f.fragments, pieces[0], "{f:#?}");
+    // The seam lies inside the preview (a content-only JPEG seam) and the sensor data is blind: Partial.
+    assert_eq!(f.health, Health::Partial);
+    let got = extracted(&src, f);
+    same(&got[p.clone()], &a.bytes[p.clone()]);
+    same(&got, &a.bytes);
+    // The preview, out of the extracted file, is a whole JPEG.
+    let preview = SimSource::new(got[p].to_vec());
+    let found = final_view(&events_of(&preview, &ScanOptions::default()));
+    assert!(
+        found
+            .values()
+            .any(|j| j.start == 0 && j.kind == FileKind::Jpeg && j.health == Health::Intact),
+        "{found:#?}"
+    );
+}
+
+/// The ARW findings of the final view.
+fn raws(view: &std::collections::BTreeMap<u64, Finding>) -> Vec<&Finding> {
+    view.values().filter(|f| f.kind == FileKind::Arw).collect()
+}
+
+/// Two RAWs of one camera and settings (seeds 1 and 2) written interleaved, next free cluster first: A1 B1 A2 B2 ...
+/// from cluster 300; both deleted. No `Intact` finding is made of the other's bytes.
+fn burst_interleaved(a: &[u8], b: &[u8], cuts_a: &[u32], cuts_b: &[u32]) -> Vec<Health> {
+    let (na, nb) = (clusters_for(a.len()), clusters_for(b.len()));
+    let counts = |cuts: &[u32], n: u32| {
+        let mut out = Vec::new();
+        let mut prev = 0;
+        for &c in cuts.iter().chain(std::iter::once(&n)) {
+            out.push(c - prev);
+            prev = c;
+        }
+        out
+    };
+    let (ca, cb) = (counts(cuts_a, na), counts(cuts_b, nb));
+    assert_eq!(ca.len(), cb.len());
+    let (mut fa, mut fb) = (Vec::new(), Vec::new());
+    let mut next = 300;
+    for (x, y) in ca.iter().zip(&cb) {
+        fa.push(next);
+        next += x;
+        fb.push(next);
+        next += y;
+    }
+    let (src, pieces) = raw_card(
+        &[
+            deleted("DSC00010.ARW", a, runs(&fa, &ca)),
+            deleted("DSC00011.ARW", b, runs(&fb, &cb)),
+        ],
+        &[],
+        &[],
+    );
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let mut out = Vec::new();
+    for p in &pieces {
+        let f = at(&view, p[0].start);
+        assert_eq!(f.kind, FileKind::Arw, "{f:#?}");
+        out.push(f.health);
+    }
+    for f in raws(&view) {
+        if f.health == Health::Intact {
+            let own = if f.start == pieces[0][0].start {
+                a
+            } else {
+                assert_eq!(
+                    f.start, pieces[1][0].start,
+                    "an Intact RAW elsewhere: {f:#?}"
+                );
+                b
+            };
+            same(&extracted(&src, f), own);
+        }
+    }
+    out
+}
+
+#[test]
+fn burst_arw_neighbours_are_not_glued_intact() {
+    let (a, b) = (lossless_arw(1), lossless_arw(2));
+    let h = burst_interleaved(&a.bytes, &b.bytes, &[4, 8, 12], &[4, 8, 12]);
+    assert!(
+        h.iter().all(|&h| h == Health::Partial),
+        "in-tile seams: {h:?}"
+    );
+    // Cut at tile boundaries, where Intact is possible: each RAW's own bytes only. The neighbours' tiles at a candidate
+    // start do not end where the seam's next tile is declared to (their byte counts differ), so both are proven.
+    let ((a, ca), (b, cb)) = (tile_aligned_arw(1), tile_aligned_arw(2));
+    let h = burst_interleaved(&a.bytes, &b.bytes, &ca, &cb);
+    assert_eq!(h, [Health::Intact, Health::Intact]);
+}
+
+#[test]
+fn raw_preview_found_in_a_later_piece_is_its_own() {
+    // The IFDs fill the first cluster; the thumbnail (IFD1) and the preview right after it open the second piece. The
+    // scan finds both as Intact photos, claimed, their ranges touching (one merged range): they are the RAW's own files
+    // at the places its structure gives, so they neither stop its free run nor its candidates (D10, Q7).
+    let a = arw(&ArwOptions {
+        thumbnail: true,
+        jpegs_at: CLUSTER as u32,
+        ..ArwOptions::default()
+    });
+    let (t, p) = (a.thumbnail.clone().unwrap(), a.preview.clone().unwrap());
+    assert_eq!((t.start as u64, t.end), (CLUSTER, p.start));
+    let n = clusters_for(a.bytes.len());
+    let clusters = cut_runs(&[300, 900, 500], &[1, 8], n);
+    let (src, pieces) = raw_card(
+        &[deleted("DSC00007.ARW", &a.bytes, clusters)],
+        &[301, 908],
+        &[],
+    );
+    let events = events_of(&src, &ScanOptions::default());
+    let view = final_view(&events);
+    let f = raw_at(&view, pieces[0][0].start, FileKind::Arw, a.bytes.len());
+    assert_eq!(f.fragments, pieces[0], "{f:#?}");
+    assert_eq!(f.health, Health::Partial, "a seam inside a tile");
+    same(&extracted(&src, f), &a.bytes);
+    // The two JPEG findings stay, nested in the RAW at its own offsets (Q16: the same file, recorded once as its own).
+    let second = pieces[0][1].start;
+    for (range, what) in [(&t, "thumbnail"), (&p, "preview")] {
+        let at_abs = second + (range.start as u64 - CLUSTER);
+        let j = at(&view, at_abs);
+        assert_eq!(
+            (j.kind, j.health, j.len),
+            (FileKind::Jpeg, Health::Intact, range.len() as u64),
+            "{what}: {j:#?}"
+        );
+        assert!(
+            f.ranges()
+                .iter()
+                .any(|r| r.start <= at_abs && at_abs + j.len <= r.start + r.len),
+            "{what} nested in the RAW"
+        );
+    }
 }

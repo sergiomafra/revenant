@@ -825,6 +825,10 @@ pub struct TiffRaw {
     pub bytes: Vec<u8>,
     pub preview: Option<std::ops::Range<usize>>,
     pub raw: std::ops::Range<usize>,
+    /// The lossless-JPEG tiles of the raw data, in file order ([`arw`] with [`ArwCompression::Lossless`]); else empty.
+    pub tiles: Vec<std::ops::Range<usize>>,
+    /// The IFD1 thumbnail JPEG ([`arw`] with [`ArwOptions::thumbnail`]); else `None`.
+    pub thumbnail: Option<std::ops::Range<usize>>,
 }
 
 struct TiffEntry {
@@ -883,8 +887,22 @@ impl Enc {
         }
     }
 
+    fn longs(self, tag: u16, v: &[u32]) -> TiffEntry {
+        TiffEntry {
+            tag,
+            typ: 4,
+            count: v.len() as u32,
+            data: v.iter().flat_map(|&x| self.u32(x)).collect(),
+        }
+    }
+
     /// One IFD: entry table, then the values that do not fit in four bytes. `start` is where the IFD will sit.
-    fn ifd(self, start: u32, mut entries: Vec<TiffEntry>) -> Vec<u8> {
+    fn ifd(self, start: u32, entries: Vec<TiffEntry>) -> Vec<u8> {
+        self.ifd_next(start, entries, 0)
+    }
+
+    /// [`Enc::ifd`] whose next-IFD pointer is `next` (0: none).
+    fn ifd_next(self, start: u32, mut entries: Vec<TiffEntry>, next: u32) -> Vec<u8> {
         entries.sort_by_key(|e| e.tag);
         let mut table = Vec::new();
         table.extend_from_slice(&self.u16(entries.len() as u16));
@@ -907,7 +925,7 @@ impl Enc {
                 cursor += (e.data.len() + e.data.len() % 2) as u32;
             }
         }
-        table.extend_from_slice(&[0; 4]); // no next IFD
+        table.extend_from_slice(&self.u32(next));
         table.extend(external);
         table
     }
@@ -1027,6 +1045,260 @@ pub fn tiff_raw(opts: &TiffRawOptions) -> TiffRaw {
     TiffRaw {
         preview: preview_bytes.map(|p| prev_at as usize..prev_at as usize + p.len()),
         raw: raw_start..bytes.len(),
+        tiles: Vec::new(),
+        thumbnail: None,
+        bytes,
+    }
+}
+
+/// How [`arw`] stores the sensor data (the three ARW recording modes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArwCompression {
+    /// Compression 1: one strip of 16-bit samples (seeded noise).
+    Uncompressed,
+    /// Compression 7: lossless JPEG (SOF3) tiles.
+    Lossless,
+    /// Compression 32767 (Sony's lossy coding): one strip of seeded bytes, one per pixel.
+    Lossy,
+}
+
+/// Shape of a synthetic Sony ARW built by [`arw`].
+#[derive(Clone, Debug)]
+pub struct ArwOptions {
+    pub compression: ArwCompression,
+    /// Sensor size; a multiple of `tile` in both directions for [`ArwCompression::Lossless`].
+    pub width: u32,
+    pub height: u32,
+    /// Tile side for [`ArwCompression::Lossless`] (each tile one component of 14 bits).
+    pub tile: u32,
+    /// JPEG preview (width, height): the same smooth scene for every seed, shifted by `seed % 16` pixels, as in a burst.
+    pub preview: (u32, u32),
+    pub seed: u64,
+    pub exif: TestExif,
+    /// A 160×120 thumbnail in IFD1, right before the preview, padded with fill bytes (`FF` before its EOI) to a
+    /// multiple of 512 bytes so the preview starts on a sector.
+    pub thumbnail: bool,
+    /// File offset of the first embedded JPEG (the thumbnail, else the preview); 0: the first sector after the IFDs.
+    pub jpegs_at: u32,
+    /// When not 0, the sensor data starts on a multiple of `align` from the start of the file, and each tile of
+    /// `aligned_tiles` is padded with fill bytes before its EOI so that it ends on one too (its declared length
+    /// includes them, as the JPEG syntax allows).
+    pub align: u32,
+    pub aligned_tiles: Vec<usize>,
+}
+
+impl Default for ArwOptions {
+    /// Lossless, 1024×768 in tiles of 256, a 640×480 preview, seed 1, no thumbnail, nothing aligned.
+    fn default() -> Self {
+        ArwOptions {
+            compression: ArwCompression::Lossless,
+            width: 1024,
+            height: 768,
+            tile: 256,
+            preview: (640, 480),
+            seed: 1,
+            exif: TestExif::default(),
+            thumbnail: false,
+            jpegs_at: 0,
+            align: 0,
+            aligned_tiles: Vec::new(),
+        }
+    }
+}
+
+/// `jpeg` with `pad` fill bytes (`FF`) inserted before its EOI.
+fn with_fill(jpeg: &[u8], pad: usize) -> Vec<u8> {
+    let mut out = jpeg[..jpeg.len() - 2].to_vec();
+    out.resize(out.len() + pad, 0xFF);
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
+/// A Sony-like ARW, little-endian: IFD0 (Make "SONY", the JPEG preview through JPEGInterchangeFormat, the Exif IFD,
+/// one SubIFD), optionally IFD1 with a thumbnail, then the SubIFD with the sensor data: Compression 1 (one strip), 7
+/// (lossless JPEG tiles of `tile`×`tile`, TileOffsets/TileByteCounts) or 32767 (one strip of seeded bytes). The
+/// embedded JPEGs come before the sensor data, as Sony lays it out, and the sensor data ends the file.
+pub fn arw(opts: &ArwOptions) -> TiffRaw {
+    let enc = Enc(false);
+    let preview = {
+        let (w, h) = opts.preview;
+        encode_rgb(
+            &smooth_pixels(w, h, 0x00A6_7000, (opts.seed % 16) as u32),
+            w,
+            h,
+        )
+    };
+    let thumb = opts.thumbnail.then(|| {
+        let t = jpeg_smooth(160, 120, 0x00A6_7001 ^ opts.seed);
+        let pad = (t.len() + 2).div_ceil(512) * 512 - t.len();
+        with_fill(&t, pad)
+    });
+    let make = opts.exif.make.clone().unwrap_or_else(|| "SONY".into());
+    // Sensor data, before its placement: tiles (unpadded) or one strip.
+    let mut tiles: Vec<Vec<u8>> = Vec::new();
+    let mut strip: Vec<u8> = Vec::new();
+    match opts.compression {
+        ArwCompression::Lossless => {
+            assert!(
+                opts.tile > 0
+                    && opts.width.is_multiple_of(opts.tile)
+                    && opts.height.is_multiple_of(opts.tile)
+            );
+            let n = (opts.width / opts.tile) * (opts.height / opts.tile);
+            tiles = (0..u64::from(n))
+                .map(|k| {
+                    lossless_jpeg(
+                        opts.tile,
+                        opts.tile,
+                        1,
+                        14,
+                        opts.seed.wrapping_mul(0x9E37) ^ k,
+                    )
+                })
+                .collect();
+        }
+        ArwCompression::Uncompressed => {
+            strip = DiskImage::noise(
+                opts.width as usize * opts.height as usize * 2,
+                opts.seed ^ 0x4152_5731,
+            )
+            .bytes;
+        }
+        ArwCompression::Lossy => {
+            strip = DiskImage::noise(
+                opts.width as usize * opts.height as usize,
+                opts.seed ^ 0x4152_5732,
+            )
+            .bytes;
+        }
+    }
+    let code: u16 = match opts.compression {
+        ArwCompression::Uncompressed => 1,
+        ArwCompression::Lossless => 7,
+        ArwCompression::Lossy => 32767,
+    };
+    let ntiles = tiles.len();
+    let entries = |sub: u32, exif: u32, prev: u32, th: u32, offs: &[u32], cnts: &[u32]| {
+        let mut e0 = vec![
+            enc.long(0x0100, opts.preview.0),
+            enc.long(0x0101, opts.preview.1),
+            enc.ascii(0x010F, &make),
+        ];
+        if let Some(m) = &opts.exif.model {
+            e0.push(enc.ascii(0x0110, m));
+        }
+        e0.push(enc.long(0x014A, sub));
+        e0.push(enc.long(0x0201, prev));
+        e0.push(enc.long(0x0202, preview.len() as u32));
+        let ex = exif_entries(enc, &opts.exif);
+        if !ex.is_empty() {
+            e0.push(enc.long(0x8769, exif));
+        }
+        let e1 = thumb.as_ref().map(|t| {
+            vec![
+                enc.short(0x0103, 6),
+                enc.long(0x0201, th),
+                enc.long(0x0202, t.len() as u32),
+            ]
+        });
+        let mut es = vec![
+            enc.long(0x0100, opts.width),
+            enc.long(0x0101, opts.height),
+            enc.short(0x0102, if code == 32767 { 8 } else { 14 }),
+            enc.short(0x0103, code),
+        ];
+        if code == 7 {
+            es.push(enc.long(0x0142, opts.tile));
+            es.push(enc.long(0x0143, opts.tile));
+            es.push(enc.longs(0x0144, offs));
+            es.push(enc.longs(0x0145, cnts));
+        } else {
+            es.push(enc.long(0x0111, offs[0]));
+            es.push(enc.long(0x0116, opts.height));
+            es.push(enc.long(0x0117, cnts[0]));
+        }
+        (e0, e1, es, ex)
+    };
+    let zeros = vec![0u32; ntiles.max(1)];
+    let (l0, l1, ls, lx) = {
+        let (e0, e1, es, ex) = entries(0, 0, 0, 0, &zeros, &zeros);
+        (
+            enc.ifd(0, e0).len() as u32,
+            e1.map_or(0, |e| enc.ifd(0, e).len() as u32),
+            enc.ifd(0, es).len() as u32,
+            if ex.is_empty() {
+                0
+            } else {
+                enc.ifd(0, ex).len() as u32
+            },
+        )
+    };
+    let ifd0_at = 8u32;
+    let ifd1_at = ifd0_at + l0;
+    let sub_at = ifd1_at + l1;
+    let exif_at = sub_at + ls;
+    let ifds_end = exif_at + lx;
+    let jpegs_at = if opts.jpegs_at == 0 {
+        ifds_end.div_ceil(512) * 512
+    } else {
+        assert!(opts.jpegs_at >= ifds_end, "the IFDs end at {ifds_end}");
+        opts.jpegs_at
+    };
+    let thumb_len = thumb.as_ref().map_or(0, Vec::len) as u32;
+    let thumb_at = jpegs_at;
+    let prev_at = jpegs_at + thumb_len;
+    let mut raw_at = prev_at + preview.len() as u32;
+    if opts.align > 0 {
+        raw_at = raw_at.div_ceil(opts.align) * opts.align;
+    } else {
+        raw_at = raw_at.div_ceil(2) * 2;
+    }
+    // Place the sensor data, padding the aligned tiles.
+    let mut sensor: Vec<u8> = Vec::new();
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    if code == 7 {
+        for (k, t) in tiles.iter().enumerate() {
+            let at = raw_at as usize + sensor.len();
+            let t = if opts.align > 0 && opts.aligned_tiles.contains(&k) {
+                let a = opts.align as usize;
+                let pad = (at + t.len()).div_ceil(a) * a - (at + t.len());
+                with_fill(t, pad)
+            } else {
+                t.clone()
+            };
+            ranges.push(at..at + t.len());
+            sensor.extend(t);
+        }
+    } else {
+        ranges.push(raw_at as usize..raw_at as usize + strip.len());
+        sensor = strip;
+    }
+    let offs: Vec<u32> = ranges.iter().map(|r| r.start as u32).collect();
+    let cnts: Vec<u32> = ranges.iter().map(|r| r.len() as u32).collect();
+    let (e0, e1, es, ex) = entries(sub_at, exif_at, prev_at, thumb_at, &offs, &cnts);
+    let mut bytes = vec![b'I', b'I', 0x2A, 0];
+    bytes.extend_from_slice(&enc.u32(ifd0_at));
+    bytes.extend(enc.ifd_next(ifd0_at, e0, if e1.is_some() { ifd1_at } else { 0 }));
+    if let Some(e1) = e1 {
+        bytes.extend(enc.ifd(ifd1_at, e1));
+    }
+    bytes.extend(enc.ifd(sub_at, es));
+    if !ex.is_empty() {
+        bytes.extend(enc.ifd(exif_at, ex));
+    }
+    debug_assert_eq!(bytes.len() as u32, ifds_end);
+    bytes.resize(jpegs_at as usize, 0);
+    if let Some(t) = &thumb {
+        bytes.extend_from_slice(t);
+    }
+    bytes.extend_from_slice(&preview);
+    bytes.resize(raw_at as usize, 0);
+    bytes.extend(sensor);
+    TiffRaw {
+        preview: Some(prev_at as usize..prev_at as usize + preview.len()),
+        raw: raw_at as usize..bytes.len(),
+        tiles: if code == 7 { ranges } else { Vec::new() },
+        thumbnail: thumb.map(|t| thumb_at as usize..thumb_at as usize + t.len()),
         bytes,
     }
 }
@@ -1104,6 +1376,8 @@ pub fn panasonic_rw2(opts: &Rw2Options) -> TiffRaw {
     TiffRaw {
         preview: Some(512..512 + preview.len()),
         raw: raw_at as usize..bytes.len(),
+        tiles: Vec::new(),
+        thumbnail: None,
         bytes,
     }
 }
@@ -1223,6 +1497,8 @@ pub fn olympus_orf(om_system: bool, raw_len: usize, seed: u64, exif: &TestExif) 
     TiffRaw {
         preview: Some(big_abs..big_abs + big.len()),
         raw: raw_at as usize..bytes.len(),
+        tiles: Vec::new(),
+        thumbnail: None,
         bytes,
     }
 }

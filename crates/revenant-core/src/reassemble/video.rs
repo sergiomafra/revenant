@@ -23,8 +23,8 @@ use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use super::{
-    Budget, Checks, Counted, Proof, Seams, Search, Space, Taken, WalkEnd, Walked, health, improves,
-    search,
+    Budget, Checks, Counted, Proof, Refutes, Seams, Search, Space, Taken, WalkEnd, Walked, health,
+    improves, replaces, search,
 };
 use crate::cache::CachedSource;
 use crate::filesystem::{FsState, Placement};
@@ -1524,13 +1524,6 @@ fn finding(f: &Finding, found: &Search, kind: FileKind, checks: &Checks) -> Opti
     })
 }
 
-/// A format whose walk can tell that a placement's bytes are not the file's.
-pub(crate) trait Refutes {
-    /// Whether the walk of `view` from the file's start fails before its end by content (a check refutes its bytes);
-    /// a cut by the view's end, an unreadable byte or spent steps refute nothing.
-    fn refutes(&mut self, view: &dyn Source) -> bool;
-}
-
 impl Refutes for VideoSeams {
     fn refutes(&mut self, view: &dyn Source) -> bool {
         let mut r = Reader::with_window(view, WALK_WINDOW);
@@ -1552,36 +1545,6 @@ impl Refutes for MoofSeams {
         let run = self.run(view, &MoofState::default(), len, false, &mut |_, _, _| {});
         run.failed && !matches!(run.end, WalkEnd::Stopped)
     }
-}
-
-/// Whether `new`, complete but no better than `old` by [`improves`] (both `Partial`, the same length), still replaces
-/// it (ruling Q43): it has other pieces, and `old`'s own pieces (its `fragments`, else one piece of its length), walked
-/// by the same seams over `source`, fail before their end by content. Whatever placed `old` (a guess, a recorded run,
-/// a chain), a placement its content does not refute stays: otherwise [`improves`] is the only rule (D6).
-fn replaces(
-    old: &Finding,
-    new: &Finding,
-    complete: bool,
-    source: &dyn Source,
-    seams: &mut dyn Refutes,
-) -> bool {
-    if !(complete
-        && old.health == Health::Partial
-        && new.health == Health::Partial
-        && new.len == old.len
-        && new.fragments != old.fragments)
-    {
-        return false;
-    }
-    let pieces = if old.fragments.is_empty() {
-        vec![Fragment {
-            start: old.start,
-            len: old.len,
-        }]
-    } else {
-        old.fragments.clone()
-    };
-    seams.refutes(&Fragmented::new(source, pieces))
 }
 
 /// A video whose index comes before its media data (its own `moov` first, or fragments) searched; `None` when `f` has

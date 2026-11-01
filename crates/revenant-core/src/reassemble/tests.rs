@@ -455,6 +455,51 @@ fn prefilter_reads_are_charged_and_memoized() {
 }
 
 #[test]
+fn a_unit_opened_by_an_own_file_at_its_place_is_a_candidate() {
+    // A claimed photo (two touching findings, merged by `Runs`) starting a unit, with a finding start there: the file's
+    // own embedded files at logical 64 KiB (4 KiB) and 68 KiB (12 KiB). After a seam at logical 64 KiB that unit is a
+    // candidate (D9, D10, Q7); after a seam elsewhere, or for files 512 bytes off, it is not.
+    let g = 6 * MIB;
+    let mut claimed = Runs::default();
+    claimed.add(g, g + 4 * K, usize::MAX);
+    claimed.add(g + 4 * K, g + 16 * K, usize::MAX);
+    let taken = Taken::new(&[], &claimed);
+    let starts = [g, g + 4 * K];
+    let limits = Limits::DEFAULT;
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &starts, &limits);
+    let own = [
+        Fragment {
+            start: 64 * K,
+            len: 4 * K,
+        },
+        Fragment {
+            start: 68 * K,
+            len: 12 * K,
+        },
+    ];
+    let list = |own: &[Fragment], seam: u64| {
+        space
+            .candidates_with_own(g - 2 * U, &[], own, seam, 3, &mut |_| true)
+            .0
+    };
+    // The claimed photos fill the units g to g + 4U: only the first one is opened by them.
+    let after = [g - U, g + 4 * U, g + 5 * U];
+    assert_eq!(list(&own, 64 * K), [g - U, g, g + 4 * U]);
+    assert_eq!(list(&own, 32 * K), after);
+    assert_eq!(list(&[], 64 * K), after);
+    let off: Vec<Fragment> = own
+        .iter()
+        .map(|o| Fragment {
+            start: o.start + 512,
+            len: o.len,
+        })
+        .collect();
+    assert_eq!(list(&off, 64 * K), after);
+    // The plain listing is the one without own files.
+    assert_eq!(space.candidates(g - 2 * U, &[], 3, &mut |_| true).0, after);
+}
+
+#[test]
 fn free_run_stops_at_taken_used_and_finding_starts() {
     let g = 4 * MIB;
     let fr =

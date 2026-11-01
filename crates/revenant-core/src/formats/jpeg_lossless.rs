@@ -7,9 +7,6 @@
 //! Only the Huffman table builder and the byte source are shared with the baseline decoder in `jpeg_entropy`, which keeps
 //! rejecting SSSS over 11. Every loop is bounded by the declared sample count and by the bytes below the caller's limit.
 
-// Nothing calls this yet outside its tests: the RAW seam check (reassembly of tiles and strips) plugs into it next.
-#![allow(dead_code)]
-
 use std::collections::VecDeque;
 
 use super::Reader;
@@ -222,6 +219,7 @@ pub(crate) struct LlCursor {
 impl LlCursor {
     /// The same state, every position minus `by` (for decoding the same bytes through a view that starts `by` later);
     /// `None` when the view would start after the cursor.
+    #[allow(dead_code)] // No walk starts a view inside a tile yet: tested, kept for one that does.
     pub(crate) fn shifted_back(&self, by: u64) -> Option<LlCursor> {
         let mut c = self.clone();
         c.pos = c.pos.checked_sub(by)?;
@@ -252,6 +250,7 @@ pub(crate) struct LlRun {
     /// How the walk ended; `Eoi { at }` only for a complete tile whose `FF D9` ends exactly at the limit.
     pub end: End,
     /// Difference codes decoded (the index of the first one not decoded).
+    #[allow(dead_code)] // Read by the unit tests; callers go by `end`.
     pub samples: u64,
     /// Cursors at the last [`RESUME_POINTS`] row boundaries reached, oldest first.
     pub resume: Vec<LlCursor>,
@@ -442,6 +441,30 @@ pub(crate) fn decode_lossless(
         samples: c.sample,
         resume: resume.into(),
     }
+}
+
+/// Whether the lossless-JPEG tiles `tiles` (`(absolute offset, length)`, in file order) of a RAW all decode to their
+/// declared ends ([`decode_lossless`]: the exact sample count, `FF D9` ending exactly there). Tiles whose first frame is
+/// not one [`lossless_frame`] covers cannot be checked: `true`. A tile of another file of the same frame can pass (its
+/// `Eoi` is evidence, not proof), so `true` is no proof of the data; `false` means some tile is not what the structure
+/// declares.
+pub(crate) fn tiles_decode(r: &mut Reader, tiles: &[(u64, u64)]) -> bool {
+    let Some(&(o, l)) = tiles.first() else {
+        return true;
+    };
+    if lossless_frame(r, o, o.saturating_add(l)).is_none() {
+        return true;
+    }
+    tiles.iter().all(|&(o, l)| {
+        let end = o.saturating_add(l);
+        !super::cancelled()
+            && lossless_frame(r, o, end).is_some_and(|(f, scan)| {
+                matches!(
+                    decode_lossless(r, &f, f.start(scan), end).end,
+                    End::Eoi { .. }
+                )
+            })
+    })
 }
 
 #[cfg(test)]

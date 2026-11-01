@@ -146,6 +146,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fragments (a cut between fragments cannot be told from another clip's fragment of the same camera), else partial;
   its fragments must follow each other in order. When two deleted videos
   start with the same bytes and one index fits both, the one found first is put back and the copy is left as it was.
+- RAW photos (ARW first; CR2, NEF, DNG, ORF and RW2 the same way) split into pieces on a card are put back together
+  after the scan, from the card's free space: their structure, previews and, in lossless-compressed RAWs, each block of
+  the image are checked where the structure puts them. Most come back with their bytes in place but reported partial:
+  a cut inside the image data of an uncompressed or lossy RAW cannot be checked at all, and a cut inside a lossless
+  block, a preview or anywhere else is placed by its content but never proven. A RAW is intact only when every cut lies
+  exactly between two whole lossless blocks that end where the structure says, and nothing else on the card fits.
 
 ### Changed
 
@@ -189,6 +195,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- A lossless-compressed RAW (ARW, DNG) whose image blocks after its first piece were another file's (a burst
+  neighbour written right after it) was reported intact: every lossless block must now end where the structure says, or
+  the RAW is partial (and put back together when the rest of it is found).
 - A video whose index comes before its frames (`moov` first, or fragmented MP4) with other data written over part of
   its frames was reported intact: such a video is now intact only when every frame it lists checks out in place and,
   when fragmented, its fragments follow each other in order, else partial (and put back together when the rest of it

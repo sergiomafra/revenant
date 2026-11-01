@@ -382,3 +382,146 @@ fn lossless_jpeg_has_a_valid_frame_and_exact_codes() {
     let j = revenant_testkit::lossless_jpeg(256, 256, 1, 16, 3);
     assert!(count_lossless_samples(&j, 256, 256, 1, 16).1 >= 12);
 }
+
+/// Little-endian u32 at `at`.
+fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+/// The entries of the little-endian IFD at `at`: (tag, type, count, value field) and the next-IFD pointer.
+fn ifd_entries(b: &[u8], at: usize) -> (Vec<(u16, u16, u32, u32)>, u32) {
+    let n = u16::from_le_bytes([b[at], b[at + 1]]) as usize;
+    let e = (0..n)
+        .map(|i| {
+            let p = at + 2 + 12 * i;
+            (
+                u16::from_le_bytes([b[p], b[p + 1]]),
+                u16::from_le_bytes([b[p + 2], b[p + 3]]),
+                le32(b, p + 4),
+                le32(b, p + 8),
+            )
+        })
+        .collect();
+    (e, le32(b, at + 2 + 12 * n))
+}
+
+fn tag(e: &[(u16, u16, u32, u32)], t: u16) -> Option<(u16, u32, u32)> {
+    e.iter()
+        .find(|x| x.0 == t)
+        .map(|&(_, typ, count, v)| (typ, count, v))
+}
+
+#[test]
+fn arw_lays_out_like_a_sony_raw() {
+    use revenant_testkit::{ArwCompression, ArwOptions, arw};
+    for compression in [
+        ArwCompression::Uncompressed,
+        ArwCompression::Lossless,
+        ArwCompression::Lossy,
+    ] {
+        let a = arw(&ArwOptions {
+            compression,
+            thumbnail: true,
+            ..ArwOptions::default()
+        });
+        let b = &a.bytes;
+        assert_eq!(&b[..4], b"II*\0");
+        let (e0, next) = ifd_entries(b, le32(b, 4) as usize);
+        let (_, n, make_at) = tag(&e0, 0x010F).unwrap();
+        assert_eq!(
+            &b[make_at as usize..make_at as usize + n as usize],
+            b"SONY\0"
+        );
+        // The preview, pointed at by IFD0, before the raw data; the thumbnail by IFD1, right before the preview.
+        let p = a.preview.clone().unwrap();
+        assert_eq!(tag(&e0, 0x0201).unwrap().2 as usize, p.start);
+        assert_eq!(tag(&e0, 0x0202).unwrap().2 as usize, p.len());
+        assert_eq!(&b[p.start..p.start + 2], [0xFF, 0xD8]);
+        assert_eq!(&b[p.end - 2..p.end], [0xFF, 0xD9]);
+        let t = a.thumbnail.clone().unwrap();
+        let (e1, _) = ifd_entries(b, next as usize);
+        assert_eq!(tag(&e1, 0x0201).unwrap().2 as usize, t.start);
+        assert_eq!(tag(&e1, 0x0202).unwrap().2 as usize, t.len());
+        assert_eq!((t.end, t.len() % 512, t.start % 512), (p.start, 0, 0));
+        assert_eq!(&b[t.end - 2..t.end], [0xFF, 0xD9]);
+        assert!(p.end <= a.raw.start && a.raw.end == b.len());
+        // The SubIFD holds the raw data.
+        let (_, _, sub) = tag(&e0, 0x014A).unwrap();
+        let (es, _) = ifd_entries(b, sub as usize);
+        let code = tag(&es, 0x0103).unwrap().2 & 0xFFFF;
+        match compression {
+            ArwCompression::Uncompressed | ArwCompression::Lossy => {
+                assert_eq!(
+                    code,
+                    if compression == ArwCompression::Lossy {
+                        32767
+                    } else {
+                        1
+                    }
+                );
+                assert_eq!(tag(&es, 0x0111).unwrap().2 as usize, a.raw.start);
+                assert_eq!(tag(&es, 0x0117).unwrap().2 as usize, a.raw.len());
+                assert!(a.tiles.is_empty());
+            }
+            ArwCompression::Lossless => {
+                assert_eq!(code, 7);
+                assert_eq!(a.tiles.len(), 4 * 3, "1024×768 in tiles of 256");
+                let (_, n, offs) = tag(&es, 0x0144).unwrap();
+                let (_, _, cnts) = tag(&es, 0x0145).unwrap();
+                assert_eq!(n as usize, a.tiles.len());
+                for (k, r) in a.tiles.iter().enumerate() {
+                    assert_eq!(le32(b, offs as usize + 4 * k) as usize, r.start);
+                    assert_eq!(le32(b, cnts as usize + 4 * k) as usize, r.len());
+                    assert_eq!(&b[r.start..r.start + 2], [0xFF, 0xD8]);
+                    assert_eq!(&b[r.end - 2..r.end], [0xFF, 0xD9]);
+                    let (count, _) = count_lossless_samples(&b[r.clone()], 256, 256, 1, 14);
+                    assert_eq!(count, 256 * 256);
+                }
+                assert_eq!(a.tiles[0].start, a.raw.start);
+                assert!(a.tiles.windows(2).all(|w| w[0].end == w[1].start));
+            }
+        }
+    }
+}
+
+#[test]
+fn arw_tiles_can_end_on_a_grid() {
+    use revenant_testkit::{ArwCompression, ArwOptions, arw};
+    let grid = 32 << 10;
+    let a = arw(&ArwOptions {
+        compression: ArwCompression::Lossless,
+        align: grid,
+        aligned_tiles: vec![2, 5, 8],
+        ..ArwOptions::default()
+    });
+    assert_eq!(a.tiles[0].start % grid as usize, 0);
+    for (k, t) in a.tiles.iter().enumerate() {
+        assert_eq!(
+            t.end % grid as usize == 0,
+            [2, 5, 8].contains(&k),
+            "tile {k}: {t:?}"
+        );
+        // Padded with fill bytes before the EOI: still a whole frame of exact samples.
+        let tile = &a.bytes[t.clone()];
+        let mut data = tile[..tile.len() - 2].to_vec();
+        while data.last() == Some(&0xFF) {
+            data.pop();
+        }
+        data.extend_from_slice(&[0xFF, 0xD9]);
+        assert_eq!(data.len() < tile.len(), [2, 5, 8].contains(&k), "tile {k}");
+        let (count, _) = count_lossless_samples(&data, 256, 256, 1, 14);
+        assert_eq!(count, 256 * 256);
+    }
+    // Two seeds of the same options: the same frame, different bytes.
+    let b = arw(&ArwOptions {
+        compression: ArwCompression::Lossless,
+        seed: 2,
+        ..ArwOptions::default()
+    });
+    let a = arw(&ArwOptions {
+        compression: ArwCompression::Lossless,
+        ..ArwOptions::default()
+    });
+    assert_ne!(a.bytes, b.bytes);
+    assert_eq!(a.tiles.len(), b.tiles.len());
+}
