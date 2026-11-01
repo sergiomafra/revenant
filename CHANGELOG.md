@@ -211,6 +211,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Two deleted files that once started at the same place on a card, with the same date and time (a camera whose clock
+  was never set, or a photo deleted and re-shot within two seconds), could give one photo's bytes, plus the leftover
+  bytes after them, under the other's name and size, reported intact. Neither name is given now: the photo found there
+  comes out on its own, without a name.
 - A lossless-compressed RAW (ARW, DNG) whose image blocks after its first piece were another file's (a burst
   neighbour written right after it) was reported intact: every lossless block must now end where the structure says, or
   the RAW is partial (and put back together when the rest of it is found).

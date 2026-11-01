@@ -1782,3 +1782,40 @@ fn old_chain_run_into_by_a_file_found_before_it_is_not_proof() {
     assert_ne!(f.health, Health::Intact, "{f:#?}");
     assert_ne!(deleted_as(&f).1, Placement::OldChain, "{f:#?}");
 }
+
+#[test]
+fn deleted_entries_tied_at_one_start_name_neither() {
+    // A camera with an unset clock (every stamp equal): A deleted, B written over A's clusters (shorter, as many
+    // clusters), B deleted too. Both entries start at the same cluster and neither is newer: which one owns the bytes
+    // cannot be told, so neither name is given. B's bytes are carved, Intact, without a name; A's size never places B's
+    // photo with the slack after it.
+    let cl = 4096u64;
+    let a = jpeg_smooth(1024, 768, 1);
+    let need = clusters_in(a.len(), cl);
+    let b_photo = (2..64)
+        .map(|s| jpeg_smooth(1024, 768, s))
+        .find(|j| j.len() < a.len() && clusters_in(j.len(), cl) == need)
+        .expect("a shorter photo of as many clusters");
+    let clusters: Vec<u32> = (3000..3000 + need).collect();
+    let mut b = exfat(cl as u32);
+    let (pa, pb) = ("DCIM/100MSDCF/DSC00001.JPG", "DCIM/100MSDCF/DSC00002.JPG");
+    b.add_at(pa, &a, &clusters);
+    b.delete(pa, DeleteStyle::Camera);
+    b.add_at(pb, &b_photo, &clusters);
+    b.delete(pb, DeleteStyle::Camera);
+    let mut v = b.build();
+    old_data(&b, &mut v, 2900..3200, &clusters, cl);
+    let (src, ev) = scanned(&v);
+    let start = VOL + b.cluster_offset(3000);
+    let view = final_view(&ev);
+    let f = view
+        .values()
+        .find(|f| f.start == start)
+        .unwrap_or_else(|| panic!("a finding at the shared start: {view:#?}"));
+    assert_eq!(
+        (f.kind, f.health, f.len, f.origin.is_none()),
+        (FileKind::Jpeg, Health::Intact, b_photo.len() as u64, true),
+        "{f:#?}"
+    );
+    same(&extracted(&src, f), &b_photo);
+}

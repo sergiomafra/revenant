@@ -2,8 +2,6 @@
 //! its own pieces) and how that merges with the carving at the same start, so a file found both ways comes out once
 //! (rulings D3, D5, D6, D7). Pure functions of the source's bytes, so the result does not depend on who measures.
 
-use std::cmp::Ordering;
-
 use super::pipeline::{self, Measured};
 use crate::filesystem::{FsFile, FsOrigin, FsState, Listing, Placement};
 use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
@@ -85,33 +83,43 @@ fn overlaps(ranges: &[Fragment], start: u64, end: u64) -> bool {
     ranges.get(i).is_some_and(|r| r.start < end)
 }
 
-/// Whether `a` is kept over `b` at the same start: live before deleted, then the latest `modified` (a missing one loses
-/// to a present one), then listing order (`a` comes first, so a tie keeps it).
-fn beats(a: &FsFile, b: &FsFile) -> bool {
-    let live = |f: &FsFile| f.origin.state == FsState::Live;
-    match live(a).cmp(&live(b)) {
-        Ordering::Greater => return true,
-        Ordering::Less => return false,
-        Ordering::Equal => {}
-    }
-    // "YYYY-MM-DDTHH:MM:SS" sorts as it reads; `None` sorts first.
-    let modified = |f: &FsFile| f.origin.modified.as_ref().map(|t| t.local.clone());
-    modified(a) >= modified(b)
+/// The order of the files at one start: live before deleted, then the latest `modified` (a missing one loses to a
+/// present one). "YYYY-MM-DDTHH:MM:SS" sorts as it reads; `None` sorts first.
+fn rank_at_start(f: &FsFile) -> (bool, Option<String>) {
+    (
+        f.origin.state == FsState::Live,
+        f.origin.modified.as_ref().map(|t| t.local.clone()),
+    )
 }
 
-/// One file per distinct first-piece start, `files` sorted by it (the listing's order).
+/// One file per distinct first-piece start, `files` sorted by it (the listing's order): the first of the highest
+/// [`rank_at_start`]. When that is a deleted file and another deleted file ranks the same (deleted entries over each
+/// other with equal times: an unset clock, the 2-second resolution), which one the clusters hold cannot be told, so
+/// neither is kept: the head there is carved like any other, without a name (part 1.6, ruling Q52).
 pub(crate) fn keep(files: Vec<FsFile>) -> Vec<FsFile> {
     let mut out: Vec<FsFile> = Vec::with_capacity(files.len());
-    for f in files {
-        match out.last_mut() {
-            Some(last) if last.pieces[0].start == f.pieces[0].start => {
-                if !beats(last, &f) {
-                    *last = f;
-                }
-            }
-            _ => out.push(f),
+    let mut group: Vec<FsFile> = Vec::new();
+    let flush = |group: &mut Vec<FsFile>, out: &mut Vec<FsFile>| {
+        let Some(best) = group.iter().map(rank_at_start).max() else {
+            return;
+        };
+        let mut top = group.drain(..).filter(|f| rank_at_start(f) == best);
+        let first = top.next().expect("the best is in the group");
+        let tied = top.next().is_some();
+        if !(tied && first.origin.state == FsState::Deleted) {
+            out.push(first);
         }
+    };
+    for f in files {
+        if group
+            .first()
+            .is_some_and(|g| g.pieces[0].start != f.pieces[0].start)
+        {
+            flush(&mut group, &mut out);
+        }
+        group.push(f);
     }
+    flush(&mut group, &mut out);
     out
 }
 
@@ -639,10 +647,27 @@ mod tests {
             at(FsState::Deleted, None, "B"),
         ];
         assert_eq!(names(v), ["A"]);
-        // Then listing order.
+        // Deleted files tied (equal times, or none): neither is kept (Q52), unless one ranks above them.
         let v = vec![
             at(FsState::Deleted, None, "FIRST"),
             at(FsState::Deleted, None, "SECOND"),
+        ];
+        assert!(names(v).is_empty());
+        let v = vec![
+            at(FsState::Deleted, Some("2025-01-01T00:00:00"), "A"),
+            at(FsState::Deleted, Some("2025-01-01T00:00:00"), "B"),
+        ];
+        assert!(names(v).is_empty());
+        let v = vec![
+            at(FsState::Deleted, Some("2025-01-01T00:00:00"), "A"),
+            at(FsState::Deleted, Some("2025-01-01T00:00:00"), "B"),
+            at(FsState::Deleted, Some("2025-02-01T00:00:00"), "NEWER"),
+        ];
+        assert_eq!(names(v), ["NEWER"]);
+        // Live files tied: listing order, as before.
+        let v = vec![
+            at(FsState::Live, None, "FIRST"),
+            at(FsState::Live, None, "SECOND"),
         ];
         assert_eq!(names(v), ["FIRST"]);
         // Other starts are all kept.

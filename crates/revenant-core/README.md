@@ -1806,6 +1806,10 @@ a probe over the raw source that refuses, without reading it, any range the cach
   (with a sector above 512 the others are dropped silently; the carving still finds them). When several share a
   first-piece start (deleted entries over each other, a cross-link), one is kept: a live one before a deleted one, then
   the latest `modified` (a missing time loses to a present one), then listing order; the others are not reported.
+  When the best of them is deleted and another deleted one ties with it (equal times, or none: a camera with an unset
+  clock, a re-shot within the 2-second resolution), which one the clusters hold cannot be told, so none is kept: the
+  head there is carved like any other, without a name (ruling Q52). Before, the first in listing order was kept, and
+  its size could place another photo's bytes with the slack after them as `Intact` under the wrong name.
 - **Nothing is skipped because of the file system** (ruling R10): every head the signature rules examine is still
   examined, and only an `Intact` finding skips its pieces, as before.
 - **A listed file's finding** is added at the sector holding its first piece, always (whether a format recognizes the
