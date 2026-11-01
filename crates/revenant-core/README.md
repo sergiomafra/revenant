@@ -823,8 +823,11 @@ the file's read budget and must lie in place in the first piece: no seam falls i
   after it. The boxes (a `moof`, an `mdat` header, the head, an `mfro`) never count as evidence across a seam. So a
   seam on or near a fragment boundary is never proven by content, and the video is then at most `Partial` (until a
   file system proves its placement, D14), as is any video whose fragments are smaller than about a unit (each cut then
-  has a fragment start within a unit after it). Such a result, complete and of the same length as a deleted file's
-  earlier one-piece guess, still replaces it (its pieces). Otherwise the walk ends at the last valid box (an invalid
+  has a fragment start within a unit after it). Such a result, complete, `Partial` and of the same length as the
+  finding's earlier `Partial` placement, replaces it (its pieces) only when that placement's own pieces, walked the
+  same way, fail before their end by content (ruling Q43: a guessed one-piece run with other data in it); a placement
+  its content does not refute, whatever placed it (a guess, a recorded run, a chain), stays, and `improves` is the only
+  rule otherwise (D6). Otherwise the walk ends at the last valid box (an invalid
   header after it: the end of the file, or another file's data), and the result is at most `Partial`; one whose chain
   is valid to the very end of its pieces counts as complete for `improves`, so it replaces a shorter earlier result.
   The prefilter checks what the walks expected within one unit after the seam (the next box header, the samples of the

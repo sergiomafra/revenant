@@ -1524,15 +1524,64 @@ fn finding(f: &Finding, found: &Search, kind: FileKind, checks: &Checks) -> Opti
     })
 }
 
-/// Whether `new`, complete but no better than `old` by [`improves`] (both `Partial`, no longer), still replaces it: it
-/// has the same length and other pieces (a deleted file guessed in one piece, its content refuted there, and put back
-/// in the pieces its content proves only up to `Partial`, such as a fragmented video cut between fragments, Q42).
-fn replaces(old: &Finding, new: &Finding, complete: bool) -> bool {
-    complete
+/// A format whose walk can tell that a placement's bytes are not the file's.
+pub(crate) trait Refutes {
+    /// Whether the walk of `view` from the file's start fails before its end by content (a check refutes its bytes);
+    /// a cut by the view's end, an unreadable byte or spent steps refute nothing.
+    fn refutes(&mut self, view: &dyn Source) -> bool;
+}
+
+impl Refutes for VideoSeams {
+    fn refutes(&mut self, view: &dyn Source) -> bool {
+        let mut r = Reader::with_window(view, WALK_WINDOW);
+        if let Some(head) = self.head.clone()
+            && let InPlace::Differs(_) = head_in_place(&mut r, &head, view.len())
+        {
+            return true;
+        }
+        matches!(
+            self.walk_all(&mut r, view.len(), &mut |_, _, _| {}),
+            Err(SampleEnd::Fail { .. })
+        )
+    }
+}
+
+impl Refutes for MoofSeams {
+    fn refutes(&mut self, view: &dyn Source) -> bool {
+        let len = view.len();
+        let run = self.run(view, &MoofState::default(), len, false, &mut |_, _, _| {});
+        run.failed && !matches!(run.end, WalkEnd::Stopped)
+    }
+}
+
+/// Whether `new`, complete but no better than `old` by [`improves`] (both `Partial`, the same length), still replaces
+/// it (ruling Q43): it has other pieces, and `old`'s own pieces (its `fragments`, else one piece of its length), walked
+/// by the same seams over `source`, fail before their end by content. Whatever placed `old` (a guess, a recorded run,
+/// a chain), a placement its content does not refute stays: otherwise [`improves`] is the only rule (D6).
+fn replaces(
+    old: &Finding,
+    new: &Finding,
+    complete: bool,
+    source: &dyn Source,
+    seams: &mut dyn Refutes,
+) -> bool {
+    if !(complete
         && old.health == Health::Partial
         && new.health == Health::Partial
         && new.len == old.len
-        && new.fragments != old.fragments
+        && new.fragments != old.fragments)
+    {
+        return false;
+    }
+    let pieces = if old.fragments.is_empty() {
+        vec![Fragment {
+            start: old.start,
+            len: old.len,
+        }]
+    } else {
+        old.fragments.clone()
+    };
+    seams.refutes(&Fragmented::new(source, pieces))
 }
 
 /// A video whose index comes before its media data (its own `moov` first, or fragments) searched; `None` when `f` has
@@ -1561,7 +1610,7 @@ pub(crate) fn reassemble_index_first(
     let space = Space::new(ctx.grids, f.start, source.len(), taken, ctx.starts, limits);
     let counted = Counted::new(source);
     counted.set_limit(limits.file_read.min(budget.read));
-    let (found, own_ok, clean) = if layout.mdat.is_some() {
+    let (found, own_ok, clean, mut seams): (_, _, _, Box<dyn Refutes>) = if layout.mdat.is_some() {
         let seams = VideoSeams::with_own_moov(&counted, f.start);
         budget.charge(0, counted.read());
         let mut seams = seams?.with_unit(space.unit());
@@ -1572,7 +1621,7 @@ pub(crate) fn reassemble_index_first(
             return Some(None);
         };
         let own = index_health(seams.moov_payload(), found.len, false) == Health::Intact;
-        (found, own, false)
+        (found, own, false, Box::new(seams))
     } else {
         let seams = MoofSeams::new(&counted, f.start);
         budget.charge(0, counted.read());
@@ -1586,14 +1635,15 @@ pub(crate) fn reassemble_index_first(
         let clean = !found.complete
             && known.is_none()
             && seams.clean(&Fragmented::new(source, found.pieces.clone()));
-        (found, true, clean)
+        (found, true, clean, Box::new(seams))
     };
     if cancel.is_cancelled() || found.pieces.first().map(|p| p.start) != Some(f.start) {
         return Some(None);
     }
     let checks = checks(ctx, source, &found, known, own_ok);
     Some(finding(f, &found, layout.kind, &checks).filter(|new| {
-        improves(f, new, found.complete || clean) || replaces(f, new, found.complete)
+        improves(f, new, found.complete || clean)
+            || replaces(f, new, found.complete, source, seams.as_mut())
     }))
 }
 
@@ -2523,5 +2573,110 @@ mod tests {
                 "{f:?}"
             );
         }
+    }
+
+    /// A `Partial` finding of `bytes`' length at `start`, in `pieces` (none: one piece).
+    fn partial_at(start: u64, len: u64, pieces: Vec<Fragment>) -> Finding {
+        Finding {
+            id: 1,
+            start,
+            len,
+            kind: FileKind::Mp4,
+            health: Health::Partial,
+            fragments: pieces,
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn a_placement_its_content_does_not_refute_is_not_replaced() {
+        // Ruling Q43: a complete `Partial` reassembly of the same length replaces an old `Partial` placement only when
+        // the old pieces, walked by the same seams, fail before their end.
+        const C: u64 = 32 << 10;
+        let (a, _) = padded_parts(13);
+        let clip = a.concat();
+        let len = clip.len() as u64;
+        // The clip whole at cluster 0 of a card, and a complete `Partial` reassembly in other pieces.
+        let mut card = noise_card(400, C);
+        card[HEAP as usize..(HEAP + len) as usize].copy_from_slice(&clip);
+        let src = Mem(card);
+        let old = partial_at(HEAP, len, Vec::new());
+        let mut new = old.clone();
+        new.fragments = vec![
+            Fragment {
+                start: HEAP,
+                len: 5 * C,
+            },
+            Fragment {
+                start: HEAP + 200 * C,
+                len: len - 5 * C,
+            },
+        ];
+        let mut seams = MoofSeams::new(&src, HEAP).unwrap().with_unit(C);
+        assert!(
+            !replaces(&old, &new, true, &src, &mut seams),
+            "the old pieces pass"
+        );
+        // The same old placement with other data from its sixth cluster on: refuted, replaced.
+        let mut card = src.0.clone();
+        card[(HEAP + 5 * C) as usize..(HEAP + 6 * C) as usize].fill(0x5A);
+        let src = Mem(card);
+        let mut seams = MoofSeams::new(&src, HEAP).unwrap().with_unit(C);
+        assert!(
+            replaces(&old, &new, true, &src, &mut seams),
+            "the old pieces fail"
+        );
+        // Never a better health, a shorter or longer one, the same pieces or an incomplete one.
+        assert!(!replaces(&old, &old, true, &src, &mut seams));
+        assert!(!replaces(&old, &new, false, &src, &mut seams));
+    }
+
+    #[test]
+    fn a_moof_per_track_is_walked_through() {
+        // An audio-only `moof` (track 2) after each video fragment, the sequence renumbered: the walk follows the chain
+        // to the known size.
+        let (a, _) = padded_parts(13);
+        let clip = a.concat();
+        let mut out = Vec::new();
+        let mut pos = 0;
+        let mut seq = 0u32;
+        let be =
+            |b: &[u8], at: usize| u32::from_be_bytes(b[at..at + 4].try_into().unwrap()) as usize;
+        while pos < clip.len() {
+            let size = be(&clip, pos);
+            let kind = clip[pos + 4..pos + 8].to_vec();
+            let mut bytes = clip[pos..pos + size].to_vec();
+            if kind == b"moof" {
+                seq += 1;
+                bytes[8 + 12..8 + 16].copy_from_slice(&seq.to_be_bytes());
+            }
+            out.extend_from_slice(&bytes);
+            if kind == b"mdat" {
+                seq += 1;
+                let mut mfhd = vec![0u8; 4];
+                mfhd.extend_from_slice(&seq.to_be_bytes());
+                let mut tfhd = 0x02_0000u32.to_be_bytes().to_vec();
+                tfhd.extend_from_slice(&2u32.to_be_bytes());
+                let build = |off: i32| {
+                    let mut trun = 0x201u32.to_be_bytes().to_vec();
+                    trun.extend_from_slice(&1u32.to_be_bytes());
+                    trun.extend_from_slice(&off.to_be_bytes());
+                    trun.extend_from_slice(&100u32.to_be_bytes());
+                    let traf = bx(b"traf", &[bx(b"tfhd", &tfhd), bx(b"trun", &trun)].concat());
+                    bx(b"moof", &[bx(b"mfhd", &mfhd), traf].concat())
+                };
+                let n = build(0).len() as i32;
+                out.extend(build(n + 8));
+                out.extend(bx(b"mdat", &[0x5A; 100]));
+            }
+            pos += size;
+        }
+        let src = Mem(out.clone());
+        let mut seams = MoofSeams::new(&src, 0)
+            .unwrap()
+            .with_known(Some(out.len() as u64));
+        let from = seams.begin();
+        let w = seams.walk(&src, &[], &from, src.len());
+        assert!(matches!(w.end, WalkEnd::Complete { len } if len == out.len() as u64));
     }
 }
