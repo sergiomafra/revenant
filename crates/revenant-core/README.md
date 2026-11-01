@@ -1257,6 +1257,40 @@ similar photos with the same tables) can give the walk no break at that cluster 
 through the other photo's run and may find no complete solution, and the photo keeps its earlier result (or comes out
 `Partial` with what fitted), never `Intact`.
 
+### Realistic cards (`tests/reassembly_cards.rs`)
+
+Cards built the way a camera fills them, each on exFAT (128 MiB, 32 KiB and 128 KiB clusters) with both allocations
+of the testkit: the lowest free cluster first (`Alloc::FirstFit`) and a rotating next-free pointer that wraps at the
+end of the card (`Alloc::NextFree`). A shot is its ARW (1536×1024, lossless or uncompressed) written first, then its
+JPEG (DRI 0, sizes that differ from shot to shot); a long clip fills the card so the pointer wraps into the holes;
+every cluster no file took holds old data (noise); each file is a minute newer than the one before.
+
+- **Delete in camera, shoot again**: 12 shots, shots 3, 6 and 9 deleted in camera, 8 more shots and 2 clips (in the
+  holes, or at the end and then in the holes), then 2 of the new shots deleted in camera too; lossless and uncompressed
+  RAWs.
+- **Format in camera, shoot again**: the same life up to 20 shots, quick-formatted, then 6 shots over the start: the old
+  files have no entry left, they are carved and reassembled from content.
+- **Delete on a computer**: JPEG-only shots and clips culled in camera (holes smaller than a RAW next to larger ones),
+  8 more shots, then the first 5 new shots (or clips) in pieces deleted on a computer: exFAT clearing the chain
+  (`ZeroChain`), and FAT32 (260 MiB, 4 KiB clusters, the smallest FAT32 on a cluster grid) as Windows does.
+- **A burst of look-alikes**: `jpeg_burst(2048, 1536, 4, 6)` written next-free into holes of 1–3 clusters between live
+  photos, then deleted (in camera or on a computer).
+
+Two oracles run over every card (ruling Q51). `no_intact_finding_is_glued`: the extracted bytes of every `Intact` final
+finding equal exactly one file ever written (a RAW's own preview found at its place in the RAW is the same file, Q16);
+never relaxed. `recovered`: every file still whole on the card comes back at its start with its exact bytes and the
+health its proof allows: `Intact` for one piece, a live chain, a surviving exFAT chain no other entry claims (D14), a
+video placed by content (its sample table) and a lossless RAW cut only at tile boundaries; `Partial` for a RAW cut
+inside a tile, its preview or its sensor data and for a JPEG in three or more pieces placed by content (Q37); a JPEG in
+two pieces may be `Intact` through the 1.3 two-piece join (unchanged by Q37). Two gaps for videos are recorded, not
+failed (never `Intact`): a deleted `moov`-at-end video in pieces whose file-system guess is already exact holds its own
+`moov`, which is then no orphan, so it is not searched and stays `Partial` with its exact bytes; one whose first piece
+ends the heap and goes on at its start (the next-free pointer wrapping) is not recovered whole.
+
+The allocation is an assumption (design D19): how Sony's firmware picks clusters is not known, so the cards may not
+cover the real pattern; the manual run on a real card (part 1.6, task 13) checks it. The cards are built and scanned
+once per test binary (the files encoded once, in parallel, at most 4 cards at a time); about 100 s in a debug build.
+
 ## File systems: volumes
 
 `filesystem::volumes(source)` lists every FAT12, FAT16, FAT32 and exFAT volume of a source, in offset order (at most 16,
