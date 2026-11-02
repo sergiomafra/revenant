@@ -221,6 +221,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   padded to the same block) still cannot be told apart: the file comes out whole and exact, but under the older
   file's name and dates. A RAW that the camera pads with zeros to its usual block (as Sony does) is not mistaken for
   this: it keeps its name, and a deleted RAW in pieces whose old chain checks out keeps coming back intact.
+- A deleted video's entry over another, shorter clip that the scan put back together from its pieces gave that clip,
+  exact, under the old entry's name, reported intact, though its length was not the entry's. A file put back together
+  whose length is not its entry's now comes out without the name, and at most partial.
 - A deleted video in pieces whose place the card's file system already gave right (only other files between its
   pieces) came back with its exact bytes but only partial, and one whose piece ran into an old deleted entry's spot
   could not be put back at all: both now come back intact when every frame checks out across the seams.

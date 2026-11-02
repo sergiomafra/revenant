@@ -650,6 +650,7 @@ impl Commit<'_, '_> {
             {
                 f.health = Health::Partial;
             }
+            self.name_only_at_size(&mut f);
             out.push(f);
         }
         Ok((out, budget))
@@ -687,7 +688,7 @@ impl Commit<'_, '_> {
             return Err(EngineError::Cancelled);
         }
         self.shared.check()?;
-        Ok(out
+        let mut out: Vec<Finding> = out
             .into_iter()
             .filter(|f| {
                 // A reassembly bug: caught in debug builds, ignored (no event) in release.
@@ -695,7 +696,31 @@ impl Commit<'_, '_> {
                 debug_assert!(ok, "pieces contract broken by the reassembly: {f:?}");
                 ok
             })
-            .collect())
+            .collect();
+        for f in &mut out {
+            self.name_only_at_size(f);
+        }
+        Ok(out)
+    }
+
+    /// Ruling Q57: a pairing or reassembly result of a deleted entry whose length is not the entry's recorded size
+    /// (outside a TIFF RAW's own grain padding, Q54 (b)) is another file than the entry: it carries no name, and is at
+    /// most `Partial` to the end of the scan like any finding reported without its entry's name (Q55 (2)).
+    fn name_only_at_size(&mut self, f: &mut Finding) {
+        let Some(o) = &f.origin else {
+            return;
+        };
+        if o.state != FsState::Deleted || f.len == o.size || fs::raw_padding(f.kind, f.len, o.size)
+        {
+            return;
+        }
+        f.origin = None;
+        if f.health == Health::Intact {
+            f.health = Health::Partial;
+        }
+        if let Err(k) = self.unnamed.binary_search(&f.id) {
+            self.unnamed.insert(k, f.id);
+        }
     }
 
     /// After the pairing and the reassembly: the names the old directories give (ruling D11), merged with the pairing's

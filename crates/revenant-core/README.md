@@ -418,7 +418,11 @@ measurement, however many checks need it.
 
 `formats::Jpeg` follows the marker segments by their declared lengths (so the thumbnail embedded in an APP1/EXIF segment does
 not end the file; DAC and JPG markers count as segments, and `FF` fill bytes before a marker are skipped), requires DQT and SOF before SOS, and scans the entropy-coded data up to EOI (`FF D9`), up to
-`JPEG_MAX_LEN` (64 MiB). If the header walk breaks on an unreadable sector, the search for EOI continues from there. Health:
+`JPEG_MAX_LEN` (64 MiB). If the header walk breaks on an unreadable sector, the search for EOI continues from there. A
+carved JPEG ends at its primary image's EOI: the images a camera appends after it (MPF previews, a motion photo's
+video) are not part of its measure; they come back as findings of their own only when they start on a sector (the
+scan examines heads at sector starts), and with the file through a file-system entry, whose tail check counts them
+(D6). Health:
 
 - `Intact`: EOI found, no unreadable sector inside, and the content verified (ruling Q6). For a frame Revenant's entropy
   decoder covers (below), the evidence is that decoder walking every MCU, the exact count with restart markers in
@@ -1252,7 +1256,9 @@ is complete (its walk reached the file's end) and longer; for a JPEG, a video wi
 a complete `Partial` result of the same length with other pieces when the old finding's own pieces fail by content
 (Q43; a JPEG: its entropy-coded data does not decode through them, an unreadable sector refuting nothing), as a
 deleted file's guess over old data does. It then comes out as an `Event::Updated` with the same id
-(its pieces, length and health; a deleted file keeps its origin, with placement `Carved`, D15), merged with the
+(its pieces, length and health; a deleted file keeps its origin, with placement `Carved`, D15, when the result's
+length is the entry's recorded size, or a TIFF RAW's grain padding of it; another length is another file: no name,
+at most `Partial`, ruling Q57; so for the pairing's results), merged with the
 pairing's and the old folders' updates for that id (the reassembly's pieces win over the pairing's). An `Intact` result
 claims its pieces for the candidates after it. A cancel stops the step (the scan returns `cancelled`, no `Updated`);
 a source that vanishes during it stops the scan with `device_gone`.
@@ -1849,7 +1855,8 @@ a probe over the raw source that refuses, without reading it, any range the cach
   exemption (Q55 (1)): a camera that allocates next-free fills a deleted file's freed runs in order, so a shorter
   photo can take its exact chain. Cost: a deleted photo that really was zero-padded inside its recorded size loses its
   name (it is still recovered); a clip with a size-0 `mdat` whose own padding follows its last sample loses it too.
-  **The content's end** (ruling Q56) is the format's full extent, taken once before the fill check: the structure's
+  **The content's end** (ruling Q56; for deleted entries only, Q57: a live file keeps the 1.4 measure, a size-0
+  `mdat` running to the end of its file) is the format's full extent, taken once before the fill check: the structure's
   end (for a video whose index comes first and whose `mdat` has size 0, "to the end of the file", the highest sample
   end its index lists: otherwise such an `mdat` would run to the entry's size whatever the clip), then the whole files
   D6 allows after it (an MPF image, a motion photo's video, as most camera JPEGs carry). So a shorter camera JPEG with

@@ -2146,10 +2146,17 @@ fn clip_mdat_size_zero(samples: usize, seed: u64) -> Vec<u8> {
     .bytes
 }
 
-/// No finding is `Intact` under A's name with other bytes than A's, and the finding at A's start is no `Intact` file
-/// of bytes that are neither A's nor B's (B's primary image without the image appended to it, which the carving
-/// reports as its own finding, is B's).
-fn no_false_intact(a: &[u8], b_file: &[u8], pa: &str, start: u64, src: &SimSource, ev: &[Event]) {
+/// No finding is `Intact` under A's name with other bytes than A's, and the finding at A's start, when `Intact`, is
+/// exactly A, B or one of `also` (review M-10: exact equality, never a prefix).
+fn no_false_intact(
+    a: &[u8],
+    b_file: &[u8],
+    also: &[&[u8]],
+    pa: &str,
+    start: u64,
+    src: &SimSource,
+    ev: &[Event],
+) {
     for f in final_view(ev)
         .values()
         .filter(|f| f.health == Health::Intact)
@@ -2163,7 +2170,7 @@ fn no_false_intact(a: &[u8], b_file: &[u8], pa: &str, start: u64, src: &SimSourc
             if named_a {
                 got == a
             } else {
-                got == a || b_file.starts_with(&got)
+                got == a || got == b_file || also.contains(&got.as_slice())
             },
             "a false Intact: {f:#?}"
         );
@@ -2178,13 +2185,20 @@ fn deleted_entry_over_a_shorter_jpeg_with_an_appended_image_names_nothing() {
     let cl = 4096u64;
     let a = jpeg_smooth(1024, 768, 1);
     let need = clusters_in(a.len(), cl);
-    let b_file = (2..200)
-        .map(jpeg_with_appended)
-        .find(|j| j.len() < a.len() && clusters_in(j.len(), cl) == need)
+    let seed = (2..200)
+        .find(|&s| {
+            let j = jpeg_with_appended(s);
+            j.len() < a.len() && clusters_in(j.len(), cl) == need
+        })
         .expect("a shorter photo with an appended image, of as many clusters");
+    let b_file = jpeg_with_appended(seed);
+    // Ruling Q57: the carving at A's start may be B's whole primary image, nameless, `Intact`, without its appended
+    // image: that one does not start on a sector, so the scan never examines its head (a carved JPEG ends at its
+    // primary EOI since 1.3). No foreign byte, no name: accepted, and asserted exactly.
+    let b_primary = jpeg_smooth(1024, 768, seed);
     for fat in [false, true] {
         let (pa, start, src, ev) = deleted_entry_card(fat, cl, "JPG", &a, Some(&b_file), &[300]);
-        no_false_intact(&a, &b_file, &pa, start, &src, &ev);
+        no_false_intact(&a, &b_file, &[&b_primary], &pa, start, &src, &ev);
     }
 }
 
@@ -2221,7 +2235,7 @@ fn deleted_clip_over_a_shorter_mdat_size_zero_clip_names_nothing() {
         .expect("a shorter clip of as many clusters");
     for firsts in [&[300u32][..], &[300, 600, 900][..]] {
         let (pa, start, src, ev) = deleted_entry_card(false, cl, "MP4", &a, Some(&b_file), firsts);
-        no_false_intact(&a, &b_file, &pa, start, &src, &ev);
+        no_false_intact(&a, &b_file, &[], &pa, start, &src, &ev);
     }
 }
 
@@ -2235,4 +2249,104 @@ fn deleted_mdat_size_zero_clip_keeps_its_name() {
         assert_eq!(f.health, Health::Intact, "{firsts:?}: {f:#?}");
         same(&extracted(&src, &f), &a);
     }
+}
+
+#[test]
+fn live_clip_with_a_size_zero_mdat_keeps_the_bytes_after_its_last_sample() {
+    // Re-review 5 I-4 (ruling Q57): the content end of Q56 is for deleted entries only. A live clip whose `mdat` has
+    // size 0 runs to the end of the file: the bytes after its last sample are part of its `mdat`, nothing against it
+    // (the 1.4 measure). On 7ee4fd0: Partial.
+    let cl = 32 * 1024u64;
+    let mut a = clip_mdat_size_zero(40, 1);
+    a.extend((0..3000u32).map(|i| i.wrapping_mul(2_654_435_761).rotate_left(7) as u8 | 1));
+    let mut b = exfat(cl as u32);
+    let path = format!("{DIR}/DSC00001.MP4");
+    let clusters: Vec<u32> = (300..300 + clusters_in(a.len(), cl)).collect();
+    b.add_at(&path, &a, &clusters);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1300, &clusters, cl);
+    let (src, ev) = scanned(&v);
+    let f = final_named(&ev, &path);
+    assert_eq!(
+        (f.health, deleted_as(&f).0),
+        (Health::Intact, FsState::Live),
+        "{f:#?}"
+    );
+    same(&extracted(&src, &f), &a);
+}
+
+#[test]
+fn pairing_gives_no_name_to_a_clip_of_another_size() {
+    // Re-review 5 I-3 (ruling Q57): A, a deleted MP4 entry of 622,592 B in 3 runs; B, a moov-at-end clip of 557,710 B
+    // whose `mdat` ends on a cluster, written over A's first 2 runs and on (its `moov` right after), deleted, its slot
+    // reused. B's chain rewrote A's: A is a one-run guess, its view B's `mdat` head then other data (`Damaged`, named).
+    // The pairing puts B back exactly, in 2 pieces; its length is not A's recorded size, so the name is not A's: no
+    // name, at most `Partial` to the end (Q55 (2)). On 7ee4fd0: Intact under A's name.
+    let cl = 32 * 1024u64;
+    let mut pad = 0usize;
+    let bv = loop {
+        let v = camera_video(
+            &AvcOptions {
+                samples: 40,
+                seed: 5,
+                mov: false,
+                mdat_pad: pad,
+                small_nals: false,
+            },
+            VideoCodec::Avc,
+            VideoLayout::MoovAtEnd,
+        );
+        if (v.moov.start as u64).is_multiple_of(cl) {
+            break v;
+        }
+        pad += (v.moov.start as u64).next_multiple_of(cl) as usize - v.moov.start;
+    };
+    let b_file = bv.bytes.clone();
+    let n_mdat = (bv.moov.start as u64 / cl) as u32;
+    let (n1, n2) = (n_mdat / 2, n_mdat - n_mdat / 2);
+    let nm = clusters_in(bv.moov.len(), cl);
+    let n3 = 2u32;
+    let mut a: Vec<u8> = (0..(u64::from(n1 + n2) * cl) as u32)
+        .map(|i| i.wrapping_mul(2_654_435_761).rotate_left(7) as u8 | 1)
+        .collect();
+    a.resize((u64::from(n1 + n2 + n3) * cl) as usize, 0);
+    let ac: Vec<u32> = (300..300 + n1)
+        .chain(600..600 + n2)
+        .chain(900..900 + n3)
+        .collect();
+    let bc: Vec<u32> = (300..300 + n1).chain(600..600 + n2 + nm).collect();
+    let mut b = exfat(cl as u32);
+    b.reuse_slots(true);
+    let path = |n: u32, ext: &str| format!("{DIR}/DSC0000{n}.{ext}");
+    let (d, c) = (jpeg(64, 64, 9, 0), jpeg(64, 64, 10, 0));
+    b.add_at(&path(0, "JPG"), &d, &[20]);
+    b.add_at(&path(1, "MP4"), &a, &ac);
+    b.delete(&path(0, "JPG"), DeleteStyle::Camera);
+    b.delete(&path(1, "MP4"), DeleteStyle::Camera);
+    b.add_at(&path(2, "MP4"), &b_file, &bc);
+    b.delete(&path(2, "MP4"), DeleteStyle::Camera);
+    b.add_at(&path(3, "JPG"), &c, &[40]);
+    let mut v = b.build();
+    let mut keep = ac.clone();
+    keep.extend(&bc);
+    old_data(&b, &mut v, 64..1300, &keep, cl);
+    let (src, ev) = scanned(&v);
+    let start = VOL + b.cluster_offset(300);
+    let view = final_view(&ev);
+    let f = view
+        .values()
+        .find(|f| f.start == start)
+        .unwrap_or_else(|| panic!("a finding at A's start: {view:#?}"));
+    // The pairing put B back (its 2 pieces, exact).
+    same(&extracted(&src, f), &b_file);
+    assert_eq!(
+        (f.kind, f.health, f.origin.as_ref(), f.fragments.len()),
+        (FileKind::Mp4, Health::Partial, None, 2),
+        "{f:#?}"
+    );
+    assert!(
+        view.values()
+            .all(|f| f.origin.as_ref().is_none_or(|o| o.path() != path(1, "MP4"))),
+        "A's name is given to nothing"
+    );
 }

@@ -229,20 +229,24 @@ fn content_end(view: &dyn Source, kind: FileKind, l: u64) -> u64 {
     }
 }
 
-/// How a file of `kind` measured `l` bytes into `view` ends against the recorded `size` (rulings D6, Q53–Q56):
+/// How a file of `kind` measured `l` bytes into `view` ends against the recorded `size` (rulings D6, Q53–Q57):
 /// `(tail_ok, padded, at_size)` of [`ViewMeasure`]. The content's end is the format's full extent: its structure's
-/// ([`content_end`]), then the whole files D6 allows after it (an MPF image, a motion photo's video), up to where only
+/// (for a `deleted` entry [`content_end`]; a live one keeps the 1.4 measure, a size-0 `mdat` to the end of its file,
+/// ruling Q57), then the whole files D6 allows after it (an MPF image, a motion photo's video), up to where only
 /// fill follows. `at_size`: that end is the size, or a TIFF RAW's own grain padding fills the rest ([`raw_padding`]);
 /// `padded`: fill follows it before the view's end, and it is no such RAW padding.
 fn ends(
     formats: &[Box<dyn Format>],
     view: &dyn Source,
-    kind: FileKind,
-    l: u64,
-    size: u64,
+    (kind, l): (FileKind, u64),
+    (deleted, size): (bool, u64),
     cancel: &CancelToken,
 ) -> (bool, bool, bool) {
-    let l = content_end(view, kind, l);
+    let l = if deleted {
+        content_end(view, kind, l)
+    } else {
+        l
+    };
     let Some(end) = tail_end(formats, view, l, cancel) else {
         return (false, false, false);
     };
@@ -256,7 +260,7 @@ fn ends(
 
 /// Ruling Q54 (b): the padding a camera writes into its own TIFF-based RAWs (Sony pads ARWs with zeros to a 4 KiB or
 /// 64 KiB multiple): a recorded `size` that is the structure's end `l` rounded up to one of those grains.
-fn raw_padding(kind: FileKind, l: u64, size: u64) -> bool {
+pub(crate) fn raw_padding(kind: FileKind, l: u64, size: u64) -> bool {
     matches!(
         kind,
         FileKind::Arw
@@ -337,7 +341,14 @@ pub(crate) fn measure_view(
     let (m, own) =
         measure_at(formats, &view, 0, cancel).map_or((None, Vec::new()), |x| (Some(x.m), x.own));
     let (tail_ok, padded, at_size) = m.as_ref().map_or((false, false, false), |m| {
-        ends(formats, &view, m.kind, m.len, f.origin.size, cancel)
+        let deleted = f.origin.state == FsState::Deleted;
+        ends(
+            formats,
+            &view,
+            (m.kind, m.len),
+            (deleted, f.origin.size),
+            cancel,
+        )
     });
     let old_chain = f.origin.state == FsState::Deleted && f.origin.placement == Placement::OldChain;
     let checks = old_chain
@@ -385,7 +396,13 @@ pub(crate) fn fs_job(
         && c.len <= piece.len
     {
         let view = Fragmented::new(source, f.pieces.clone());
-        let (tail_ok, padded, at_size) = ends(formats, &view, c.kind, c.len, f.origin.size, cancel);
+        let (tail_ok, padded, at_size) = ends(
+            formats,
+            &view,
+            (c.kind, c.len),
+            (true, f.origin.size),
+            cancel,
+        );
         return FsJobResult {
             view: ViewMeasure {
                 m: Some(c.clone()),
@@ -1041,9 +1058,8 @@ mod tests {
             ends(
                 &formats,
                 &src,
-                at.m.kind,
-                at.m.len,
-                size,
+                (at.m.kind, at.m.len),
+                (true, size),
                 &CancelToken::default(),
             )
         };
