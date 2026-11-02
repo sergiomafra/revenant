@@ -178,7 +178,13 @@ Rulings Q20 a Q59 do controlador (do registro de execução). Cada uma com o cus
   `recovered` exige bytes exatos e a saúde por tipo e prova. Custo: possível rodada extra.
 - **Q52:** carimbo de tempo igual (apagado antigo vence o empate) é bug do motor: empate ⇒ nenhum dos nomes; o `moov`
   próprio de um vídeo apagado passa a ser buscado; testkit ganha reuso de entradas. Custo: num empate verdadeiro os dois
-  nomes se perdem (a foto volta sem nome).
+  nomes se perdem (a foto volta sem nome). As partes (3) a (5): (3) a volta do NextFree ao início do heap já funcionava
+  (a ordem dos candidatos dá a volta: depois da janela, o "primeiro buraco" desde o início do heap); o clipe que dava a
+  volta só falhava pelos inícios de entradas velhas (corrigido na mesma rodada) e sai `Intact` nos cartões exFAT
+  NextFree, guardado pelo teste `deleted_video_wrapping_past_the_heap_end_is_intact`; sem resíduo; (4) a junção de dois pedaços da 1.3
+  com cauda quase igual segue `Intact` pelo Q37 (as regras da 1.3 não mudam; o oráculo só aceita `Intact` com bytes
+  exatos), limite documentado; (5) o testkit ganha `reuse_slots` (a entrada nova toma a primeira vaga livre ou apagada,
+  como as câmeras) e um cartão de apagar na câmera por tamanho de cluster o usa, para exercitar o `OldChain` e o N-1.
 - **Q53:** para uma entrada apagada, estrutura que termina antes do tamanho com só enchimento depois não prova
   identidade: o achado é a escultura, sem o nome. Custo: apagados com enchimento perdem o nome (voltam pelo conteúdo).
 - **Q54:** (b) o enchimento do próprio formato (RAW TIFF arredondado a 4 KiB ou 64 KiB) não dispara o Q53; (a) substituído

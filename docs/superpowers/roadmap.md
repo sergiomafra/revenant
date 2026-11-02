@@ -57,9 +57,10 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
     orçamento por arquivo e por busca.
   - Vídeo de câmera H.264/H.265: com o `moov` no fim, antes do `mdat`, com `mdat` de tamanho 0 e fragmentado (`moof`);
     cada quadro conferido onde o índice o põe, inclusive a peça do meio pequena.
-  - RAW (ARW primeiro; CR2, NEF, DNG, ORF, RW2) onde a emenda é provada: estrutura TIFF, prévia e, no sem perdas, cada
+  - RAW (ARW primeiro; CR2 só `Partial`; NEF, DNG, ORF, RW2) onde a emenda é provada: estrutura TIFF, prévia e, no sem perdas, cada
     bloco decodificado; `Intact` só com cortes exatamente entre blocos.
-  - Apagados e fragmentados no FAT/exFAT voltam no lugar, com nome e tamanho; no exFAT, a cadeia que sobrevive ao apagar
+  - Apagados e fragmentados no FAT/exFAT voltam no lugar, com nome e tamanho (sem nome quando a estrutura termina antes
+    do tamanho, Q53); no exFAT, a cadeia que sobrevive ao apagar
     na câmera é prova (`old_chain`) quando nada no cartão a contradiz.
   - Nunca cola duas fotos e chama de `Intact`: um JPEG em 2 ou mais pedaços posto só pelo conteúdo sai `Partial`.
   - Não cobre (para depois):

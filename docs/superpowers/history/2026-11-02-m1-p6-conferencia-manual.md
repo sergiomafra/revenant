@@ -143,18 +143,23 @@ resultados vão para a seção "Conferência manual" de `docs/superpowers/histor
    REVENANT_SAMPLES=$HOME/rv-a6700/dri cargo test --release -p revenant-core --test real_samples sony_restart_intervals -- --ignored --nocapture
    ```
 
-   Esperado: linhas `sony-ilce-6700.arw: JPEG at … (… B), 6192x4128, DRI 0` (e as das outras prévias) e a dos blocos
+   Esperado: linhas como `sony-ilce-6700.arw: JPEG at … (… B), 6192x4128, DRI 0` (por exemplo: 6192x4128 é o tamanho
+   da amostra CC0; o seu é o da sua câmera) (e as das outras prévias) e a dos blocos
    (`tiles, TileByteCounts …`, só no sem perdas). A amostra CC0 da A6700 deu DRI 0 em todas; um valor maior que 0 aqui
    muda o custo da 1.6 para a câmera: registre.
 
 ## 7. Repetir com os outros jeitos de apagar
 
 Para cada variante, repita o passo 5 inteiro (nova imagem `cardN.img`, `scanN.jsonl`, `achadosN`, `conferenciaN.txt`) e o
-passo 6.1–6.2, sempre partindo do cartão como ficou no passo anterior.
+passo 6.1–6.2, sempre partindo do cartão como ficou no passo anterior. As fotos novas de cada variante não têm resumo
+ainda: no passo 5.2, antes de desmontar, copie-as pelo Finder para `depois/` e rode de novo o comando do `depois.sha`
+(ele refaz a lista com tudo o que está em `depois/`), senão a contagem de `FALTA` não as cobre.
 
 1. **Apagar no computador (Mac):** com o cartão montado no Mac, apague no Finder as fotos 25 e 30 (os dois arquivos de
    cada) e o clipe 3, e **esvazie o Lixo** com o cartão ainda conectado (senão os arquivos só vão para `.Trashes` do
-   cartão). Antes de apagar, confira que eles já estão em `antes/`. Ejete, fotografe mais 10 fotos na câmera e faça o
+   cartão). Esvaziar o Lixo com o cartão conectado faz o macOS gravar no cartão (`.Trashes`, `.fseventsd`): num cartão
+   de teste isso é aceitável, mas muda o experimento (são escritas do sistema, não da câmera); anote. Antes de apagar,
+   confira que eles já estão em `antes/`. Ejete, fotografe mais 10 fotos na câmera e faça o
    passo 5 com `card2.img`. O que muda: o macOS pode zerar a cadeia; anote o `placement` desses apagados.
 2. **Apagar no computador (Windows), se houver um PC:** no Explorer, apague com **Shift+Delete** as fotos 35 e 40 e o
    clipe longo; fotografe mais 10 na câmera e faça o passo 5 no Mac com `card3.img` (a cópia pode ser no Mac).
