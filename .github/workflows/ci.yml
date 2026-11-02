@@ -24,7 +24,7 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings -W clippy::incompatible_msrv
       - name: Test
         run: cargo test --workspace
 
