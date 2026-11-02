@@ -583,6 +583,14 @@ pub(crate) trait Seams {
     fn settles_unproven(&self) -> bool {
         false
     }
+
+    /// Whether a first complete solution in two or more pieces settles the search whatever its proof: the caller's
+    /// health rule caps such a result at `Partial` (a JPEG placed by content alone, Q37), so the rest of the search and
+    /// the re-check could only take uniqueness away from it, and the result (the first solution) stays the same. It is
+    /// then reported neither unique nor exhaustive.
+    fn settles_in_pieces(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct Walked<S> {
@@ -707,6 +715,15 @@ impl<'a> Counted<'a> {
         self.limit.store(limit, Ordering::Relaxed);
     }
 
+    fn limit(&self) -> u64 {
+        self.limit.load(Ordering::Relaxed)
+    }
+
+    /// Counts `n` bytes as read (a walk charged again without reading them again: [`Ctx::replay`]).
+    fn add_read(&self, n: u64) {
+        self.read.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Whether a read was refused for the limit.
     fn over(&self) -> bool {
         self.over.load(Ordering::Relaxed)
@@ -760,7 +777,8 @@ enum Stop {
     Budget,
     /// A second complete solution: the result cannot be unique, nothing more to learn.
     Ambiguous,
-    /// The first complete solution is not `Proven` and the format settles for it ([`Seams::settles_unproven`]).
+    /// The first complete solution is not `Proven` and the format settles for it ([`Seams::settles_unproven`]), or it
+    /// is in pieces and the caller settles for it ([`Seams::settles_in_pieces`]).
     Settled,
 }
 
@@ -926,6 +944,18 @@ impl<'c, S: Seams> Ctx<'c, S> {
         if !self.charge() {
             return None;
         }
+        self.walk_charged(pieces, g, run, from, limit)
+    }
+
+    /// The same walk once its try is charged.
+    fn walk_charged(
+        &mut self,
+        pieces: &[Fragment],
+        g: u64,
+        run: u64,
+        from: &S::State,
+        limit: u64,
+    ) -> Option<Walked<S::State>> {
         let seams: Vec<u64> = pieces
             .iter()
             .scan(0, |end, p| {
@@ -938,6 +968,19 @@ impl<'c, S: Seams> Ctx<'c, S> {
         let source: &dyn Source = self.source;
         let view = Fragmented::new(source, v);
         Some(self.seams.walk(&view, &seams, from, limit))
+    }
+
+    /// Charges the walk `p` stands for again: one try, and its bytes when the file's read limit lets every one of them
+    /// be read again (else it must be walked again: [`Replay::Walk`], its try charged).
+    fn replay(&mut self, p: Prewalked<S::State>) -> Replay<S::State> {
+        if !self.charge() {
+            return Replay::Spent;
+        }
+        if self.source.read().saturating_add(p.read) > self.source.limit() {
+            return Replay::Walk;
+        }
+        self.source.add_read(p.read);
+        Replay::Done(p.walked)
     }
 
     /// Records `pieces ++ [g, len]` as a partial result when it checked more bytes than the best so far.
@@ -971,6 +1014,11 @@ impl<'c, S: Seams> Ctx<'c, S> {
         self.solutions.push((sol, blind));
         if self.solutions.len() >= 2 {
             self.stop = Some(Stop::Ambiguous);
+        } else if self.seams.settles_in_pieces()
+            && pruning()
+            && merged(&self.solutions[0].0).len() >= 2
+        {
+            self.stop = Some(Stop::Settled);
         } else if self.seams.settles_unproven() {
             // As the final proof does: past the read limit (its reads are still charged to the file).
             self.source.set_limit(u64::MAX);
@@ -993,6 +1041,21 @@ impl<'c, S: Seams> Ctx<'c, S> {
         l: u64,
         blind: bool,
     ) {
+        self.dfs_walked(pieces, from, g, l, blind, None);
+    }
+
+    /// [`Ctx::dfs`], with the walk of the candidate just made by [`Ctx::class_of`] (same pieces, start, state and
+    /// limit) when there is one: it is not walked again, but charged again as the walk it stands for (one try and the
+    /// bytes it read), so the budget and the result are those of walking it again.
+    fn dfs_walked(
+        &mut self,
+        pieces: &mut Vec<Fragment>,
+        from: &(u64, S::State),
+        g: u64,
+        l: u64,
+        blind: bool,
+        walked: Option<Prewalked<S::State>>,
+    ) {
         if self.stop.is_some() {
             return;
         }
@@ -1004,8 +1067,23 @@ impl<'c, S: Seams> Ctx<'c, S> {
         if run == 0 {
             return;
         }
-        let Some(w) = self.walk(pieces, g, run, &from.1, l + run) else {
-            return;
+        let w = match walked.filter(|p| p.run == run && reusing()) {
+            Some(p) => match self.replay(p) {
+                Replay::Done(w) => w,
+                Replay::Spent => return,
+                Replay::Walk => {
+                    let Some(w) = self.walk_charged(pieces, g, run, &from.1, l + run) else {
+                        return;
+                    };
+                    w
+                }
+            },
+            None => {
+                let Some(w) = self.walk(pieces, g, run, &from.1, l + run) else {
+                    return;
+                };
+                w
+            }
         };
         let checked = w.checked.clamp(l, l + run);
         self.partial(pieces, g, checked - l);
@@ -1105,14 +1183,8 @@ impl<'c, S: Seams> Ctx<'c, S> {
                 start: g,
                 len: b - l,
             });
-            let (evident, blinds) = self.classify(pieces, &st, g + (b - l), b);
             // Q2: blind candidates are descended into too, after the evident ones, and count toward uniqueness.
-            for g2 in evident {
-                self.dfs(pieces, &st, g2, b, blind);
-            }
-            for g2 in blinds {
-                self.dfs(pieces, &st, g2, b, true);
-            }
+            self.descend(pieces, &st, g + (b - l), b, blind, true);
             pieces.pop();
         }
     }
@@ -1211,10 +1283,7 @@ impl<'c, S: Seams> Ctx<'c, S> {
                 // format cannot check, filled from any free run) is not descended into.
                 let is_top = rank == 0 && top[i] == Some(b);
                 self.short = false;
-                let (evident, _) = self.classify(&pieces, &st, p.start + (b - starts[i]), b);
-                for g2 in evident {
-                    self.dfs(&mut pieces, &st, g2, b, false);
-                }
+                self.descend(&mut pieces, &st, p.start + (b - starts[i]), b, false, false);
                 // Walked to the end: no candidate or break-point cap, budget or cancel cut it short (the piece cap may be
                 // hit: past it no alternative fits).
                 top_done[i] |= is_top && !self.short && self.stop.is_none();
@@ -1247,6 +1316,59 @@ impl<'c, S: Seams> Ctx<'c, S> {
         ok.then_some(g2)
     }
 
+    /// The next piece's candidates after `pieces` (seam at logical `b`, absolute `end`), walked from `st`, descended into:
+    /// the evident ones (content evidence past the seam) in D4 order, then, with `blinds`, the blind ones (Q2), `blind`
+    /// telling whether the path so far had a seam without evidence.
+    ///
+    /// When the format's prefilter answers depend only on the candidate and the seam ([`Seams::memo_prefilter`]), each
+    /// candidate is walked when its turn comes, after the descents into the evident ones before it: the same descents in
+    /// the same order as walking them all first ([`Ctx::classify`]), but once the search stops (a second solution, a
+    /// settled first one, the budget) the candidates after it are never walked. Walking them all first spent most of a
+    /// scattered card's reassembly on candidates never descended into (Task 11: 80 843 candidate walks for 6 902
+    /// descents). A format whose prefilter remembers what earlier walks saw keeps the order of walks of `classify`.
+    #[allow(clippy::too_many_arguments)]
+    fn descend(
+        &mut self,
+        pieces: &mut Vec<Fragment>,
+        st: &(u64, S::State),
+        end: u64,
+        b: u64,
+        blind: bool,
+        blinds: bool,
+    ) {
+        if !(self.seams.memo_prefilter() && pruning()) {
+            let (evident, blind_ones) = self.classify(pieces, st, end, b);
+            for g2 in evident {
+                self.dfs(pieces, st, g2, b, blind);
+            }
+            if blinds {
+                for g2 in blind_ones {
+                    self.dfs(pieces, st, g2, b, true);
+                }
+            }
+            return;
+        }
+        let mut blind_ones = Vec::new();
+        for g2 in self.listed(pieces, end, b) {
+            if self.stop.is_some() {
+                break;
+            }
+            let (class, walked) = self.class_of(pieces, st, g2, b);
+            match class {
+                // Descended at once: its walk is the one just made.
+                Class::Evident => self.dfs_walked(pieces, st, g2, b, blind, walked),
+                Class::Blind => blind_ones.push(g2),
+                Class::Dropped => {}
+                Class::Halt => break,
+            }
+        }
+        if blinds {
+            for g2 in blind_ones {
+                self.dfs(pieces, st, g2, b, true);
+            }
+        }
+    }
+
     /// The candidates after `pieces` (seam at logical `b`, absolute `end`), walked from `st`: the evident ones (content
     /// evidence past the seam) and the blind ones (none: broken only further on, or complete through blind data), each
     /// in D4 order.
@@ -1257,6 +1379,26 @@ impl<'c, S: Seams> Ctx<'c, S> {
         end: u64,
         b: u64,
     ) -> (Vec<u64>, Vec<u64>) {
+        let cands = self.listed(pieces, end, b);
+        let mut evident = Vec::new();
+        let mut blinds = Vec::new();
+        for g2 in cands {
+            if self.stop.is_some() {
+                break;
+            }
+            match self.class_of(pieces, st, g2, b).0 {
+                Class::Evident => evident.push(g2),
+                Class::Blind => blinds.push(g2),
+                Class::Dropped => {}
+                Class::Halt => break,
+            }
+        }
+        (evident, blinds)
+    }
+
+    /// The candidate starts after `pieces` (seam at logical `b`, absolute `end`) in D4 order: the anchored one, the
+    /// file system's next piece and the listed free unit starts that pass the prefilter.
+    fn listed(&mut self, pieces: &[Fragment], end: u64, b: u64) -> Vec<u64> {
         let mut cands: Vec<u64> = self.anchored(pieces, end, b).into_iter().collect();
         let space = self.space;
         let cap = self.limits.seam_candidates;
@@ -1308,36 +1450,114 @@ impl<'c, S: Seams> Ctx<'c, S> {
                 None => {}
             }
         }
-        let mut evident = Vec::new();
-        let mut blinds = Vec::new();
-        for g2 in cands {
-            if self.stop.is_some() {
-                break;
-            }
-            let Some(max) = self.max_len(b) else {
-                break;
-            };
-            let run2 = space.free_run(g2, pieces, &self.own_at(g2, b), max);
-            if run2 == 0 {
-                continue;
-            }
-            let Some(w2) = self.walk(pieces, g2, run2, &st.1, b + run2) else {
-                break;
-            };
-            match w2.end {
-                // Complete without evidence past the seam (blind data to the end): blind, in D4 order with the others.
-                WalkEnd::Complete { .. } if w2.checked <= b => blinds.push(g2),
-                WalkEnd::Complete { .. } => evident.push(g2),
-                WalkEnd::Broken { .. } if w2.checked > b => evident.push(g2),
-                // No evidence either way at the seam, broken only further on (even inside its own run: a blind
-                // cluster then foreign data): blind, descended. Only a candidate broken right at the seam is dropped.
-                WalkEnd::Broken { at } if at > b => blinds.push(g2),
-                WalkEnd::Broken { .. } => {}
-                WalkEnd::Stopped => self.cut_short(),
-            }
-        }
-        (evident, blinds)
+        cands
     }
+
+    /// Candidate `g2` after `pieces` (seam at logical `b`) walked from `st`, and that walk with what it read.
+    fn class_of(
+        &mut self,
+        pieces: &[Fragment],
+        st: &(u64, S::State),
+        g2: u64,
+        b: u64,
+    ) -> (Class, Option<Prewalked<S::State>>) {
+        let space = self.space;
+        let Some(max) = self.max_len(b) else {
+            return (Class::Halt, None);
+        };
+        let run2 = space.free_run(g2, pieces, &self.own_at(g2, b), max);
+        if run2 == 0 {
+            return (Class::Dropped, None);
+        }
+        let before = self.source.read();
+        let Some(w2) = self.walk(pieces, g2, run2, &st.1, b + run2) else {
+            return (Class::Halt, None);
+        };
+        let read = self.source.read() - before;
+        let class = Self::class_of_walk(&w2, b);
+        if matches!(w2.end, WalkEnd::Stopped) {
+            self.cut_short();
+        }
+        // A walk a read was refused in (the file's read limit) stands for nothing: it is walked again.
+        let walked = (!self.source.over()).then_some(Prewalked {
+            walked: w2,
+            run: run2,
+            read,
+        });
+        (class, walked)
+    }
+
+    /// What walk `w2` of a candidate after a seam at logical `b` showed.
+    fn class_of_walk(w2: &Walked<S::State>, b: u64) -> Class {
+        match w2.end {
+            // Complete without evidence past the seam (blind data to the end): blind, in D4 order with the others.
+            WalkEnd::Complete { .. } if w2.checked <= b => Class::Blind,
+            WalkEnd::Complete { .. } => Class::Evident,
+            WalkEnd::Broken { .. } if w2.checked > b => Class::Evident,
+            // No evidence either way at the seam, broken only further on (even inside its own run: a blind
+            // cluster then foreign data): blind, descended. Only a candidate broken right at the seam is dropped.
+            WalkEnd::Broken { at } if at > b => Class::Blind,
+            WalkEnd::Broken { .. } => Class::Dropped,
+            WalkEnd::Stopped => Class::Dropped,
+        }
+    }
+}
+
+/// A candidate's walk made by [`Ctx::class_of`]: the free run it walked and the bytes it read.
+struct Prewalked<S> {
+    walked: Walked<S>,
+    run: u64,
+    read: u64,
+}
+
+/// What [`Ctx::replay`] did.
+enum Replay<S> {
+    /// Charged again: the walk stands.
+    Done(Walked<S>),
+    /// The budget is spent (the search stops).
+    Spent,
+    /// Its try is charged, but it must be walked again.
+    Walk,
+}
+
+/// What the walk of one candidate showed ([`Ctx::class_of`]).
+enum Class {
+    Evident,
+    Blind,
+    Dropped,
+    /// The search cannot go on here (no length left, or the budget is spent or the search cancelled).
+    Halt,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Unit tests: the search without the work it saves since part 1.6's measure (every candidate of a seam walked
+    /// before the first descent, no settling in pieces), to compare the outcomes (they must be the same).
+    pub(crate) static UNPRUNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Unit tests: every evident candidate walked again when descended into (to compare with [`Ctx::replay`]).
+    pub(crate) static NO_REUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a candidate's walk is reused when it is descended into at once ([`Ctx::dfs_walked`]); always, outside the
+/// unit tests that compare with [`NO_REUSE`].
+fn reusing() -> bool {
+    #[cfg(test)]
+    return !NO_REUSE.with(|u| u.get());
+    #[cfg(not(test))]
+    true
+}
+
+/// Whether the search skips the work that cannot change its result ([`Ctx::descend`], [`Seams::settles_in_pieces`]);
+/// always, outside the unit tests that compare with [`UNPRUNED`].
+fn pruning() -> bool {
+    #[cfg(test)]
+    return !UNPRUNED.with(|u| u.get());
+    #[cfg(not(test))]
+    true
 }
 
 /// The proof of a complete solution: the format's over its merged pieces, lowered to `Unproven` when a seam on its path
@@ -1406,10 +1626,18 @@ pub(crate) fn search<S: Seams>(
     ctx.dfs(&mut Vec::new(), &root, start, 0, false);
     // A read refused during the search makes it not exhaustive; one refused during the re-check does not.
     let refused = counted.over();
+    #[cfg(test)]
+    let main = (
+        ctx.tries,
+        counted.read(),
+        ctx.stop == Some(Stop::Budget) || refused,
+    );
     if ctx.solutions.len() == 1 && ctx.stop.is_none() {
         let left = budget.tries_left().saturating_sub(ctx.tries);
         ctx.recheck(limits.recheck_tries.min(left));
     }
+    #[cfg(test)]
+    let recheck = (ctx.tries - main.0, counted.read() - main.1);
 
     let Ctx {
         seams,
@@ -1463,6 +1691,18 @@ pub(crate) fn search<S: Seams>(
     {
         f.unique = false;
     }
+    #[cfg(test)]
+    measure::search(measure::SearchStat {
+        tries,
+        read: counted.read(),
+        recheck_tries: recheck.0,
+        recheck_read: recheck.1,
+        budget_hit: main.2,
+        recheck_spent: recheck.0 >= limits.recheck_tries,
+        exhaustive: found.as_ref().is_some_and(|f| f.exhaustive),
+        complete: found.as_ref().is_some_and(|f| f.complete),
+        unique: found.as_ref().is_some_and(|f| f.unique),
+    });
     budget.charge(tries, counted.read());
     found
 }
@@ -1749,10 +1989,14 @@ pub(crate) fn reassemble(
     // Which video first had a complete solution with each orphan `moov` (index in `ctx.moovs`).
     let mut owner: HashMap<usize, u64> = HashMap::new();
     let mut out: Vec<Finding> = Vec::new();
+    #[cfg(test)]
+    let step = measure::Step::begin();
     for f in candidates {
         if cancel.is_cancelled() || budget.spent() {
             break;
         }
+        #[cfg(test)]
+        let file = measure::File::begin(f, &budget);
         // A video with its index before its media data (its own `moov` first, or fragments).
         let index_first = if matches!(f.kind, FileKind::Mp4 | FileKind::Mov) && !done(f) {
             video::reassemble_index_first(source, f, &taken, ctx, &mut budget, cancel)
@@ -1802,6 +2046,8 @@ pub(crate) fn reassemble(
             }
             _ => None,
         };
+        #[cfg(test)]
+        file.end(&budget, new.as_ref());
         if let Some(new) = new {
             if new.health == Health::Intact {
                 taken.claim(&new.ranges());
@@ -1809,6 +2055,8 @@ pub(crate) fn reassemble(
             out.push(new);
         }
     }
+    #[cfg(test)]
+    step.end(candidates.len(), &budget);
     out
 }
 
@@ -1821,7 +2069,8 @@ fn reassemble_jpeg(
     budget: &mut Budget,
     cancel: &CancelToken,
 ) -> Option<Finding> {
-    let mut seams = jpeg::JpegSeams::new(source, f.start)?;
+    // Placed by content alone (below), a result in pieces is at most `Partial` (Q37): its first solution settles it.
+    let mut seams = jpeg::JpegSeams::new(source, f.start)?.settling_in_pieces();
     let space = Space::new(
         ctx.grids,
         f.start,
@@ -1962,5 +2211,7 @@ fn reassemble_raw(
         .then_some(new)
 }
 
+#[cfg(test)]
+pub(crate) mod measure;
 #[cfg(test)]
 mod tests;

@@ -2275,16 +2275,22 @@ pub enum BenchImage {
     /// An exFAT volume in an MBR disk (first LBA 8192) filling the image, holding the `DenseJpeg` files as live files
     /// in `DCIM/100TEST`, every 4th one deleted.
     ExfatCard,
+    /// An exFAT volume (128 KiB clusters, lowest free cluster first) in an MBR disk that a camera used for a long time:
+    /// rounds of shots (lossless ARW + JPEG pairs, JPEG-only shots, a clip), the JPEG-only shots and the clip deleted in
+    /// camera, the next round written into the holes (so its files lie in pieces), and the first pair in pieces of the
+    /// round before deleted in camera too, until the card is full. It measures the scan with the reassembly at work.
+    ScatteredCard,
 }
 
 impl BenchImage {
-    pub const ALL: [BenchImage; 6] = [
+    pub const ALL: [BenchImage; 7] = [
         BenchImage::Noise,
         BenchImage::DenseJpeg,
         BenchImage::DenseRaw,
         BenchImage::Video,
         BenchImage::CutJpeg,
         BenchImage::ExfatCard,
+        BenchImage::ScatteredCard,
     ];
 
     pub fn name(self) -> &'static str {
@@ -2295,6 +2301,7 @@ impl BenchImage {
             BenchImage::Video => "video",
             BenchImage::CutJpeg => "cut-jpeg",
             BenchImage::ExfatCard => "exfat-card",
+            BenchImage::ScatteredCard => "scattered-card",
         }
     }
 
@@ -2322,13 +2329,15 @@ fn write_noise(rng: &mut SplitMix64, mut n: u64, out: &mut dyn Write) -> std::io
 /// `DenseJpeg`/`CutJpeg` cycle 8 distinct JPEGs (3000×2000, else 320×240); `DenseRaw` cycles 4 RAWs (Arw, Nef, Cr2, Dng;
 /// 24 MiB / 1 MiB of raw data, preview 1616×1080 / 160×120); `Video` writes MP4s with `mdat` of 256 MiB / 8 MiB.
 pub fn write_bench_image(kind: BenchImage, len: u64, out: &mut dyn Write) -> std::io::Result<u64> {
-    if kind == BenchImage::ExfatCard {
-        return write_exfat_card(len, out);
+    match kind {
+        BenchImage::ExfatCard => return write_exfat_card(len, out),
+        BenchImage::ScatteredCard => return write_scattered_card(len, out),
+        _ => {}
     }
     let big = len >= BENCH_BIG;
     let files: Vec<Vec<u8>> = match kind {
         BenchImage::Noise => Vec::new(),
-        BenchImage::ExfatCard => unreachable!("handled above"),
+        BenchImage::ExfatCard | BenchImage::ScatteredCard => unreachable!("handled above"),
         BenchImage::DenseJpeg | BenchImage::CutJpeg => {
             let (w, h) = if big { (3000, 2000) } else { (320, 240) };
             (0..8).map(|s| jpeg(w, h, 100 + s, 30_000)).collect()
@@ -2431,6 +2440,142 @@ fn write_exfat_card(len: u64, out: &mut dyn Write) -> std::io::Result<u64> {
     out.write_all(&mbr_head(&mut volume, CARD_FIRST_LBA))?;
     out.write_all(&volume)?;
     Ok(names.len() as u64)
+}
+
+/// Cluster size of the `ScatteredCard` volume.
+const SCATTERED_CLUSTER: u32 = 128 * 1024;
+
+/// One shot of the `ScatteredCard` camera: the files it writes, as (extension, bytes).
+fn scattered_shot(n: u64, pair: bool, big: bool) -> Vec<(&'static str, Vec<u8>)> {
+    // The JPEG's size changes from shot to shot, as a camera's do, so the new files straddle the holes.
+    let (base, step, arw_size, preview) = if big {
+        (1280, 64, (1536, 1024), (640, 480))
+    } else {
+        (256, 16, (256, 256), (160, 120))
+    };
+    let w = base + step * (n as u32 * 7 % 11);
+    let mut files = Vec::new();
+    if pair {
+        let raw = arw(&ArwOptions {
+            compression: ArwCompression::Lossless,
+            width: arw_size.0,
+            height: arw_size.1,
+            preview,
+            seed: n,
+            ..ArwOptions::default()
+        });
+        files.push(("ARW", raw.bytes));
+    }
+    files.push(("JPG", jpeg_smooth(w, w / 4 * 3, 5000 + n)));
+    files
+}
+
+/// The `ScatteredCard` image (see [`BenchImage::ScatteredCard`]); returns how many files were written on the card
+/// (live or deleted, whole or overwritten since). Built in memory like `ExfatCard`.
+fn write_scattered_card(len: u64, out: &mut dyn Write) -> std::io::Result<u64> {
+    let (image, written) = scattered_card(len, SCATTERED_CLUSTER);
+    out.write_all(&image)?;
+    Ok(written)
+}
+
+/// The disk image of [`BenchImage::ScatteredCard`] (`len` bytes, a multiple of 512 past 4 MiB) with clusters of
+/// `cluster` bytes, and how many files were written on it. From 512 MiB up the shots are a 1536×1024 lossless ARW with a
+/// 640×480 preview and a 1280×960 to 1920×1440 smooth JPEG, the clips 120 frames; below, a 256×256 ARW with a 160×120
+/// preview, a 256×192 to 416×312 JPEG and 8 frames (so a small card with small clusters keeps files in pieces).
+pub fn scattered_card(len: u64, cluster: u32) -> (Vec<u8>, u64) {
+    use fs::{DeleteStyle, FsBuilder, FsType, mbr_head};
+    let head_len = u64::from(CARD_FIRST_LBA) * 512;
+    assert!(
+        len > head_len && len.is_multiple_of(512),
+        "the scattered-card image needs a multiple of 512 bytes past 4 MiB"
+    );
+    let big = len >= BENCH_BIG;
+    let mut b = FsBuilder::new(FsType::Exfat, len - head_len, cluster);
+    b.mkdir("DCIM/100MSDCF");
+    let cluster = u64::from(cluster);
+    // As `ExfatCard`: 2% of the clusters (at least 64) for the file system's own and the rounding.
+    let room = {
+        let all = u64::from(b.cluster_count());
+        all - (all / 50).max(64)
+    };
+    // (path, clusters) of every live file.
+    let mut live: Vec<(String, u64)> = Vec::new();
+    let mut written = 0u64;
+    let mut n = 0u64;
+    let mut fragmented_before: Vec<String> = Vec::new();
+    // Shots are encoded ahead in parallel batches (encoding is most of the time this takes).
+    let mut ahead: std::collections::VecDeque<Vec<(&'static str, Vec<u8>)>> = Default::default();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    'card: for round in 0u64.. {
+        let mut culled = Vec::new();
+        let mut pairs = Vec::new();
+        for i in 0..6u64 {
+            n += 1;
+            let pair = i % 2 == 1;
+            if ahead.is_empty() {
+                // Shot k is a pair when k is even (i = (k - 1) % 6 is odd).
+                let first = n;
+                ahead = std::thread::scope(|s| {
+                    let handles: Vec<_> = (first..first + 6 * threads as u64)
+                        .map(|k| s.spawn(move || scattered_shot(k, k % 2 == 0, big)))
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+            }
+            let mut files: Vec<(String, Vec<u8>)> = ahead
+                .pop_front()
+                .expect("encoded ahead")
+                .into_iter()
+                .map(|(ext, bytes)| (format!("DCIM/100MSDCF/DSC{n:05}.{ext}"), bytes))
+                .collect();
+            if i == 2 {
+                let samples = if big { 120 } else { 8 };
+                let clip = camera_video(
+                    &AvcOptions {
+                        samples,
+                        seed: 9000 + round,
+                        mov: false,
+                        mdat_pad: 0,
+                        small_nals: false,
+                    },
+                    VideoCodec::Avc,
+                    VideoLayout::MoovAtEnd,
+                );
+                files.push((format!("DCIM/100MSDCF/C{round:04}.MP4"), clip.bytes));
+            }
+            for (path, bytes) in files {
+                let need = (bytes.len() as u64).div_ceil(cluster);
+                if live.iter().map(|f| f.1).sum::<u64>() + need > room {
+                    break 'card;
+                }
+                let clusters = b.add(&path, &bytes);
+                written += 1;
+                live.push((path.clone(), need));
+                if path.ends_with(".MP4") || !pair {
+                    culled.push(path);
+                } else if clusters.windows(2).any(|w| w[1] != w[0] + 1) {
+                    pairs.push(path);
+                }
+            }
+        }
+        // In camera: the JPEG-only shots and the clip of this round, and the first file in pieces of the round before.
+        culled.extend(fragmented_before.first().cloned());
+        for path in &culled {
+            b.delete(path, DeleteStyle::Camera);
+            live.retain(|f| &f.0 != path);
+        }
+        fragmented_before = pairs;
+    }
+    // At last the whole card is deleted on a computer that clears the chains: every file still on it is placed by its
+    // content (the reassembly's work).
+    for (path, _) in &live {
+        b.delete(path, DeleteStyle::ZeroChain);
+    }
+    let mut volume = b.build();
+    drop(b);
+    let mut image = mbr_head(&mut volume, CARD_FIRST_LBA);
+    image.append(&mut volume);
+    (image, written)
 }
 
 #[cfg(test)]

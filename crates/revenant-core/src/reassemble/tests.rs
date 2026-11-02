@@ -1632,3 +1632,289 @@ fn content_checks_per_kind() {
         FileKind::Raf
     ));
 }
+
+/// The hostile image of `tests/reassembly.rs` (Task 4) grown to `len`: a smooth photo's first 64 KiB at 0, then 4096
+/// sectors that each hold the next 510 bytes of it and an `EOI` (every one a passing continuation), zeros after.
+fn hostile_image(len: usize) -> Vec<u8> {
+    let photo = revenant_testkit::jpeg_smooth(2048, 1536, 3);
+    let first = 64 * 1024;
+    let mut img = vec![0u8; len];
+    img[..first].copy_from_slice(&photo[..first]);
+    let mut sector = [0u8; 512];
+    sector[..510].copy_from_slice(&photo[first..first + 510]);
+    sector[510..].copy_from_slice(&[0xFF, 0xD9]);
+    for k in 0..4096 {
+        let at = first + k * 512;
+        img[at..at + 512].copy_from_slice(&sector);
+    }
+    img
+}
+
+/// Scans `img` (default options) recording the reassembly step; prints what it spent and returns it with the scan's
+/// seconds.
+fn measured_scan(name: &str, img: Vec<u8>) -> (measure::Recorded, f64) {
+    let gib = img.len() as f64 / f64::from(1u32 << 30);
+    let src = Mem(img);
+    let guard = measure::record();
+    let t = std::time::Instant::now();
+    let mut events = 0u64;
+    crate::scan::scan(
+        &src,
+        &crate::formats::all_formats(),
+        &crate::scan::ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |_| events += 1,
+    )
+    .expect("scan");
+    let secs = t.elapsed().as_secs_f64();
+    let rec = measure::take();
+    drop(guard);
+    let step: f64 = rec.steps.iter().map(|s| s.secs).sum();
+    let files = &rec.files;
+    let sum = |f: &dyn Fn(&measure::FileStat) -> u64| files.iter().map(f).sum::<u64>();
+    let searches = files.iter().flat_map(|f| f.searches.iter());
+    let hits = files
+        .iter()
+        .filter(|f| f.searches.iter().any(|s| s.budget_hit))
+        .count();
+    let spent = files
+        .iter()
+        .filter(|f| f.searches.iter().any(|s| s.recheck_spent))
+        .count();
+    println!(
+        "== {name}: {gib:.2} GiB, scan {secs:.2} s, {events} events, reassembly step {step:.2} s ({:.2} s per GiB), \
+         {} candidates, {} searched ({} searches), tries {} (re-check {}), read {:.1} MiB (re-check {:.1} MiB), \
+         file budget hit by {hits}, re-check spent by {spent}, improved {}, scan budget left {:?}",
+        step / gib,
+        rec.steps.iter().map(|s| s.candidates).sum::<usize>(),
+        files.len(),
+        searches.clone().count(),
+        sum(&|f| f.tries),
+        searches.clone().map(|s| s.recheck_tries).sum::<u64>(),
+        sum(&|f| f.read) as f64 / MIB as f64,
+        searches.map(|s| s.recheck_read).sum::<u64>() as f64 / MIB as f64,
+        files.iter().filter(|f| f.after.is_some()).count(),
+        rec.steps
+            .iter()
+            .map(|s| (s.tries_left, s.read_left >> 20))
+            .collect::<Vec<_>>(),
+    );
+    let mut kinds: Vec<FileKind> = files.iter().map(|f| f.kind).collect();
+    kinds.sort_by_key(|k| k.as_str());
+    kinds.dedup();
+    for k in kinds {
+        let of: Vec<&measure::FileStat> = files.iter().filter(|f| f.kind == k).collect();
+        let (mut intact, mut partial, mut same) = (0, 0, 0);
+        for f in &of {
+            match f.after {
+                Some(Health::Intact) => intact += 1,
+                Some(_) => partial += 1,
+                None => same += 1,
+            }
+        }
+        println!(
+            "   {:>4}: {} files, {:.2} s, tries {}, read {:.1} MiB, budget hit {}, re-check spent {}, \
+             exhaustive {}, unique {}; now Intact {intact}, improved not Intact {partial}, unchanged {same}",
+            k.as_str(),
+            of.len(),
+            of.iter().map(|f| f.secs).sum::<f64>(),
+            of.iter().map(|f| f.tries).sum::<u64>(),
+            of.iter().map(|f| f.read).sum::<u64>() as f64 / MIB as f64,
+            of.iter()
+                .filter(|f| f.searches.iter().any(|s| s.budget_hit))
+                .count(),
+            of.iter()
+                .filter(|f| f.searches.iter().any(|s| s.recheck_spent))
+                .count(),
+            of.iter()
+                .filter(|f| f.searches.iter().any(|s| s.exhaustive))
+                .count(),
+            of.iter()
+                .filter(|f| f.searches.iter().any(|s| s.unique))
+                .count(),
+        );
+    }
+    let mut slow: Vec<&measure::FileStat> = files.iter().collect();
+    slow.sort_by(|a, b| b.secs.total_cmp(&a.secs));
+    for f in slow.iter().take(8) {
+        println!(
+            "   slowest: #{} {} {:?} at {} len {}: {:.3} s, tries {}, read {:.1} MiB -> {:?} in {} pieces; {:?}",
+            f.id,
+            f.kind.as_str(),
+            f.before,
+            f.start,
+            f.len,
+            f.secs,
+            f.tries,
+            f.read as f64 / MIB as f64,
+            f.after,
+            f.pieces,
+            f.searches,
+        );
+    }
+    (rec, step)
+}
+
+/// Seeded noise (SplitMix64), for the real samples' surroundings.
+struct SplitNoise(u64);
+
+impl SplitNoise {
+    fn fill(&mut self, buf: &mut [u8]) {
+        for chunk in buf.chunks_mut(8) {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            chunk.copy_from_slice(&z.to_le_bytes()[..chunk.len()]);
+        }
+    }
+}
+
+fn events_of(img: &[u8]) -> Vec<String> {
+    let src = Mem(img.to_vec());
+    let mut out = Vec::new();
+    crate::scan::scan(
+        &src,
+        &crate::formats::all_formats(),
+        &crate::scan::ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |e| {
+            if !matches!(e, crate::scan::Event::Rate { .. }) {
+                out.push(format!("{e:?}"))
+            }
+        },
+    )
+    .expect("scan");
+    out
+}
+
+/// A walk reused when its candidate is descended into is charged as if walked again (one try and the bytes it read): for
+/// any try or read budget, the result and the budget left are those of walking it again.
+#[test]
+fn a_reused_walk_is_charged_as_walked_again() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    // Look-alikes: a copy of run 2 and of run 3 further on, so seams have several evident candidates.
+    card.put(6 * MIB, ID, 16..24, 40, 1);
+    card.noise(6 * MIB + units(8), 4);
+    card.put(7 * MIB, ID, 24..32, 40, 1);
+    card.noise(7 * MIB + units(8), 4);
+    let src = card.mem();
+    let run = |limits: &Limits, reuse: bool| {
+        NO_REUSE.with(|u| u.set(!reuse));
+        let (s, budget) = search_on(&src, &mut toy(40), MIB, &[], limits, None);
+        NO_REUSE.with(|u| u.set(false));
+        (s, budget.tries_left(), budget.read_left())
+    };
+    let mut reused = 0;
+    for file_read in (0..64).map(|k| k * 160).chain([u64::MAX]) {
+        for file_tries in [1, 2, 3, 5, 8, 13, 21, 34, 1 << 16] {
+            let limits = Limits {
+                file_read,
+                file_tries,
+                ..Limits::DEFAULT
+            };
+            let a = run(&limits, true);
+            let b = run(&limits, false);
+            assert_eq!(a, b, "file_read {file_read}, file_tries {file_tries}");
+            reused += usize::from(a.0.as_ref().is_some_and(|s| s.complete));
+        }
+    }
+    assert!(reused > 0, "some searches complete");
+}
+
+/// The scan's events on `img` with the search's pruning on or off ([`UNPRUNED`]), and the tries its reassembly spent.
+fn events_and_tries(img: &[u8], unpruned: bool) -> (Vec<String>, u64) {
+    let guard = measure::record();
+    UNPRUNED.with(|u| u.set(unpruned));
+    let events = events_of(img);
+    UNPRUNED.with(|u| u.set(false));
+    let tries = measure::take().files.iter().map(|f| f.tries).sum();
+    drop(guard);
+    (events, tries)
+}
+
+/// The work the search skips since the measure of part 1.6 (each candidate of a seam walked in turn, the evident ones
+/// descended into at once, without walking them twice; a reassembled JPEG settled on its first solution in pieces)
+/// changes no outcome: a small scattered card (files in pieces deleted on a computer) scanned with and without it gives
+/// the same events, with files put back in pieces, for fewer tries.
+#[test]
+fn pruned_search_changes_no_outcome() {
+    let (card, _) = revenant_testkit::scattered_card(16 << 20, 32 << 10);
+    let (pruned, fewer) = events_and_tries(&card, false);
+    let (unpruned, more) = events_and_tries(&card, true);
+    let in_pieces = pruned
+        .iter()
+        .filter(|e| e.starts_with("Updated") && e.contains("fragments: [Fragment"))
+        .count();
+    assert!(in_pieces >= 3, "{in_pieces} files put back in pieces");
+    assert!(pruned == unpruned, "the outcomes differ");
+    assert!(fewer < more, "{fewer} tries pruned, {more} not");
+}
+
+/// The reassembly's budgets and time (release only; prints numbers, `REVENANT_MEASURE_MIB` sets the size, 1024 by
+/// default): the hostile image of Task 4 grown to the size, the `scattered-card` bench image (where the step must give
+/// the same events with and without the pruning, [`UNPRUNED`]) and the `cut-jpeg` one (every cut photo a candidate whose
+/// rest is nowhere), and with `REVENANT_SAMPLES` each real sample in noise as `tests/real_samples.rs` scans it. The time
+/// bound of the hostile card lives here (Q8: not in the integration tests' wall clock): at most 10 s per GiB.
+#[test]
+#[ignore = "release-only measure: cargo test --release -p revenant-core --lib reassembly_budget_measure -- --ignored --nocapture"]
+fn reassembly_budget_measure() {
+    let mib: u64 = std::env::var("REVENANT_MEASURE_MIB").map_or(1024, |v| v.parse().expect("MiB"));
+    let len = mib << 20;
+    let gib = len as f64 / f64::from(1u32 << 30);
+    let (hostile, step) = measured_scan("hostile", hostile_image(len as usize));
+    assert!(!hostile.files.is_empty(), "the hostile photo is searched");
+    assert!(step <= 10.0 * gib, "hostile: {step:.2} s for {gib:.2} GiB");
+    let bench = |kind| {
+        let mut img = Vec::with_capacity(len as usize);
+        revenant_testkit::write_bench_image(kind, len, &mut img).expect("in memory");
+        img
+    };
+    let card = bench(revenant_testkit::BenchImage::ScatteredCard);
+    let (scattered, _) = measured_scan("scattered-card", card.clone());
+    assert!(
+        !scattered.files.is_empty(),
+        "the scattered card has candidates"
+    );
+    let pruned = events_of(&card);
+    UNPRUNED.with(|u| u.set(true));
+    let t = std::time::Instant::now();
+    let unpruned = events_of(&card);
+    UNPRUNED.with(|u| u.set(false));
+    println!(
+        "   unpruned scan {:.2} s; same events: {}",
+        t.elapsed().as_secs_f64(),
+        pruned == unpruned
+    );
+    assert!(
+        pruned == unpruned,
+        "the pruning changed the scattered card's outcome"
+    );
+    drop(card);
+    measured_scan("cut-jpeg", bench(revenant_testkit::BenchImage::CutJpeg));
+    // With the real samples at hand, each one in noise as `tests/real_samples.rs` scans it.
+    if let Some(dir) = std::env::var_os("REVENANT_SAMPLES") {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(dir);
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("samples dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .collect();
+        names.sort();
+        for path in names {
+            let bytes = std::fs::read(&path).expect("sample");
+            let at = (1 << 20) + 512;
+            let mut img = vec![0u8; at];
+            SplitNoise(0x5A3).fill(&mut img);
+            img.extend_from_slice(&bytes);
+            let mut tail = vec![0u8; 1 << 20];
+            SplitNoise(0x5A4).fill(&mut tail);
+            img.extend_from_slice(&tail);
+            measured_scan(&path.file_name().unwrap().to_string_lossy(), img);
+        }
+    }
+}

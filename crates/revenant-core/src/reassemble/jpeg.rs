@@ -78,6 +78,8 @@ pub(crate) struct JpegSeams {
     hint: Option<(u64, Vec<(u64, f64)>)>,
     /// The last phase from a state to a seam (see [`Lead`]).
     lead: Option<Lead>,
+    /// [`Seams::settles_in_pieces`]: set by [`JpegSeams::settling_in_pieces`].
+    settle: bool,
 }
 
 /// A whole view decoded: the decoder's position before each MCU decoded, the luma DC values, how it ended.
@@ -120,7 +122,15 @@ impl JpegSeams {
             means: Vec::new(),
             hint: None,
             lead: None,
+            settle: false,
         })
+    }
+
+    /// For a caller whose result in pieces is at most `Partial` whatever the search says (the reassembly step: a JPEG
+    /// placed by content alone, Q37): the search settles on its first complete solution in two or more pieces.
+    pub(crate) fn settling_in_pieces(mut self) -> Self {
+        self.settle = true;
+        self
     }
 
     /// MCUs between restart markers; 0 without them (Q16 is the health rule's: a photo with them reassembled from
@@ -919,6 +929,10 @@ impl Seams for JpegSeams {
         }
     }
 
+    fn settles_in_pieces(&self) -> bool {
+        self.settle
+    }
+
     /// The 1.3 window rule on the candidate's first sector.
     fn prefilter(&mut self, r: &mut Reader, g: u64, seam: u64) -> bool {
         let _ = seam;
@@ -1149,6 +1163,74 @@ mod tests {
         assert_eq!(s.proof, Proof::Proven);
         // Q37: placed by content alone, so at most Partial however good the search.
         assert_eq!(jpeg_health_cap(&s, true), Health::Partial);
+    }
+
+    /// Settling in pieces (the reassembly step's JPEG, Q37) stops at the first solution in pieces: the same pieces as
+    /// the whole search, for fewer tries, reported neither unique nor exhaustive (the result is `Partial` either way);
+    /// a photo in one run is not settled (one run keeps the 1.3 rule: it may be `Intact`).
+    #[test]
+    fn a_jpeg_in_pieces_settles_on_its_first_solution() {
+        let j = testkit::jpeg_smooth(2048, 1536, 3);
+        let cluster = 16 << 10;
+        let (card, runs) = scatter(&j, cluster, &[40, 90, 61, 200]);
+        let g = grid(&card, cluster);
+        let src = Mem(card);
+        let tries = |settle: bool| {
+            let seams = JpegSeams::new(&src, runs[0].start).unwrap();
+            let mut seams = if settle {
+                seams.settling_in_pieces()
+            } else {
+                seams
+            };
+            let taken = Taken::new(&[], &Runs::default());
+            let starts = [runs[0].start];
+            let limits = Limits::DEFAULT;
+            let space = Space::new(&[g], runs[0].start, src.len(), &taken, &starts, &limits);
+            let mut budget = Budget::new(&limits);
+            let s = search(
+                &mut seams,
+                &src,
+                &space,
+                runs[0].start,
+                None,
+                &limits,
+                &mut budget,
+                &CancelToken::default(),
+            )
+            .expect("found");
+            (s, Limits::DEFAULT.scan_tries - budget.tries_left())
+        };
+        let (whole, all) = tries(false);
+        let (settled, fewer) = tries(true);
+        assert_eq!(settled.pieces, whole.pieces);
+        assert_eq!(settled.len, whole.len);
+        assert!(
+            settled.complete && !settled.unique && !settled.exhaustive,
+            "{settled:?}"
+        );
+        assert!(fewer < all, "{fewer} tries settled, {all} not");
+        assert_eq!(
+            jpeg_health_cap(&settled, true),
+            jpeg_health_cap(&whole, true)
+        );
+        // One run: the whole search, as without settling.
+        let mut one = noise_card(64, cluster);
+        let f = put(&mut one, at(cluster, 8), &j);
+        let g = grid(&one, cluster);
+        let src = Mem(one);
+        let mut seams = JpegSeams::new(&src, f.start).unwrap().settling_in_pieces();
+        let s = find_with(
+            &mut seams,
+            &src,
+            &[g],
+            f.start,
+            &[f.start],
+            &[],
+            &Limits::DEFAULT,
+        )
+        .expect("found");
+        assert_eq!(s.pieces, vec![f]);
+        assert!(s.complete && s.unique && s.exhaustive, "{s:?}");
     }
 
     #[test]

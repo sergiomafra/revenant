@@ -146,6 +146,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fragments (a cut between fragments cannot be told from another clip's fragment of the same camera), else partial;
   its fragments must follow each other in order. When two deleted videos
   start with the same bytes and one index fits both, the one found first is put back and the copy is left as it was.
+- `revenant-dev bench` has a `scattered-card` image: a card a camera used for a long time (photos, RAWs and clips
+  deleted and shot again into the holes), at last deleted on a computer, so the scan puts its files in pieces back
+  together.
 - RAW photos (ARW first; CR2, NEF, DNG, ORF and RW2 the same way) split into pieces on a card are put back together
   after the scan, from the card's free space: their structure, previews and, in lossless-compressed RAWs, each block of
   the image are checked where the structure puts them. Most come back with their bytes in place but reported partial:

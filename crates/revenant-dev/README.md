@@ -223,7 +223,17 @@ Images (files go back to back, each at the next 512-byte boundary, the rest is s
   twice the image size (about 2 GiB at the default `--size-mib`): the builder keeps a copy of every file and `build()`
   allocates the image.
 - `cut-jpeg`: like `dense-jpeg` but the second half of every file is noise. It has no speed target (each cut JPEG starts
-  a gap search that may re-read its 64 MiB window); it is only measured and reported.
+  a gap search that may re-read its 64 MiB window, then the reassembly searches it again, until the scan's read budget
+  for the reassembly is spent); it is only measured and reported.
+- `scattered-card`: an exFAT volume (128 KiB clusters, lowest free cluster first) on an MBR disk that a camera used for
+  a long time: rounds of six shots (three of them a lossless ARW and its JPEG, three a JPEG only, and a clip), the
+  JPEG-only shots and the clip deleted in camera, the next round written into those holes (so its files lie in pieces)
+  and the first file in pieces of the round before deleted in camera too, until the card is full; at last everything
+  on it is deleted on a computer that clears the cluster chains. Every file still on the card is then placed by its
+  content: it measures the scan with the reassembly at work (lossless RAWs, photos and clips in pieces). `placed`
+  counts every file ever written (overwritten ones too), so `found` is lower. Built in memory like `exfat-card` (peak
+  memory about four times the image size); writing it takes about 90 s at the default size (the shots are encoded in
+  parallel).
 
 The numbers are page-cache throughput (the first write leaves the image in the cache): an upper bound for a card reader,
 not a prediction of it. The measured numbers (before and after part 1.3, and the machine) are in the engine's README,

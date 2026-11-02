@@ -1172,6 +1172,25 @@ through data it cannot check); only a candidate broken right at the seam is drop
 order; both count toward uniqueness, so a blind true continuation next to an evident look-alike makes the result not
 unique. A solution through a blind seam is at most `Unproven`.
 
+**Walking candidates in turn (part 1.6, measured in Task 11).** The candidates of a seam are listed first (the listing
+and the prefilter as above), then walked one at a time: an evident one is descended into at once, its walk reused for
+the descent (not walked again, but charged again: one walk and the bytes it read, so the budget is spent exactly as if
+it had been walked twice), a blind one is kept for after the evident ones, one broken at the seam is dropped. The
+descents are those of walking every candidate first, in the same order; only the candidates after the point where the
+search stops (a second solution, a first one it settles for, the budget) are never walked. A format whose prefilter
+remembers what its earlier walks saw (`Seams::memo_prefilter` false: fragmented MP4) keeps the old order, every
+candidate walked before the first descent. On the `scattered-card` bench image at 512 MiB, walking every candidate first
+spent 80 843 candidate walks for 6 902 descents (29 of the reassembly's 34 s on its 83 lossless ARWs); in turn, the
+same events come out in 11.4 s. The unit test `pruned_search_changes_no_outcome` scans a small scattered card both ways
+and needs the same events, and `a_reused_walk_is_charged_as_walked_again` the same result and budget left for any try
+or read budget.
+
+**Settling on a first solution.** A format whose seams are mostly unprovable (a RAW) settles on its first complete
+solution when it is not `Proven` (`Seams::settles_unproven`); the reassembly step's JPEG settles on its first complete
+solution in two or more pieces (`Seams::settles_in_pieces`): placed by content alone, it is at most `Partial` whatever
+the rest of the search finds (Q37), and the result is that first solution either way. It is then reported neither
+unique nor exhaustive. A JPEG found in one run is searched to the end (it may be `Intact`, the 1.3 rule).
+
 **What uniqueness covers, and what is best effort.** Uniqueness is decided within bounds: candidates only inside the
 window; look-alikes inside a piece only at the break points the re-check tries within its budget, never through the
 solution's own units; and the re-check follows only evident candidates. A look-alike beyond those bounds can leave a
@@ -1202,6 +1221,19 @@ file) must match the sum of the pieces exactly; when both are known and disagree
 | Reassembly candidates     | 4096 findings per scan            |
 | Claimed runs              | 2^18 per scan                     |
 | Own embedded files        | 64 per file (past it: none)       |
+
+The limits are unchanged by the measure of part 1.6 (`reassembly_budget_measure`, an ignored unit test, release, 1 GiB
+images; numbers in "Performance"): on the hostile image of `tests/reassembly.rs` grown to 1 GiB (a photo's first 64 KiB
+and 4096 sectors that each continue it for 510 bytes and end it) the step takes 0.2 s, exhaustive, under the 10 s per
+GiB bound the measure asserts; on `scattered-card` no file hits its try or read budget and the scan's budget is far
+from spent. Where a budget is hit: every cut photo of `cut-jpeg` (no rest anywhere, other photos of the same tables
+around) spends its 512 MiB, so the scan's 16 GiB run out after 32 of its 95 candidates (the others are not searched:
+the step stops at a spent budget); a photo cut in noise as in `tests/real_samples.rs` takes about 1 s for its 512 MiB;
+on 4 KiB to 8 KiB clusters a photo's search can spend its 2^16 walks. A video's walk reads every frame and the
+re-check its own: a 253 MiB clip in 3 pieces of 128 KiB clusters read 364 MiB (308 MiB in the re-check) and came out
+`Intact` in 2.9 s, so a clip of more than about 350 MiB in pieces can outgrow the file's 512 MiB; a 761 MiB clip
+(60 000 frames) laid out the same way was not put back at all, with nothing complete after 33 walks and 20 MiB read
+(not a budget: a known limit, its cause not looked into yet).
 
 A file's budget is its own limits within what the scan has left; the prefilter's reads are charged to it (each
 prefilter call reads through its own one-sector reader, and a (start, seam) pair asked again is answered from memory,
@@ -2287,6 +2319,30 @@ device against the image of the same card, as the opt-in `os_devices` test print
 (not a card reader): 76 to 79 MB/s on the raw device against 80 to 84 MB/s on the image file (this run), 113 to 127
 against 148 to 154 in the part's first run, so reading the raw device costs a little, not a multiple.
 
+**End of 1.6 (reassembly, Task 11).** Against `main` (`c9e590a`, the 1.5 head, which has no reassembly step) built in a
+separate worktree and target, and the 1.6 head before Task 11 (`ca6aacb`), interleaved, three rounds with a pause, best
+of 5 scans (3 for `exfat-card`, `cut-jpeg` and `scattered-card`), load average 3 to 4 (the first two rounds of the day, at load 15 to 88, spread
+by more than 40% against themselves and are not used):
+
+| Image            | `main` (s) | before Task 11 (s) | end of 1.6 (s) | end of 1.6 (MB/s) |
+| ---------------- | ---------: | -----------------: | -------------: | ----------------: |
+| `noise`          |       0.42 |               0.45 |           0.43 |            2473.4 |
+| `dense-jpeg`     |       2.02 |               2.03 |           1.92 |             560.0 |
+| `dense-raw`      |       0.66 |               0.66 |           0.63 |            1710.3 |
+| `video`          |       0.42 |               0.42 |           0.44 |            2450.2 |
+| `exfat-card`     |       1.98 |               1.99 |           1.88 |             569.8 |
+| `cut-jpeg`       |       2.41 |              81.17 |          25.08 |              42.8 |
+| `scattered-card` |          - |                  - |          26.93 |              39.9 |
+
+The images with no reassembly candidate (all but the last two: the step does not run) are within 5% of `main`
+(`video` 0.44 against 0.42 s is 0.02 s, inside `main`'s own spread of 0.42 to 0.45 s between rounds). `cut-jpeg` has no speed target
+(see the dev README): every cut photo is a reassembly candidate whose rest is nowhere, the step spends the scan's
+16 GiB read budget on the first 32 of them (a photo of 3000×2000 decodes about one MCU row, some 90 KB, of every
+look-alike candidate before the DC test can reject it) and stops; Task 11's pruning took it from 81 s to 25 s, with
+the same events. `scattered-card` (new; 4298 files written, 2277 found, 435 reassembly candidates) spends 26 s in the
+reassembly (161 lossless ARWs 22.8 s, 240 JPEGs 3.3 s, 34 clips 0.02 s; `reassembly_budget_measure`), against
+143 s without the pruning (the same events).
+
 Every placed file is found in every run. What it means for a card: an SD card reader delivers at most about 100 MB/s
 (UHS-I) to about 300 MB/s (UHS-II), so with the default threads the scan keeps up with the reader on every image here,
 the photo-dense ones included (`dense-jpeg` 503.9 and `dense-raw` 1576.9 MB/s, above the 300 MB/s goal). With one
@@ -2384,6 +2440,27 @@ never `Intact`. Both are ignored by default:
 scripts/fetch-samples.sh
 REVENANT_SAMPLES=samples/cache cargo test -p revenant-core --test real_samples -- --ignored
 ```
+
+Two more (part 1.6, also ignored, run by the same command). `real_previews_split_in_three` cuts each sample's
+preview in three at 32 KiB multiples on an exFAT card of 32 KiB clusters, its pieces out of order and interleaved with
+the next sample's preview cut the same way, both deleted on a computer that clears the chain (so they are placed by
+content alone): each must come back with its exact bytes and never `Intact` (a JPEG placed by content alone in two or
+more pieces is at most `Partial`, Q37), and no finding may hold runs of both previews. The previews with restart
+markers (X-S10, K-r, TG-7, DRI 4) come back exact, `Partial`, in 3 pieces. The five with DRI 0 (EOS Kiss F, EOS R6,
+Z 6, ILCE-7S, DMC-LX7) do not (`KNOWN_MISSED`, measured in Task 11, the same on the head before it): out of step their
+data decodes on without an error, so the walk of the first piece breaks far past its true end and the true cut is not
+among the break points tried (the known limit at the end of "The reassembly step"); each stays the file system's
+one-run guess, `Partial`, never `Intact`, holding the next runs' bytes. `sony_restart_intervals` prints, for every
+Sony sample, each embedded JPEG with its size and restart interval, and whether the lossless sensor tiles have equal
+`TileByteCounts`; it asserts only that a Sony sample is there. The ILCE-7S: the 1616×1080 preview and the 160×120
+thumbnail have DRI 0, and its sensor data is one strip of Sony's lossy coding (no tiles). A lossless ILCE-6700 file (raw.pixls.us
+id 6736, CC0, SHA-256 `dc3e2ed22f46fcef778553767e0703bc37cfb043f107afe2d7e6e4dbca34200a`, not in the list, see below)
+measured the same way: its 6192×4128, 1616×1080 and 160×120 JPEGs have DRI 0, and its 117 tiles of 512×512 have 116
+distinct `TileByteCounts` (199 024 to 402 736 bytes), so a foreign tile matching a tile boundary's exact count by its
+size is the unlikely case Q15 assumed. That file is not in `samples.toml` because the engine reports it `Partial`
+whole and contiguous: its SubIFD declares one strip covering all the tiles (StripOffsets/StripByteCounts, 35 765 152
+bytes) next to the tiles, and the strip, which starts with a lossless-JPEG header, is checked as one lossless unit that
+does not end where declared (a known limit to fix before it joins the list).
 
 CI runs it in the `samples` job: a failed download (raw.pixls.us down) skips the test without failing the build, while
 a failing test fails it. There is no HEIC sample: none with a verifiable CC0/public-domain license was found.
