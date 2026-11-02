@@ -228,17 +228,32 @@ fn cancel_is_prompt_during_a_long_measurement() {
     let mut img = DiskImage::noise(64 * MIB as usize, 8);
     img.put(0, &video);
     let data = bytes(&img);
-    // An 8 MiB cache reads one block ahead, so the video is measured (≈ 3 s of slow window loads) while the read stage
-    // waits; the cancel comes once the listing (5 slow windows) and the first block are read.
+    // Counted by the reads (final review I-2: a wall-clock bound flaked on a loaded machine). The cancel comes on the
+    // 24th read inside the `mdat`: the listing loads 5 windows there and an 8 MiB cache reads one block ahead, so that
+    // read is the video's measurement, a 1 MiB window load, with about 40 more to go. A measurement checks the cancel
+    // before each window load: after it, only the reads already in flight touch the `mdat`, at most one per thread.
     for threads in [1, 8] {
-        let source = SimSource::new(data.clone()).slow(mdat, 60 * MIB, Duration::from_millis(50));
-        let (r, took) = cancel_after(
-            &source,
-            &opts(threads, 8 * MIB as usize),
-            Duration::from_secs(1),
-        );
+        let cancel = CancelToken::default();
+        let source =
+            SimSource::new(data.clone()).cancel_after_reads_in(mdat, 60 * MIB, 24, &cancel);
+        let t = Instant::now();
+        let (r, _) = run(&source, &opts(threads, 8 * MIB as usize), &cancel);
         assert_eq!(code(&r), Some("cancelled"), "{threads}");
-        assert!(took < Duration::from_secs(1), "{threads}: {took:?}");
+        let after = source.reads_after_cancel().expect("the cancel fired");
+        let in_mdat = after
+            .iter()
+            .filter(|&&(at, n)| at < mdat + 60 * MIB && at + n as u64 > mdat)
+            .count();
+        assert!(
+            in_mdat <= threads,
+            "{threads}: {in_mdat} reads after the cancel: {after:?}"
+        );
+        // Anti-hang only (the reads above are the measure): generous for a loaded machine.
+        assert!(
+            t.elapsed() < Duration::from_secs(30),
+            "{threads}: {:?}",
+            t.elapsed()
+        );
     }
 }
 

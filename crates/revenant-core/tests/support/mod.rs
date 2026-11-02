@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use revenant_core::device::{DestInfo, DeviceOps, DiskInfo, UnmountGuard};
 use revenant_core::source::{DiskId, Geometry, RawDevice, Source, VolumeId};
-use revenant_core::{EngineError, Event, Finding};
+use revenant_core::{CancelToken, EngineError, Event, Finding};
 use revenant_testkit::fs::{FsBuilder, FsType, Partitioning, disk};
 
 enum Data {
@@ -40,6 +40,10 @@ struct State {
     gone: bool,
     /// `revive` was called: the vanishing triggers are off.
     revived: bool,
+    /// Reads so far touching the [`SimSource::cancel_after_reads_in`] range.
+    in_cancel_range: u64,
+    /// The index in `reads` of the read that fired that cancel.
+    cancelled_at: Option<usize>,
 }
 
 /// An in-memory [`Source`] that simulates a failing device. `Send + Sync`; the read log and the flaky counters live
@@ -55,6 +59,8 @@ pub struct SimSource {
     /// After this many reads, reads return short past the new length (`len()` unchanged).
     shrink: Option<(u64, u64)>,
     disk: Option<DiskId>,
+    /// `[start, end)`, `n` and the token of [`SimSource::cancel_after_reads_in`].
+    cancel_in: Option<(u64, u64, u64, CancelToken)>,
     state: Mutex<State>,
 }
 
@@ -77,6 +83,7 @@ impl SimSource {
             gone_after: None,
             shrink: None,
             disk: None,
+            cancel_in: None,
             state: Mutex::new(State::default()),
         }
     }
@@ -119,6 +126,26 @@ impl SimSource {
     pub fn shrink_after(mut self, reads: u64, new_len: u64) -> Self {
         self.shrink = Some((reads, new_len));
         self
+    }
+
+    /// The `n`-th read call touching `[start, start + len)` cancels `cancel` before it is served (it is served): a cancel
+    /// at a known point of the work, whatever the machine's speed. [`SimSource::reads_after_cancel`] then tells what
+    /// was read after it.
+    pub fn cancel_after_reads_in(
+        mut self,
+        start: u64,
+        len: u64,
+        n: u64,
+        cancel: &CancelToken,
+    ) -> Self {
+        self.cancel_in = Some((start, start + len, n, cancel.clone()));
+        self
+    }
+
+    /// The reads logged after the one that fired [`SimSource::cancel_after_reads_in`] (`None`: it never fired).
+    pub fn reads_after_cancel(&self) -> Option<Vec<(u64, usize)>> {
+        let st = self.lock();
+        st.cancelled_at.map(|i| st.reads[i + 1..].to_vec())
     }
 
     /// The source reads the whole disk `id` (what [`Source::disk`] answers).
@@ -174,6 +201,15 @@ impl Source for SimSource {
             let mut st = self.lock();
             st.reads.push((offset, buf.len()));
             st.calls += 1;
+            if let Some((s, e, n, cancel)) = &self.cancel_in
+                && touches(offset, end, (*s, *e))
+            {
+                st.in_cancel_range += 1;
+                if st.in_cancel_range == *n {
+                    cancel.cancel();
+                    st.cancelled_at = Some(st.reads.len() - 1);
+                }
+            }
             if !st.revived {
                 if self.gone_after.is_some_and(|n| st.calls > n)
                     || self.gone_at.is_some_and(|at| end > at)

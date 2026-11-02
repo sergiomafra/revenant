@@ -57,6 +57,6 @@ Regra: todo erro vira uma instrução aqui.
   topo). Antes do PR, `grep -rn "os::unix" crates` e conferir que cada uso está protegido. (PR #5: `os_builders.rs`
   quebrou o CI do Windows.)
 - Este Mac fica carregado por outros projetos do Sérgio (carga 30 a 120): um teste com limite de relógio falhou
-  (`fs_fat::hostile_high_word_entries_are_bounded`, 9 s contra 5 s) e o `bench` espalhou mais de 40% contra ele mesmo.
-  Teste novo nunca mede relógio (conta passos ou leituras); velocidade só se mede com `uptime` baixo e build de controle
-  intercalado. (1.6)
+  (`fs_fat::hostile_high_word_entries_are_bounded`, 9 s contra 5 s; hoje conta leituras) e o `bench` espalhou mais de
+  40% contra ele mesmo. Teste novo nunca mede relógio (conta passos ou leituras; relógio só como trava anti-travamento
+  folgada, ≤ 30 s); velocidade só se mede com `uptime` baixo e build de controle intercalado. (1.6)
