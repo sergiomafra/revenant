@@ -30,7 +30,7 @@ use crate::formats::jpeg::{decode_health, preview_health, walk_header};
 use crate::formats::jpeg_entropy::{self, End};
 use crate::formats::jpeg_lossless::{LlCursor, decode_lossless, lossless_frame};
 use crate::formats::{Fragment, Health, Reader, SECTOR, cancelled};
-use crate::source::{DiskId, Source, VolumeId};
+use crate::source::{DiskId, Fragmented, Source, VolumeId};
 use crate::tiff::{self, TIFF_MAX_LEN};
 
 use super::{Proof, Refutes, Seams, WalkEnd, Walked};
@@ -141,8 +141,10 @@ pub(crate) struct RawSeams {
     len: u64,
     /// The previews and JPEG-coded strips/tiles of the first piece's structure, logical (D10).
     own: Vec<Fragment>,
-    /// The units of the last view walked: the prefilter reads the unit at the seam from them.
-    last: Vec<Unit>,
+    /// The units of the file read contiguously from its start (the first piece, then what follows it on the source):
+    /// the prefilter reads the unit at the seam from them, so its answer depends on the candidate and the seam only
+    /// (ruling Q59), never on what was walked before.
+    units: Vec<Unit>,
     /// The re-check's hint for the last solution asked about: its length and the cut positions.
     hints: Option<(u64, Vec<u64>)>,
 }
@@ -180,12 +182,21 @@ impl RawSeams {
             .map(|&(start, len)| Fragment { start, len })
             .chain(merged)
             .collect();
-        Some(RawSeams {
+        let mut seams = RawSeams {
             len: info.end,
             own,
-            last: Vec::new(),
+            units: Vec::new(),
             hints: None,
-        })
+        };
+        let whole = Fragmented::new(
+            source,
+            vec![Fragment {
+                start,
+                len: info.end.min(available),
+            }],
+        );
+        seams.units = seams.layout(&whole).units;
+        Some(seams)
     }
 
     /// The units of `view`, from its TIFF structure (bytes past the view read as zeros).
@@ -248,7 +259,6 @@ impl RawSeams {
     ) -> (Walked<RawState>, bool) {
         let limit = limit.min(view.len());
         let layout = self.layout(view);
-        self.last = layout.units.clone();
         let mut checked = from.pos;
         let mut resume = Vec::new();
         if layout.broken {
@@ -497,14 +507,15 @@ fn check_tile(
     let run = decode_lossless(r, &frame, from, to);
     *rows = run.resume;
     match run.end {
-        // Only at the declared end, with the exact count (Q15); an anchor unless fill bytes pad it there (Q46).
+        // Only at the declared end, with the exact count (Q15); an anchor unless fill bytes pad it there (Q46), before
+        // its EOI or after it (Sony's 16-byte tile grain).
         End::Eoi { at } => {
             let mut fill = 0;
             while fill < 2 && at > u.start + fill && r.byte(at - 1 - fill) == Some(0xFF) {
                 fill += 1;
             }
             Check::Pass {
-                anchored: fill <= 1,
+                anchored: fill <= 1 && at + 2 == u.end,
             }
         }
         End::Error { at } => Check::Fail { at },
@@ -609,13 +620,13 @@ impl Seams for RawSeams {
         self.own.clone()
     }
 
-    /// The unit at the seam (Q1), from the structure of the last walk (the piece before the seam): a tile starting
-    /// there must start with a lossless-JPEG header, a JPEG with `FF D8 FF`; a seam inside a tile needs entropy-coded
-    /// data up to the tile's end within the first sector ([`may_be_entropy`]). Anything else is kept (blind, an IFD, a
-    /// preview's inside). The answer depends on the structure, which lies in the first piece of every RAW seen so far:
-    /// it is remembered per (candidate, seam).
+    /// The unit at the seam (Q1), from the structure of the file read contiguously (`units`, fixed when the search
+    /// begins): a tile starting there must start with a lossless-JPEG header, a JPEG with `FF D8 FF`; a seam inside a
+    /// tile needs entropy-coded data up to the tile's end within the first sector ([`may_be_entropy`]). Anything else is
+    /// kept (blind, an IFD, a preview's inside, a structure that does not say). A function of the candidate and the seam
+    /// alone: remembered per (candidate, seam), and the candidates of a seam are walked in turn (ruling Q59).
     fn prefilter(&mut self, r: &mut Reader, g: u64, seam: u64) -> bool {
-        let Some(u) = self.last.iter().find(|u| u.start <= seam && seam < u.end) else {
+        let Some(u) = self.units.iter().find(|u| u.start <= seam && seam < u.end) else {
             return true;
         };
         match u.kind {
@@ -673,7 +684,6 @@ mod tests {
     use crate::cache::Runs;
     use crate::formats::tests::Mem;
     use crate::scan::CancelToken;
-    use crate::source::Fragmented;
     use crate::source::VolumeId;
     use revenant_testkit::{ArwCompression, ArwOptions, TiffRaw, arw};
 
@@ -965,6 +975,47 @@ mod tests {
     }
 
     #[test]
+    fn the_prefilter_does_not_depend_on_earlier_walks() {
+        // Ruling Q59: its answer for a (candidate, seam) is the same whatever was walked before (none, a view too short to
+        // hold a tile, the whole file), so it may be remembered and the candidates walked in turn.
+        let a = lossless(1);
+        let inside = a.tiles[4].start as u64 + 1000;
+        let mut flat = vec![0u8; 4096];
+        flat.extend_from_slice(&[0xFF, 0xC4, 0, 0]);
+        let ask = |s: &mut RawSeams| {
+            let src = Mem(flat.clone());
+            s.prefilter(&mut Reader::new(&src), 4096 - 256, inside)
+        };
+        let src = Mem(a.bytes.clone());
+        let mut s = seams_of(&a.bytes);
+        let fresh = ask(&mut s);
+        let short = Fragmented::new(
+            &src,
+            vec![Fragment {
+                start: 0,
+                len: 4096,
+            }],
+        );
+        let from = s.begin();
+        let _ = s.walk(&short, &[], &from, 4096);
+        let after_short = ask(&mut s);
+        let len = a.bytes.len() as u64;
+        let _ = s.walk(
+            &Fragmented::new(&src, vec![Fragment { start: 0, len }]),
+            &[],
+            &from,
+            len,
+        );
+        let after_whole = ask(&mut s);
+        assert_eq!((fresh, after_short), (after_whole, after_whole));
+        assert!(
+            !after_whole,
+            "the seam lies in a tile: a marker that cannot be there is refused"
+        );
+        assert!(s.memo_prefilter());
+    }
+
+    #[test]
     fn a_placement_with_foreign_tile_data_is_refuted() {
         let a = lossless(1);
         let mut s = seams_of(&a.bytes);
@@ -1146,6 +1197,25 @@ mod tests {
         whole.truncate(a.bytes.len());
         assert_eq!(proof(&whole, &[ta.start as u64]), Proof::Unproven);
         assert_eq!(proof(&whole, &[ta.end as u64]), Proof::Unproven);
+    }
+
+    #[test]
+    fn sony_fill_after_a_tile_is_no_anchor() {
+        // Fill after a tile's EOI (Sony's 16-byte grain) is padding like fill before it (Q46): the tile passes, but a
+        // seam at its end is no proof; a tile of the same file that needs no fill still anchors one.
+        let a = arw(&ArwOptions {
+            tile_fill_to: 16,
+            ..ArwOptions::default()
+        });
+        let filled = |t: &std::ops::Range<usize>| a.bytes[t.end - 1] == 0xFF;
+        let t = a.tiles[..a.tiles.len() - 1]
+            .iter()
+            .find(|t| filled(t))
+            .expect("a filled tile");
+        assert_eq!(proof(&a.bytes, &[]), Proof::Proven);
+        assert_eq!(proof(&a.bytes, &[t.end as u64]), Proof::Unproven);
+        let a = arw(&ArwOptions::default());
+        assert_eq!(proof(&a.bytes, &[a.tiles[3].end as u64]), Proof::Proven);
     }
 
     #[test]

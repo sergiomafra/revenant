@@ -863,6 +863,94 @@ fn lossless_tiles_of_another_file_make_the_raw_partial() {
 }
 
 #[test]
+fn sony_lossless_arw_with_fill_after_each_tile_is_intact() {
+    // ILCE-6700: every tile is followed by FF fill bytes after its EOI up to a multiple of 16 bytes, inside its
+    // TileByteCounts, and the SubIFD also declares a strip over the tiles. A whole contiguous file is Intact.
+    let opts = |seed| testkit::ArwOptions {
+        tile_fill_to: 16,
+        strip_over_tiles: true,
+        seed,
+        ..testkit::ArwOptions::default()
+    };
+    let a = testkit::arw(&opts(1));
+    assert!(
+        a.tiles.iter().any(|t| a.bytes[t.end - 1] == 0xFF),
+        "some tile is padded"
+    );
+    let m = TiffRaw.measure(&Bytes(a.bytes.clone()), 0).unwrap();
+    assert_eq!(
+        (m.kind, m.health, m.len),
+        (FileKind::Arw, Health::Intact, a.bytes.len() as u64)
+    );
+    let at = 1 << 20;
+    let mut img = testkit::DiskImage::noise(at + a.bytes.len() + (1 << 20), 0x6701);
+    img.put(at, &a.bytes);
+    let found = scan_image(&img.save());
+    let raw: Vec<_> = found.iter().filter(|f| f.2 == FileKind::Arw).collect();
+    assert_eq!(
+        raw,
+        [&(
+            at as u64,
+            a.bytes.len() as u64,
+            FileKind::Arw,
+            Health::Intact
+        )],
+        "{found:?}"
+    );
+    // Another file's tiles from the fifth on still make it Partial.
+    let b = testkit::arw(&opts(2));
+    let cut = a.tiles[4].start + 100;
+    let mut glued = a.bytes[..cut].to_vec();
+    glued.extend_from_slice(&b.bytes[cut..]);
+    glued.resize(a.bytes.len(), 0);
+    let m = TiffRaw.measure(&Bytes(glued), 0).unwrap();
+    assert_eq!((m.kind, m.health), (FileKind::Arw, Health::Partial));
+}
+
+#[test]
+fn lossless_arw_with_a_strip_over_its_tiles_is_intact() {
+    // ILCE-6700 layout: the SubIFD declares the lossless tiles and also one strip that covers them all. The tiles are the
+    // units; the strip is no lossless JPEG of its own (it would end at its first tile's EOI, not where declared).
+    let a = testkit::arw(&testkit::ArwOptions {
+        strip_over_tiles: true,
+        ..testkit::ArwOptions::default()
+    });
+    let m = TiffRaw.measure(&Bytes(a.bytes.clone()), 0).unwrap();
+    assert_eq!(
+        (m.kind, m.health, m.len),
+        (FileKind::Arw, Health::Intact, a.bytes.len() as u64)
+    );
+    // In a scan, at a sector start in noise: one finding, Intact, the whole file.
+    let at = 1 << 20;
+    let mut img = testkit::DiskImage::noise(at + a.bytes.len() + (1 << 20), 0x6700);
+    img.put(at, &a.bytes);
+    let found = scan_image(&img.save());
+    let raw: Vec<_> = found.iter().filter(|f| f.2 == FileKind::Arw).collect();
+    assert_eq!(
+        raw,
+        [&(
+            at as u64,
+            a.bytes.len() as u64,
+            FileKind::Arw,
+            Health::Intact
+        )],
+        "{found:?}"
+    );
+    // Its tiles of another file still make it Partial.
+    let b = testkit::arw(&testkit::ArwOptions {
+        strip_over_tiles: true,
+        seed: 2,
+        ..testkit::ArwOptions::default()
+    });
+    let cut = a.tiles[4].start + 100;
+    let mut glued = a.bytes[..cut].to_vec();
+    glued.extend_from_slice(&b.bytes[cut..]);
+    glued.resize(a.bytes.len(), 0);
+    let m = TiffRaw.measure(&Bytes(glued), 0).unwrap();
+    assert_eq!((m.kind, m.health), (FileKind::Arw, Health::Partial));
+}
+
+#[test]
 fn raw_preview_crossing_a_piece_is_not_reported_twice() {
     // A live ARW in two runs on an exFAT card, its preview crossing from the first cluster into the second run (part 1.4,
     // T9): the chain places the RAW, and its preview is not a second finding (D12 of part 1.4: its own files).

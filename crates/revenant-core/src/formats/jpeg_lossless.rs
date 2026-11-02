@@ -370,9 +370,18 @@ fn marker_after_padding(c: &mut LlCursor, src: &mut Bytes) -> Result<(u64, u8), 
     }
 }
 
+/// Fill bytes accepted after a tile's EOI (fewer than this), up to its declared end: Sony's 16-byte tile grain.
+const FILL_AFTER_EOI: u64 = 16;
+
+/// Whether `[from, limit)` is fewer than [`FILL_AFTER_EOI`] bytes, all `FF` (one at least).
+fn fill_to(src: &mut Bytes, from: u64, limit: u64) -> bool {
+    from < limit && limit - from < FILL_AFTER_EOI && (from..limit).all(|p| src.get(p) == Some(0xFF))
+}
+
 /// Walks difference codes from `from`, reading only bytes in `[from.pos, limit)`, `limit` being the tile's declared end
 /// (TileOffsets + TileByteCounts). The result is `End::Eoi` only when exactly width × height × components samples are
-/// decoded, then padding, optional fill bytes and an `FF D9` that ends exactly at `limit`: Huffman streams
+/// decoded, then padding, optional fill bytes and an `FF D9` that ends exactly at `limit`, or is followed there by
+/// fewer than 16 `FF` fill bytes (Sony's tile grain; `Eoi { at }` gives the marker's place): Huffman streams
 /// resynchronize, so a sample count alone can be reached by chance on a neighbour's tail. Restart markers are checked
 /// when the frame has a restart interval, and padding bits must be 1-bits. A cursor is kept at every row of samples (at
 /// most [`RESUME_POINTS`]).
@@ -397,6 +406,9 @@ pub(crate) fn decode_lossless(
         if c.sample >= total {
             break match marker_after_padding(&mut c, &mut src) {
                 Ok((at, 0xD9)) if at.checked_add(2) == Some(limit) => End::Eoi { at },
+                // Sony pads every lossless tile with `FF` after its EOI to a multiple of 16 bytes, inside its
+                // TileByteCounts (ILCE-6700): fewer than 16 fill bytes up to `limit`, nothing else.
+                Ok((at, 0xD9)) if fill_to(&mut src, at + 2, limit) => End::Eoi { at },
                 Ok((at, _)) => End::Error { at },
                 Err(Fail::Error(at)) => End::Error { at },
                 Err(Fail::OutOfData) => End::OutOfData,
@@ -573,6 +585,32 @@ mod tests {
         filled.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xD9]);
         let (_, run) = decode(&filled, filled.len() as u64);
         assert_eq!(run.end, eoi(filled.len()));
+    }
+
+    #[test]
+    fn fill_after_the_marker_is_sonys_tile_grain_only() {
+        // Sony pads each lossless tile with FF after its EOI to a multiple of 16 bytes (ILCE-6700).
+        let j = testkit::lossless_jpeg(64, 64, 1, 14, 3);
+        let len = j.len();
+        for n in [1, 5, 15] {
+            let mut padded = j.clone();
+            padded.resize(len + n, 0xFF);
+            let (_, run) = decode(&padded, padded.len() as u64);
+            assert_eq!(run.end, End::Eoi { at: len as u64 - 2 }, "{n} fill bytes");
+        }
+        // 16 or more is no tile grain; anything but FF after the marker is not fill.
+        let mut long = j.clone();
+        long.resize(len + 16, 0xFF);
+        assert!(!matches!(
+            decode(&long, long.len() as u64).1.end,
+            End::Eoi { .. }
+        ));
+        let mut other = j.clone();
+        other.extend_from_slice(&[0xFF, 0xFF, 0x00]);
+        assert!(!matches!(
+            decode(&other, other.len() as u64).1.end,
+            End::Eoi { .. }
+        ));
     }
 
     #[test]

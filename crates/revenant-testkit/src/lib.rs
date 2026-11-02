@@ -1093,6 +1093,14 @@ pub struct ArwOptions {
     /// When not 0, zeros after the sensor data up to a multiple of `pad_to` bytes, inside the file (Sony pads its ARWs
     /// to 4 KiB or 64 KiB); no IFD references them, `raw` ends where the sensor data does.
     pub pad_to: usize,
+    /// With [`ArwCompression::Lossless`]: the SubIFD also declares one strip (StripOffsets/StripByteCounts) covering all
+    /// the tiles, from the first tile's start to the last one's end, as the ILCE-6700 (and other recent Sony bodies)
+    /// write next to TileOffsets/TileByteCounts.
+    pub strip_over_tiles: bool,
+    /// With [`ArwCompression::Lossless`], when not 0: each tile not aligned nor sized is followed by `FF` fill bytes after
+    /// its EOI up to a multiple of `tile_fill_to` bytes, inside its TileByteCounts (Sony's lossless ARWs pad every tile
+    /// so to 16 bytes).
+    pub tile_fill_to: usize,
 }
 
 impl Default for ArwOptions {
@@ -1113,6 +1121,8 @@ impl Default for ArwOptions {
             flat_tiles: Vec::new(),
             sized_tiles: Vec::new(),
             pad_to: 0,
+            strip_over_tiles: false,
+            tile_fill_to: 0,
         }
     }
 }
@@ -1218,6 +1228,11 @@ pub fn arw(opts: &ArwOptions) -> TiffRaw {
             enc.short(0x0103, code),
         ];
         if code == 7 {
+            if opts.strip_over_tiles {
+                let (first, last) = (offs[0], offs.len() - 1);
+                es.push(enc.long(0x0111, first));
+                es.push(enc.long(0x0117, offs[last] + cnts[last] - first));
+            }
             es.push(enc.long(0x0142, opts.tile));
             es.push(enc.long(0x0143, opts.tile));
             es.push(enc.longs(0x0144, offs));
@@ -1279,6 +1294,10 @@ pub fn arw(opts: &ArwOptions) -> TiffRaw {
                 let want = (at + t.len()).div_ceil(a) * a - at;
                 lossless_jpeg_sized(opts.tile, opts.tile, 1, 14, seed, want)
                     .expect("a tile size within reach of the grid")
+            } else if opts.tile_fill_to > 0 {
+                let mut t = t.clone();
+                t.resize(t.len().next_multiple_of(opts.tile_fill_to), 0xFF);
+                t
             } else {
                 t.clone()
             };

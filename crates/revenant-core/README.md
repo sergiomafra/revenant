@@ -1001,7 +1001,9 @@ A walk breaks right at a seam when a unit holding it fails within 4096 bytes aft
 has evidence past a seam once a unit holding or following it decodes 4096 bytes past it, or passes whole. A candidate
 with nothing checked past the seam is blind, even when its free run reaches the known length: candidates are then taken
 in their order (next free first), so blind sensor data is placed by that order, a piece ending where its free run does.
-The prefilter reads the unit at the seam: a tile starting there must start with a lossless-JPEG header, a JPEG with
+The prefilter reads the unit at the seam from the structure of the file read contiguously from its start, fixed when
+the search begins (ruling Q59; it used to come from the last view walked, so its answer depended on what was walked
+before it): a tile starting there must start with a lossless-JPEG header, a JPEG with
 `FF D8 FF`; a seam inside a tile needs entropy-coded data (no stray marker) up to the tile's end within the candidate's
 first sector; a run of one byte value passes (a flat area, such as clipped highlights, codes as zero bytes). The
 previews and JPEG-coded tiles are the RAW's own files (the tiles merged into one range where they follow each other; a
@@ -1014,8 +1016,8 @@ a preview share those bytes and are the same file, nested (Q16).
 whole and are anchored at their declared places: a tile boundary where the next tile decodes whole and its `FF D9` ends
 exactly at its own declared end, an IFD table at its offset inside the first piece. The proof is the tile's exact
 compressed size: another tile of the same frame decodes whole too, and only its different length gives it away. So a
-tile padded with fill bytes before its `FF D9` (any same-frame tile whose data fits fills the same slot) proves no
-seam, before or after it (ruling Q46). Never:
+tile padded with fill bytes before its `FF D9`, or after it (Sony's 16-byte grain), proves no seam, before or after
+it (any same-frame tile whose data fits fills the same slot; ruling Q46). Never:
 
 - a seam inside a lossless tile (a piece of another tile of the same frame passes the check a few percent of the time,
   Q44);
@@ -1042,8 +1044,10 @@ JPEG (SOF3) frame its header declares. `lossless_frame` reads the header (one DH
 included. `decode_lossless` then walks the difference codes (a Huffman category of 0-16 and that many extra bits; 16 has
 none), without computing predictions, from a cursor, reading only below the tile's declared end (`TileOffsets` +
 `TileByteCounts`). It returns `Eoi` only when exactly width x height x components samples decode **and** the `FF D9`
-marker ends exactly at the declared end: a Huffman stream resynchronizes, so a count alone can be reached by chance on
-the tail of a neighbouring tile. Padding bits must be 1-bits. Restart markers are checked when the frame has a restart interval, a cursor is kept at
+marker ends exactly at the declared end, or is followed up to it by fewer than 16 `FF` fill bytes and nothing else (Sony
+pads every lossless tile so to a multiple of 16 bytes, inside its `TileByteCounts`: the ILCE-6700 sample; without this
+a whole, contiguous file of it came out `Partial`, found in part 1.6's Task 11): a Huffman stream resynchronizes, so a
+count alone can be reached by chance on the tail of a neighbouring tile. Padding bits must be 1-bits. Restart markers are checked when the frame has a restart interval, a cursor is kept at
 every row of samples so a walk can resume over other bytes, and every length is checked arithmetic bounded by the
 declared sample count and the limit. `Eoi` is **evidence, not proof**: the walk reads no pixels, so a piece of another
 tile of the same frame (same header and table) still passes a few percent of the time (about 1% in the unit tests'
@@ -1058,7 +1062,8 @@ still rejects categories over 11.
 the extent (`end`, relative to the header; the limit clamps every range, whatever references it, and `starts_past_cap` tells a range starting at or past `TIFF_MAX_LEN` from a mere cut), Make/Model/lens/serial/ISO/DateTimeOriginal, the largest image size, whether
 `DNGVersion` is present, the embedded JPEG ranges (`JPEGInterchangeFormat`, strips/tiles of Compression 6/7 starting
 with FF D8, Panasonic's JpgFromRaw and an Olympus MakerNote's JPEGs) and the other strip/tile ranges (raw data, including
-Panasonic's raw data). Header magics `II*\0`, `MM\0*`, `IIRO`, `IIRS`, `MMOR`, `IIU\0`
+Panasonic's raw data; in an IFD that declares tiles, a strip overlapping them is no range of its own: the ILCE-6700
+writes one strip over all its lossless tiles, and the tiles win). Header magics `II*\0`, `MM\0*`, `IIRO`, `IIRS`, `MMOR`, `IIU\0`
 are accepted; BigTIFF and anything else gives `None`.
 
 It follows the IFD chain, SubIFDs, Exif, GPS (extent only) and Interop IFDs; the next pointer of Exif/GPS/Interop IFDs is
@@ -1179,7 +1184,9 @@ it had been walked twice), a blind one is kept for after the evident ones, one b
 descents are those of walking every candidate first, in the same order; only the candidates after the point where the
 search stops (a second solution, a first one it settles for, the budget) are never walked. A format whose prefilter
 remembers what its earlier walks saw (`Seams::memo_prefilter` false: fragmented MP4) keeps the old order, every
-candidate walked before the first descent. On the `scattered-card` bench image at 512 MiB, walking every candidate first
+candidate walked before the first descent; the TIFF RAW's prefilter reads the structure of the file as found at its
+start, never the last view walked, so its answers are the candidate's and the seam's alone (ruling Q59, unit test
+`the_prefilter_does_not_depend_on_earlier_walks`). On the `scattered-card` bench image at 512 MiB, walking every candidate first
 spent 80 843 candidate walks for 6 902 descents (29 of the reassembly's 34 s on its 83 lossless ARWs); in turn, the
 same events come out in 11.4 s. The unit test `pruned_search_changes_no_outcome` scans a small scattered card both ways
 and needs the same events, and `a_reused_walk_is_charged_as_walked_again` the same result and budget left for any try
@@ -1229,11 +1236,12 @@ GiB bound the measure asserts; on `scattered-card` no file hits its try or read 
 from spent. Where a budget is hit: every cut photo of `cut-jpeg` (no rest anywhere, other photos of the same tables
 around) spends its 512 MiB, so the scan's 16 GiB run out after 32 of its 95 candidates (the others are not searched:
 the step stops at a spent budget); a photo cut in noise as in `tests/real_samples.rs` takes about 1 s for its 512 MiB;
-on 4 KiB to 8 KiB clusters a photo's search can spend its 2^16 walks. A video's walk reads every frame and the
-re-check its own: a 253 MiB clip in 3 pieces of 128 KiB clusters read 364 MiB (308 MiB in the re-check) and came out
-`Intact` in 2.9 s, so a clip of more than about 350 MiB in pieces can outgrow the file's 512 MiB; a 761 MiB clip
-(60 000 frames) laid out the same way was not put back at all, with nothing complete after 33 walks and 20 MiB read
-(not a budget: a known limit, its cause not looked into yet).
+on 4 KiB to 8 KiB clusters a photo's search can spend its 2^16 walks. A video reads far less than its size: clips
+in 3 pieces of 128 KiB clusters (run 1, run 3, run 2 on the card, 8 MiB apart) of 253 to 697 MiB came out `Intact` in
+2.6 to 3.1 s, reading 230 to 469 MiB (most of it in the re-check). **The window is a limit of its own**: a piece that
+starts more than 256 MiB after the end of the piece before it (and is not within the first 256 MiB of the heap) is
+never a candidate, so the same layout at 761 MiB (run 3, 254 MiB, lies between run 1 and run 2) is not put back
+(33 walks, nothing complete); written in order (run 1, run 2, run 3) it is `Intact`.
 
 A file's budget is its own limits within what the scan has left; the prefilter's reads are charged to it (each
 prefilter call reads through its own one-sector reader, and a (start, seam) pair asked again is answered from memory,
@@ -1298,7 +1306,10 @@ a source that vanishes during it stops the scan with `device_gone`.
 A known limit: a piece followed at once on the card by a run of another photo whose data decodes on smoothly (two
 similar photos with the same tables) can give the walk no break at that cluster boundary; the search then goes on
 through the other photo's run and may find no complete solution, and the photo keeps its earlier result (or comes out
-`Partial` with what fitted), never `Intact`.
+`Partial` with what fitted), never `Intact`. In particular, a JPEG with no restart markers (DRI 0) in three or more
+pieces, placed by content alone, is often not put back (5 of the 8 real camera previews of `real_previews_split_in_three`,
+and the ILCE-6700's): it stays the `Partial` one-run guess of the file system or the carving, which holds the bytes of
+whatever follows its first piece (the 1.4 behaviour; never `Intact`, ruling Q59).
 
 ### Realistic cards (`tests/reassembly_cards.rs`)
 
@@ -2335,11 +2346,13 @@ by more than 40% against themselves and are not used):
 | `scattered-card` |          - |                  - |          26.93 |              39.9 |
 
 The images with no reassembly candidate (all but the last two: the step does not run) are within 5% of `main`
-(`video` 0.44 against 0.42 s is 0.02 s, inside `main`'s own spread of 0.42 to 0.45 s between rounds). `cut-jpeg` has no speed target
-(see the dev README): every cut photo is a reassembly candidate whose rest is nowhere, the step spends the scan's
-16 GiB read budget on the first 32 of them (a photo of 3000×2000 decodes about one MCU row, some 90 KB, of every
-look-alike candidate before the DC test can reject it) and stops; Task 11's pruning took it from 81 s to 25 s, with
-the same events. `scattered-card` (new; 4298 files written, 2277 found, 435 reassembly candidates) spends 26 s in the
+(`video` 0.44 against 0.42 s is 0.02 s, inside `main`'s own spread of 0.42 to 0.45 s between rounds). `cut-jpeg` is outside the
+5% gate, which binds images without fragmentation (ruling Q59: its cut photos are fragments by design), and has no
+speed target (see the dev README): its scan takes 25 s against 2.4 s on `main`, bounded and documented here. Every cut
+photo is a reassembly candidate whose rest is nowhere; each spends its 512 MiB (a photo of 3000×2000 decodes about one
+MCU row, some 90 KB, of every look-alike candidate before the DC test can reject it), so the scan's 16 GiB read budget
+runs out after about 32 of the 95 candidates and the later ones (in id order, so further on the card) are not searched
+at all: they keep their `Partial` cut finding. Task 11's pruning took it from 81 s to 25 s, with the same events. `scattered-card` (new; 4298 files written, 2277 found, 435 reassembly candidates) spends 26 s in the
 reassembly (161 lossless ARWs 22.8 s, 240 JPEGs 3.3 s, 34 clips 0.02 s; `reassembly_budget_measure`), against
 143 s without the pruning (the same events).
 
@@ -2426,15 +2439,16 @@ characters on Windows is a write error (`write_failed`) there, never an escape.
 
 ## Tested against real files
 
-`tests/real_samples.rs` runs the engine over real camera files (one each of CR2, CR3, NEF, ARW, RAF, DNG, ORF, RW2; all
+`tests/real_samples.rs` runs the engine over real camera files (one each of CR2, CR3, NEF, RAF, DNG, ORF, RW2 and two
+ARWs, an ILCE-7S and a lossless ILCE-6700; all
 CC0 from raw.pixls.us, listed with URL and SHA-256 in `samples/samples.toml`, never committed). Each is embedded in a
 noise image at a sector start and must come out as exactly one finding of its kind, `Intact`, with the file's length
 (for ARW, trailing zero padding under 64 KiB aside), make and model, and a preview that decodes strictly. A second test
 splits each sample's preview in two at k/10 (k = 2..=8, on a sector boundary) with its own tail 8 MiB further on: it
 must come out joined and `Intact`, or joined and `Partial` for the previews that use restart markers (Q16: 21 of the
-56, all of the X-S10, TG-7 and K-r splits), the 2 known `Partial` splits above aside; and with another sample's tail
-instead,
-never `Intact`. Both are ignored by default:
+63, all of the X-S10, TG-7 and K-r splits), the 2 known `Partial` splits above aside; the ILCE-6700's 6192×4128
+preview, the same on `main` (1.3 join): joined exact but `Partial` at 2/10 and 3/10, joined one sector off the cut
+(`Partial`) at 4/10; and with another sample's tail instead, never `Intact`. Both are ignored by default:
 
 ```sh
 scripts/fetch-samples.sh
@@ -2445,22 +2459,21 @@ Two more (part 1.6, also ignored, run by the same command). `real_previews_split
 preview in three at 32 KiB multiples on an exFAT card of 32 KiB clusters, its pieces out of order and interleaved with
 the next sample's preview cut the same way, both deleted on a computer that clears the chain (so they are placed by
 content alone): each must come back with its exact bytes and never `Intact` (a JPEG placed by content alone in two or
-more pieces is at most `Partial`, Q37), and no finding may hold runs of both previews. The previews with restart
-markers (X-S10, K-r, TG-7, DRI 4) come back exact, `Partial`, in 3 pieces. The five with DRI 0 (EOS Kiss F, EOS R6,
-Z 6, ILCE-7S, DMC-LX7) do not (`KNOWN_MISSED`, measured in Task 11, the same on the head before it): out of step their
+more pieces is at most `Partial`, Q37), and no `Intact` finding may hold runs of both previews (ruling Q59). The previews with restart
+markers (X-S10, K-r, TG-7, DRI 4) come back exact, `Partial`, in 3 pieces. The six with DRI 0 (EOS Kiss F, EOS R6,
+Z 6, ILCE-7S, ILCE-6700, DMC-LX7) do not (`KNOWN_MISSED`, measured in Task 11, the same on the head before it): out of step their
 data decodes on without an error, so the walk of the first piece breaks far past its true end and the true cut is not
 among the break points tried (the known limit at the end of "The reassembly step"); each stays the file system's
-one-run guess, `Partial`, never `Intact`, holding the next runs' bytes. `sony_restart_intervals` prints, for every
+one-run guess, `Partial`, never `Intact` (asserted), holding the next runs' bytes. `sony_restart_intervals` prints, for every
 Sony sample, each embedded JPEG with its size and restart interval, and whether the lossless sensor tiles have equal
 `TileByteCounts`; it asserts only that a Sony sample is there. The ILCE-7S: the 1616×1080 preview and the 160×120
-thumbnail have DRI 0, and its sensor data is one strip of Sony's lossy coding (no tiles). A lossless ILCE-6700 file (raw.pixls.us
-id 6736, CC0, SHA-256 `dc3e2ed22f46fcef778553767e0703bc37cfb043f107afe2d7e6e4dbca34200a`, not in the list, see below)
-measured the same way: its 6192×4128, 1616×1080 and 160×120 JPEGs have DRI 0, and its 117 tiles of 512×512 have 116
+thumbnail have DRI 0, and its sensor data is one strip of Sony's lossy coding (no tiles). The lossless ILCE-6700
+(raw.pixls.us id 6736): its 6192×4128, 1616×1080 and 160×120 JPEGs have DRI 0, and its 117 tiles of 512×512 have 116
 distinct `TileByteCounts` (199 024 to 402 736 bytes), so a foreign tile matching a tile boundary's exact count by its
-size is the unlikely case Q15 assumed. That file is not in `samples.toml` because the engine reports it `Partial`
-whole and contiguous: its SubIFD declares one strip covering all the tiles (StripOffsets/StripByteCounts, 35 765 152
-bytes) next to the tiles, and the strip, which starts with a lossless-JPEG header, is checked as one lossless unit that
-does not end where declared (a known limit to fix before it joins the list).
+size is the unlikely case Q15 assumed. Each of its tiles is followed by `FF` fill after its EOI up to a multiple of
+16 bytes, and its SubIFD also declares one strip over all the tiles; the fill now passes (see "Lossless JPEG check"),
+the strip is no unit of its own (it starts where the first tile does and the tiles are the units), and the whole file
+comes out `Intact`, as on `main`.
 
 CI runs it in the `samples` job: a failed download (raw.pixls.us down) skips the test without failing the build, while
 a failing test fails it. There is no HEIC sample: none with a verifiable CC0/public-domain license was found.

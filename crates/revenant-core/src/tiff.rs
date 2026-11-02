@@ -733,6 +733,38 @@ impl Walker<'_, '_> {
         } else {
             (&t.strip_offsets, &t.strip_counts)
         };
+        // An IFD with tiles and strips (the ILCE-6700 writes one strip over all its lossless tiles): the tiles win, and a
+        // strip that overlaps the IFD's own tiles is no range of its own (it would be one lossless JPEG ending at its
+        // first tile's EOI, not where declared).
+        // The tiles' extent as disjoint runs in order, so each strip is looked up in O(log n).
+        let mut tiles: Vec<(u64, u64)> = t
+            .tile_offsets
+            .iter()
+            .zip(&t.tile_counts)
+            .map(|(&o, &l)| (o, o.saturating_add(l)))
+            .filter(|&(o, e)| e > o)
+            .collect();
+        tiles.sort_unstable();
+        let mut runs: Vec<(u64, u64)> = Vec::with_capacity(tiles.len());
+        for (o, e) in tiles {
+            match runs.last_mut() {
+                Some(last) if o <= last.1 => last.1 = last.1.max(e),
+                _ => runs.push((o, e)),
+            }
+        }
+        let over_tiles = |o: u64, l: u64| {
+            let e = o.saturating_add(l);
+            // The first run ending after `o` is the only one that can start before `e`.
+            let i = runs.partition_point(|&(_, re)| re <= o);
+            runs.get(i).is_some_and(|&(ro, _)| ro < e)
+        };
+        let (strip_offsets, strip_counts): (Vec<u64>, Vec<u64>) = strip_offsets
+            .iter()
+            .zip(strip_counts.iter())
+            .filter(|&(&o, &l)| !over_tiles(o, l))
+            .map(|(&o, &l)| (o, l))
+            .unzip();
+        let (strip_offsets, strip_counts) = (&strip_offsets, &strip_counts);
         if let (Some(o), Some(l)) = (t.jpeg_offset, t.jpeg_len)
             && l > 0
         {
@@ -1021,8 +1053,9 @@ mod tests {
             started.elapsed()
         );
         assert!(i.data.len() + i.jpegs.len() <= 262_144);
-        // The per-walk value budget is what stops it: 16 IFDs worth of values (2 ranges per offset/count pair).
-        assert_eq!(i.data.len(), 131_072);
+        // The per-walk value budget is what stops it: 16 IFDs worth of values, one range per offset/count pair (the
+        // strips lie over their IFD's tiles, so the tiles win).
+        assert_eq!(i.data.len(), 65_536);
         assert!(i.truncated);
     }
 
@@ -1294,6 +1327,38 @@ mod tests {
         assert_eq!(i.data.len(), 1000);
         assert_eq!(i.jpegs.len(), 1); // only the real preview
         assert!(!i.truncated && !i.garbled);
+    }
+
+    #[test]
+    fn a_strip_over_the_ifds_own_tiles_is_no_range() {
+        // ILCE-6700: the SubIFD declares its lossless tiles and also one strip covering them all. The tiles win: the
+        // strip is no range of its own (not raw data, not a lossless unit, not a JPEG-coded start).
+        let tile = revenant_testkit::lossless_jpeg(16, 16, 1, 12, 3);
+        let n = 4;
+        let (offs, cnts, data) = (300usize, 300 + 4 * n, 400usize);
+        let entries = [
+            entry(0x0103, 3, 1, 7),
+            entry(0x0111, 4, 1, data as u32),
+            entry(0x0117, 4, 1, (n * tile.len()) as u32),
+            entry(0x0144, 4, n as u32, offs as u32),
+            entry(0x0145, 4, n as u32, cnts as u32),
+        ];
+        let ifd = ifd_bytes(&entries, 0);
+        let mut b = file(data + n * tile.len(), &[(8, ifd.clone())]);
+        let mut ranges = Vec::new();
+        for k in 0..n {
+            let at = data + k * tile.len();
+            put(&mut b, at, &tile);
+            put(&mut b, offs + 4 * k, &le(at as u32));
+            put(&mut b, cnts + 4 * k, &le(tile.len() as u32));
+            ranges.push((at as u64, tile.len() as u64));
+        }
+        let i = walk_all(&b).unwrap();
+        assert_eq!(i.lossless, ranges);
+        assert_eq!(i.data, ranges);
+        let starts: Vec<u64> = ranges.iter().map(|r| r.0).collect();
+        assert_eq!(i.jpeg_data_starts, starts);
+        assert_eq!(i.end, (data + n * tile.len()) as u64);
     }
 
     #[test]

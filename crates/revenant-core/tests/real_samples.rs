@@ -310,9 +310,19 @@ fn split_at(len: usize, k: usize) -> usize {
 const KNOWN_PARTIAL: [(&str, usize); 2] =
     [("canon-eos-kiss-f.cr2", 3), ("canon-eos-kiss-f.cr2", 5)];
 
+/// Splits joined with their exact pieces but `Partial`: the ILCE-6700's 6192×4128 preview cut at 2/10 and 3/10
+/// (measured in part 1.6, Task 11, the same on `main`: the 1.3 join is not sure of its break point there).
+const KNOWN_JOINED_PARTIAL: [(&str, usize); 2] =
+    [("sony-ilce-6700.arw", 2), ("sony-ilce-6700.arw", 3)];
+
+/// Splits joined one sector off the true cut (512 bytes of the gap in place of the photo's own): `Partial`, never
+/// `Intact` (the ILCE-6700 preview at 4/10, the same on `main`).
+const KNOWN_OFF_CUT: [(&str, usize); 1] = [("sony-ilce-6700.arw", 4)];
+
 /// Every sample's preview split at k/10 (k = 2..=8) on a sector boundary, with its own tail [`GAP`] bytes later: the
 /// photo is found joined and `Intact`, pieces exact (joined but `Partial` when the preview uses restart markers, ruling
-/// Q16; [`KNOWN_PARTIAL`] aside). The same first piece with the tail of the
+/// Q16; [`KNOWN_PARTIAL`] aside, [`KNOWN_JOINED_PARTIAL`] joined exact but `Partial`, [`KNOWN_OFF_CUT`] `Partial`).
+/// The same first piece with the tail of the
 /// next sample's preview (split at the same k) instead: never `Intact`. Every case is checked and every failure listed
 /// before the test fails.
 #[test]
@@ -348,12 +358,26 @@ fn real_previews_split_in_two() {
             } else {
                 Health::Intact
             };
+            let health = if KNOWN_JOINED_PARTIAL.contains(&(s.name.as_str(), k)) {
+                Health::Partial
+            } else {
+                health
+            };
             let joined = own.as_ref().is_some_and(|f| {
                 f.health == health && f.len == p.len() as u64 && f.fragments == expected
             });
             let known = KNOWN_PARTIAL.contains(&(s.name.as_str(), k));
+            let off_cut = KNOWN_OFF_CUT.contains(&(s.name.as_str(), k));
             match (joined, known) {
                 (true, false) => own_ok += 1,
+                (false, false)
+                    if off_cut
+                        && own.as_ref().is_some_and(|f| {
+                            f.health == Health::Partial && f.len == p.len() as u64
+                        }) =>
+                {
+                    own_ok += 1
+                }
                 // A known exception stays a contiguous `Partial` (never glued to anything else).
                 (false, true)
                     if own
@@ -579,25 +603,28 @@ fn thirds(len: usize) -> [usize; 3] {
     [a, b, len.div_ceil(c) - a - b]
 }
 
-/// Previews the search does not put back from three pieces (measured in part 1.6, Task 11): restart interval 0, so
-/// nothing in the data marks where a piece ends. Out of step, their data decodes on without an error, the walk of a
-/// piece breaks far past its true end, and the true cut is not among the break points tried: the file stays the file
-/// system's one-run guess, `Partial` (never `Intact`), which holds the bytes of the runs after its first piece (the
-/// next preview's among them). The previews with restart markers (X-S10, K-r, TG-7) do come back exact.
-const KNOWN_MISSED: [&str; 5] = [
+/// Previews the search does not put back from three pieces (measured in part 1.6, Task 11; a known limit, ruling Q59):
+/// restart interval 0, so nothing in the data marks where a piece ends. Out of step, their data decodes on without an
+/// error, the walk of a piece breaks far past its true end, and the true cut is not among the break points tried: the
+/// file stays the file system's one-run guess, `Partial` (never `Intact`, asserted), which holds the bytes of the runs
+/// after its first piece (the next preview's among them: the 1.4 carving behaviour). The previews with restart markers
+/// (X-S10, K-r, TG-7) do come back exact.
+const KNOWN_MISSED: [&str; 6] = [
     "canon-eos-kiss-f.cr2",
     "canon-eos-r6.cr3",
     "nikon-z6.nef",
     "sony-ilce-7s.arw",
+    "sony-ilce-6700.arw",
     "panasonic-dmc-lx7.rw2",
 ];
 
 /// Every sample's largest preview cut in three at 32 KiB multiples on an exFAT card (32 KiB clusters, deleted on a
 /// computer that clears the chain: placed by content alone), its pieces out of order, interleaved with the three pieces
 /// of the next sample's preview (deleted the same way): each preview comes back with its exact bytes, never `Intact`
-/// (a JPEG placed by content alone in two or more pieces is at most `Partial`, Q37 and ruling Q58), and no finding holds
-/// runs of both previews; [`KNOWN_MISSED`] aside, which must still never be `Intact` (nor any finding holding runs of
-/// both previews). The DRI of each preview is printed (D21). Every case is checked and every failure listed.
+/// (a JPEG placed by content alone in two or more pieces is at most `Partial`, Q37 and ruling Q58), and no `Intact`
+/// finding holds runs of both previews (Q59: the rule binds `Intact` findings; a `Partial` one-run guess may hold the
+/// next file's bytes); [`KNOWN_MISSED`] aside for the exact bytes, each of which must still not be `Intact`. The DRI of
+/// each preview is printed (D21). Every case is checked and every failure listed.
 #[test]
 #[ignore = "needs downloaded samples: scripts/fetch-samples.sh, then REVENANT_SAMPLES=samples/cache"]
 fn real_previews_split_in_three() {
@@ -680,7 +707,6 @@ fn real_previews_split_in_three() {
         let dri = restart_interval(p);
         let at = p_runs[0].0;
         let known = |name: &str| KNOWN_MISSED.contains(&name);
-        let next = &list[(i + 1) % list.len()].name;
         match last.values().find(|f| f.start == at) {
             Some(f) if f.health == Health::Intact => failures.push(format!(
                 "{}: Intact, never for content in pieces: {f:?}",
@@ -697,24 +723,24 @@ fn real_previews_split_in_three() {
                     ""
                 }
             ),
-            Some(f) if known(&s.name) => println!(
-                "{}: DRI {dri}, known miss: {:?} in {} pieces, not its exact bytes",
-                s.name,
-                f.health,
-                f.ranges().len()
-            ),
+            Some(f) if known(&s.name) => {
+                assert_ne!(f.health, Health::Intact, "{}: a known miss", s.name);
+                println!(
+                    "{}: DRI {dri}, known miss: {:?} in {} pieces, not its exact bytes",
+                    s.name,
+                    f.health,
+                    f.ranges().len()
+                )
+            }
             other => failures.push(format!(
                 "{} (DRI {dri}): not its exact bytes: {other:?}",
                 s.name
             )),
         }
         for f in last.values() {
-            let both = touches(f, &p_runs) && touches(f, &q_runs);
-            // A known miss's one-run guess holds the runs after its first piece (`Partial`, see KNOWN_MISSED).
-            let excused = f.health != Health::Intact && (known(&s.name) || known(next));
-            if both && !excused {
+            if f.health == Health::Intact && touches(f, &p_runs) && touches(f, &q_runs) {
                 failures.push(format!(
-                    "{}: a finding holds runs of both previews: {f:?}",
+                    "{}: an Intact finding holds runs of both previews: {f:?}",
                     s.name
                 ));
             }

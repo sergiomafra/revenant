@@ -55,6 +55,9 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
 - **1.6, fragmentação avançada** (depois da 1.5; não segura o marco A):
   - Arquivos em 3 ou mais pedaços (JPEG e vídeo), usando o tamanho de cluster que a 1.4 traz.
   - Fragmentação de RAW, onde houver como validar a emenda (prévia JPEG, tamanhos do sistema de arquivos).
+  - Não cobre (para depois): JPEG sem marcadores de reinício (DRI 0) em 3 ou mais pedaços, colocado só pelo conteúdo,
+    muitas vezes não volta (fica o palpite de uma corrida, Parcial, como na 1.4: 5 das 8 prévias reais na medição da
+    Tarefa 11); falta um jeito de achar o corte verdadeiro quando os dados fora de ordem decodificam sem erro.
 
 ## Módulo 2: App (Tauri 2 + React; telas aprovadas antes de cada parte)
 
