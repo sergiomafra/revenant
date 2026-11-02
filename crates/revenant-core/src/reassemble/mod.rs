@@ -1531,11 +1531,21 @@ pub(crate) struct Context<'a> {
     pub frags_capped: bool,
     /// More claimed runs than [`Limits::claimed_runs`]: some `Intact` pieces may read free (D18).
     pub claimed_capped: bool,
+    /// The ids, ascending, of the candidates the scan reported as a deleted entry's pieces without its name: never
+    /// `Intact` (ruling Q55 (2)).
+    pub unnamed: &'a [u64],
     /// A volume listing dropped entries: live clusters may be unknown (Q5).
     pub listing_truncated: bool,
     /// What the pairing left of its `moov` load and sample budgets: the videos' `moov`s are loaded within it.
     pub moov_budget: crate::pairing::Budget,
     pub limits: &'a Limits,
+}
+
+impl Context<'_> {
+    /// Whether `f` is a deleted entry's pieces the scan reported without its name (ruling Q55 (2)).
+    pub(crate) fn is_unnamed(&self, f: &Finding) -> bool {
+        self.unnamed.binary_search(&f.id).is_ok()
+    }
 }
 
 /// What the scan checks besides the search for the health of a reassembly (D6).
@@ -1554,6 +1564,8 @@ pub(crate) struct Checks {
     pub own_ok: bool,
     /// A JPEG with restart markers (DRI > 0): at most `Partial` in 2 or more pieces (Q16).
     pub restarts: bool,
+    /// The candidate is a deleted entry's pieces the scan reported without its name: at most `Partial` (ruling Q55 (2)).
+    pub unnamed: bool,
     /// The pieces were placed by their content alone, no file system proving where they lie (every result of
     /// [`search`]: an old exFAT chain proves its placement in the scan's merge instead, D14; a JPEG in 2 or more pieces
     /// is then at most `Partial`, ruling Q37).
@@ -1562,8 +1574,9 @@ pub(crate) struct Checks {
 
 /// The health of a reassembly of a file of `kind` (D6): `Intact` iff the search is complete, unique, exhaustive and
 /// `Proven`, no cap was hit, the listing is whole (Q5), no piece holds an unreadable sector, the known size matches, the
-/// format's own check passes, it is no JPEG with restart markers in 2 or more pieces (Q16) and, for a JPEG, the format's
-/// cap allows it ([`jpeg::jpeg_health_cap`]: placed by content alone, 2 or more pieces never are, Q37); else `Partial`.
+/// format's own check passes, it is no JPEG with restart markers in 2 or more pieces (Q16), it is not a deleted entry's
+/// pieces reported without its name (Q55) and, for a JPEG, the format's cap allows it ([`jpeg::jpeg_health_cap`]: placed
+/// by content alone, 2 or more pieces never are, Q37); else `Partial`.
 pub(crate) fn health(found: &Search, kind: FileKind, c: &Checks) -> Health {
     let search = found.complete && found.unique && found.exhaustive && found.proof == Proof::Proven;
     let many = found.pieces.len() >= 2;
@@ -1579,7 +1592,8 @@ pub(crate) fn health(found: &Search, kind: FileKind, c: &Checks) -> Health {
         && !c.listing_truncated
         && !c.bad
         && c.size_ok
-        && c.own_ok;
+        && c.own_ok
+        && !c.unnamed;
     if search && format && scan {
         Health::Intact
     } else {
@@ -1840,6 +1854,7 @@ fn reassemble_jpeg(
         size_ok: known.is_none_or(|k| k == found.len),
         own_ok: true,
         restarts: seams.restart_interval() > 0,
+        unnamed: ctx.is_unnamed(f),
         // Every result of the search is placed by content alone: an exFAT chain that proves a placement does so in the
         // scan's merge (D14), and such a file is no candidate.
         content_only: true,
@@ -1919,6 +1934,7 @@ fn reassemble_raw(
         size_ok: known.is_none_or(|k| k == found.len),
         own_ok: true,
         restarts: false,
+        unnamed: ctx.is_unnamed(f),
         content_only: true,
     };
     // The preview's strict decode: only when nothing else keeps the file from `Intact`.

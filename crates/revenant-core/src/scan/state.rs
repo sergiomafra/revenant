@@ -60,6 +60,8 @@ pub(crate) struct ScanState {
     /// The ranges of the `Intact` findings emitted, `Runs` as `(start, end)`.
     claimed: Vec<(u64, u64)>,
     claimed_capped: bool,
+    /// The ids of the findings reported as a deleted entry's pieces without its name, ascending (ruling Q55).
+    unnamed: Vec<u64>,
     /// `Shared::skips`.
     skips: Vec<(u64, u64)>,
     /// The finders' tails as of `position`.
@@ -166,6 +168,7 @@ pub(super) fn capture(
         frags_capped,
         claimed,
         claimed_capped,
+        unnamed,
     } = commit;
     let tails = ahead
         .front()
@@ -199,6 +202,7 @@ pub(super) fn capture(
         frags_capped: *frags_capped,
         claimed: claimed.to_vec(),
         claimed_capped: *claimed_capped,
+        unnamed: unnamed.clone(),
         skips: lock(&shared.skips).to_vec(),
         tails,
         bad,
@@ -208,6 +212,11 @@ pub(super) fn capture(
 
 fn corrupt<T>() -> Result<T, EngineError> {
     Err(EngineError::SessionCorrupt)
+}
+
+/// Strictly ascending (ids, each once).
+fn ascending(ids: &[u64]) -> bool {
+    ids.windows(2).all(|w| w[0] < w[1])
 }
 
 impl ScanState {
@@ -246,6 +255,7 @@ impl ScanState {
             frags_capped,
             claimed,
             claimed_capped,
+            unnamed,
             skips,
             tails,
             bad,
@@ -268,7 +278,7 @@ impl ScanState {
         ) else {
             return corrupt();
         };
-        if frags.len() > MAX_CANDIDATES {
+        if frags.len() > MAX_CANDIDATES || !ascending(&unnamed) {
             return corrupt();
         }
         if shared.cache.restore(bad, coverage).is_none() || !finders.restore(tails) {
@@ -300,6 +310,7 @@ impl ScanState {
         commit.frags_capped = frags_capped;
         commit.claimed = claimed;
         commit.claimed_capped = claimed_capped;
+        commit.unnamed = unnamed;
         Ok(position)
     }
 }
@@ -445,6 +456,7 @@ impl Codec for ScanState {
             frags_capped,
             claimed,
             claimed_capped,
+            unnamed,
             skips,
             tails,
             bad,
@@ -474,6 +486,7 @@ impl Codec for ScanState {
         e.bool(*frags_capped);
         e.seq(claimed);
         e.bool(*claimed_capped);
+        e.seq(unnamed);
         e.seq(skips);
         e.put(tails);
         e.seq(bad);
@@ -506,6 +519,7 @@ impl Codec for ScanState {
             frags_capped: d.bool()?,
             claimed: d.seq()?,
             claimed_capped: d.bool()?,
+            unnamed: d.seq()?,
             skips: d.seq()?,
             tails: d.get()?,
             bad: d.seq()?,
@@ -519,7 +533,8 @@ impl Codec for ScanState {
             && state.carved.len() <= MAX_FILES
             && state.own_len <= MAX_OWN_STARTS as u64
             && state.frags.len() <= MAX_CANDIDATES
-            && state.claimed.len() <= MAX_CLAIMED_RUNS;
+            && state.claimed.len() <= MAX_CLAIMED_RUNS
+            && state.unnamed.len() <= MAX_FILES;
         if !within_caps || entries != state.own_len {
             return corrupt();
         }

@@ -1504,6 +1504,7 @@ pub(crate) fn reassemble_video(
     let checks = checks(
         ctx,
         source,
+        f,
         &found,
         known,
         index_health(&m.payload, len, false) == Health::Intact,
@@ -1516,6 +1517,7 @@ pub(crate) fn reassemble_video(
 fn checks(
     ctx: &super::Context,
     source: &CachedSource,
+    f: &Finding,
     found: &Search,
     known: Option<u64>,
     own_ok: bool,
@@ -1532,6 +1534,7 @@ fn checks(
         size_ok: known.is_none_or(|k| k == found.len),
         own_ok,
         restarts: false,
+        unnamed: ctx.is_unnamed(f),
         content_only: true,
     }
 }
@@ -1636,7 +1639,7 @@ pub(crate) fn reassemble_index_first(
     if cancel.is_cancelled() || found.pieces.first().map(|p| p.start) != Some(f.start) {
         return Some(None);
     }
-    let checks = checks(ctx, source, &found, known, own_ok);
+    let checks = checks(ctx, source, f, &found, known, own_ok);
     Some(finding(f, &found, layout.kind, &checks).filter(|new| {
         improves(f, new, found.complete || clean)
             || replaces(f, new, found.complete, source, seams.as_mut())

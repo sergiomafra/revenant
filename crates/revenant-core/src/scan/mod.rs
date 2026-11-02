@@ -381,6 +381,10 @@ struct Commit<'a, 's> {
     claimed: Runs,
     /// A range was dropped by that cap: no reassembly is `Intact` (ruling D18).
     claimed_capped: bool,
+    /// The ids, ascending, of the findings reported as a deleted entry's pieces without its name ([`Padded::Unnamed`]):
+    /// at most `Partial` to the end of the scan, whatever the pairing or the reassembly make of them (ruling Q55 (2)).
+    /// One per kept file at most, so within the listing's [`MAX_FILES`].
+    unnamed: Vec<u64>,
 }
 
 #[cfg(test)]
@@ -641,7 +645,9 @@ impl Commit<'_, '_> {
             if !ok {
                 continue;
             }
-            if self.capped && f.health == Health::Intact {
+            if (self.capped || self.unnamed.binary_search(&f.id).is_ok())
+                && f.health == Health::Intact
+            {
                 f.health = Health::Partial;
             }
             out.push(f);
@@ -670,6 +676,7 @@ impl Commit<'_, '_> {
             capped: self.capped,
             frags_capped: self.frags_capped,
             claimed_capped: self.claimed_capped,
+            unnamed: &self.unnamed,
             // Only the listing's flag so far (the old folders come after): live clusters may be unknown (ruling Q5).
             listing_truncated: self.summary.listing_truncated,
             moov_budget,
@@ -815,12 +822,18 @@ impl Commit<'_, '_> {
                         health: m.health,
                         fragments: m.fragments,
                     };
-                    // Q54: the entry's pieces stay, but not its name (`merge` already left it at most `Partial`).
-                    let origin = (rule != Padded::Unnamed).then_some(m.origin);
-                    if origin.is_none() && measurement.health == Health::Intact {
+                    // Q54/Q55: the entry's pieces stay, but not its name (`merge` already left it at most `Partial`),
+                    // and nothing after makes it `Intact`.
+                    let unnamed = rule == Padded::Unnamed;
+                    let origin = (!unnamed).then_some(m.origin);
+                    if unnamed && measurement.health == Health::Intact {
                         measurement.health = Health::Partial;
                     }
+                    let id = self.next_id;
                     self.add(at, measurement, origin, own, head);
+                    if unnamed && self.next_id > id {
+                        self.unnamed.push(id);
+                    }
                 }
             }
             if bad {
@@ -1275,6 +1288,7 @@ pub(crate) fn scan_with(
             frags_capped: false,
             claimed: Runs::default(),
             claimed_capped: false,
+            unnamed: Vec::new(),
         };
         let mut finders = Finders {
             orphan: (!volumes.is_empty()).then(|| OrphanFinder::new(&volumes)),

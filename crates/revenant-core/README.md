@@ -1278,9 +1278,11 @@ whose clock was never set (every stamp equal).
   Two more cards (one per cluster size) with a camera that reuses the deleted entries' slots (`FsBuilder::reuse_slots`):
   one more shot, the review's lone stale entry (D and A shot and deleted, a shorter B over A's clusters takes D's
   slots, is deleted, and C takes them again, so A's entry stands alone over B's bytes and zeros, Q53), the next 3 shots
-  in pieces deleted on a computer, then a RAW X in 2 runs deleted in camera and an edited copy (a longer name, so it
-  takes no deleted entry's slots) written over X's first run: X's entry stays over a chain another file rewrote (ruling
-  Q50 N-1). And one whose clock was never set, the first new shot
+  in pieces deleted on a computer, then a photo X in 2 runs deleted in camera and an edited copy Y (a longer name, so
+  it takes no deleted entry's slots), FAT-chained from X's last clusters on: Y's chain rewrites X's last FAT entries,
+  so X's old chain no longer reads whole and the listing places X by the one-run guess from its start (ruling Q50
+  N-1); the card checks that this path was taken (X's first finding: its entry's, `guessed`, one run of its size).
+  And one whose clock was never set, the first new shot
   (written from the very cluster of the first deleted photo) deleted too: two entries tie at one start (Q52).
 - **Format in camera, shoot again**: the same culled life, quick-formatted, then 6 shots over the start: they cover
   the first holes only, so old files in pieces stay whole further on, with no entry left; carved and reassembled.
@@ -1839,11 +1841,21 @@ a probe over the raw source that refuses, without reading it, any range the cach
   start (its length and health), without the entry's name or size; with no carving there (unreadable or skipped start)
   the entry's finding is at most `Partial`. A live file keeps the D6 rule. Ruling Q54 bounds it: a format's own
   padding is no such sign (a TIFF-based RAW whose recorded size is its structure's end rounded up to 4 KiB or 64 KiB,
-  as Sony pads its ARWs, keeps its name and placement); an `OldChain` entry whose view passes its checks keeps its
-  placement, name and health; and the carving replaces a fragmented entry only when it reads the same bytes as the
-  view (contiguous, within the first piece), else the entry's pieces stay, without the name, at most `Partial`. Cost:
-  a deleted photo that really was zero-padded inside its recorded size loses its name (it is still recovered), and an
-  ARW over another whose sizes match a grain rounding by coincidence keeps the older name.
+  as Sony pads its ARWs, keeps its name and placement); and the carving replaces a fragmented entry only when it reads
+  the same bytes as the view (contiguous, within the first piece), else the entry's pieces stay, without the name,
+  at most `Partial` **to the end of the scan**: the pairing and the reassembly may move its pieces, never make it
+  `Intact` (ruling Q55 (2); the ids of these findings are part of a session's checkpoints). An old exFAT chain is no
+  exemption (Q55 (1)): a camera that allocates next-free fills a deleted file's freed runs in order, so a shorter
+  photo can take its exact chain. Cost: a deleted photo that really was zero-padded inside its recorded size loses its
+  name (it is still recovered), and an ARW over another whose sizes match a grain rounding by coincidence keeps the
+  older name. The whole decision, in one place (`scan::fs::decide`), for a deleted entry by how its structure ends:
+
+  | Structure ends | Recorded run / guess | Old chain (`old_chain`) |
+  | --- | --- | --- |
+  | at the size, or a RAW's own grain padding fills the rest | name kept; D3/D5 (`Intact` when trusted) | name kept; `Intact`, `old_chain` when every check passes, else `guessed`, `Partial` |
+  | early, then fill only | no name: the carving at the start, or the entry's pieces at most `Partial` | the same |
+  | early, then whole files, then fill (D6) | name kept; D3/D5 (the 1.4 rule) | name kept; `guessed`, `Partial` (no proof) |
+  | early, then other bytes | name kept; at most `Partial` | name kept; `guessed`, `Partial` |
 - **Nothing is skipped because of the file system** (ruling R10): every head the signature rules examine is still
   examined, and only an `Intact` finding skips its pieces, as before.
 - **A listed file's finding** is added at the sector holding its first piece, always (whether a format recognizes the
@@ -2161,8 +2173,12 @@ merge (rulings D3, D5, D6), from the measurement through the view of the file's 
    Exception (part 1.6, D14): a deleted file the listing placed `old_chain` keeps an `Intact` view, untrusted as it is,
    when every content check its format has passes over the view (a JPEG: the strict decode; a video: its index
    `Intact` and every checkable sample in place, whatever its layout, at least one checked; a TIFF RAW: its structure,
-   its largest preview strict, every IFD, embedded JPEG and lossless tile whole), its tail is coherent and its pieces
-   sum to the entry's size. The view's measure also stands for "no other file starts inside" where it looks: every
+   its largest preview strict, every IFD, embedded JPEG and lossless tile whole), its tail is coherent, its pieces
+   sum to the entry's size and its structure ends exactly at that size (ruling Q55: the JPEG's EOI, a video's last
+   box, at the size; or a TIFF RAW's own zero padding to its 4 KiB or 64 KiB grain fills the rest, Q54 (b)). A
+   structure that ends early, over fill or whole files, proves nothing about the entry: a shorter file may have been
+   written over its exact chain (see the Q53 rule in [File systems in the scan](#file-systems-in-the-scan)). The
+   view's measure also stands for "no other file starts inside" where it looks: every
    format ends a file at a sector start where another header is recognized and confirmed (its own embedded files
    aside); a video's boxes other than `mdat` are not looked at. These checks run
    in the file's job (the measuring threads), only for `old_chain` files, read the view once more and are bounded by

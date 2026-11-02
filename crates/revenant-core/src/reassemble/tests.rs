@@ -1372,6 +1372,7 @@ fn good_checks() -> Checks {
         size_ok: true,
         own_ok: true,
         restarts: false,
+        unnamed: false,
         content_only: false,
     }
 }
@@ -1398,7 +1399,7 @@ fn health_needs_every_condition() {
         assert_eq!(health(&s, jpeg, &c), Health::Partial, "{name}");
         assert_eq!(health(&s, FileKind::Mp4, &c), Health::Partial, "{name}");
     }
-    let checks: [Mutation<Checks>; 9] = [
+    let checks: [Mutation<Checks>; 10] = [
         ("capped", |c| c.capped = true),
         ("frags_capped", |c| c.frags_capped = true),
         ("claimed_capped", |c| c.claimed_capped = true),
@@ -1408,11 +1409,20 @@ fn health_needs_every_condition() {
         ("own check", |c| c.own_ok = false),
         ("restarts (Q16)", |c| c.restarts = true),
         ("content only (Q37)", |c| c.content_only = true),
+        ("unnamed (Q55)", |c| c.unnamed = true),
     ];
     for (name, f) in checks {
         let mut c = good_checks();
         f(&mut c);
         assert_eq!(health(&s, jpeg, &c), Health::Partial, "{name}");
+    }
+    // A deleted entry's pieces reported without its name are never `Intact`, of any kind, in any number of pieces.
+    let unnamed = Checks {
+        unnamed: true,
+        ..good_checks()
+    };
+    for kind in [FileKind::Arw, FileKind::Mp4] {
+        assert_eq!(health(&s, kind, &unnamed), Health::Partial, "{kind:?}");
     }
     // Q16 and Q37 bite only a JPEG in 2 or more pieces: one run placed by content keeps the 1.3 rule, and another
     // format is not capped by them.

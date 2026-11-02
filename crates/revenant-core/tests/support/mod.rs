@@ -716,8 +716,9 @@ pub fn on_disk(volume: &[u8]) -> Vec<u8> {
 pub mod cards {
     use revenant_testkit::fs::{DeleteStyle, FsBuilder, FsType, Partitioning, disk};
     use revenant_testkit::{
-        AvcOptions, AvcVideo, Mp4Options, Rw2Options, TestExif, TiffRaw, TiffRawOptions,
-        TiffVariant, avc_video, jpeg, jpeg_smooth, mp4, panasonic_rw2, tiff_raw,
+        ArwCompression, ArwOptions, AvcOptions, AvcVideo, Mp4Options, Rw2Options, TestExif,
+        TiffRaw, TiffRawOptions, TiffVariant, arw, avc_video, jpeg, jpeg_smooth, mp4,
+        panasonic_rw2, tiff_raw,
     };
 
     use super::SimSource;
@@ -1120,6 +1121,62 @@ pub mod cards {
             card(super::on_disk(&b.build()), vec![(bad, bad + 512)]),
             pieces,
         )
+    }
+
+    /// The re-review's C-3 scenario (ruling Q55) on exFAT with 32 KiB clusters and slots reused: D, then A (an
+    /// uncompressed ARW) FAT-chained in 3 runs from clusters 300, 600 and 900, both deleted in camera; B, a shorter ARW
+    /// in as many clusters, written over A's chain in A's order, deleted; C takes B's slots; old data around them. A's
+    /// entry stands alone over B's bytes and zeros: the scan reports its pieces without its name, `Partial` to the end
+    /// (without that cap the reassembly would make it one run `Intact` over the gaps). The card and A's start.
+    pub fn unnamed() -> (Card, u64) {
+        const CLUSTER: u64 = 32 * KIB;
+        let need = |len: usize| (len as u64).div_ceil(CLUSTER) as u32;
+        let raw = |seed: u64, preview: (u32, u32)| {
+            arw(&ArwOptions {
+                compression: ArwCompression::Uncompressed,
+                seed,
+                preview,
+                ..ArwOptions::default()
+            })
+            .bytes
+        };
+        let a = raw(1, ArwOptions::default().preview);
+        let b_raw = (2..200u64)
+            .map(|s| {
+                let w = 640 - 8 * (s as u32 % 60);
+                raw(s, (w, w * 3 / 4))
+            })
+            .find(|r| r.len() < a.len() && need(r.len()) == need(a.len()))
+            .expect("a shorter ARW of as many clusters");
+        let each = need(a.len()) / 3;
+        let clusters: Vec<u32> = (300..300 + each)
+            .chain(600..600 + each)
+            .chain(900..900 + need(a.len()) - 2 * each)
+            .collect();
+        let mut b = FsBuilder::new(FsType::Exfat, 64 * MIB, CLUSTER as u32);
+        b.reuse_slots(true);
+        // D and C: JPEGs whose names take as many entry slots as the ARWs'.
+        let path = |n: u32, ext: &str| format!("{DIR}/DSC0000{n}.{ext}");
+        let (d, c) = (jpeg(64, 64, 9, 0), jpeg(64, 64, 10, 0));
+        b.add_at(&path(0, "JPG"), &d, &[20]);
+        b.add_at(&path(1, "ARW"), &a, &clusters);
+        b.delete(&path(0, "JPG"), DeleteStyle::Camera);
+        b.delete(&path(1, "ARW"), DeleteStyle::Camera);
+        b.add_at(&path(2, "ARW"), &b_raw, &clusters);
+        b.delete(&path(2, "ARW"), DeleteStyle::Camera);
+        b.add_at(&path(3, "JPG"), &c, &[40]);
+        let mut v = b.build();
+        let top = 960u32;
+        let old = noise(CLUSTER * u64::from(top), 0x01D);
+        for k in 64..top {
+            if !clusters.contains(&k) {
+                let at = b.cluster_offset(k) as usize;
+                let from = (u64::from(k) * CLUSTER) as usize;
+                v[at..at + CLUSTER as usize].copy_from_slice(&old[from..from + CLUSTER as usize]);
+            }
+        }
+        let start = VOL + b.cluster_offset(clusters[0]);
+        (card(super::on_disk(&v), Vec::new()), start)
     }
 
     /// F: [`three_piece`] with one unreadable sector inside P5 (R is put back together by the reassembly step).

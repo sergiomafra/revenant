@@ -1925,3 +1925,153 @@ fn padded_arw_in_one_run_keeps_its_name() {
     );
     same(&extracted(&src, &f), &a);
 }
+
+/// The re-review's C-3 scenario (ruling Q55), on exFAT with `cluster`-byte clusters and slots reused: D, then A in 3 runs
+/// (FAT-chained, from clusters 300, 600, 900), both deleted in camera; B, a shorter file of `kind` in as many clusters,
+/// written over A's clusters in A's order (the next shot fills A's freed runs: its chain is A's again); B deleted; C
+/// takes B's slots. A's entry stands alone over B's bytes and the zero-filled rest of its last cluster, with an old chain
+/// that reads whole. Old data around them. A's bytes, B's, A's path, A's start, the source and the events.
+fn old_chain_rewritten_by_a_shorter_file(
+    kind: FileKind,
+    cluster: u64,
+    tail: &[u8],
+) -> (Vec<u8>, Vec<u8>, String, u64, SimSource, Vec<Event>) {
+    let (a, b_file) = match kind {
+        FileKind::Jpeg => {
+            let a = jpeg_smooth(1024, 768, 1);
+            let need = clusters_in(a.len(), cluster);
+            let b_file = (2..64)
+                .map(|s| jpeg_smooth(1024, 768, s))
+                .find(|j| j.len() + tail.len() < a.len() && clusters_in(j.len(), cluster) == need)
+                .expect("a shorter photo of as many clusters");
+            (a, b_file)
+        }
+        FileKind::Arw => {
+            let options = |seed: u64, preview: (u32, u32)| ArwOptions {
+                compression: ArwCompression::Uncompressed,
+                seed,
+                preview,
+                ..ArwOptions::default()
+            };
+            let a = arw(&options(1, ArwOptions::default().preview)).bytes;
+            let need = clusters_in(a.len(), cluster);
+            let b_file = (2..200u64)
+                .map(|s| {
+                    let w = 640 - 8 * (s as u32 % 60);
+                    arw(&options(s, (w, w * 3 / 4))).bytes
+                })
+                .find(|r| r.len() + tail.len() < a.len() && clusters_in(r.len(), cluster) == need)
+                .expect("a shorter ARW of as many clusters");
+            (a, b_file)
+        }
+        _ => unreachable!(),
+    };
+    let ext = if kind == FileKind::Jpeg { "JPG" } else { "ARW" };
+    let path = |n: u32| format!("{DIR}/DSC0000{n}.{ext}");
+    let clusters = split(&[300, 600, 900], clusters_in(a.len(), cluster));
+    let mut b = exfat(cluster as u32);
+    b.reuse_slots(true);
+    let (d, c) = (jpeg(64, 64, 9, 0), jpeg(64, 64, 10, 0));
+    let run =
+        |from: u32, j: &[u8]| (from..from + clusters_in(j.len(), cluster)).collect::<Vec<u32>>();
+    b.add_at(&path(0), &d, &run(20, &d));
+    b.add_at(&path(1), &a, &clusters);
+    b.delete(&path(0), DeleteStyle::Camera);
+    b.delete(&path(1), DeleteStyle::Camera);
+    let mut written = b_file.clone();
+    written.extend_from_slice(tail);
+    b.add_at(&path(2), &written, &clusters);
+    b.delete(&path(2), DeleteStyle::Camera);
+    b.add_at(&path(3), &c, &run(40, &c));
+    let mut v = b.build();
+    old_data(
+        &b,
+        &mut v,
+        64..1300.min(b.cluster_count()),
+        &clusters,
+        cluster,
+    );
+    let (src, ev) = scanned(&v);
+    let start = VOL + b.cluster_offset(clusters[0]);
+    (a, b_file, path(1), start, src, ev)
+}
+
+/// What a test of the scenario above asserts: A's name is given to nothing (its structure ends early over fill: no proof
+/// of A, Q53, its old chain no exemption, Q55); the file at A's start is no `Intact` file of other bytes than B's, and,
+/// in pieces without a name, it stays `Partial` to the end of the scan (Q55 (2)).
+fn names_nothing_and_is_no_false_intact(
+    a: &[u8],
+    b_file: &[u8],
+    pa: &str,
+    start: u64,
+    src: &SimSource,
+    ev: &[Event],
+) -> Finding {
+    let view = final_view(ev);
+    let named: Vec<&Finding> = view
+        .values()
+        .filter(|f| f.origin.as_ref().is_some_and(|o| o.path() == pa))
+        .collect();
+    assert!(named.is_empty(), "A's name on {named:#?}");
+    let f = view
+        .values()
+        .find(|f| f.start == start)
+        .unwrap_or_else(|| panic!("a finding at A's start: {view:#?}"))
+        .clone();
+    if f.health == Health::Intact {
+        let got = extracted(src, &f);
+        assert!(got != a, "A's bytes are not on the card");
+        same(&got, b_file);
+    }
+    f
+}
+
+#[test]
+fn old_chain_rewritten_by_a_shorter_photo_names_nothing() {
+    // Re-review 3 C-3 (ruling Q55 (1)): on HEAD 2c7a286, `Intact`, `OldChain`, A's name and size, B's bytes and zeros.
+    for cluster in [4096, 32 * 1024] {
+        let (a, b_file, pa, start, src, ev) =
+            old_chain_rewritten_by_a_shorter_file(FileKind::Jpeg, cluster, &[]);
+        let f = names_nothing_and_is_no_false_intact(&a, &b_file, &pa, start, &src, &ev);
+        assert_eq!(
+            (f.kind, f.origin.as_ref()),
+            (FileKind::Jpeg, None),
+            "{cluster}: {f:#?}"
+        );
+    }
+}
+
+#[test]
+fn old_chain_of_an_arw_rewritten_by_a_shorter_one_names_nothing() {
+    // C-3 for an uncompressed ARW, whose sensor bytes no content check places: the finding at A's start is A's pieces
+    // without a name (`Unnamed`), and the reassembly never makes it a one-run `Intact` over the gaps (I-2, Q55 (2)).
+    let (a, b_file, pa, start, src, ev) =
+        old_chain_rewritten_by_a_shorter_file(FileKind::Arw, 32 * 1024, &[]);
+    let f = names_nothing_and_is_no_false_intact(&a, &b_file, &pa, start, &src, &ev);
+    assert_eq!(
+        (f.kind, f.health, f.origin.as_ref()),
+        (FileKind::Arw, Health::Partial, None),
+        "{f:#?}"
+    );
+}
+
+#[test]
+fn old_chain_over_a_shorter_photo_and_a_whole_file_is_no_proof() {
+    // The decision table's cell "old chain, structure ends early, whole files then fill" (Q55 (1)): the chain is proof
+    // only when the structure ends at the recorded size. B and a small whole JPEG after it fill A's chain up to zeros:
+    // the tail is coherent (D6) but proves nothing about A, so A is never `Intact` under its name.
+    let tail = jpeg(16, 16, 11, 0);
+    let (a, b_file, pa, start, src, ev) =
+        old_chain_rewritten_by_a_shorter_file(FileKind::Jpeg, 32 * 1024, &tail);
+    let view = final_view(&ev);
+    for f in view.values().filter(|f| f.health == Health::Intact) {
+        let named_a = f.origin.as_ref().is_some_and(|o| o.path() == pa);
+        assert!(
+            !named_a || extracted(&src, f) == a,
+            "Intact under A's name with other bytes: {f:#?}"
+        );
+        if f.start == start {
+            same(&extracted(&src, f), &b_file);
+        }
+    }
+}

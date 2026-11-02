@@ -388,6 +388,40 @@ fn resume_with_reassembly_equals_the_whole_scan() {
     }
 }
 
+#[test]
+fn resume_keeps_an_unnamed_finding_partial() {
+    // Ruling Q55 (2): the ids of the findings reported without their entry's name travel in the state, so a resumed
+    // scan keeps them `Partial` through the reassembly exactly as the whole scan does.
+    let (card, start) = cards::unnamed();
+    let o = opts(8, 256 << 20);
+    let r = record(&card.source, &o);
+    let found = r
+        .events
+        .iter()
+        .find_map(|e| match e {
+            Event::Found(f) if f.start == start => Some(f.clone()),
+            _ => None,
+        })
+        .expect("a finding at A's start");
+    assert_eq!(
+        (found.origin.is_none(), found.health, found.fragments.len()),
+        (true, crate::formats::Health::Partial, 3),
+        "{found:#?}"
+    );
+    assert!(
+        !r.events.iter().any(|e| matches!(e, Event::Updated(f)
+            if f.id == found.id && f.health == crate::formats::Health::Intact)),
+        "raised to Intact after the scan"
+    );
+    let paired = r.points.iter().find(|p| p.read.is_none()).unwrap();
+    let state: ScanState = from_bytes(&paired.state).unwrap();
+    assert_eq!(state.unnamed, vec![found.id]);
+    assert!(state.frags.iter().any(|f| f.id == found.id));
+    for p in chosen(&r.points, 3, 55) {
+        check_resume("unnamed", &card.source, &r, &o, &p);
+    }
+}
+
 /// Release builds only (about 10 minutes in a debug build): every boundary of every card, one configuration.
 #[cfg(not(debug_assertions))]
 #[test]
@@ -758,6 +792,9 @@ fn a_state_off_the_scan_is_corrupt() {
     assert_eq!(bad(|s| s.shape.block *= 2), "session_corrupt");
     assert_eq!(bad(|s| s.shape.sector = 4096), "session_corrupt");
     assert_eq!(bad(|s| s.shape.filesystems = false), "session_corrupt");
+    // The unnamed ids are ascending, each once (ruling Q55).
+    assert_eq!(bad(|s| s.unnamed = vec![3, 3]), "session_corrupt");
+    assert_eq!(bad(|s| s.unnamed = vec![5, 2]), "session_corrupt");
     assert_eq!(bad(|s| s.shape.total += 512), "session_corrupt");
     let other = |o: ScanOptions| {
         resume(&card.source, &o, &r.listing, p)
