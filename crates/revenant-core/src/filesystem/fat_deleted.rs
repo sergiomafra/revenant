@@ -216,7 +216,10 @@ fn family(kind: FileKind) -> &'static str {
 /// running out before all were checked, the step budget running out or a cancel give `None`. Files with the same `lo`
 /// and format share one answer (ruling R10). The checks run by high word, each round over every open question, so one
 /// round looks at one 256 KiB stretch of the FAT and the FAT is read once in order; each lookup costs a step, paid for
-/// the whole round before it starts. Cancel is checked before each round and every 1024 lookups.
+/// the whole round before it starts. The phase spends at most `cap` steps (the rest of the budget stays for the
+/// placements): a round that would pass it ends the phase, the questions still open are unanswered and the second
+/// result is true. Cancel is checked before each round and every 1024 lookups.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn high_words(
     map: &mut dyn ClusterMap,
     probes: &mut Probes<'_>,
@@ -225,7 +228,8 @@ pub(super) fn high_words(
     offset: impl Fn(u32) -> Option<u64>,
     last: u32,
     asks: &[(u32, FileKind)],
-) -> Vec<Option<u32>> {
+    cap: u64,
+) -> (Vec<Option<u32>>, bool) {
     struct Question {
         lo: u32,
         family: &'static str,
@@ -257,6 +261,8 @@ pub(super) fn high_words(
         }
     };
     let mut looked = 0u64;
+    let mut spent = 0u64;
+    let mut capped = false;
     'rounds: for h in 0..=last >> 16 {
         let base = h << 16;
         let due = questions
@@ -266,10 +272,20 @@ pub(super) fn high_words(
         if due == 0 {
             continue;
         }
-        if cancel.is_cancelled() || !steps.spend(due) {
+        if cancel.is_cancelled() {
             close_all(&mut questions);
             break;
         }
+        if spent + due > cap {
+            capped = true;
+            close_all(&mut questions);
+            break;
+        }
+        if !steps.spend(due) {
+            close_all(&mut questions);
+            break;
+        }
+        spent += due;
         for i in 0..questions.len() {
             let q = &mut questions[i];
             let c = base | q.lo;
@@ -299,7 +315,7 @@ pub(super) fn high_words(
             }
         }
     }
-    of.iter().map(|&i| questions[i].found).collect()
+    (of.iter().map(|&i| questions[i].found).collect(), capped)
 }
 
 #[cfg(test)]

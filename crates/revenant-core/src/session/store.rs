@@ -22,8 +22,9 @@ use crate::filesystem::crc32;
 use crate::source::Regular;
 
 const MAGIC: &[u8; 8] = b"RVNTSESS";
-/// The format version this engine writes and reads.
-pub(super) const VERSION: u16 = 1;
+/// The format version this engine writes and reads: 2 since the reassembly's state joined the checkpoints (part 1.6);
+/// sessions of version 1 are refused with `session_version` (ruling Q10).
+pub(super) const VERSION: u16 = 2;
 /// Magic, kind and version.
 pub(super) const HEADER_LEN: u64 = 11;
 
@@ -304,11 +305,33 @@ mod tests {
         }
         // Another version: `session_version`.
         let mut b = bytes.clone();
-        b[9] = 2;
+        b[9..11].copy_from_slice(&(VERSION + 1).to_le_bytes());
         assert!(matches!(
             unframe(Kind::Checkpoint, &b),
             Err(EngineError::SessionVersion)
         ));
+    }
+
+    #[test]
+    fn session_version_one_is_refused() {
+        // Part 1.6 added the reassembly's state to a checkpoint: the format is version 2, and a session saved by 1.5
+        // (version 1) is refused by the version check with the error of any unknown version (ruling Q10).
+        assert_eq!(VERSION, 2);
+        let bytes = framed(Kind::Checkpoint, b"payload");
+        assert_eq!(u16::from_le_bytes([bytes[9], bytes[10]]), 2);
+        assert_eq!(unframe(Kind::Checkpoint, &bytes).unwrap(), b"payload");
+        for v in [1u16, 0, 3, u16::MAX] {
+            let mut b = bytes.clone();
+            b[9..11].copy_from_slice(&v.to_le_bytes());
+            for kind in [Kind::Checkpoint, Kind::Manifest] {
+                let mut b = b.clone();
+                b[8] = kind as u8;
+                assert!(
+                    matches!(unframe(kind, &b), Err(EngineError::SessionVersion)),
+                    "version {v}"
+                );
+            }
+        }
     }
 
     #[test]

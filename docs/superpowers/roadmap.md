@@ -1,6 +1,6 @@
 # Revenant — roteiro até a versão 1.0
 
-Atualizado em 25/10/2026. Cada parte segue o mesmo caminho: spec, depois telas (quando houver tela), depois plano, execução por
+Atualizado em 02/11/2026. Cada parte segue o mesmo caminho: spec, depois telas (quando houver tela), depois plano, execução por
 subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizada em toda parte.
 
 ## Marcos
@@ -39,7 +39,7 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
   - Arquivo recuperado sem nome ganha um nome por data e câmera; a extração sanea os nomes.
   - Não cobre: arquivo apagado e fragmentado (sai `Partial`, vai para a 1.6); NTFS, APFS e HFS+ (a escultura segue
     cobrindo). Pendências e decisões em `docs/superpowers/history/2026-10-25-m1-p4-pendencias.md`.
-- **1.5, disco de verdade, concluída** (aguardando PR/merge):
+- **1.5, disco de verdade, concluída** (PR #6):
   - Lê o cartão ou HD direto pelo aparelho no Mac e no Windows, desmontando sem ejetar e sempre só leitura; lista os
     discos e recusa o disco do sistema.
   - Conferência prévia: tudo o que já se sabe estar errado (permissão, aparelho mudo, setor ilegível, desmontagem, destino
@@ -52,9 +52,32 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
     computador e os textos de cada aviso (Módulo 2); copiar e buscar ao mesmo tempo (ideia para depois). Pendências em
     `docs/superpowers/history/2026-10-25-m1-p5-pendencias.md`; conferência com hardware em
     `docs/superpowers/history/2026-10-25-m1-p5-conferencia-manual.md`.
-- **1.6, fragmentação avançada** (depois da 1.5; não segura o marco A):
-  - Arquivos em 3 ou mais pedaços (JPEG e vídeo), usando o tamanho de cluster que a 1.4 traz.
-  - Fragmentação de RAW, onde houver como validar a emenda (prévia JPEG, tamanhos do sistema de arquivos).
+- **1.6, fragmentação avançada, concluída** (revisão final feita e corrigida; aguardando o PR/merge):
+  - JPEG, vídeo e RAW em 3 ou mais pedaços, buscados no espaço livre do cartão na grade de clusters que a 1.4 traz, com
+    orçamento por arquivo e por busca.
+  - Vídeo de câmera H.264/H.265: com o `moov` no fim, antes do `mdat`, com `mdat` de tamanho 0 e fragmentado (`moof`);
+    cada quadro conferido onde o índice o põe, inclusive a peça do meio pequena.
+  - RAW (ARW primeiro; CR2 só `Partial`; NEF, DNG, ORF, RW2) onde a emenda é provada: estrutura TIFF, prévia e, no sem perdas, cada
+    bloco decodificado; `Intact` só com cortes exatamente entre blocos.
+  - Apagados e fragmentados no FAT/exFAT voltam no lugar, com nome e tamanho (sem nome quando a estrutura termina antes
+    do tamanho, Q53); no exFAT, a cadeia que sobrevive ao apagar
+    na câmera é prova (`old_chain`) quando nada no cartão a contradiz.
+  - Nunca cola duas fotos e chama de `Intact`: um JPEG em 2 ou mais pedaços posto só pelo conteúdo sai `Partial`.
+  - Não cobre (para depois):
+    - RAW sem compressão (ou com perdas) espalhado nos dados do sensor: volta com os bytes no lugar, mas `Partial`.
+    - Continuação a mais de 256 MiB do pedaço anterior, ou depois de 4096 candidatos numa emenda (um clipe de 761 MiB em 3
+      pedaços fora de ordem não volta).
+    - JPEG sem marcadores de reinício (DRI 0) em 3 ou mais pedaços, colocado só pelo conteúdo, muitas vezes não volta
+      (fica o palpite de uma corrida, Parcial, como na 1.4: 6 das 9 prévias reais na medição da Tarefa 11); falta um
+      jeito de achar o corte verdadeiro quando os dados fora de ordem decodificam sem erro.
+    - Um apagado sobrescrito por outro arquivo de exatamente o mesmo tamanho sai com os bytes certos e o nome do antigo:
+      conferir a identidade pelo EXIF (data da foto contra as datas da entrada).
+    - Um RAW, HEIC, RAF, CR3 ou vídeo com trilha sem conferência (ProRes) gravado contíguo sobre o primeiro pedaço de um
+      apagado e passando dele não volta inteiro (os dados depois desse pedaço não são conferidos; o JPEG e o vídeo com
+      todas as amostras conferidas voltam, sem nome, Q61/Q62); no RAW sem perdas, conferir bloco a bloco resolveria.
+    - O padrão de alocação real da Sony: a conferir pelo roteiro com a A6700.
+  - Decisões, resíduos aceitos e pendências em `docs/superpowers/history/2026-11-02-m1-p6-pendencias.md`; conferência
+    com a câmera em `docs/superpowers/history/2026-11-02-m1-p6-conferencia-manual.md`.
 
 ## Módulo 2: App (Tauri 2 + React; telas aprovadas antes de cada parte)
 

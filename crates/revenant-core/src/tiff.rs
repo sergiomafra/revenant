@@ -79,6 +79,17 @@ pub(crate) struct TiffInfo {
     /// Starts of the `data` ranges that are JPEG-coded and so may begin with FF D8: strips/tiles of an IFD whose
     /// Compression is JPEG-based (6, 7, 34892) and a JPEGInterchangeFormat range clamped to the limit.
     pub jpeg_data_starts: Vec<u64>,
+    /// The `data` ranges of strips/tiles whose IFD is Compression 7 and whose first SOF is SOF3 (lossless JPEG, as in
+    /// lossless DNG tiles): the ones a structure check can examine (evidence, not proof). A CR2's raw IFD is Compression 6
+    /// and is not listed here.
+    pub lossless: Vec<(u64, u64)>,
+    /// Each IFD's entry table (`2 + 12 × count + 4` bytes: count, entries, next pointer), relative to the header.
+    pub ifds: Vec<(u64, u64)>,
+    /// The `data` ranges that are neither JPEG-coded nor lossless: uncompressed or vendor-compressed (lossy) sensor data,
+    /// which has no structure to check (a seam inside it is blind). Data in neither `lossless` nor `sensor` (Compression
+    /// 34892, a JPEG-coded range whose SOF is not SOF3 or was not found, a frame `lossless_frame` rejects) is blind too:
+    /// never provable.
+    pub sensor: Vec<(u64, u64)>,
     /// IFD entries processed (test observation of the entry cap).
     #[cfg(test)]
     pub entries_seen: usize,
@@ -229,7 +240,18 @@ fn walk_from(r: &mut Reader, base: u64, limit: u64, root: Kind) -> Option<TiffIn
     };
     let first = w.u32_of([head[4], head[5], head[6], head[7]]);
     w.run(u64::from(first), root);
-    Some(w.info)
+    let mut info = w.info;
+    // Raw data that is neither JPEG-coded nor lossless has no structure to check.
+    let coded: HashSet<u64> = info.jpeg_data_starts.iter().copied().collect();
+    let lossless: HashSet<(u64, u64)> = info.lossless.iter().copied().collect();
+    let sensor: Vec<(u64, u64)> = info
+        .data
+        .iter()
+        .filter(|&&(o, l)| !coded.contains(&o) && !lossless.contains(&(o, l)))
+        .copied()
+        .collect();
+    info.sensor = sensor;
+    Some(info)
 }
 
 impl Walker<'_, '_> {
@@ -333,7 +355,11 @@ impl Walker<'_, '_> {
             self.entry(off + 2 + 12 * i, kind, &mut seen, &mut tags, &mut found);
         }
         self.finish_image(&tags);
-        if self.claim(off + table, 4)
+        let next_claimed = self.claim(off + table, 4);
+        self.info
+            .ifds
+            .push((off, table + if next_claimed { 4 } else { 0 }));
+        if next_claimed
             && declared <= MAX_ENTRIES
             && kind == Kind::Image
             && let Some(next) = self.read_u32(off + table)
@@ -534,36 +560,40 @@ impl Walker<'_, '_> {
 
     /// Whether the JPEG at `o` (`len` bytes) starts with FF D8 and its first SOF is SOF0, SOF1 or SOF2.
     fn is_lossy_jpeg(&mut self, o: u64, len: u64) -> bool {
+        matches!(self.first_sof(o, len), Some(0xC0..=0xC2))
+    }
+
+    /// The marker of the first SOF of the JPEG at `o` (`len` bytes), if it starts with FF D8 and one comes within the
+    /// first [`SOF_SEGMENTS`] marker segments before any SOS or EOI.
+    fn first_sof(&mut self, o: u64, len: u64) -> Option<u8> {
         let mut magic = [0u8; 2];
         if self.r.read(self.abs(o), &mut magic) != 2 || magic != [0xFF, 0xD8] {
-            return false;
+            return None;
         }
         let mut pos = 2u64;
         for _ in 0..SOF_SEGMENTS {
             if pos.saturating_add(4) > len {
-                return false;
+                return None;
             }
             let mut seg = [0u8; 4];
             if self.r.read(self.abs(o + pos), &mut seg) != 4 || seg[0] != 0xFF {
-                return false;
+                return None;
             }
             match seg[1] {
-                0xC0..=0xC2 => return true,
-                0xDA | 0xD9 => return false,
-                // Other SOFs (lossless, arithmetic, hierarchical) are not previews.
-                0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF => return false,
+                m @ (0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) => return Some(m),
+                0xDA | 0xD9 => return None,
                 0x01 | 0xD0..=0xD8 => pos += 2,
                 0xFF => pos += 1,
                 _ => {
                     let seg_len = u64::from(u16::from_be_bytes([seg[2], seg[3]]));
                     if seg_len < 2 {
-                        return false;
+                        return None;
                     }
                     pos += 2 + seg_len;
                 }
             }
         }
-        false
+        None
     }
 
     /// Olympus/OM System MakerNote at `at` (`len` bytes, already claimed): header "OLYMPUS\0" + byte order + version with
@@ -703,6 +733,40 @@ impl Walker<'_, '_> {
         } else {
             (&t.strip_offsets, &t.strip_counts)
         };
+        // An IFD with tiles and strips (the ILCE-6700 writes one strip over all its lossless tiles): the tiles win. A
+        // strip lying wholly inside the IFD's own tiles is no range of its own (it would be one lossless JPEG ending at
+        // its first tile's EOI, not where declared); any other strip stays a range, and counts toward the extent, but is
+        // never a lossless unit (review I-1: dropping one that reaches past the tiles would cut the file short).
+        // The tiles' extent as disjoint runs in order, so each strip is looked up in O(log n).
+        let mut tiles: Vec<(u64, u64)> = t
+            .tile_offsets
+            .iter()
+            .zip(&t.tile_counts)
+            .map(|(&o, &l)| (o, o.saturating_add(l)))
+            .filter(|&(o, e)| e > o)
+            .collect();
+        tiles.sort_unstable();
+        let mut runs: Vec<(u64, u64)> = Vec::with_capacity(tiles.len());
+        for (o, e) in tiles {
+            match runs.last_mut() {
+                Some(last) if o <= last.1 => last.1 = last.1.max(e),
+                _ => runs.push((o, e)),
+            }
+        }
+        let inside_tiles = |o: u64, l: u64| {
+            let e = o.saturating_add(l);
+            // The first run ending after `o` is the only one that can hold `[o, e)`.
+            let i = runs.partition_point(|&(_, re)| re <= o);
+            runs.get(i).is_some_and(|&(ro, re)| ro <= o && e <= re)
+        };
+        let (strip_offsets, strip_counts): (Vec<u64>, Vec<u64>) = strip_offsets
+            .iter()
+            .zip(strip_counts.iter())
+            .filter(|&(&o, &l)| !inside_tiles(o, l))
+            .map(|(&o, &l)| (o, l))
+            .unzip();
+        let has_tiles = !runs.is_empty();
+        let (strip_offsets, strip_counts) = (&strip_offsets, &strip_counts);
         if let (Some(o), Some(l)) = (t.jpeg_offset, t.jpeg_len)
             && l > 0
         {
@@ -718,10 +782,11 @@ impl Walker<'_, '_> {
         let jpeg_compression = matches!(t.compression, Some(6 | 7));
         // Lossy-JPEG DNG tiles (34892) and JPEG strips not classified as previews may begin with FF D8.
         let jpeg_coded = matches!(t.compression, Some(6 | 7 | 34892));
-        let mut kind: Option<bool> = None;
-        for (offsets, counts) in [
-            (strip_offsets, strip_counts),
-            (&t.tile_offsets, &t.tile_counts),
+        // What the first range of the IFD is, once: `(lossy JPEG, lossless JPEG)`.
+        let mut kind: Option<(bool, bool)> = None;
+        for (offsets, counts, strips) in [
+            (strip_offsets, strip_counts, true),
+            (&t.tile_offsets, &t.tile_counts, false),
         ] {
             for (&o, &l) in offsets.iter().zip(counts.iter()) {
                 if l == 0 {
@@ -746,12 +811,24 @@ impl Walker<'_, '_> {
                     return;
                 }
                 // One lookup per IFD: all its strips/tiles share one Compression.
-                let lossy =
-                    *kind.get_or_insert_with(|| jpeg_compression && self.is_lossy_jpeg(o, l));
+                let (lossy, lossless) = *kind.get_or_insert_with(|| {
+                    let sof = if jpeg_compression {
+                        self.first_sof(o, l)
+                    } else {
+                        None
+                    };
+                    (
+                        matches!(sof, Some(0xC0..=0xC2)),
+                        t.compression == Some(7) && sof == Some(0xC3),
+                    )
+                });
                 if lossy {
                     self.info.jpegs.push((o, l));
                 } else {
                     self.info.data.push((o, l));
+                    if lossless && !(strips && has_tiles) {
+                        self.info.lossless.push((o, l));
+                    }
                     if jpeg_coded {
                         self.info.jpeg_data_starts.push(o);
                     }
@@ -978,8 +1055,9 @@ mod tests {
             started.elapsed()
         );
         assert!(i.data.len() + i.jpegs.len() <= 262_144);
-        // The per-walk value budget is what stops it: 16 IFDs worth of values (2 ranges per offset/count pair).
-        assert_eq!(i.data.len(), 131_072);
+        // The per-walk value budget is what stops it: 16 IFDs worth of values, one range per offset/count pair (the
+        // strips lie over their IFD's tiles, so the tiles win).
+        assert_eq!(i.data.len(), 65_536);
         assert!(i.truncated);
     }
 
@@ -1251,6 +1329,111 @@ mod tests {
         assert_eq!(i.data.len(), 1000);
         assert_eq!(i.jpegs.len(), 1); // only the real preview
         assert!(!i.truncated && !i.garbled);
+    }
+
+    #[test]
+    fn a_strip_over_the_ifds_own_tiles_is_no_range() {
+        // ILCE-6700: the SubIFD declares its lossless tiles and also one strip covering them all. The tiles win: the
+        // strip is no range of its own (not raw data, not a lossless unit, not a JPEG-coded start).
+        let tile = revenant_testkit::lossless_jpeg(16, 16, 1, 12, 3);
+        let n = 4;
+        let (offs, cnts, data) = (300usize, 300 + 4 * n, 400usize);
+        let entries = [
+            entry(0x0103, 3, 1, 7),
+            entry(0x0111, 4, 1, data as u32),
+            entry(0x0117, 4, 1, (n * tile.len()) as u32),
+            entry(0x0144, 4, n as u32, offs as u32),
+            entry(0x0145, 4, n as u32, cnts as u32),
+        ];
+        let ifd = ifd_bytes(&entries, 0);
+        let mut b = file(data + n * tile.len(), &[(8, ifd.clone())]);
+        let mut ranges = Vec::new();
+        for k in 0..n {
+            let at = data + k * tile.len();
+            put(&mut b, at, &tile);
+            put(&mut b, offs + 4 * k, &le(at as u32));
+            put(&mut b, cnts + 4 * k, &le(tile.len() as u32));
+            ranges.push((at as u64, tile.len() as u64));
+        }
+        let i = walk_all(&b).unwrap();
+        assert_eq!(i.lossless, ranges);
+        assert_eq!(i.data, ranges);
+        let starts: Vec<u64> = ranges.iter().map(|r| r.0).collect();
+        assert_eq!(i.jpeg_data_starts, starts);
+        assert_eq!(i.end, (data + n * tile.len()) as u64);
+        // A strip reaching 100 bytes past the tiles (review I-1): still a range and the extent, never a lossless unit.
+        let long = (n * tile.len() + 100) as u32;
+        let e = 8 + 2 + 12 * 2;
+        b[e + 8..e + 12].copy_from_slice(&long.to_le_bytes());
+        b.resize(data + long as usize, 0);
+        let i = walk_all(&b).unwrap();
+        assert_eq!(i.lossless, ranges);
+        assert!(
+            i.data.contains(&(data as u64, u64::from(long))),
+            "{:?}",
+            i.data
+        );
+        assert_eq!(i.end, data as u64 + u64::from(long));
+    }
+
+    #[test]
+    fn compression_7_lossless_tiles_are_listed() {
+        let tile = revenant_testkit::lossless_jpeg(16, 16, 1, 12, 3);
+        let n = 4;
+        let (offs, cnts, data) = (300usize, 300 + 4 * n, 400usize);
+        let entries = [
+            entry(0x0103, 3, 1, 7),
+            entry(0x0144, 4, n as u32, offs as u32),
+            entry(0x0145, 4, n as u32, cnts as u32),
+        ];
+        let ifd = ifd_bytes(&entries, 0);
+        let mut b = file(data + n * tile.len(), &[(8, ifd.clone())]);
+        let mut ranges = Vec::new();
+        for k in 0..n {
+            let at = data + k * tile.len();
+            put(&mut b, at, &tile);
+            put(&mut b, offs + 4 * k, &le(at as u32));
+            put(&mut b, cnts + 4 * k, &le(tile.len() as u32));
+            ranges.push((at as u64, tile.len() as u64));
+        }
+        let i = walk_all(&b).unwrap();
+        assert_eq!(i.lossless, ranges);
+        assert_eq!(i.data, ranges, "still raw data, as before");
+        assert!(i.sensor.is_empty() && i.jpegs.is_empty());
+        assert_eq!(i.ifds, vec![(8, ifd.len() as u64)]);
+        assert!(!i.garbled && !i.truncated);
+    }
+
+    #[test]
+    fn uncompressed_and_sony_lossy_data_are_sensor() {
+        for compression in [1u16, 32767] {
+            let strip = [0x5Au8; 64];
+            let i = strip_tiff(compression, &strip);
+            assert_eq!(i.sensor, vec![(200, 64)], "compression {compression}");
+            assert_eq!(i.data, i.sensor);
+            assert!(i.lossless.is_empty());
+            assert_eq!(i.ifds.len(), 1);
+        }
+        // JPEG-coded compressions that are not SOF3 are in neither list; lossless JPEG is lossless, not sensor.
+        let i = strip_tiff(7, &jpeg_with_sof(0xC3));
+        assert_eq!((i.lossless.len(), i.sensor.len()), (1, 0));
+        let i = strip_tiff(7, &[0u8; 40]);
+        assert_eq!(
+            (i.lossless.len(), i.sensor.len()),
+            (0, 0),
+            "JPEG-coded, unclassified"
+        );
+        let i = strip_tiff(34892, &[0u8; 40]);
+        assert_eq!((i.lossless.len(), i.sensor.len()), (0, 0));
+    }
+
+    #[test]
+    fn ifds_list_every_entry_table() {
+        let a = ifd_bytes(&[entry(0x0100, 4, 1, 5), entry(0x0101, 4, 1, 6)], 100);
+        let b = ifd_bytes(&[entry(0x0100, 4, 1, 5)], 0);
+        let i = walk_all(&file(200, &[(8, a.clone()), (100, b.clone())])).unwrap();
+        assert_eq!(i.ifds, vec![(8, a.len() as u64), (100, b.len() as u64)]);
+        assert_eq!(a.len(), 2 + 12 * 2 + 4);
     }
 
     #[test]

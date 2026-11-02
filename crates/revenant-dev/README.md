@@ -93,8 +93,8 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   files (some may lack their name, folder or dates); it is the same on every `volume` line and in the summary.
 - A `found` (or `updated`) line for a file the file system lists also carries where it came from: `name`, `path`
   (`folder/name`, root-relative, `/`-separated; the name alone when the folder is unknown), `state` (`live`, `deleted` or
-  `orphaned`), `placement` (`chain`, `recorded`, `guessed` or `carved`: how its clusters were found), `volume` (the
-  `index` of its `volume` line), `fs_size` (the size the directory entry records) and, when the entry has them,
+  `orphaned`), `placement` (`chain`, `recorded`, `guessed`, `old_chain` or `carved`: how its clusters were found),
+  `volume` (the `index` of its `volume` line), `fs_size` (the size the directory entry records) and, when the entry has them,
   `created` and `modified` (`YYYY-MM-DDTHH:MM:SS` as recorded, with `+HH:MM`/`-HH:MM` when the volume stores the UTC
   offset):
 
@@ -132,7 +132,9 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   in `id` order. Today: a file found by its signature on a quick-formatted card that an old folder names (the same line
   with its `name`, `path` such as `?/100MSDCF/DSC01234.JPG`, `state` `orphaned` and `placement` `carved`), and a
   camera video whose index (`moov`) ended up elsewhere on the card, found `damaged` and then put back together from its
-  two pieces (both in one line when both apply):
+  two pieces, and a photo, RAW or video put back together from its pieces by the reassembly after the scan (its
+  `fragments`, `len` and `health`; `partial` unless every cut is proven, see "Reassembly" in the core README). All of
+  these come in one line per `id` when several apply:
 
   ```json
   {"event":"found","id":1,"start":1048576,"len":55090,"kind":"mp4","health":"damaged"}
@@ -223,7 +225,17 @@ Images (files go back to back, each at the next 512-byte boundary, the rest is s
   twice the image size (about 2 GiB at the default `--size-mib`): the builder keeps a copy of every file and `build()`
   allocates the image.
 - `cut-jpeg`: like `dense-jpeg` but the second half of every file is noise. It has no speed target (each cut JPEG starts
-  a gap search that may re-read its 64 MiB window); it is only measured and reported.
+  a gap search that may re-read its 64 MiB window, then the reassembly searches it again, until the scan's read budget
+  for the reassembly is spent); it is only measured and reported.
+- `scattered-card`: an exFAT volume (128 KiB clusters, lowest free cluster first) on an MBR disk that a camera used for
+  a long time: rounds of six shots (three of them a lossless ARW and its JPEG, three a JPEG only, and a clip), the
+  JPEG-only shots and the clip deleted in camera, the next round written into those holes (so its files lie in pieces)
+  and the first file in pieces of the round before deleted in camera too, until the card is full; at last everything
+  on it is deleted on a computer that clears the cluster chains. Every file still on the card is then placed by its
+  content: it measures the scan with the reassembly at work (lossless RAWs, photos and clips in pieces). `placed`
+  counts every file ever written (overwritten ones too), so `found` is lower. Built in memory like `exfat-card` (peak
+  memory about four times the image size); writing it takes about 90 s at the default size (the shots are encoded in
+  parallel).
 
 The numbers are page-cache throughput (the first write leaves the image in the cache): an upper bound for a card reader,
 not a prediction of it. The measured numbers (before and after part 1.3, and the machine) are in the engine's README,

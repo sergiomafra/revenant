@@ -37,6 +37,13 @@ use revenant_core::EngineError;
 assert_eq!(EngineError::Cancelled.code(), "cancelled");
 ```
 
+Part 1.6 (files in pieces) added no error code: a budget that ran out, two placements that both fit or a cut that
+cannot be checked make a file `Partial`, never an error. What the engine puts back together, and when it calls the
+result `Intact`, is under [Reassembly](#reassembly) (the search), [Fragmented JPEG](#fragmented-jpeg),
+[Video in three or more pieces](#video-in-three-or-more-pieces), [Fragmented RAW](#fragmented-raw) and
+[File systems in the scan](#file-systems-in-the-scan) (deleted files in pieces); its known limits and accepted risks
+are stated there, and its measured cost under [Performance](#performance).
+
 ## Source
 
 `source::Source` is the engine's read-only disk-access layer: `len()`, `read_at(offset, buf)` (positional, no shared cursor; fills
@@ -418,7 +425,11 @@ measurement, however many checks need it.
 
 `formats::Jpeg` follows the marker segments by their declared lengths (so the thumbnail embedded in an APP1/EXIF segment does
 not end the file; DAC and JPG markers count as segments, and `FF` fill bytes before a marker are skipped), requires DQT and SOF before SOS, and scans the entropy-coded data up to EOI (`FF D9`), up to
-`JPEG_MAX_LEN` (64 MiB). If the header walk breaks on an unreadable sector, the search for EOI continues from there. Health:
+`JPEG_MAX_LEN` (64 MiB). If the header walk breaks on an unreadable sector, the search for EOI continues from there. A
+carved JPEG ends at its primary image's EOI: the images a camera appends after it (MPF previews, a motion photo's
+video) are not part of its measure; they come back as findings of their own only when they start on a sector (the
+scan examines heads at sector starts), and with the file through a file-system entry, whose tail check counts them
+(D6). Health:
 
 - `Intact`: EOI found, no unreadable sector inside, and the content verified (ruling Q6). For a frame Revenant's entropy
   decoder covers (below), the evidence is that decoder walking every MCU, the exact count with restart markers in
@@ -517,8 +528,8 @@ the photo's contiguous bytes (decoded again, scanned for erased sectors, and dec
 there is one: at most 3 × 64 MiB), its 64 MiB window once, at most 64 MiB for the tries and the checks of files in the
 gap, and the two pieces once more to judge the reassembled photo (at most 64 MiB).
 
-Not covered: progressive, arithmetic-coded or 12-bit JPEGs (any frame the decoder does not cover), a first piece under
-16 KiB, three or more pieces, a second piece that lies before the first, a second piece that ends past the window, and
+Not covered by this two-piece search: progressive, arithmetic-coded or 12-bit JPEGs (any frame the decoder does not
+cover), a first piece under 16 KiB, three or more pieces (see below), a second piece that lies before the first, a second piece that ends past the window, and
 two photos written interleaved (each split in two with the other's pieces in between): they are at most `Partial`, and
 a photo of the same frame glued to the other's tail exactly on a restart marker may even come out `Intact` as a
 contiguous file (the MCU count and restart markers are all right, and a DC step below the seam threshold is not seen).
@@ -536,6 +547,51 @@ tail in the set that was tried). And a photo whose entropy-coded data holds a
 whole 512-byte sector of one repeated byte value is treated as cut there (rulings Q5, C3): camera photos very rarely do
 this, but a large flat area coded with optimized Huffman tables could (all `00`); such a photo is `Partial` and is not
 put back together.
+
+**Three or more pieces** (`reassemble/jpeg.rs`, crate-private; the scan uses it from the reassembly step on, see
+"Reassembly"). The same decoder walks the photo across the pieces the seam search proposes. The walk's state is the
+decoder's state at an MCU-row boundary, with the luma DC values of the rows above it. At each seam the walk learns the
+seam's MCU: the first one the decoder cannot complete with the bytes before the seam (the proof derives it the same
+way). A continuation has content evidence once the MCU row below the seam's row is decoded. The early DC test (ruling Q14: it drops only what the final test would reject too) runs
+once the rows down to that one are trusted, and again as more rows are decoded, on every seam of the path. Its bound
+is the `⌊n/2⌋`-th smallest of the trusted block-row boundary means, above and below the seams, off them. Trusted rows
+are those above the row boundary before the last one the walk reached: the search never cuts a piece above it, so they
+belong to the photo whatever comes after; the last row may already be foreign data that still decodes. That needs more
+than half of them, so a seam in the upper half of a photo is tested only once the walk has decoded past the middle. A
+decode error or a rejected seam before a seam's evidence breaks the walk right at that seam: the candidate is dropped. A
+piece that ends, or meets an erased or unreadable sector (`data_end`), before the row below its seam has no evidence
+either way: blind (Q2). A walk that reaches EOI with every MCU must also pass the final test, the 1.3 DC seam test with
+several seams (`jpeg_join::seams_ok`). Its base is the median of the block-row boundary means off **every** seam, and each
+seam's mean must be at most 3 × that base + 4. A photo of fewer than 4 block rows is never proven (`Unproven`). The
+proof (`Seams::prove`) decodes the reassembled photo whole and applies the same test. Off a cluster grid the second
+piece may start at any sector. JPEG decoding falls back into step a few bytes into misaligned data of the same frame
+(the photo's own later bytes, a burst neighbour's), so such starts are candidates with evidence too. With the seam in
+the upper half, each costs a walk past the middle of the photo before the DC test can drop it, and on a card full of
+same-camera data the search can run out of budget: the photo is then at most `Partial`. With restart markers the rule of
+1.3 stays (Q16): a photo reassembled from two or more pieces is at most `Partial` (the reassembly step's health rule
+applies it; `JpegSeams::restart_interval` reports the interval).
+
+**Placed by content alone: at most `Partial`** (ruling Q37, `reassemble::jpeg::jpeg_health_cap`). A JPEG the
+reassembly search puts together from two or more pieces by their content alone is at most `Partial`, unconditionally,
+even when every seam is proven and the search found no other solution. The bytes are still put back in the best order
+found (the seam tests, the search and the uniqueness re-check choose the pieces). The reason: uniqueness cannot be
+established for a JPEG from content. A near-identical photo of the same burst can donate its middle clusters at the
+right file offsets: on a reused card its head may be overwritten while its middle is still free, and with tables or
+exposure a little different its data still decodes in step and passes the DC seam test. No search bound and no test on
+the heads the scan found can rule that out. `Intact` stays possible only when the file system proves where the pieces
+lie: a live FAT/exFAT chain (the 1.4 behaviour: such a file is measured over its chain and is never a reassembly
+candidate), or, from part 1.6 task 9 on, a surviving exFAT chain that meets the `OldChain` conditions; those placements
+reach the cap with `content_only = false`, or do not go through it at all. A photo found in one run keeps the 1.3 rule
+(`jpeg_health_cap` caps only two or more pieces), and the 1.3 two-piece join above is unchanged, with its known limit
+for a near-identical tail. The cost: a fragmented photo with no surviving chain comes back assembled, often perfect, but
+`Partial`. The reassembly step (see "Reassembly") applies `jpeg_health_cap` in its health rule, together with the
+scan's own checks (restart markers, Q16; bad sectors; caps; the known size), which only lower it.
+
+For the uniqueness re-check (`Seams::suspicious_breaks`) the JPEG orders the cut positions by how much the DC grid jumps
+at each MCU. At each block of the seam line the MCU would make, it takes how far the vertical DC step across the line is
+from the mean of the steps just above and below it. A smooth photo's steps change slowly, and another photo of the same
+frame spliced in at that MCU shifts them, even a burst neighbour's (DC grids 0.5–1.4 apart). So the re-check cuts a long
+piece first where a look-alike could have been spliced in, not only near its end.
 
 Synthetic JPEGs and disk images for tests come from the `revenant-testkit` workspace crate (`publish = false`); its
 `fs` module builds FAT12/16/32 and exFAT volumes (with deleted files, raw entries and quick formats) inside MBR or GPT
@@ -575,7 +631,21 @@ its frames is whole; a photo written over the video is not at a chunk offset, so
   `Damaged`.
 - Otherwise the `stco`/`co64` and `stsz` tables of each `trak` are checked: any chunk offset at or past the measured end, or
   `first chunk offset + total sample size` past it, gives `Partial`; else `Intact`. Fragmented files (`moof`) have no such
-  tables and are `Intact` when their boxes are complete.
+  tables and are `Intact` when their boxes are complete (and their samples pass, below).
+- Index first (part 1.6): when the `moov` comes before the first `mdat` (an `mdat` of size 0 included), or the file is
+  fragmented, nothing but the samples tells whether the bytes after the first piece of a video stored in pieces are its
+  own: its `mdat` size, or its chain of boxes, still fits. Such an otherwise `Intact` video is checked sample by sample
+  in place, within the measured length (the pairing's structural check, `isobmff::check_sample`: NAL lengths and header
+  bytes, or a Motion-JPEG frame's markers; at most 2^24 steps), and any failing sample makes it `Partial`. For a
+  fragmented file each `moof`'s samples of its first checkable video track (`traf/tfhd/trun`, see
+  `isobmff::fragment_samples`) are checked in the file, over at most 65,536 top-level boxes (`MAX_BOXES`), and the
+  fragments must follow each other (`isobmff::Chain`: `mfhd` sequence numbers 1, 2, 3…, each `tfdt`, when there is one,
+  where the previous fragment's samples ended; a `moof` of other tracks only, as muxers writing one `moof` per track do,
+  takes the next number and leaves the time as it was); a garbled `moof` or one out of sequence is `Partial`. Every sample a `moof` lists, of any track, costs one of the 2^24 steps, and an empty sample
+  costs one too. Tracks with no check (audio, other codecs) and sample tables the listing cannot use are not
+  checked, as before. A `moov` at the end needs none of this: it is found only where the media data really ends. The
+  cost: the walk reads a few bytes per NAL unit through the scan's cache, which loads whole 1 MiB windows, so an
+  index-first video is read about once more (the scan skips an `Intact` file's bytes).
 
 Unreadable sectors:
 
@@ -624,7 +694,9 @@ Pairing a video at `s` (the `Found` start) with a candidate at `q`:
    header's forbidden bit 0, the type 1–23 (H.264) or at most 40 with a non-zero temporal id (HEVC), the units summing
    exactly to the sample size. A Motion-JPEG sample starts `FF D8 FF` and ends `FF D9`. `A(i)` reads sample `i` at
    `s + offset`, `B(i)` at `q − P + offset`. `k` = the first sample failing `A` (binary search; `n` if the last passes).
-   Up to 32 evenly spaced samples before `k` must pass `A` and up to 32 after it must pass `B`.
+   Every sample before `k` must pass `A` and every sample after it must pass `B` (part 1.6, closing C7 of 1.3: 32
+   evenly spaced samples per side let a middle piece of a few samples placed elsewhere go unnoticed). The checks are
+   `isobmff::check_sample`, shared with the reassembly of videos in three or more pieces.
 6. Break points `L1`: sector boundaries (relative to `s`) from the start of sample `k − 1` (not its end: a sample cut
    inside its last NAL unit's payload still passes `A`) to the start of sample `k + 1` (or `P`), at least `payload`,
    at most 4096 tried; samples `k − 1` and `k` must pass read across `L1` (bytes before it at `s`, after it at the second
@@ -663,9 +735,127 @@ further pair is checked). Judging a `moov`'s tables costs time in proportion to 
 Cancellation is looked at before each `moov`, each pair and each break point; a cancelled scan returns
 `Err(Cancelled)` without the remaining `Updated` events.
 
-Not covered: a video in three or more pieces (a middle piece holding fewer than 1/32 of the samples between the two
-verified sides may go unnoticed and be paired), a `moov` before its `mdat`, an `mdat` of size 0, two videos whose first
-pieces are identical, and fragmented MP4 (`moof`).
+A video in three or more pieces is not paired (some sample fails on either side); the reassembly step puts it back
+together (see "Video in three or more pieces"). So does it for the layouts the pairing leaves out: a `moov` before its
+`mdat`, an `mdat` of size 0, fragmented MP4 (`moof`), and two videos whose first pieces are identical (see "Videos with
+the index first, open-ended or fragmented").
+
+### Video in three or more pieces
+
+After the pairing, the reassembly step (see "Reassembly") searches every moov-less MP4/MOV the pairing did not make
+`Intact` (`reassemble/video.rs`, crate-internal), with each orphan `moov` that fits it by the pairing's arithmetic filter
+(step 4 above; the `moov`s are loaded once for the whole step, with the pairing's budgets, the filter judged against
+every candidate video, within what the pairing left of its 1 GiB load budget and its sample budget: one of each for
+both). Each such `moov` is one search; two or more giving a complete solution make the result not unique (`Partial`).
+Two candidate videos that a `moov` fits and whose first pieces are the same (D17: the same length, where the samples
+stop passing over the free run from each start, and the same bytes, compared through the cache within the file's read
+budget) are one video: only the lowest id is searched with that `moov`, with the copies' equal bytes kept out of its
+pieces (those bytes are its own), and the others are left as they are. Otherwise, as in the pairing, a `moov` that
+completes two videos puts back neither: the later one is not updated, and neither is the earlier one (which cannot be
+`Intact`: an `Intact` video claims its `moov`).
+
+- **The file.** Logical offsets are file offsets: 0 is the video's start, each checkable sample (the pairing's tracks:
+  H.264, HEVC, Motion-JPEG) lies at the offset the index lists, and the `moov` goes at `P` (the end of `mdat`). The
+  known length is `P` plus the `moov` size (a deleted file's entry size must match it), and the anchor puts `P` at the
+  `moov` found: the last piece must hold it there.
+- **The walk.** The samples in file order, each one wholly in the view checked by the pairing's structural check (NAL
+  lengths and header bytes, or a JPEG's SOI and EOI), read through the pieces chosen so far. It breaks where the bytes a
+  failing sample read stop fitting, resumes after each passing sample (from the end of its last checked byte: a sample
+  cut inside its last NAL unit's payload still passes, so the piece may end anywhere after it), and completes when
+  every sample passed and the `moov`'s bytes sit at `P`.
+- **The prefilter.** A candidate unit passes when the first sample starting at or after the seam, read at its place in
+  the candidate, fits as far as it lies in that unit (bytes past it may be in another piece). A seam with no sample
+  starting within one unit after it is blind and still tried.
+- **The proof.** `Proven` only when every checkable sample passes in place, the `moov` sits at `P`, no seam lies
+  before the `mdat` payload, and **every seam has checked bytes within one unit before it and within one unit after
+  it**: a cut one unit earlier or later would then read a checked byte from elsewhere. The checks read lengths and
+  headers, never payloads, so a seam inside a long NAL unit (more than a unit from any header) is not proven. Nor is a
+  seam where the checked bytes within one unit on either side all belong to samples of one size (ruling Q39, local:
+  another clip of a constant-bitrate camera would pass every check there; one frame of another size elsewhere in the
+  clip does not lift it). Structure (box headers, the index) counts as evidence of its own.
+- **Suspicious cuts.** For the uniqueness re-check, the unit boundaries inside unchecked stretches where a seam would
+  not be proven, longest stretch first; none when every boundary has checked bytes around it.
+- **Health.** As for any reassembly (see "The reassembly step"), with the index judged against the length as for a
+  contiguous file (`index_health`) as the format's own check. The positional proof makes `Intact` possible from content
+  alone (unlike a JPEG, ruling Q37).
+
+Residual risks: the checks never read a payload, so a run of another clip whose NAL layout matches the clip's own
+sample by sample (the same sizes and NAL lengths, other payload) is indistinguishable from it; where the clip's own run
+was lost and such a run lies free, the video comes back `Intact` with that run in it. Two real clips match that way
+only with frames of one size, which the local guard above covers; the exact-layout case is kept as an ignored
+reproduction (`reassemble::video::tests::a_donor_with_the_exact_nal_layout_is_not_intact`). Off a cluster grid
+(512-byte sectors), a seam whose next sample starts in the last bytes of a sector is blind for every candidate, so the
+4096-candidate cap is hit there and a video in three or more pieces is seldom exhaustive (`Partial`).
+
+Outcomes measured on the synthetic cards (`tests/reassembly.rs`): H.264 in five one-cluster pieces and H.265 in four
+pieces on 32 KiB clusters, a middle piece of one cluster holding fewer than 1/32 of the samples, and two clips of one
+camera written in alternating clusters (each index fits both by its arithmetic) all come back `Intact` with their own
+bytes. Two copies of the last piece (two orphan `moov`s) give `Partial`. NAL units of 2–24 KiB on 4 KiB clusters give
+`Partial`: not unique and not proven, and the first solution found need not be the clip's bytes (a cut inside a long
+payload fits a cluster away).
+
+Bounds: the reassembly's budgets per file (all of a video's searches share one), plus 2^24 sample-check steps per
+search and what the pairing left of its `moov` load and sample budgets (a `moov` dropped by them, in the pairing or
+here, makes no video of the step `Intact`). A walk reads through one-sector windows (a few bytes per NAL unit), every byte asked charged to the file's
+read budget: a video much larger than the budget's 512 MiB of reads (counting the walks, the proof and the re-check)
+comes out `Partial` or as before.
+
+### Videos with the index first, open-ended or fragmented
+
+The reassembly step also searches an MP4/MOV candidate whose index comes before its media data (`reassemble/video.rs`;
+a header-only walk, `isobmff::index_first_layout`: an `ftyp` that is not a CR3's, a `moov`, then an `mdat` or a fragment
+box). Its head (the `ftyp` up to the `mdat` payload, or up to the first fragment box; at most 17 MiB) is read within
+the file's read budget and must lie in place in the first piece: no seam falls in it.
+
+- **Its own `moov` first** (`ftyp, moov, mdat`; `VideoSeams::with_own_moov`): the walk, prefilter, proof and suspicious
+  cuts of "Video in three or more pieces", without an anchor. The known length is the end of `mdat` when its size is
+  declared, else (size 0) the highest sample end of any track (padding after the last sample is then left out, and a
+  deleted file's entry size that says otherwise leaves nothing complete). The index must list a checkable sample and no
+  sample outside the `mdat`.
+- **Fragmented** (`ftyp, moov` with an `mvex`, then `moof`/`mdat` pairs; `MoofSeams`): the walk reads the top-level
+  boxes in order, each header checked (a declared size, a type of `moof mdat sidx styp free skip mfra`, within the
+  known size), each `moof` parsed (at most `MOOV_MAX_LEN`, never loaded past it; `fragment_samples`: the base data
+  offset explicit, the `moof` start when default-base-is-moof or for the first `traf`, else where the previous
+  `traf`'s data ended; each `trun`'s data offset, sample sizes and durations, else the `tfhd` or `trex` defaults; at most
+  4,000,000 samples per `moof`, each listed sample of any track one of the search's 2^24 steps, checked arithmetic) and
+  its samples checked in the `mdat` right after it, which must hold them all. A whole fragment of another clip checks
+  itself, so the fragments must follow each other: the first one's `mfhd` sequence number is 1 and each next one's the
+  previous plus one, and its `tfdt` (when there is one) is where the previous fragment's samples ended (a `moof` of other
+  tracks only takes the next number and leaves the time); the state of a walk carries that chain across seams. These
+  are necessary, never enough: two clips of one camera number their fragments alike, and with a fixed frame rate and
+  fragment length carry the same times, so a whole fragment of the other clip at the same place passes them all. It resumes after each passing sample
+  and at each box end, and stops after `MAX_BOXES` (65,536) boxes per walk, undecided (C9). It completes when an `mfra`
+  closes the chain (its last box an `mfro` giving the `mfra`'s size, and a `tfra` listing no `moof` past the last one
+  walked: a path jumping from an earlier fragment to the `mfra` leaves some out; an `mfra` without `tfra` completes
+  nothing) or when the box chain ends exactly at the known size: a deleted file's entry size (the format itself has
+  none). The proof also checks that every `moof` the `tfra` lists is one of the chain's.
+  **The proof (ruling Q42)**: a seam is `Proven` only when the bytes on both sides belong to one fragment: checked
+  samples of that same fragment within one unit before and after it, and no fragment starting on it or within one unit
+  after it. The boxes (a `moof`, an `mdat` header, the head, an `mfro`) never count as evidence across a seam. So a
+  seam on or near a fragment boundary is never proven by content, and the video is then at most `Partial` (until a
+  file system proves its placement, D14), as is any video whose fragments are smaller than about a unit (each cut then
+  has a fragment start within a unit after it). Such a result, complete, `Partial` and of the same length as the
+  finding's earlier `Partial` placement, replaces it (its pieces) only when that placement's own pieces, walked the
+  same way, fail before their end by content (ruling Q43: a guessed one-piece run with other data in it); a placement
+  its content does not refute, whatever placed it (a guess, a recorded run, a chain), stays, and `improves` is the only
+  rule otherwise (D6). Otherwise the walk ends at the last valid box (an invalid
+  header after it: the end of the file, or another file's data), and the result is at most `Partial`; one whose chain
+  is valid to the very end of its pieces counts as complete for `improves`, so it replaces a shorter earlier result.
+  The prefilter checks what the walks expected within one unit after the seam (the next box header, the samples of the
+  `moof` in progress): every walk's expectations are kept (at most 2^18; past that every candidate is kept), a candidate
+  passing any one of them is kept, and its answers are not remembered per file, as they depend on the path (the engine
+  asks the format, `Seams::memo_prefilter`). The proof counts box headers and `moof`s as structure.
+
+Outcomes on the synthetic cards: a moov-first H.264 clip in three pieces, the same with an `mdat` of size 0, and a
+fragmented H.265 clip in three pieces with its deleted entry's size come back `Intact`; the fragmented clip after a
+quick format (no size, no `mfra`) comes back `Partial` in its exact pieces; there the clip has fragments of 64 large
+samples (about 850 KiB), so its cuts lie inside fragments. The same clip with fragments of 16 small samples, or with
+every fragment padded to whole clusters and cut between fragments, comes back in its exact pieces but `Partial`
+(Q42). With two clips of one camera padded that way, a fragment of the other clip in place of a lost one is never
+`Intact`: one numbered out of sequence is refused, and one with the right number, time and place is not proven. Two copies of a moov-less clip's first piece
+off the cluster grid with one `moov` (D17) give the lower id `Intact` and leave the copy `Damaged`; on a cluster grid
+the re-check never follows a copy back into the solution's own later runs, so the lower id is unique there in any
+case.
 
 ## Formats: CR3 and HEIC (ISO BMFF)
 
@@ -777,11 +967,100 @@ and
   no embedded JPEG preview, or when the largest preview (by SOF pixel count, over all previews) decodes only leniently
   or not at all (the raw data may still be fine). If the size of any preview cannot be measured (no SOF, zero size, over
   the decode cap) no smaller one may vouch for the file, so it is `Partial`. `Intact` only when the largest preview
-  decodes strictly. There is no RAW decoder, so the raw data itself is never verified.
+  decodes strictly and every lossless-JPEG tile or strip (`Compression 7`, SOF3) decodes to its declared end (the
+  lossless JPEG check below, when the first tile's frame is one it covers; else the tiles are not checked): a tile that
+  does not end where it is declared to is another file's data (a burst neighbour written right after a first piece),
+  so the RAW is `Partial`. That costs one walk of the tiles' difference codes per lossless RAW (tiles in file order; a
+  range overlapping one already checked is skipped, so a structure listing one tile many times costs no more than the
+  file's bytes). There is no RAW decoder, so uncompressed or lossy raw data is never verified, and a lossless tile that
+  passes is evidence, not proof. A known limit (from 1.4): an uncompressed or lossy RAW whose first piece is followed by
+  other data with no file start in it is measured `Intact` from those contiguous bytes (only its structure and preview
+  are checked), so it is never a reassembly candidate; only a file system proving its placement can catch it. Part 1.6
+  narrows it for deleted exFAT files whose FAT chain survives whole (in two or more runs): the contiguous carving no
+  longer replaces the chain's placement, and the reassembly cannot make a contiguous solution unique against an
+  unrefuted chain (see [Deduplication](#deduplication) and [The reassembly step](#the-reassembly-step)). It still
+  stands for a RAW carved without a file system, and for a deleted RAW whose guess, one run of free clusters, is
+  trusted by the 1.4 rule D3: a FAT or chain-zeroed exFAT delete, and an exFAT chain that no longer reads whole (a
+  later FAT-chained file rewrote one of its FAT entries), whose old chain is then lost and gives way to the guess.
 - Inside an `Intact` RAW the scan suppresses heads, so its embedded previews are not reported separately. A `Partial`
   RAW hides its own JPEGs too (`Format::own_files`: its previews and JPEG-coded strips/tiles, at most 64; ruling D12):
   a JPEG the scan finds at one of their starts, lying wholly inside the RAW, is not reported. A `Damaged` RAW hides
-  nothing. See [Scan](#scan).
+  nothing. See [Scan](#scan). A live RAW whose preview crosses from one of its runs into the next is one finding: the
+  chain places it, and the preview is not reported again.
+
+### Fragmented RAW
+
+A TIFF RAW found in pieces is put back together by the reassembly (see "Reassembly"), with seams of its own
+(`reassemble::raw`, D13, ruling Q45). The known length is the TIFF extent of the first piece's structure; the units of the
+file, in file order, come from the TIFF structure read over the pieces so far (bytes past them read as zeros, so a
+structure not yet in view is simply not there):
+
+- **Checked:** the IFD entry tables (the structure must read without a structural error); the embedded JPEGs (previews,
+  thumbnails), decoded by the 1.3 entropy decoder across any seam inside them (a JPEG holding a seam must end exactly
+  at its declared end, else a burst neighbour's tail decoding on to its own end would pass); the lossless-JPEG tiles,
+  walked to an `FF D9` that ends exactly at the tile's declared end with the exact sample count, resuming at a row of
+  samples before a seam.
+- **Blind:** everything else: uncompressed or vendor-coded (lossy) sensor data, data in neither list (`Compression
+  34892`, frames the lossless check does not cover; CR2 slices are `Compression 6` and are blind too, conservatively,
+  ruling C6), padding, value blocks. A blind stretch is not read, gives no evidence either way and never breaks.
+
+A walk breaks right at a seam when a unit holding it fails within 4096 bytes after it (the candidate is dropped), and
+has evidence past a seam once a unit holding or following it decodes 4096 bytes past it, or passes whole. A candidate
+with nothing checked past the seam is blind, even when its free run reaches the known length: candidates are then taken
+in their order (next free first), so blind sensor data is placed by that order, a piece ending where its free run does.
+The prefilter reads the unit at the seam from the structure of the file read contiguously from its start, fixed when
+the search begins (ruling Q59; it used to come from the last view walked, so its answer depended on what was walked
+before it): a tile starting there must start with a lossless-JPEG header, a JPEG with
+`FF D8 FF`; a seam inside a tile needs entropy-coded data (no stray marker) up to the tile's end within the candidate's
+first sector; a run of one byte value passes (a flat area, such as clipped highlights, codes as zero bytes). The
+previews and JPEG-coded tiles are the RAW's own files (the tiles merged into one range where they follow each other; a
+file with more than 64 own ranges is taken to have none, conservatively): found as photos of their own in a later piece
+and claimed, they neither stop its free run nor keep their unit from being a candidate when they lie exactly where the
+structure puts them (D10, a coverage test, Q7); those checks are charged to the file's walks like the prefilter's. They stay reported as photos too; the RAW and such
+a preview share those bytes and are the same file, nested (Q16).
+
+**What is proven, and what is only placed.** `Proven` only when every seam lies exactly between two units that passed
+whole and are anchored at their declared places: a tile boundary where the next tile decodes whole and its `FF D9` ends
+exactly at its own declared end, an IFD table at its offset inside the first piece. The proof is the tile's exact
+compressed size: another tile of the same frame decodes whole too, and only its different length gives it away. So a
+tile padded with fill bytes before its `FF D9`, or after it (Sony's 16-byte grain), proves no seam, before or after
+it (any same-frame tile whose data fits fills the same slot; ruling Q46). Never:
+
+- a seam inside a lossless tile (a piece of another tile of the same frame passes the check a few percent of the time,
+  Q44);
+- inside a preview (a burst neighbour's preview is near-identical, Q37);
+- inside sensor data or other blind data.
+
+Such a RAW comes back with its pieces chosen by content and its bytes in place, but `Partial`; since nothing found after
+its first complete solution could change that, the search stops there (`Seams::settles_unproven`: the result is
+reported neither unique nor exhaustive). In practice almost every RAW put back together from content alone is
+`Partial`: `Intact` needs every cut on a tile boundary (rare unless the tiles are cluster-aligned) or, later, a file
+system proving the placement. A placement that is already the best by health and length (a deleted entry's guess) is
+replaced only when its own pieces fail by content (a tile or the preview breaks in them, ruling Q43); blind data refutes
+nothing.
+
+Cost (measured on the synthetic cards of `tests/reassembly.rs`, release): an unprovable RAW settles within about 400 to
+4100 walks and 1 to 76 MB read; a proven one is re-checked for uniqueness at every cluster boundary inside its pieces
+(about 7000 to 12,700 walks and 160 to 220 MB read, within the file's 512 MiB).
+
+### Lossless JPEG check (internal)
+
+`formats::jpeg_lossless` (written from ITU-T T.81 Annex H) tells whether the bytes of a RAW tile or strip are the lossless
+JPEG (SOF3) frame its header declares. `lossless_frame` reads the header (one DHT per component, one SOF3 of 2-16 bits and
+1-4 components, optional DRI, one scan with predictor 1-7) and returns `None` for anything else, a baseline JPEG
+included. `decode_lossless` then walks the difference codes (a Huffman category of 0-16 and that many extra bits; 16 has
+none), without computing predictions, from a cursor, reading only below the tile's declared end (`TileOffsets` +
+`TileByteCounts`). It returns `Eoi` only when exactly width x height x components samples decode **and** the `FF D9`
+marker ends exactly at the declared end, or is followed up to it by fewer than 16 `FF` fill bytes and nothing else (Sony
+pads every lossless tile so to a multiple of 16 bytes, inside its `TileByteCounts`: the ILCE-6700 sample; without this
+a whole, contiguous file of it came out `Partial`, found in part 1.6's Task 11): a Huffman stream resynchronizes, so a
+count alone can be reached by chance on the tail of a neighbouring tile. Padding bits must be 1-bits. Restart markers are checked when the frame has a restart interval, a cursor is kept at
+every row of samples so a walk can resume over other bytes, and every length is checked arithmetic bounded by the
+declared sample count and the limit. `Eoi` is **evidence, not proof**: the walk reads no pixels, so a piece of another
+tile of the same frame (same header and table) still passes a few percent of the time (about 1% in the unit tests'
+fixed measurement of spliced tails), and a caller must not take it as proof of identity. Its callers: the TIFF RAW
+measure (`tiles_decode`: every tile must end where it is declared to) and the RAW seams (see "Fragmented RAW"). The baseline decoder shares only the Huffman table builder and the byte reader, and
+still rejects categories over 11.
 
 ## TIFF reader (internal)
 
@@ -790,7 +1069,8 @@ and
 the extent (`end`, relative to the header; the limit clamps every range, whatever references it, and `starts_past_cap` tells a range starting at or past `TIFF_MAX_LEN` from a mere cut), Make/Model/lens/serial/ISO/DateTimeOriginal, the largest image size, whether
 `DNGVersion` is present, the embedded JPEG ranges (`JPEGInterchangeFormat`, strips/tiles of Compression 6/7 starting
 with FF D8, Panasonic's JpgFromRaw and an Olympus MakerNote's JPEGs) and the other strip/tile ranges (raw data, including
-Panasonic's raw data). Header magics `II*\0`, `MM\0*`, `IIRO`, `IIRS`, `MMOR`, `IIU\0`
+Panasonic's raw data; in an IFD that declares tiles, a strip overlapping them is no range of its own: the ILCE-6700
+writes one strip over all its lossless tiles, and the tiles win). Header magics `II*\0`, `MM\0*`, `IIRO`, `IIRS`, `MMOR`, `IIU\0`
 are accepted; BigTIFF and anything else gives `None`.
 
 It follows the IFD chain, SubIFDs, Exif, GPS (extent only) and Interop IFDs; the next pointer of Exif/GPS/Interop IFDs is
@@ -807,7 +1087,14 @@ file). `truncated` is a size cap hit (the walk is incomplete, not malformed). Ca
 and treat `truncated` as at best `Partial`. First value wins for Make/Model/lens/serial/ISO/date. Each IFD is classified
 once, by the SOF of its first strip/tile (they share one Compression): SOF0/1/2 go to `jpegs`; lossless JPEG (SOF3) is
 `data`. `jpeg_data_starts` lists the `data` ranges that are JPEG-coded (an IFD with Compression 6, 7 or 34892, or a
-JPEGInterchangeFormat range clamped to the limit), the only ones that may begin with FF D8.
+JPEGInterchangeFormat range clamped to the limit), the only ones that may begin with FF D8. Three more lists are
+additive (`data` is unchanged): `lossless` holds the `data` ranges of an IFD with Compression 7 whose first strip/tile
+starts with a SOF3 (lossless JPEG, as in lossless DNG tiles; a CR2's raw IFD is Compression 6 and is not listed),
+the ones the lossless JPEG check above can examine (evidence, not proof); `ifds` holds every visited IFD's entry table (`2 + 12 × count + 4` bytes, relative to the header), the
+bytes that must be the file's own; `sensor` holds the `data` ranges that are neither JPEG-coded nor lossless
+(uncompressed, or vendor/lossy such as Sony's Compression 32767, and Panasonic's raw data), which have no structure to
+check, so a seam inside them is blind; so is data in neither list (Compression 34892, a JPEG-coded range whose SOF is
+not SOF3, a frame the lossless check rejects): never provable.
 
 Vendor data it reads: in an RW2 (`IIU\0`) IFD0, Panasonic's tags 0x0002/0x0003 (sensor size), 0x000A (bits per sample),
 0x002D (raw format), 0x002E (JpgFromRaw, a lossy JPEG goes to `jpegs`) and 0x0118 (raw data offset; the length is computed
@@ -832,6 +1119,263 @@ source) is a detector bug: debug builds assert on it, release builds ignore it (
 pieces for a photo it puts back together (see "Fragmented JPEG"); the scan copies a measurement's `fragments` into its
 finding. After an `Intact` finding in pieces, the scan skips heads only inside
 its pieces (each rounded out to whole sectors), so files in the gaps between them are still found.
+
+## Reassembly
+
+The seam search (`reassemble`, crate-internal) puts back together a file found in more than two pieces; the scan runs
+it in its reassembly step, after the pairing (see "The reassembly step" below). A **seam** is a logical position of the file
+where one piece ends and the next begins. Each format describes its content through the `Seams` trait: it walks the
+file's logical bytes over a view of the pieces chosen so far plus a candidate run (told where the view's seams are),
+says where the content stops fitting
+(`Broken`), where the file ends (`Complete`), up to where it checked the content (its evidence), and from which states
+a walk may resume in another piece; at the end it proves the whole file (`Proven`, `Unproven` or `Failed`). A format may
+also give the file's known length, an anchor (a logical offset that must sit at a given absolute place, such as a video's
+orphan `moov`), its own embedded files, and a cheap prefilter for candidates. The JPEG (see "Fragmented JPEG"), the
+MP4/MOV video (its index elsewhere, see "Video in three or more pieces"; its index first or in fragments, see
+"Videos with the index first, open-ended or fragmented") and the TIFF RAW (see "Fragmented RAW") have seams.
+
+**The space.** A piece lies on the volume's cluster grid when the file starts at a cluster start of a volume with
+clusters of at least 4096 bytes; otherwise on 512-byte sectors, forward only, with a 64 MiB window and at most 4 pieces.
+A unit is free when it is inside the heap, no live file of the volume's listing holds it, no `Intact` finding (or earlier
+`Intact` reassembly) claimed it, it is not already a piece of the file, and no other finding starts in it (a finding a
+file-system entry placed where no format recognizes a head, an old entry over clusters another file took since, is no
+start: ruling Q52). A run of free
+units stops at the first unit that is not free; a claimed range wholly covered by the file's own embedded files at their
+exact places (a RAW's preview found as its own `Intact` JPEG) does not stop it (coverage, not equality, since touching
+claimed ranges are merged); for the same reason a unit taken only by such files, were the piece to start there, is a
+candidate. Taken ranges are stepped over range by range, never cluster by cluster, except a unit opened by such own
+files (stepped one unit, its check charged to the file's walks). The window bounds
+only the distance to a candidate, never a piece's length: a piece runs as far as its units are free, until its walk
+breaks, the known length ends or the read budget does.
+
+**The order of candidates.** After a piece ending at absolute `end`: the free unit starts from `end` up to
+`end + 256 MiB` in ascending order ("next free"), then, on a grid, from the heap start (at most 256 MiB of it) up to
+`end` ("first hole"). The unit right at `end` is never a candidate (continuing there is no seam). The prefilter runs
+while the candidates are listed; at most 4096 survivors per seam count, and more than that means the seam was not
+exhausted. A window cut is not a cap hit: **uniqueness holds only inside the window** (256 MiB on a grid, 64 MiB off
+it); a look-alike continuation beyond it could leave a seam falsely unique, and the content proof is the guard against
+that (accepted risk). When the format gives an anchor, the start it implies comes first.
+
+**Break points.** When a walk breaks, the piece may end at any unit boundary between the last resume point at or before
+the checked evidence and the break, nearest to the break first, at most 64; more means not exhausted.
+
+**The uniqueness re-check.** A walk that goes on fitting can still run into a look-alike: another file's data right
+after a piece that happens to continue the content (a burst of the same scene, a tail of the same stream). So once the
+search has found exactly one complete solution, a separate re-check tries, for every piece of it, earlier break
+points: first the unit boundaries at or before the positions the format marks as suspicious (`Seams::suspicious_breaks`,
+most suspicious first; positions in one unit count once), then the nearest to the piece's end, at most 64 per piece, taken round robin over the pieces; from each it lists the next
+piece's candidates and searches on from those with content evidence past the new seam (a blind candidate is not
+followed there: filling units the format cannot check from any free run is no evidence of another file). No candidate
+starts in a unit of the found solution itself (rulings Q33, Q36): read out of step, the solution's own later units can
+look like a continuation and take the whole budget. This hides the true paths that reuse or rejoin the solution's own
+pieces, as when a burst neighbour's data stands in the middle of a photo; the JPEG does not rely on uniqueness for
+those (a content-only JPEG in two or more pieces is at most `Partial`, Q37, see "Fragmented JPEG"). Any other complete solution makes the result not unique. The re-check has its own
+budget (2^14 walks per file); running out of it, or of break points, does not make the search non-exhaustive, with
+one exception (Q33): when the format gives hints, every candidate at each piece's most suspicious cut must be walked to
+the end (no candidate or break-point cap, budget or cancel cutting it short), else the result is not exhaustive. Hitting
+the piece cap there does not count, and neither does a piece whose cut would need a piece beyond the cap: no alternative
+fits within it (Q34). The accepted cost: a correct photo next to a whole burst neighbour (whose data passes as a
+continuation at the cut, so the walk there is long) can stay `Partial` when the re-check budget runs out at that cut.
+
+**Candidates with and without evidence.** A candidate passes when its walk checks content past the seam (and then
+breaks further on or completes); it is blind when its walk checks nothing past the seam yet does not break right at it
+(a cluster the format cannot check, then foreign data or the end of its run, or a walk that reaches the file's end
+through data it cannot check); only a candidate broken right at the seam is dropped. Evident candidates are descended into first, then blind ones, in
+order; both count toward uniqueness, so a blind true continuation next to an evident look-alike makes the result not
+unique. A solution through a blind seam is at most `Unproven`.
+
+**Walking candidates in turn (part 1.6, measured in Task 11).** The candidates of a seam are listed first (the listing
+and the prefilter as above), then walked one at a time: an evident one is descended into at once, its walk reused for
+the descent (not walked again, but charged again: one walk and the bytes the first walk read, so it costs at least what
+walking it again would; exactly that for a format with no memory between walks, a little more for the JPEG, whose
+second walk would replay the phase up to its first seam from memory and read less), a blind one is kept for after the
+evident ones, one broken at the seam is dropped. Where no budget is hit, the descents are those of walking every
+candidate first, in the same order, and the result is the same; only the candidates after the point where the search
+stops (a second solution, a first one it settles for) are never walked. Under a hit budget (a file's, or the scan's
+when the pruned search leaves more of it to later files) the result may differ: another `Partial` best path, or a
+later candidate searched that would not have been; never an `Intact` the whole search did not earn (an `Intact` needs
+every candidate walked with no budget hit, the same walks either way). A format whose prefilter
+remembers what its earlier walks saw (`Seams::memo_prefilter` false: fragmented MP4) keeps the old order, every
+candidate walked before the first descent; the TIFF RAW's prefilter reads the structure of the file as found at its
+start, never the last view walked, so its answers are the candidate's and the seam's alone (ruling Q59, unit test
+`the_prefilter_does_not_depend_on_earlier_walks`). On the `scattered-card` bench image at 512 MiB, walking every candidate first
+spent 80 843 candidate walks for 6 902 descents (29 of the reassembly's 34 s on its 83 lossless ARWs); in turn, the
+same events come out in 11.4 s. The unit test `pruned_search_changes_no_outcome` scans a small scattered card both ways
+and needs the same events (no budget is hit there), and `a_reused_walk_is_charged_as_walked_again`, on a format with no
+memory between walks, the same result and budget left for any try
+or read budget.
+
+**Settling on a first solution.** A format whose seams are mostly unprovable (a RAW) settles on its first complete
+solution when it is not `Proven` (`Seams::settles_unproven`); the reassembly step's JPEG settles on its first complete
+solution in two or more pieces (`Seams::settles_in_pieces`): placed by content alone, it is at most `Partial` whatever
+the rest of the search finds (Q37), and the result is that first solution either way. It is then reported neither
+unique nor exhaustive. A JPEG found in one run is searched to the end (it may be `Intact`, the 1.3 rule).
+
+**What uniqueness covers, and what is best effort.** Uniqueness is decided within bounds: candidates only inside the
+window; look-alikes inside a piece only at the break points the re-check tries within its budget, never through the
+solution's own units; and the re-check follows only evident candidates. A look-alike beyond those bounds can leave a
+result unique that is not. Formats with positional proof (a video's sample table, a RAW's tile offsets) do not depend
+on the engine's uniqueness. The JPEG, whose only proof is the DC grid, does not rely on it for `Intact` either: a JPEG
+put together in two or more pieces from content alone is at most `Partial` (Q37, "Fragmented JPEG"); for it uniqueness
+only helps pick the pieces and report the result. For a JPEG found in one run, the re-check is best effort and the 1.3
+rule stands.
+
+**The rule for `Intact`.** The search reports the first complete solution in that order (else the path that checked the
+most bytes), whether it is the only complete solution, whether nothing was cut by a cap or budget, and the proof. A file
+may be `Intact` only when the solution is unique, the search exhaustive and the proof `Proven` (the scan adds its own
+checks); otherwise it is at most `Partial`. A JPEG in two or more pieces placed by content alone is at most `Partial`
+in any case (Q37). A known length (the format's, and a file-system entry's size for a deleted
+file) must match the sum of the pieces exactly; when both are known and disagree, nothing is complete.
+
+**Budgets.**
+
+| Limit                     | Value                             |
+| ------------------------- | --------------------------------- |
+| Pieces on a grid / off it | 16 / 4                            |
+| Candidates per seam       | 4096 (prefilter survivors)        |
+| Window on a grid / off it | 256 MiB / 64 MiB                  |
+| Break points per seam     | 64                                |
+| Candidate walks           | 2^16 per file, 2^22 per scan      |
+| Re-check walks            | 2^14 per file (within the scan's) |
+| Bytes read                | 512 MiB per file, 16 GiB per scan |
+| Reassembly candidates     | 4096 findings per scan            |
+| Claimed runs              | 2^18 per scan                     |
+| Own embedded files        | 64 per file (past it: none)       |
+
+The limits are unchanged by the measure of part 1.6 (`reassembly_budget_measure`, an ignored unit test, release, 1 GiB
+images; numbers in "Performance"): on the hostile image of `tests/reassembly.rs` grown to 1 GiB (a photo's first 64 KiB
+and 4096 sectors that each continue it for 510 bytes and end it) the step takes 0.2 s, exhaustive, under the 10 s per
+GiB bound the measure asserts; on `scattered-card` no file hits its try or read budget and the scan's budget is far
+from spent. Where a budget is hit: every cut photo of `cut-jpeg` (no rest anywhere, other photos of the same tables
+around) spends its 512 MiB, so the scan's 16 GiB run out after 32 of its 95 candidates (the others are not searched:
+the step stops at a spent budget); a photo cut in noise as in `tests/real_samples.rs` takes about 1 s for its 512 MiB;
+on 4 KiB to 8 KiB clusters a photo's search can spend its 2^16 walks. A video reads far less than its size: clips
+in 3 pieces of 128 KiB clusters (run 1, run 3, run 2 on the card, 8 MiB apart) of 253 to 697 MiB came out `Intact` in
+2.6 to 3.1 s, reading 230 to 469 MiB (most of it in the re-check). **The window is a limit of its own**: a piece that
+starts more than 256 MiB after the end of the piece before it (and is not within the first 256 MiB of the heap) is
+never a candidate, so the same layout at 761 MiB (run 3, 254 MiB, lies between run 1 and run 2) is not put back
+(33 walks, nothing complete); written in order (run 1, run 2, run 3) it is `Intact`.
+
+A file's budget is its own limits within what the scan has left; the prefilter's reads are charged to it (each
+prefilter call reads through its own one-sector reader, and a (start, seam) pair asked again is answered from memory,
+unless the format's answers depend on its earlier walks: `Seams::memo_prefilter`),
+and so is the listing: every 64 candidate units listed cost one walk. Reads past the file's byte budget are refused,
+so one long walk cannot overrun it. A budget hit stops the file's search, which is then not exhaustive. The search looks at the scan's cancel flag before
+every walk and every prefilter read, and gives nothing when cancelled.
+
+**Reading.** The search reads through the scan's read cache, so a sector known to be unreadable is never read again;
+nothing is written and nothing is remembered per cluster during the scan.
+
+### The reassembly step
+
+After every `Found` and the pairing, before the `Updated` events, the scan runs the search for its **candidates**,
+kept as each finding is emitted (ruling D2): never a live file's finding (its chain says where it is); a JPEG that is not
+`Intact` whose first piece is at least 16 KiB (the 1.3 join's minimum), an MP4/MOV that is not `Intact`, a `Partial`
+TIFF RAW (ARW, CR2, NEF, DNG, ORF, RW2, TIFF), and any JPEG, MP4/MOV or TIFF RAW of a deleted file that came out
+`Partial`. At most 4096 are kept, the first by id; past that, no reassembly is `Intact` (a dropped one might compete for
+the same pieces). JPEGs, TIFF RAWs (see "Fragmented RAW") and videos are searched: a video with its index first or in
+fragments (see "Videos with the index first, open-ended or fragmented"), or one with no `moov` of its own that the
+pairing did not make `Intact` and an orphan `moov` fits (see "Video in three or more pieces"; only a complete solution,
+its `moov` in place, can replace such a video's finding). A video not `Intact` whose own `moov` lies inside its finding,
+at the end of its `mdat` (a deleted file's guess that already holds it: that `moov` is no orphan), is searched with
+that `moov` too, its finding's pieces as the first hypothesis, `Intact` when the samples prove the seams (ruling Q52;
+one 16-byte read per video candidate). The scan
+also keeps the ranges of every `Intact` finding it emits (at most 2^18 merged runs; past that, no reassembly is
+`Intact`): those, the listing's live ranges, the pairing's `Intact` results and every earlier `Intact` reassembly are
+taken (see "The space"). Only this bookkeeping, one push or a few run merges per finding emitted, happens during the
+scan; nothing is added per sector.
+
+The candidates are searched one by one in id order, sequentially, through the scan's cache (one budget for the whole
+step, see "Budgets"), so the result depends only on the source's bytes and what the scan kept, never on `threads` or
+`cache_bytes`. A candidate of a deleted file gets its entry's size as the known length: its pieces must sum to it. The
+**health** of a result (D6): `Intact` only when the format's cap allows it (a JPEG placed by content alone in two or
+more pieces never does, Q37), the solution is complete, unique, exhaustive and `Proven`, no pairing candidate was
+dropped by a cap (conservative: that cap is about videos, but it blocks a JPEG's `Intact` too, C10), neither of the
+reassembly's caps was hit, the volume listing was not truncated (live clusters could be unknown, Q5), no piece holds a
+known unreadable sector, the known size matches, the format's own check of the whole file passes (the JPEG: the strict
+decode, run only when nothing else stands in the way; a video: its index against its length) and it is no JPEG with
+restart markers in two or more pieces
+(Q16); otherwise `Partial`. A result in one piece is contiguous (`fragments` empty).
+
+A candidate of a deleted file whose file-system pieces (two or more, not a carving's) came with it gets them as its
+**first hypothesis** (part 1.6, D14, `Space::with_hint`): at a seam where the path so far agrees with them, their seam
+is the first break point tried and their next piece the first candidate (when free). And they are a placement of their
+own: a complete solution elsewhere is not unique unless the content refutes them (their walk stops fitting before
+their end); blind data (a RAW's sensor data) refutes nothing, so a RAW found contiguous where its old chain says it was
+in pieces stays `Partial`.
+
+A result replaces the finding only when it **improves** it: a strictly better health, or both `Partial` and the result
+is complete (its walk reached the file's end) and longer; for a JPEG, a video with its index first and a TIFF RAW, also
+a complete `Partial` result of the same length with other pieces when the old finding's own pieces fail by content
+(Q43; a JPEG: its entropy-coded data does not decode through them, an unreadable sector refuting nothing), as a
+deleted file's guess over old data does. It then comes out as an `Event::Updated` with the same id
+(its pieces, length and health; a deleted file keeps its origin, with placement `Carved`, D15, when the result's
+length is the entry's recorded size, or a TIFF RAW's grain padding of it; another length is another file: no name,
+at most `Partial`, ruling Q57; so for the pairing's results), merged with the
+pairing's and the old folders' updates for that id (the reassembly's pieces win over the pairing's). An `Intact` result
+claims its pieces for the candidates after it. A cancel stops the step (the scan returns `cancelled`, no `Updated`);
+a source that vanishes during it stops the scan with `device_gone`.
+
+A known limit: a piece followed at once on the card by a run of another photo whose data decodes on smoothly (two
+similar photos with the same tables) can give the walk no break at that cluster boundary; the search then goes on
+through the other photo's run and may find no complete solution, and the photo keeps its earlier result (or comes out
+`Partial` with what fitted), never `Intact`. In particular, a JPEG with no restart markers (DRI 0) in three or more
+pieces, placed by content alone, is often not put back (6 of the 9 real camera previews of `real_previews_split_in_three`,
+the ILCE-6700's among them): it stays the `Partial` one-run guess of the file system or the carving, which holds the bytes of
+whatever follows its first piece (the 1.4 behaviour; never `Intact`, ruling Q59).
+
+### Realistic cards (`tests/reassembly_cards.rs`)
+
+Cards built the way a camera fills them, each on exFAT (128 MiB, 32 KiB and 128 KiB clusters) with both allocations
+of the testkit: the lowest free cluster first (`Alloc::FirstFit`) and a rotating next-free pointer that wraps at the
+end of the card (`Alloc::NextFree`). A shot is its ARW (1536×1024, lossless or uncompressed) written first, then its
+JPEG (DRI 0, sizes that differ from shot to shot); a long clip fills the card so the pointer wraps into the holes;
+every cluster no file took holds old data (noise); each file is a minute newer than the one before, except on one card
+whose clock was never set (every stamp equal).
+
+- **Delete in camera, shoot again**: 18 shots (the odd ones JPEG-only) with 5 clips, the JPEG-only shots and the clips
+  culled in camera (holes smaller than a RAW next to larger ones: whole shots fit a whole shot's hole exactly), 8 more
+  shots and 2 clips (in the holes, or at the end and then in the holes), then the first 3 new shots in pieces deleted
+  in camera too; lossless and uncompressed RAWs (the uncompressed ones zero-padded to 64 KiB, as Sony pads them, Q54).
+  Two more cards (one per cluster size) with a camera that reuses the deleted entries' slots (`FsBuilder::reuse_slots`):
+  one more shot, the review's lone stale entry (D and A shot and deleted, a shorter B over A's clusters takes D's
+  slots, is deleted, and C takes them again, so A's entry stands alone over B's bytes and zeros, Q53), the next 3 shots
+  in pieces deleted on a computer, then a photo X in 2 runs deleted in camera and an edited copy Y (a longer name, so
+  it takes no deleted entry's slots), FAT-chained from X's last clusters on: Y's chain rewrites X's last FAT entries,
+  so X's old chain no longer reads whole and the listing places X by the one-run guess from its start (ruling Q50
+  N-1); the card checks that this path was taken (X's first finding: its entry's, `guessed`, one run of its size).
+  And one whose clock was never set, the first new shot
+  (written from the very cluster of the first deleted photo) deleted too: two entries tie at one start (Q52).
+- **Format in camera, shoot again**: the same culled life, quick-formatted, then 6 shots over the start: they cover
+  the first holes only, so old files in pieces stay whole further on, with no entry left; carved and reassembled.
+- **Delete on a computer**: the same culled life, then the first 5 new shots (or clips) in pieces deleted on a
+  computer: exFAT clearing the chain (`ZeroChain`), and FAT32 (260 MiB, 4 KiB clusters, the smallest FAT32 on a
+  cluster grid) as Windows does.
+- **A burst of look-alikes**: `jpeg_burst(2048, 1536, 4, 6)` written next-free into holes of 1–3 clusters between live
+  photos, then deleted (in camera or on a computer); on one card the photos between the holes are deleted on the
+  computer too, so the file system's guess runs into other clusters and the search chooses among the neighbours'
+  pieces.
+
+Two oracles run over every card (ruling Q51). `no_intact_finding_is_glued`: the extracted bytes of every `Intact` final
+finding equal exactly one file ever written (a RAW's own preview found at its place in the RAW is the same file, Q16),
+and a finding with a name whose file still has an entry carries that file's name; never relaxed. A RAW's bytes count
+as its own also when only the camera's zero padding at its end is missing (no IFD references it, as `real_samples`
+allows). `recovered`: every file still whole on the card comes back at its start with its exact bytes and the
+health its proof allows: `Intact` for one piece, a live chain, a surviving exFAT chain no other entry claims (D14), a
+video placed by content whose every seam its samples prove (a NAL unit starts within one cluster on each side; with
+4 KiB clusters and NAL units of up to 24 KiB that often fails, and the video is `Partial` with its exact bytes) and a
+lossless RAW cut only at tile boundaries; `Partial` for a RAW cut inside a tile, its preview or its sensor data and
+for a JPEG in three or more pieces placed by content (Q37); a JPEG in two pieces may be `Intact` through the 1.3
+two-piece join (unchanged by Q37), with its exact bytes. A clip whose first piece ends the heap and goes on at its
+start (the next-free pointer wrapping) is put back like any other: the candidate order already looks from the heap
+start ("first hole"). Every card holds at least 3 files whole on it, in pieces, that the file system does not place
+(entry gone, chain cleared, a FAT delete, or an exFAT chain another entry claims): with
+the reassembly step disabled, every card test fails but `no_intact_finding_is_glued` (a guard: no reassembly makes
+fewer `Intact` findings).
+
+The allocation is an assumption (design D19): how Sony's firmware picks clusters is not known, so the cards may not
+cover the real pattern; the manual run on a real card (part 1.6, task 13) checks it. The cards are built and scanned
+once per test binary (the files encoded once, in parallel, at most 4 cards at a time); about 4 min in a debug build (the 32 KiB burst card alone, its search over look-alike pieces) and 35 s in a release one.
 
 ## File systems: volumes
 
@@ -923,8 +1467,9 @@ heads through a `Probe` over the raw source (see Deleted files); `read` uses the
   mov, cr2, cr3, nef nrw, arw, dng, orf ori, rw2, raf, heic heif hif, tif tiff; any case). Each is an `FsFile`:
   - `origin`: `volume` (the volume's index), `folder` (components joined by `/`, from the root, no leading `/`, `""`
     for the root; `None` when dropped, see Bounds; one string shared by the files of a folder), `name`, `state` (`live`,
-    or `deleted`), `placement` (`chain` for a live file, `guessed` for a deleted one; exFAT adds `recorded`; a scan
-    finding's origin may say `carved`, see [Deduplication](#deduplication)), `size` as
+    or `deleted`), `placement` (`chain` for a live file, `guessed` for a deleted one; exFAT adds `recorded` and
+    `old_chain`, see [File systems: exFAT](#file-systems-exfat); a scan finding's origin may say `carved`, see
+    [Deduplication](#deduplication)), `size` as
     recorded, `created` and `modified` as `FsTime` (local time
     `YYYY-MM-DDTHH:MM:SS`, no offset on FAT, exFAT's UTC offset when recorded; `Display` appends `+HH:MM`/`-HH:MM`
     then; `None` when a field is out of range: month, day for that month and year,
@@ -949,7 +1494,7 @@ heads through a `Probe` over the raw source (see Deleted files); `read` uses the
   cap, a folder dropped by the path cap or budget, a volume whose contested set overflowed, a directory not entered for
   the directory or depth cap, entries not read for the entry cap or a directory chain running past 2 MiB, a volume
   too large to walk, deleted files not listed because the volume's guess steps or the listing's high-word probes ran
-  out, or deleted folders not walked because 65,536 were already waiting.
+  out, the high-word phase reaching its half of the guess budget, or deleted folders not walked because 65,536 were already waiting.
 
 The walk:
 
@@ -1007,6 +1552,12 @@ the deleted photos/videos wait, never more than the photo slots left (a later li
   ones stepped over, until `need` were taken, the heap ends, `2 × need + 1024` clusters were examined, or 4096 runs.
   Fewer than `need` (short): the pieces hold what was found. Stepping over a cluster, or more than one run, makes the
   file untrusted.
+- **In pieces (part 1.6, G5).** A FAT delete zeroes the chain, so the guess is the only placement the listing gives.
+  The scan measures the guess (and the carving at the first cluster); a photo or video that comes out `Partial`
+  (another file in the way, or pieces elsewhere) is then put back by its content (see [Reassembly](#reassembly)), the
+  entry's size as the known length: the pieces must sum to it. It keeps its name and dates (placement `carved`). A
+  photo placed so, by content alone, in two or more pieces is at most `Partial` (Q37, its exact bytes); a video can be
+  `Intact` (its sample table places every sample, within the video limits).
 - **FAT32 high word (ruling D10, C2, C3).** Windows zeroes a deleted FAT32 entry's high cluster word. On a FAT32
   volume with clusters past `0xFFFF`, a deleted file whose recorded high word is 0 has as candidates `lo` and every
   `h << 16 | lo` (`h ≥ 1`) inside the heap (at most `last >> 16`, ≤ 4096); a candidate counts when it is free today and
@@ -1032,8 +1583,12 @@ the deleted photos/videos wait, never more than the photo slots left (a later li
   high-word candidates, then the files) costs one step of 2^26; once spent, the volume's remaining deleted files are
   not listed and no further deleted folder is read (in that order, each in walk order). The allocation is read a FAT
   block at a time, so 2^26 steps of guessing take well under a second; FAT32 high-word lookups are dearer per step,
-  and a hostile volume that spends the whole budget on them takes about 10 s on the development Mac (a real card asks
-  a few of them per deleted file).
+  spending the whole budget on them takes about 10 s on the development Mac, so the cap bounds that to about half (a
+  real card asks a few of them per deleted file). The high-word phase spends at most half of the budget (2^25 steps, the crate-internal
+  `Limits::high_word_steps`), counted over its rounds: a round of lookups that would pass it ends the phase, the
+  questions still open stay unanswered (those files are not listed) and the listing is truncated. The other half stays
+  for the placements, so a hostile FAT32 volume cannot starve the files whose high word is intact. A truncated listing
+  keeps every reassembled file out of `Intact` and no old chain counts as proof, since live clusters may be unknown.
 
 Bounds (each lowerable in unit tests): per volume at most 65,536 directories, 4,000,000 directory entries (every
 32-byte slot read counts, the end marker included), depth 32 (the root is 0), 2 MiB per directory, 65,536 contested
@@ -1155,6 +1710,19 @@ and File Name §7.7 entries).
   - FAT-chained: its old FAT chain (exFAT frees clusters in the bitmap only) when it has exactly
     `ceil(DataLength / cluster)` clusters, all free today, the last one's entry end-of-chain (`guessed`, trusted only
     when it is one run); otherwise the FAT rule D4 guess (`guessed`, trusted only when one run and not short);
+  - **an old chain as proof (part 1.6, D14, ruling Q6):** such an old chain in two or more runs is placed `old_chain`
+    when, besides the above, the bitmap is there, ValidDataLength equals DataLength, the listing dropped nothing (an
+    entry it never read could claim the clusters), no other deleted entry of the volume, **of any kind** (a sidecar
+    `.XML`, a `.THM`, a `.BIN` as much as a photo; ruling Q49), **claims** any of its clusters (a NoFatChain entry its
+    recorded run, a FAT-chained one its first cluster and its own whole old chain, a deleted folder the runs it was read
+    from; a live entry's clusters are claimed by the live walk, so never free), and none of them is a contested
+    cluster. The deleted files of kinds that are not listed keep only (first cluster, size, NoFatChain), 16 B each, at
+    most 2^20 per volume (past it the listing is truncated: no old chain is proof); their old chains are followed from
+    the step budget. All the deleted entries are
+    located first, so every claim is known before one is judged (a sort of the claimed ranges and one binary search
+    per run). Otherwise it stays `guessed`: the chain is only the first hypothesis the reassembly tries. `old_chain` is
+    never trusted by itself: the scan decides (see [Deduplication](#deduplication)). Typical case: a camera's delete,
+    which keeps the FAT; a computer that zeroes the chain leaves the guess and the reassembly;
   - a first cluster outside the heap or in use today: not listed (overwritten);
   - ValidDataLength short of (or past) DataLength: not trusted.
 
@@ -1172,7 +1740,10 @@ directory instead of 2 MiB. The work is linear in what is read: each cluster is 
 counted 64 clusters at a time, and every deleted placement is paid from the step budget.
 
 Memory (on top of FAT's figures, which hold for the listing itself). The bitmap: one bit per cluster, ≤ 32 MiB at 2^28
-clusters, freed with the walk. A directory is read 128 KiB at a time and parsed entry by entry, holding one entry set
+clusters, freed with the walk. While the deleted photos/videos are placed (D14): each one's runs (8 B per run, at most
+4096 runs each, paid from the step budget like the clusters they hold) and the claimed ranges, 16 B each plus 16 B of
+prefix maxima (one per entry, one per run of an old chain, one per run of a deleted folder read), freed once they are
+placed. A directory is read 128 KiB at a time and parsed entry by entry, holding one entry set
 (≤ 608 B) besides the chunk, so a 256 MiB directory never sits in memory. The root's entries waiting for its bitmap
 entry (formatters write it first, so normally none) take 64 B each plus the name: at most 262,144 photos/videos
 (16 MiB; their names are the ones the listing keeps, not extra) and 65,536 directories (4 MiB plus names of
@@ -1289,6 +1860,12 @@ file never hides the rest of the disk; a damaged file may then overlap another f
 (not just the block), so files may cross block boundaries. Before the first block the scan reads the source's file
 systems (below), so the files they list come out with their name, folder and dates, once each.
 
+After the last block and every `Found`, three steps run in order, each over what the scan kept: the pairing of videos
+with their separated `moov` ("Video with a separated index"), the reassembly of files in three or more pieces
+([The reassembly step](#the-reassembly-step); JPEGs so far), then the names of the old folders of a quick-formatted
+card ([File systems: after a quick format](#file-systems-after-a-quick-format)). Their results come out merged, one
+`Updated` per id in id order, before `scan` returns.
+
 A `Partial` RAW's own JPEGs (rulings D12, R24): for every measurement that is not `Damaged`, the format that measured it
 also lists the embedded files it references in its own data (`Format::own_files`: a TIFF RAW's previews and JPEG-coded
 strips/tiles, a RAF's embedded JPEG, a CR3's `PRVW` and full-size JPEG; at most 64), in the same measuring step on every
@@ -1319,6 +1896,58 @@ a probe over the raw source that refuses, without reading it, any range the cach
   (with a sector above 512 the others are dropped silently; the carving still finds them). When several share a
   first-piece start (deleted entries over each other, a cross-link), one is kept: a live one before a deleted one, then
   the latest `modified` (a missing time loses to a present one), then listing order; the others are not reported.
+  When the best of them is deleted and another deleted one ties with it (equal times, or none: a camera with an unset
+  clock, a re-shot within the 2-second resolution), which one the clusters hold cannot be told, so none is kept: the
+  head there is carved like any other, without a name (ruling Q52). Before, the first in listing order was kept, and
+  its size could place another photo's bytes with the slack after them as `Intact` under the wrong name.
+- **A deleted entry whose content ends early over padding (rulings Q53–Q56).** When a deleted file's content, measured
+  through its pieces, ends before its recorded size and only padding (`00`/`FF`) follows up to that size, nothing shows the
+  bytes are that entry's: a camera reusing directory slots may have written another, shorter photo over its clusters
+  and zero-filled the rest of the last one, its own entry gone since. The finding there is then the carving at that
+  start (its length and health), without the entry's name or size; with no carving there (unreadable or skipped start)
+  the entry's finding is at most `Partial`. A live file keeps the D6 rule. Ruling Q54 bounds it: a format's own
+  padding is no such sign (a TIFF-based RAW whose recorded size is its structure's end rounded up to 4 KiB or 64 KiB,
+  as Sony pads its ARWs, keeps its name and placement); and the carving replaces the entry only when it reads the same
+  bytes as the view (contiguous, within the first piece: one that runs past it, as a size-0 `mdat` carved to the end
+  of the source, does not), else the entry's pieces stay, without the name,
+  at most `Partial` **to the end of the scan**: the pairing and the reassembly may move its pieces, never make it
+  `Intact` (ruling Q55 (2); the ids of these findings are part of a session's checkpoints). An old exFAT chain is no
+  exemption (Q55 (1)): a camera that allocates next-free fills a deleted file's freed runs in order, so a shorter
+  photo can take its exact chain. Cost: a deleted photo that really was zero-padded inside its recorded size loses its
+  name (it is still recovered); a clip with a size-0 `mdat` whose own padding follows its last sample loses it too.
+  **The content's end** (ruling Q56; for deleted entries only, Q57: a live file keeps the 1.4 measure, a size-0
+  `mdat` running to the end of its file) is the format's full extent, taken once before the fill check: the structure's
+  end (for a video whose index comes first and whose `mdat` has size 0, "to the end of the file", the highest sample
+  end its index lists: otherwise such an `mdat` would run to the entry's size whatever the clip), then the whole files
+  D6 allows after it (an MPF image, a motion photo's video, as most camera JPEGs carry). So a shorter camera JPEG with
+  its MPF image over an older entry's clusters is no proof of the older entry either. **A limit (Q56, M-7):** a deleted
+  file overwritten by another of exactly the same size (the same camera's uncompressed ARWs, or ARWs padded to the
+  same 64 KiB multiple, which is common for Sony) cannot be told apart by size: the bytes come out exactly one
+  original file, `Intact`, but under the older entry's name and dates. An identity check (the EXIF DateTimeOriginal
+  against the entry's stamps) is on the roadmap. The whole decision, in one place (`scan::fs::decide`), for a deleted
+  entry by how its content ends:
+
+  | Content ends | Recorded run / guess | Old chain (`old_chain`) |
+  | --- | --- | --- |
+  | at the size, or a RAW's own grain padding fills the rest | name kept; D3/D5 (`Intact` when trusted: a recorded run or a one-run guess of free clusters) | name kept; `Intact`, `old_chain` when every check passes, else `guessed`, `Partial` |
+  | early, then fill only | no name: the carving at the start, or the entry's pieces at most `Partial` | the same |
+  | at the end of pieces cut short of the size | name kept; D3/D5 | name kept; `guessed`, `Partial` |
+  | early, then other bytes | a recorded run whose structure is `Intact`: no name, as for fill; else name kept, at most `Partial` | an `Intact` structure: no name, as for fill; else name kept, `guessed`, `Partial` |
+
+  The "early, then other bytes" row (final review M-4, the Q57 principle: no name the structure disproves): in the
+  pieces the entry's own record gives (a recorded run or an old chain), a structure `Intact` in one run that ends
+  before the size with other bytes after it is a shorter file over the clusters (the rest of its last cluster the
+  entry's old bytes), so the name goes as for fill; a guess's early end disproves only the guess, and keeps the name.
+  **Another whole file over the first piece (final review I-1, ruling Q61).** A camera allocating the next free
+  clusters may write a whole file over a deleted entry's first run and past it. When the carving at the entry's start
+  is `Intact`, in one run, longer than that first piece and not of the recorded size, it comes out on its own, without
+  the name, unless one of four guards holds: not every byte of the carving past the first piece is checked by
+  content (re-review C-1: only a JPEG, entropy-decoded to its EOI, and a video whose `mdat` has a size and every sample
+  of whose index fits in place are; a TIFF RAW, RAF or CR3's sensor data, a HEIC's image and a track with no sample
+  check such as ProRes are not, so any bytes would pass, and a size-0 `mdat` runs to the next file start or the
+  source's end: such a file stays lost there, its start reported as the entry's pieces, a documented residual; a TIFF
+  RAW is also refused in `decide`, a second barrier); the view is padded (the fill rule decides); or the view is
+  `Intact` at the size (the entry proves itself and keeps its pieces).
 - **Nothing is skipped because of the file system** (ruling R10): every head the signature rules examine is still
   examined, and only an `Intact` finding skips its pieces, as before.
 - **A listed file's finding** is added at the sector holding its first piece, always (whether a format recognizes the
@@ -1449,8 +2078,9 @@ Events:
 - `Updated(Finding)`: a better version of a finding already reported, which replaces the earlier `Found` with the same
   `id`. Emitted after every `Found` (and the last `Progress`), before `scan` returns, in id order; counted in
   `ScanSummary::updated`. Today: a video put back together with its separated `moov` (see "Video with a separated
-  index"), and a finding an old folder of a quick-formatted card names (see
-  [File systems: after a quick format](#file-systems-after-a-quick-format)); one event per id, both merged.
+  index"), a photo put back together from three or more pieces by the reassembly step (see
+  [The reassembly step](#the-reassembly-step)), and a finding an old folder of a quick-formatted card names (see
+  [File systems: after a quick format](#file-systems-after-a-quick-format)); one event per id, all merged.
 
 `CancelToken::cancel()` (from any thread or from inside the callback) stops the scan: it is checked before each block
 examined and each block read ahead, before and after every event and while waiting for a measurement. A block
@@ -1487,7 +2117,7 @@ The saved session ([Sessions](#sessions)) stores this on disk; inside the engine
   timing and never part of a saved scan (ruling P4). The state is built only when the hook asks for it. `stopping` says
   the scan was cancelled or the source vanished once the boundary's events were out: the state is still good
   (everything in it was committed before), and the scan returns that error right after the hook.
-- `Paired`, after the pairing step, before the `Updated` events.
+- `Paired`, after the pairing and the reassembly steps, before the `Updated` events.
 
 **What the state holds** (ruling D22): the shape of the scan it belongs to (the sector and block sizes as the scan
 uses them, file systems on or off, the source's length: a scan of another shape refuses it, ruling P44), the position
@@ -1496,7 +2126,8 @@ in-order half of the scan carries from block to block (the summary, the open unr
 whether `DiskFailing` was sent, the findings not yet emitted, the next id, the orphan `moov` candidates and the ranges of
 the ISO BMFF findings that rule some out, the `Damaged` videos kept for pairing, the caps' flags, the start of every
 finding, the next listed file, the own-file starts of `Partial` RAWs with their owners' ranges, the old-folder
-candidates and the findings on a cluster grid they may name); the skip ranges; the last bytes the `moov` and old-folder
+candidates and the findings on a cluster grid they may name, the reassembly candidates and the ranges of the `Intact`
+findings emitted, with their caps' flags); the skip ranges; the last bytes the `moov` and old-folder
 searches saw before the position (a header across the boundary is still found); the cache's **whole** bad map (ruling
 P5) and its coverage from the position on. The capture names every field of the commit loop, so a field added later
 does not compile until it is saved or rebuilt. Rebuilt on resume, not stored: the cluster grids, the volumes and what the
@@ -1512,15 +2143,17 @@ for any `threads` and `cache_bytes` on either side.
 
 **What a resume reads again** (ruling D24): the blocks the stopped scan had read ahead past the position (at most the
 read-ahead, `lookahead_blocks × block`, plus what was read since the last saved checkpoint), the pieces below the
-position of listed files that start after it, and what the pairing loads (a resume from `Paired` runs the pairing again).
+position of listed files that start after it, and what the pairing and the reassembly read (a resume from `Paired` runs
+both again: they are deterministic, so they give the same `Updated` events).
 Never: the listing (ruling D23: read again with a fuller bad map it could come out different), a sector of the saved bad
 map (the cache starts with it, including runs below the position that the pairing or a file's pieces may touch), or a
 block wholly inside an `Intact` finding across the position whose bytes the cache had already read (its coverage comes
 back with the state; for that the cache now keeps its coverage from the walk's position on, not from the read-ahead's).
-Starting from the position, a scan without file systems or pairing reads nothing below it.
+Starting from the position, a scan without file systems, pairing or reassembly candidates reads nothing below it.
 
 **Memory**: the state is bounded by the caps the scan already has (pending findings, 4096 + 4096 pairing candidates,
-65,536 own-file starts, 65,536 old-folder candidates, 262,144 grid findings and one start per finding), plus the bad map
+65,536 own-file starts, 65,536 old-folder candidates, 262,144 grid findings, one start per finding, 4096 reassembly
+candidates and 2^18 claimed runs, 16 bytes each in the saved form: 4 MiB), plus the bad map
 (at most 2^20 runs, 16 bytes each in the saved form: about 16 MiB) and at most 65,536 coverage runs. The listing is
 saved once, up to a few hundred MiB in the worst case of the listing's caps.
 
@@ -1574,7 +2207,9 @@ scan_session(&source, &identity, &formats, &opts, &mut session, &sopts, &cancel,
   no longer on the volume it was checked on), and the scan's own. On any error the session stays at its last checkpoint,
   ready to run again.
 
-**The folder** (ruling D25): every file starts with `RVNTSESS`, a kind byte and the format version (`u16`, 1).
+**The folder** (ruling D25): every file starts with `RVNTSESS`, a kind byte and the format version (`u16`, 2). The
+version is 2 since the reassembly's state joined the checkpoints (part 1.6): a session saved by an earlier version
+(1) is refused with `session_version`, like any version this engine does not write (ruling Q10); scan the card again.
 
 | File                                      | Holds                                                                                          |
 | ----------------------------------------- | ---------------------------------------------------------------------------------------------- |
@@ -1627,11 +2262,38 @@ merge (rulings D3, D5, D6), from the measurement through the view of the file's 
 2. The health is at most `Partial` when the placement is not trusted (`FsFile::trusted`, ruling D3: a live chain that
    is incomplete, loops or crosses another, a deleted file not in one run of free clusters), when the tail is not
    coherent (D6, below) or when the view measurement is itself in pieces (a join inside the file's own pieces).
+   Exception (part 1.6, D14): a deleted file the listing placed `old_chain` keeps an `Intact` view, untrusted as it is,
+   when every content check its format has passes over the view (a JPEG: the strict decode; a video: its index
+   `Intact` and every checkable sample in place, whatever its layout, at least one checked; a TIFF RAW: its structure,
+   its largest preview strict, every IFD, embedded JPEG and lossless tile whole), its tail is coherent, its pieces
+   sum to the entry's size and its content ends exactly at that size (rulings Q55, Q56: the format's full extent, a
+   JPEG's appended MPF images included, a size-0 `mdat` at its last sample; or a TIFF RAW's own zero padding to its
+   4 KiB or 64 KiB grain fills the rest, Q54 (b)). Content that ends early over fill proves nothing about the entry: a shorter file may have been
+   written over its exact chain (see the Q53 rule in [File systems in the scan](#file-systems-in-the-scan)). The
+   view's measure also stands for "no other file starts inside" where it looks: every
+   format ends a file at a sector start where another header is recognized and confirmed (its own embedded files
+   aside); a video's boxes other than `mdat` are not looked at. These checks run
+   in the file's job (the measuring threads), only for `old_chain` files, read the view once more and are bounded by
+   512 MiB of reads per file (past it: no proof). An `old_chain` file that does not pass them comes out `guessed`
+   (`Partial`): its chain was a hypothesis, and the reassembly tries it first. When it is emitted, an `old_chain` file
+   that shares a byte with another finding of any health (ruling Q49: an `Intact` one emitted, one emitted without
+   origin on a cluster grid, or one still pending; one wholly inside its pieces aside, that is its own embedded file)
+   is lowered to `Partial` and `guessed` too: a file written over part of the chain from before it, whose entry was
+   lost, is found there, whole or cut. So `old_chain` in a finding always means a placement the chain and the content
+   proved together; uncompressed or lossy sensor data is then trusted to the chain, as a live chain's is. **The limit
+   (D14):** bytes written over such sensor data inside a surviving chain that left no directory record, no file start
+   and no finding (old noise, a file whose start lies off every cluster grid and whose entry is gone) are not detected:
+   the file comes out `Intact`, `old_chain`, with them. So with a damaged clip whose `mdat` size was never written (a
+   placeholder of 8 bytes, or 1 with a 64-bit size of 0: a recording cut by a power loss): it is measured only to its
+   header, so its frames written over the chain do not count as running into it.
 3. The pieces are the file system's: `len` their sum, `fragments` them when there are two or more.
 4. A deleted file takes the carving at its start instead (its length, kind, health and pieces; `placement` `carved`)
    when the carving is of the same kind, strictly healthier (`Intact` > `Partial` > `Damaged`) and exactly the
    recorded size (D5): the guess was wrong and the signature found the file. A live file never does: its chain is
-   where its bytes are. A carving of another length (a join to the tail of another photo of a burst) is not used.
+   where its bytes are. A carving of another length (a join to the tail of another photo of a burst) is not used, nor
+   (part 1.6) a carving in one piece when the file system placed the file in two or more (an old exFAT chain, a guess
+   around clusters in use): that is another placement, not a better one, and a RAW's sensor data measured contiguously
+   checks nothing (the reassembly decides between them).
 
 The tail (D6): the structure measured over the view ends at `L`, and the view (the recorded size, as far as the clusters
 and the source hold it) has `S` bytes. `L == S` is coherent. Otherwise, at most 8 times: the bytes `[L, S)` are all
@@ -1699,6 +2361,41 @@ it does not grow with the size; at 4 GiB it was 0.08 to 0.2 s). On a card read a
 device against the image of the same card, as the opt-in `os_devices` test prints it with images attached by `hdiutil`
 (not a card reader): 76 to 79 MB/s on the raw device against 80 to 84 MB/s on the image file (this run), 113 to 127
 against 148 to 154 in the part's first run, so reading the raw device costs a little, not a multiple.
+
+**End of 1.6 (reassembly, Task 11).** Against `main` (`c9e590a`, the 1.5 head, which has no reassembly step) built in a
+separate worktree and target, and the 1.6 head before Task 11 (`ca6aacb`), interleaved, three rounds with a pause, the
+best round of each, a round being the best of 5 scans (of 3 for `exfat-card`, `cut-jpeg` and `scattered-card`); the
+"end of 1.6" columns are Task 11's first commit (`e84adf4`), load average 3 to 4 (the first two rounds of the day, at load 15 to 88, spread
+by more than 40% against themselves and are not used):
+
+| Image            | `main` (s) | before Task 11 (s) | `e84adf4` (s) | `e84adf4` (MB/s) |
+| ---------------- | ---------: | -----------------: | ------------: | ---------------: |
+| `noise`          |       0.42 |               0.45 |           0.43 |            2473.4 |
+| `dense-jpeg`     |       2.02 |               2.03 |           1.92 |             560.0 |
+| `dense-raw`      |       0.66 |               0.66 |           0.63 |            1710.3 |
+| `video`          |       0.42 |               0.42 |           0.44 |            2450.2 |
+| `exfat-card`     |       1.98 |               1.99 |           1.88 |             569.8 |
+| `cut-jpeg`       |       2.41 |              81.17 |          25.08 |              42.8 |
+| `scattered-card` |          - |                  - |          26.93 |              39.9 |
+
+Its two fix rounds changed the scan path (the TIFF reader's strip rule, the lossless tile's fill after its EOI) and
+were measured again against `main`, interleaved, three rounds of best of 3 (best of 5 for `dense-raw`, with `e84adf4`
+as control): `noise` 0.45 on `main` / 0.46 at fix round 1 (`df19183`), `dense-jpeg` 2.01 / 1.98, `video` 0.45 / 0.45,
+`exfat-card` 2.31 / 2.34, `dense-raw` 0.65 / 0.65 (`e84adf4` 0.62), all within 5%; fix round 2 changes only which
+strips the TIFF reader drops (one comparison per strip) and was not measured again except `scattered-card`: 23.07 s
+(46.5 MB/s) at its head, 25.0 s at fix round 1 and 26.93 s at `e84adf4` (this machine spreads that much between
+runs).
+
+The images with no reassembly candidate (all but the last two: the step does not run) are within 5% of `main`
+(`video` 0.44 against 0.42 s is 0.02 s, inside `main`'s own spread of 0.42 to 0.45 s between rounds). `cut-jpeg` is outside the
+5% gate, which binds images without fragmentation (ruling Q59: its cut photos are fragments by design), and has no
+speed target (see the dev README): its scan takes 25 s against 2.4 s on `main`, bounded and documented here. Every cut
+photo is a reassembly candidate whose rest is nowhere; each spends its 512 MiB (a photo of 3000×2000 decodes about one
+MCU row, some 90 KB, of every look-alike candidate before the DC test can reject it), so the scan's 16 GiB read budget
+runs out after about 32 of the 95 candidates and the later ones (in id order, so further on the card) are not searched
+at all: they keep their `Partial` cut finding. Task 11's pruning took it from 81 s to 25 s, with the same events. `scattered-card` (new; 4298 files written, 2277 found, 435 reassembly candidates) spends 26 s in the
+reassembly (161 lossless ARWs 22.8 s, 240 JPEGs 3.3 s, 34 clips 0.02 s; `reassembly_budget_measure`), against
+143 s without the pruning (the same events).
 
 Every placed file is found in every run. What it means for a card: an SD card reader delivers at most about 100 MB/s
 (UHS-I) to about 300 MB/s (UHS-II), so with the default threads the scan keeps up with the reader on every image here,
@@ -1783,20 +2480,41 @@ characters on Windows is a write error (`write_failed`) there, never an escape.
 
 ## Tested against real files
 
-`tests/real_samples.rs` runs the engine over real camera files (one each of CR2, CR3, NEF, ARW, RAF, DNG, ORF, RW2; all
+`tests/real_samples.rs` runs the engine over real camera files (one each of CR2, CR3, NEF, RAF, DNG, ORF, RW2 and two
+ARWs, an ILCE-7S and a lossless ILCE-6700; all
 CC0 from raw.pixls.us, listed with URL and SHA-256 in `samples/samples.toml`, never committed). Each is embedded in a
 noise image at a sector start and must come out as exactly one finding of its kind, `Intact`, with the file's length
 (for ARW, trailing zero padding under 64 KiB aside), make and model, and a preview that decodes strictly. A second test
 splits each sample's preview in two at k/10 (k = 2..=8, on a sector boundary) with its own tail 8 MiB further on: it
 must come out joined and `Intact`, or joined and `Partial` for the previews that use restart markers (Q16: 21 of the
-56, all of the X-S10, TG-7 and K-r splits), the 2 known `Partial` splits above aside; and with another sample's tail
-instead,
-never `Intact`. Both are ignored by default:
+63, all of the X-S10, TG-7 and K-r splits), the 2 known `Partial` splits above aside; the ILCE-6700's 6192×4128
+preview, the same on `main` (1.3 join): joined exact but `Partial` at 2/10 and 3/10, joined one sector off the cut
+(`Partial`) at 4/10; and with another sample's tail instead, never `Intact`. Both are ignored by default:
 
 ```sh
 scripts/fetch-samples.sh
 REVENANT_SAMPLES=samples/cache cargo test -p revenant-core --test real_samples -- --ignored
 ```
+
+Two more (part 1.6, also ignored, run by the same command). `real_previews_split_in_three` cuts each sample's
+preview in three at 32 KiB multiples on an exFAT card of 32 KiB clusters, its pieces out of order and interleaved with
+the next sample's preview cut the same way, both deleted on a computer that clears the chain (so they are placed by
+content alone): each must come back with its exact bytes and never `Intact` (a JPEG placed by content alone in two or
+more pieces is at most `Partial`, Q37), and no `Intact` finding may hold runs of both previews (ruling Q59). The previews with restart
+markers (X-S10, K-r, TG-7, DRI 4) come back exact, `Partial`, in 3 pieces. The six with DRI 0 (EOS Kiss F, EOS R6,
+Z 6, ILCE-7S, ILCE-6700, DMC-LX7) do not (`KNOWN_MISSED`, measured in Task 11, the same on the head before it): out of step their
+data decodes on without an error, so the walk of the first piece breaks far past its true end and the true cut is not
+among the break points tried (the known limit at the end of "The reassembly step"); each stays the file system's
+one-run guess, `Partial`, never `Intact` (asserted), holding the next runs' bytes. `sony_restart_intervals` prints, for every
+Sony sample, each embedded JPEG with its size and restart interval, and whether the lossless sensor tiles have equal
+`TileByteCounts`; it asserts only that a Sony sample is there. The ILCE-7S: the 1616×1080 preview and the 160×120
+thumbnail have DRI 0, and its sensor data is one strip of Sony's lossy coding (no tiles). The lossless ILCE-6700
+(raw.pixls.us id 6736): its 6192×4128, 1616×1080 and 160×120 JPEGs have DRI 0, and its 117 tiles of 512×512 have 116
+distinct `TileByteCounts` (199 024 to 402 736 bytes), so a foreign tile matching a tile boundary's exact count by its
+size is the unlikely case Q15 assumed. Each of its tiles is followed by `FF` fill after its EOI up to a multiple of
+16 bytes, and its SubIFD also declares one strip over all the tiles; the fill now passes (see "Lossless JPEG check"),
+the strip is no unit of its own (it starts where the first tile does and the tiles are the units), and the whole file
+comes out `Intact`, as on `main`.
 
 CI runs it in the `samples` job: a failed download (raw.pixls.us down) skips the test without failing the build, while
 a failing test fails it. There is no HEIC sample: none with a verifiable CC0/public-domain license was found.

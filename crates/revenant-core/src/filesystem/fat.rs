@@ -411,7 +411,7 @@ impl<'a> Walk<'a, '_, '_> {
             .map(|f| (f.child.first, f.kind))
             .collect();
         let v = self.v;
-        let mut answers = high_words(
+        let (answers, capped) = high_words(
             &mut Unclaimed {
                 map: &mut self.map,
                 claims: &self.claims,
@@ -422,8 +422,12 @@ impl<'a> Walk<'a, '_, '_> {
             |c| v.cluster_offset(c),
             self.last,
             &asks,
-        )
-        .into_iter();
+            self.limits.high_word_steps,
+        );
+        if capped {
+            self.budget.truncated = true;
+        }
+        let mut answers = answers.into_iter();
         for (k, f) in later.into_iter().enumerate() {
             let first = if high(&f) {
                 answers.next().flatten()
@@ -1787,6 +1791,117 @@ mod tests {
         let starts: Vec<u64> = l.files.iter().map(|f| f.pieces[0].start).collect();
         assert_eq!(starts, [VOL + b.cluster_offset(70_000); 2]);
         assert!(!l.truncated);
+    }
+
+    /// Ruling D10 phase cap: the high-word checks spend at most `high_word_steps`; the rest of the guess budget stays for
+    /// the placements.
+    #[test]
+    fn high_word_phase_stops_at_its_share_of_the_budget() {
+        use revenant_testkit::{fs::DeleteStyle, jpeg};
+        let mut b = card();
+        b.add_at(
+            "F1.BIN",
+            &[1; 1001 * 512],
+            &(4000..5001).collect::<Vec<_>>(),
+        );
+        let photo = jpeg(16, 16, 1, 0);
+        let n = (photo.len() as u32).div_ceil(512);
+        b.add_at(
+            "W/W1.JPG",
+            &photo,
+            &(70_000..70_000 + n).collect::<Vec<_>>(),
+        );
+        b.delete("W/W1.JPG", DeleteStyle::Camera);
+        // 100 open questions: one round would cost 100 steps.
+        for i in 0..100u32 {
+            let name: [u8; 11] = format!("H{i:07}JPG").as_bytes().try_into().unwrap();
+            b.raw_entry("H", deleted_entry(&name, 4400 + i, 512));
+        }
+        let l = list(
+            &b,
+            &Limits {
+                guess_steps: 64,
+                high_word_steps: 32,
+                ..Limits::DEFAULT
+            },
+        );
+        let w1: Vec<_> = l
+            .files
+            .iter()
+            .filter(|f| f.origin.state == FsState::Deleted && f.origin.path().starts_with("W/"))
+            .collect();
+        assert_eq!(w1.len(), 1, "the placements still run: {:?}", paths(&l));
+        assert!(l.truncated, "the cut phase is reported");
+    }
+
+    /// The phase cap is spent across rounds: two rounds of 100 lookups fit 200 steps, not 150 (one candidate found in
+    /// round 0 is not an answer while round 1 is unchecked, so the cut round leaves the file unplaced).
+    #[test]
+    fn high_word_phase_cap_accumulates_over_rounds() {
+        use revenant_testkit::{fs::DeleteStyle, jpeg};
+        let mut b = card();
+        b.add_at(
+            "F1.BIN",
+            &[1; 1001 * 512],
+            &(4000..5001).collect::<Vec<_>>(),
+        );
+        let photo = jpeg(16, 16, 1, 0);
+        let n = (photo.len() as u32).div_ceil(512);
+        b.add_at("W/W1.JPG", &photo, &(6000..6000 + n).collect::<Vec<_>>());
+        b.delete("W/W1.JPG", DeleteStyle::WindowsFat32);
+        // 99 more questions (their candidates are in use or unrecognized): 100 open in each of the two rounds.
+        for i in 0..99u32 {
+            let name: [u8; 11] = format!("H{i:07}JPG").as_bytes().try_into().unwrap();
+            b.raw_entry("H", deleted_entry(&name, 4400 + i, 512));
+        }
+        let placed = |steps: u64| {
+            let l = list(
+                &b,
+                &Limits {
+                    high_word_steps: steps,
+                    ..Limits::DEFAULT
+                },
+            );
+            let w = l.files.iter().any(|f| f.origin.path().starts_with("W/"));
+            (w, l.truncated)
+        };
+        assert_eq!(placed(200), (true, false));
+        assert_eq!(placed(150), (false, true));
+    }
+
+    /// A waiting queue cut by the directory cap marks the listing truncated.
+    #[test]
+    fn waiting_queue_cut_marks_the_listing_truncated() {
+        use revenant_testkit::{fs::DeleteStyle, jpeg};
+        let mut b = card();
+        for i in 0..5u64 {
+            b.add(
+                &format!("FOLD000{i}/PIC0000{i}.JPG"),
+                &jpeg(16, 16, i + 1, 0),
+            );
+        }
+        for i in 0..5u64 {
+            b.delete(&format!("FOLD000{i}"), DeleteStyle::Camera);
+        }
+        let deleted = |l: &Listing| {
+            l.files
+                .iter()
+                .filter(|f| f.origin.state == FsState::Deleted)
+                .count()
+        };
+        let l = list(&b, &Limits::DEFAULT);
+        assert_eq!(deleted(&l), 5);
+        assert!(!l.truncated);
+        // The root plus two deleted folders walked; the other three never fit the queue.
+        let l = list(
+            &b,
+            &Limits {
+                dirs: 3,
+                ..Limits::DEFAULT
+            },
+        );
+        assert_eq!(deleted(&l), 2);
+        assert!(l.truncated);
     }
 
     #[test]

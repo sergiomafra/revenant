@@ -1,6 +1,8 @@
 //! The tree of FAT12/16/32 volumes: names, folders, times, cluster chains, the FAT mirror, deleted files and folders,
 //! and hostile volumes.
 
+mod support;
+
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -1210,15 +1212,36 @@ fn hostile_high_word_entries_are_bounded() {
     let probe = b.add("FILL/PROBE.TXT", &[1; 512])[0];
     let rest: Vec<u32> = (probe + 1..b.cluster_count() + 2).collect();
     b.add_at("FILL/F.BIN", &vec![7; rest.len() * 512], &rest);
-    let bytes = placed(&b);
+    // Counted by the reads (final review I-2: a wall-clock bound flaked on a loaded machine). A high-word candidate is
+    // `h << 16 | lo` with `h >= 1`: a probe of one would read a cluster at or past 0x10000. None is read, and the
+    // listing reads no more than its boot region and FATs, its directories once and a few fixed volume-search
+    // offsets: O(entries), not O(entries × high words).
+    let src = support::SimSource::new(placed(&b));
     let t = Instant::now();
-    let l = listing(&bytes);
+    let l = read(&src, &CancelToken::default());
+    assert!(deleted(&l).is_empty());
+    let heap = VOL + b.cluster_offset(2);
+    let high = VOL + b.cluster_offset(0x1_0000);
+    let end = VOL + b.cluster_offset(b.cluster_count() + 1) + 512;
+    let reads = src.reads();
+    let probed: Vec<_> = reads
+        .iter()
+        .filter(|&&(at, n)| at + n as u64 > high && at < end)
+        .collect();
+    assert!(probed.is_empty(), "high-word probes: {probed:?}");
+    let dirs: usize = ["", "DCIM", "DCIM/HOSTILE", "FILL"]
+        .iter()
+        .map(|d| b.clusters(d).len())
+        .sum();
+    let total: u64 = reads.iter().map(|&(_, n)| n as u64).sum();
+    let bound = (heap - VOL) + dirs as u64 * 512 + 64 * 1024;
+    assert!(total <= bound, "read {total} B, bound {bound} B");
+    // Anti-hang only (the reads above are the measure): generous for a loaded machine.
     assert!(
-        t.elapsed() < Duration::from_secs(5),
+        t.elapsed() < Duration::from_secs(30),
         "took {:?}",
         t.elapsed()
     );
-    assert!(deleted(&l).is_empty());
 }
 
 #[test]

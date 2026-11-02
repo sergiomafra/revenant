@@ -33,13 +33,17 @@ impl FsState {
 }
 
 /// How the pieces were placed: Chain = FAT chain or exFAT NoFatChain of a live file; Recorded = exFAT NoFatChain run
-/// of a deleted file; Guessed = deleted-file heuristic (D4); Carved = the scan's own measurement at the file's start
-/// replaced the guess (D5; set by the scan only).
+/// of a deleted file; Guessed = deleted-file heuristic (D4), or an old chain that is no proof; OldChain = an exFAT
+/// deleted file placed by the FAT chain it left (part 1.6, D14: the listing's conditions hold, see the core README);
+/// Carved = the scan's own measurement at the file's start, or the reassembly, replaced the guess (D5; set by the scan
+/// only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
     Chain,
     Recorded,
     Guessed,
+    /// An exFAT deleted file placed by its surviving FAT chain (D14).
+    OldChain,
     Carved,
 }
 
@@ -49,6 +53,7 @@ impl Placement {
             Placement::Chain => "chain",
             Placement::Recorded => "recorded",
             Placement::Guessed => "guessed",
+            Placement::OldChain => "old_chain",
             Placement::Carved => "carved",
         }
     }
@@ -473,12 +478,18 @@ impl<'a> Collector<'a> {
                 out.live.extend_from_slice(&pieces);
             }
             match (f.kind, f.origin) {
-                (Some(kind), Some(origin)) => out.files.push(FsFile {
-                    trusted: trusted(f.chain_ok, &f.runs),
-                    origin: *origin,
-                    kind,
-                    pieces,
-                }),
+                (Some(kind), Some(mut origin)) => {
+                    // An old chain over a contested cluster, or with the claims overflowed, is no proof (D14).
+                    if origin.placement == Placement::OldChain && !trusted(true, &f.runs) {
+                        origin.placement = Placement::Guessed;
+                    }
+                    out.files.push(FsFile {
+                        trusted: trusted(f.chain_ok, &f.runs),
+                        origin: *origin,
+                        kind,
+                        pieces,
+                    })
+                }
                 _ if f.live => out.others.push(first),
                 _ => {}
             }
@@ -549,10 +560,11 @@ fn merged(mut ranges: Vec<Fragment>) -> Vec<Fragment> {
 // ---- Saved form (ruling D26): a scan's listing is stored once in its session and never read again (D23) ----
 
 const FS_STATES: [FsState; 3] = [FsState::Live, FsState::Deleted, FsState::Orphaned];
-const PLACEMENTS: [Placement; 4] = [
+const PLACEMENTS: [Placement; 5] = [
     Placement::Chain,
     Placement::Recorded,
     Placement::Guessed,
+    Placement::OldChain,
     Placement::Carved,
 ];
 const FS_KINDS: [FsKind; 4] = [FsKind::Fat12, FsKind::Fat16, FsKind::Fat32, FsKind::Exfat];

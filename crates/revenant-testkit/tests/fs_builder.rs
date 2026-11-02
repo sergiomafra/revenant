@@ -1,8 +1,8 @@
 //! The synthetic FAT/exFAT volumes and MBR/GPT disks, checked against the Microsoft specifications' field offsets.
 
 use revenant_testkit::fs::{
-    DeleteStyle, FsBuilder, FsStamp, FsType, HiddenSectors, Partitioning, crc32, disk, disk_with,
-    mbr_disk, quick_format_in_place,
+    Alloc, DeleteStyle, FsBuilder, FsStamp, FsType, HiddenSectors, Partitioning, crc32, disk,
+    disk_with, mbr_disk, quick_format_in_place,
 };
 
 fn u16_at(v: &[u8], at: usize) -> u16 {
@@ -189,7 +189,11 @@ fn cluster_count_must_fit_the_type() {
 
 #[test]
 fn fat_delete_styles() {
-    for style in [DeleteStyle::Camera, DeleteStyle::WindowsFat32] {
+    for style in [
+        DeleteStyle::Camera,
+        DeleteStyle::WindowsFat32,
+        DeleteStyle::ZeroChain,
+    ] {
         let mut b = FsBuilder::new(FsType::Fat32, 48 << 20, 512);
         b.add_at("DSC00002.JPG", &[9u8; 1500], &[70_000, 70_001, 70_002]);
         let live = b.build();
@@ -212,7 +216,7 @@ fn fat_delete_styles() {
             assert_eq!(fat32_entry(&v, c), 0);
         }
         let high = match style {
-            DeleteStyle::Camera => [1, 0],
+            DeleteStyle::Camera | DeleteStyle::ZeroChain => [1, 0],
             DeleteStyle::WindowsFat32 => [0, 0],
         };
         assert_eq!(e[20..22], high, "{style:?}");
@@ -882,4 +886,202 @@ fn exfat_name_hash_uses_the_upper_case_name() {
             .wrapping_add(byte as u16);
     }
     assert_eq!(u16_at(&e[at + 1], 4), hash);
+}
+
+/// exFAT FAT entry of `c` (one FAT at sector 128).
+fn exfat_fat_entry(v: &[u8], c: u32) -> u32 {
+    u32_at(v, 128 * 512 + 4 * c as usize)
+}
+
+#[test]
+fn next_free_allocation_rotates_past_freed_gaps() {
+    const CL: usize = 32 * 1024;
+    let run = |alloc: Option<Alloc>| {
+        let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, CL as u32);
+        if let Some(a) = alloc {
+            b.alloc(a);
+        }
+        let a = b.add("DCIM/A.JPG", &[1u8; 4 * CL]);
+        let bb = b.add("DCIM/B.JPG", &[2u8; 4 * CL]);
+        b.delete("DCIM/A.JPG", DeleteStyle::Camera);
+        b.add("DCIM/C.JPG", &[3u8; 6 * CL]);
+        (a, bb, b.clusters("DCIM/C.JPG"))
+    };
+    let (a, b, c) = run(Some(Alloc::NextFree));
+    let last = *b.last().unwrap();
+    assert_eq!(c, (last + 1..last + 7).collect::<Vec<u32>>());
+    let (a2, b2, c2) = run(None);
+    assert_eq!(
+        (a2, b2),
+        (a.clone(), b.clone()),
+        "the same until the delete"
+    );
+    let last = *b.last().unwrap();
+    let expect: Vec<u32> = a.iter().copied().chain([last + 1, last + 2]).collect();
+    assert_eq!(c2, expect);
+    let (_, _, c3) = run(Some(Alloc::FirstFit));
+    assert_eq!(c3, expect, "FirstFit is the default");
+}
+
+#[test]
+fn next_free_wraps_to_the_start() {
+    const CL: usize = 32 * 1024;
+    let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, CL as u32);
+    b.alloc(Alloc::NextFree);
+    let a = b.add("A.JPG", &[1u8; 4 * CL]);
+    let end = b.cluster_count() + 2;
+    // Fill the volume up to its last cluster, free A's clusters, then add: the pointer wraps to A's gap.
+    let fill = (end - a[3] - 1) as usize;
+    b.add("FILL.BIN", &vec![2u8; fill * CL]);
+    b.delete("A.JPG", DeleteStyle::Camera);
+    assert_eq!(b.add("C.JPG", &[3u8; 2 * CL]), a[..2].to_vec());
+}
+
+#[test]
+fn zero_chain_delete_clears_the_exfat_chain() {
+    const CL: usize = 32 * 1024;
+    let chain = [10u32, 11, 20, 21];
+    let build = |style| {
+        let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, CL as u32);
+        // A chained neighbour right after the deleted file's first run, and a chained file written after the delete.
+        b.add_at("B.JPG", &[5u8; 2 * CL], &[12, 22]);
+        b.add_at("A.JPG", &[7u8; 4 * CL], &chain);
+        b.delete("A.JPG", style);
+        b.add_at("C.JPG", &[6u8; 2 * CL], &[40, 50]);
+        let v = b.build();
+        // Either way the data stays.
+        assert_eq!(v[b.cluster_offset(20) as usize], 7);
+        v
+    };
+    let camera = build(DeleteStyle::Camera);
+    let zeroed = build(DeleteStyle::ZeroChain);
+    let entries = |v: &[u8]| -> Vec<u32> { chain.iter().map(|&c| exfat_fat_entry(v, c)).collect() };
+    assert_eq!(entries(&camera), [11, 20, 21, 0xFFFF_FFFF]);
+    assert_eq!(entries(&zeroed), [0, 0, 0, 0]);
+    assert_eq!(
+        [12, 22, 40, 50].map(|c| exfat_fat_entry(&zeroed, c)),
+        [22, 0xFFFF_FFFF, 50, 0xFFFF_FFFF]
+    );
+    // Every other byte of the volume (every other FAT entry included) is the Camera build's.
+    let mut expect = camera.clone();
+    for &c in &chain {
+        let at = 128 * 512 + 4 * c as usize;
+        expect[at..at + 4].fill(0);
+    }
+    assert!(
+        zeroed == expect,
+        "only the deleted chain's FAT entries differ"
+    );
+}
+
+/// FAT16 (no root cluster: clusters 2 and 3 are free) with NextFree, `next` two clusters before the end: `A` at [2, 3]
+/// (deleted), a filler on 4..end-2. Returns the builder and `end` (one past the last cluster).
+fn next_free_near_the_end() -> (FsBuilder, u32) {
+    const CL: usize = 2048;
+    let mut b = FsBuilder::new(FsType::Fat16, 16 << 20, CL as u32);
+    b.alloc(Alloc::NextFree);
+    let end = b.cluster_count() + 2;
+    b.add_at("A.JPG", &[1u8; 2 * CL], &[2, 3]);
+    let fill: Vec<u32> = (4..end - 2).collect();
+    b.add_at("FILL.BIN", &vec![2u8; fill.len() * CL], &fill);
+    b.delete("A.JPG", DeleteStyle::Camera);
+    (b, end)
+}
+
+#[test]
+fn next_free_wraps_in_the_middle_of_a_file() {
+    let (mut b, end) = next_free_near_the_end();
+    let c = b.add("C.JPG", &[3u8; 4 * 2048]);
+    assert_eq!(c, [end - 2, end - 1, 2, 3]);
+    let v = b.build();
+    // FAT16 chain end-2 -> end-1 -> 2 -> 3 -> EOC, from the first FAT (1 reserved sector).
+    let fat16 = |c: u32| u16_at(&v, 512 + 2 * c as usize);
+    assert_eq!(
+        c.iter().map(|&c| fat16(c)).collect::<Vec<u16>>(),
+        [(end - 1) as u16, 2, 3, 0xFFFF],
+        "the chain wraps"
+    );
+}
+
+#[test]
+#[should_panic(expected = "volume full")]
+fn next_free_stops_on_a_full_volume() {
+    let (mut b, _) = next_free_near_the_end();
+    b.add("C.JPG", &[3u8; 4 * 2048]);
+    // Every cluster is taken now: one more cluster has nowhere to go.
+    b.add("D.JPG", &[4u8; 1]);
+}
+
+#[test]
+fn zero_chain_on_fat_is_a_camera_delete() {
+    let build = |style| {
+        let mut b = FsBuilder::new(FsType::Fat32, 48 << 20, 512);
+        b.add("A.JPG", &[1u8; 3 * 512]);
+        b.delete("A.JPG", style);
+        b.build()
+    };
+    assert!(build(DeleteStyle::ZeroChain) == build(DeleteStyle::Camera));
+}
+
+#[test]
+fn reused_slots_take_the_first_deleted_entry_of_the_same_size() {
+    const CL: usize = 32 * 1024;
+    for fs in [FsType::Exfat, FsType::Fat32] {
+        let len = if fs == FsType::Exfat {
+            32 << 20
+        } else {
+            48 << 20
+        };
+        let cl = if fs == FsType::Exfat { CL as u32 } else { 512 };
+        let mut b = FsBuilder::new(fs, len, cl);
+        b.reuse_slots(true);
+        b.mkdir("DCIM");
+        b.add("DCIM/A.JPG", &[1u8; 100]);
+        b.add("DCIM/B.JPG", &[2u8; 100]);
+        b.add("DCIM/LONGNAME1.JPG", &[3u8; 100]);
+        b.delete("DCIM/A.JPG", DeleteStyle::Camera);
+        b.delete("DCIM/LONGNAME1.JPG", DeleteStyle::Camera);
+        // C takes A's slots (same size); D, a longer name, takes LONGNAME1's; E finds none left and goes at the end.
+        b.add("DCIM/C.JPG", &[4u8; 100]);
+        b.add("DCIM/LONGNAME2.JPG", &[5u8; 100]);
+        b.add("DCIM/E.JPG", &[6u8; 100]);
+        let v = b.build();
+        let dir = b.clusters("DCIM")[0];
+        let cluster_len = if fs == FsType::Exfat { CL } else { 512 };
+        let names: Vec<String> = entries(&v, &b, dir, cluster_len)
+            .iter()
+            .filter_map(|e| match fs {
+                // exFAT: the file name entry (0xC1), first 2 characters.
+                FsType::Exfat if e[0] & 0x7F == 0x41 => Some(
+                    String::from_utf16_lossy(&[u16_at(e, 2), u16_at(e, 4), u16_at(e, 6)])
+                        .trim_end_matches('\0')
+                        .to_string(),
+                ),
+                // FAT: the short entries (no LFN, no dot entries), live or deleted.
+                FsType::Fat32 if e[11] != 0x0F && e[0] != 0 && e[0] != b'.' => {
+                    Some(String::from_utf8_lossy(&e[..3]).to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        match fs {
+            FsType::Exfat => assert_eq!(names, ["C.J", "B.J", "LON", "E.J"], "{fs:?}"),
+            _ => assert_eq!(names, ["C  ", "B  ", "LON", "E  "], "{fs:?}"),
+        }
+        // Without reuse, every new entry goes at the end, the deleted ones stay.
+        let mut b = FsBuilder::new(fs, len, cl);
+        b.mkdir("DCIM");
+        b.add("DCIM/A.JPG", &[1u8; 100]);
+        b.delete("DCIM/A.JPG", DeleteStyle::Camera);
+        b.add("DCIM/C.JPG", &[4u8; 100]);
+        let v = b.build();
+        let n = entries(&v, &b, b.clusters("DCIM")[0], cluster_len)
+            .iter()
+            .filter(|e| match fs {
+                FsType::Exfat => e[0] & 0x7F == 0x41,
+                _ => e[11] != 0x0F && e[0] != 0 && e[0] != b'.',
+            })
+            .count();
+        assert_eq!(n, 2, "{fs:?}");
+    }
 }

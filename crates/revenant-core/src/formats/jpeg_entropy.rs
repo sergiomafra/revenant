@@ -16,7 +16,7 @@ use super::jpeg::{MAX_DECODE_PIXELS, is_sof};
 pub(crate) const RESUME_POINTS: usize = 4096;
 
 /// Bits looked up at once by [`Huffman::fast`]; longer codes take the canonical slow path.
-const LOOKUP_BITS: u32 = 9;
+pub(crate) const LOOKUP_BITS: u32 = 9;
 /// Most blocks one interleaved MCU may hold (T.81 B.2.3).
 const MAX_BLOCKS_PER_MCU: u32 = 10;
 /// Bytes read from the source at a time.
@@ -24,20 +24,20 @@ const CHUNK: usize = 16 * 1024;
 
 /// One decoding table built from a DHT (T.81 Annex C and F.2.2.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Huffman {
+pub(crate) struct Huffman {
     /// By the next [`LOOKUP_BITS`] bits: `(code length, symbol)`; length 0 when the code is longer (or there is none).
-    fast: Vec<(u8, u8)>,
+    pub(crate) fast: Vec<(u8, u8)>,
     /// Largest code of each length 1..=16 (`-1`: no code of that length).
-    maxcode: [i32; 17],
+    pub(crate) maxcode: [i32; 17],
     /// For each length: index in `vals` of a code of that length is `code + valoff`.
-    valoff: [i32; 17],
-    vals: Vec<u8>,
+    pub(crate) valoff: [i32; 17],
+    pub(crate) vals: Vec<u8>,
 }
 
 impl Huffman {
     /// From the 16 counts of codes per length and the symbols. `None` when the counts cannot form a prefix code (more
     /// codes of some length than remain) or exceed 256 symbols.
-    fn new(counts: &[u8; 16], vals: &[u8]) -> Option<Huffman> {
+    pub(crate) fn new(counts: &[u8; 16], vals: &[u8]) -> Option<Huffman> {
         let total: usize = counts.iter().map(|&c| usize::from(c)).sum();
         if total > 256 || vals.len() != total {
             return None;
@@ -389,6 +389,13 @@ impl Cursor {
         (self.mcu, self.bits, self.nbits, self.pred)
     }
 
+    /// The position of the byte holding the next unconsumed bit when the bits consumed so far end on a byte boundary
+    /// (so another stream byte-aligned at the same MCU could be spliced in there), else `None`.
+    #[cfg(test)]
+    pub(crate) fn byte_aligned(&self) -> Option<u64> {
+        self.nbits.is_multiple_of(8).then(|| self.current_byte())
+    }
+
     /// Position of the byte holding the next unconsumed bit.
     fn current_byte(&self) -> u64 {
         if self.nbits == 0 {
@@ -433,7 +440,7 @@ pub(crate) struct Run {
 }
 
 /// Bytes `[.., limit)` of the source, read in chunks.
-struct Bytes<'r, 'a> {
+pub(crate) struct Bytes<'r, 'a> {
     r: &'r mut Reader<'a>,
     limit: u64,
     buf: Vec<u8>,
@@ -441,10 +448,21 @@ struct Bytes<'r, 'a> {
     len: usize,
 }
 
-impl Bytes<'_, '_> {
+impl<'r, 'a> Bytes<'r, 'a> {
+    /// A reader of `[.., limit)` of the source.
+    pub(crate) fn new(r: &'r mut Reader<'a>, limit: u64) -> Self {
+        Bytes {
+            r,
+            limit,
+            buf: vec![0; CHUNK],
+            start: 0,
+            len: 0,
+        }
+    }
+
     /// The byte at `pos`; `None` at or past the limit or the end of the source.
     #[inline]
-    fn get(&mut self, pos: u64) -> Option<u8> {
+    pub(crate) fn get(&mut self, pos: u64) -> Option<u8> {
         if pos >= self.limit {
             return None;
         }
@@ -1042,6 +1060,33 @@ mod tests {
             let shifted = decode(&mut r, &f, mid.shifted_back(by), len - by, true);
             assert_eq!(shifted.end, End::Eoi { at: len - 2 - by });
             assert_eq!(shifted.mcus, full.mcus);
+        }
+    }
+
+    #[test]
+    fn baseline_still_rejects_categories_over_11() {
+        // The lossless check shares the table builder, but a baseline DC difference of category 12 or more stays an
+        // error (T.81 F.1.2.1.1: baseline DC categories end at 11; lossless ones reach 16).
+        let mut j = testkit::jpeg_flat_with_restarts(64, 64, 0);
+        let dht = segment(&j, 0xC4);
+        assert_eq!(j[dht + 4], 0x00, "the first table is the DC one");
+        assert_eq!(j[dht + 4 + 17], 0, "its first symbol is category 0");
+        let (_, ok) = decode_from_start(&j, j.len() as u64, false);
+        assert_eq!(
+            ok.end,
+            End::Eoi {
+                at: j.len() as u64 - 2
+            }
+        );
+        for category in [12u8, 16] {
+            j[dht + 4 + 17] = category;
+            let (_, run) = decode_from_start(&j, j.len() as u64, false);
+            assert!(
+                matches!(run.end, End::Error { .. }),
+                "{category}: {:?}",
+                run.end
+            );
+            assert_eq!(run.mcus, 0);
         }
     }
 

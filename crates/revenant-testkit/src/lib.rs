@@ -55,6 +55,20 @@ fn encode_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
 /// of two low-frequency sinusoids whose orientation and phase come from `seed`. Neighbouring 8×8 blocks have close DC
 /// values, so a seam between two different images shows in the DC grid.
 pub fn jpeg_smooth(width: u32, height: u32, seed: u64) -> Vec<u8> {
+    encode_rgb(&smooth_pixels(width, height, seed, 0), width, height)
+}
+
+/// `n` photos of one scene and one frame (same size, tables and sampling): photo k is [`jpeg_smooth`]'s scene shifted by
+/// `k` pixels right, so neighbouring photos have near-equal DC grids (the "burst" a seam test must still tell apart).
+/// Photo 0 is `jpeg_smooth(width, height, seed)`.
+pub fn jpeg_burst(width: u32, height: u32, seed: u64, n: usize) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|k| encode_rgb(&smooth_pixels(width, height, seed, k as u32), width, height))
+        .collect()
+}
+
+/// The RGB pixels of [`jpeg_smooth`]'s scene, shifted `shift` pixels right (pixel `x` shows the scene at `x - shift`).
+fn smooth_pixels(width: u32, height: u32, seed: u64, shift: u32) -> Vec<u8> {
     let mut rng = SplitMix64(seed);
     let mut unit = || (rng.next() >> 11) as f64 / (1u64 << 53) as f64;
     let tau = std::f64::consts::TAU;
@@ -67,7 +81,10 @@ pub fn jpeg_smooth(width: u32, height: u32, seed: u64) -> Vec<u8> {
     let mut pixels = Vec::with_capacity(width as usize * height as usize * 3);
     for y in 0..height {
         for x in 0..width {
-            let (fx, fy) = (f64::from(x) / size, f64::from(y) / size);
+            let (fx, fy) = (
+                (f64::from(x) - f64::from(shift)) / size,
+                f64::from(y) / size,
+            );
             for channel in 0..3 {
                 let shift = f64::from(channel) * 0.7;
                 let v: f64 = waves
@@ -81,7 +98,7 @@ pub fn jpeg_smooth(width: u32, height: u32, seed: u64) -> Vec<u8> {
             }
         }
     }
-    encode_rgb(&pixels, width, height)
+    pixels
 }
 
 fn app1_segment(payload: &[u8]) -> Vec<u8> {
@@ -360,7 +377,7 @@ fn mp4_build(
     }
 }
 
-/// Shape of a synthetic H.264 camera video built by [`avc_video`].
+/// Shape of a synthetic camera video built by [`avc_video`] or [`camera_video`].
 pub struct AvcOptions {
     /// Video samples (frames).
     pub samples: usize,
@@ -384,10 +401,11 @@ pub struct AvcVideo {
     pub moov: std::ops::Range<usize>,
 }
 
-/// One NAL unit with a 4-byte big-endian length: `header`, then `payload` seeded random bytes.
-fn push_nal(out: &mut Vec<u8>, header: u8, payload: usize, rng: &mut SplitMix64) {
-    out.extend_from_slice(&((payload + 1) as u32).to_be_bytes());
-    out.push(header);
+/// One NAL unit with a 4-byte big-endian length: `header` (1 byte for H.264, 2 for HEVC), then `payload` seeded random
+/// bytes.
+fn push_nal(out: &mut Vec<u8>, header: &[u8], payload: usize, rng: &mut SplitMix64) {
+    out.extend_from_slice(&((payload + header.len()) as u32).to_be_bytes());
+    out.extend_from_slice(header);
     let at = out.len();
     out.resize(at + payload, 0);
     rng.fill(&mut out[at..]);
@@ -397,69 +415,94 @@ fn push_nal(out: &mut Vec<u8>, header: u8, payload: usize, rng: &mut SplitMix64)
 /// with an `avcC` (lengthSizeMinusOne = 3), `stsz` per sample, `stsc` 4 samples per chunk, `stco`. Each sample holds 1–3
 /// NAL units (4-byte big-endian length, header byte `0x65` for the first sample of a chunk, else `0x41`, seeded random
 /// payload); sample sizes are in [2 KiB, 24 KiB] from `seed` (with `small_nals`, NAL payloads in [64, 448] bytes instead).
-/// Chunks follow each other in `mdat`, then `mdat_pad` random bytes.
+/// Chunks follow each other in `mdat`, then `mdat_pad` random bytes. Byte for byte
+/// `camera_video(opts, VideoCodec::Avc, VideoLayout::MoovAtEnd)`.
 pub fn avc_video(opts: &AvcOptions) -> AvcVideo {
-    let mut rng = SplitMix64(opts.seed);
-    let mut payload = Vec::new();
-    let mut sizes = Vec::with_capacity(opts.samples);
-    for i in 0..opts.samples {
-        let header = if i % 4 == 0 { 0x65 } else { 0x41 };
-        let nals = 1 + (rng.next() % 3) as usize;
-        let start = payload.len();
-        if opts.small_nals {
-            for _ in 0..nals {
-                let len = 64 + (rng.next() % 385) as usize;
-                push_nal(&mut payload, header, len, &mut rng);
-            }
-        } else {
-            let size = 2048 + (rng.next() % (22 * 1024 + 1)) as usize;
-            // Split the sample into `nals` units of about equal size (each unit: 4-byte length, header, payload).
-            let body = size - 5 * nals;
-            for j in 0..nals {
-                let len = if j + 1 == nals {
-                    body - (nals - 1) * (body / nals)
-                } else {
-                    body / nals
-                };
-                push_nal(&mut payload, header, len, &mut rng);
-            }
-        }
-        sizes.push((payload.len() - start) as u32);
-    }
-    let at = payload.len();
-    payload.resize(at + opts.mdat_pad, 0);
-    rng.fill(&mut payload[at..]);
+    camera_video(opts, VideoCodec::Avc, VideoLayout::MoovAtEnd)
+}
 
-    let brand: &[u8; 4] = if opts.mov { b"qt  " } else { b"isom" };
-    let mut ftyp = brand.to_vec();
-    ftyp.extend_from_slice(&0u32.to_be_bytes());
-    ftyp.extend_from_slice(brand);
-    let ftyp = bmff_box(b"ftyp", &ftyp);
-    let mdat = bmff_box(b"mdat", &payload);
-    let data_at = ftyp.len() + 8;
+/// The video codec of a [`camera_video`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoCodec {
+    /// H.264: `avc1` with an `avcC`, 1-byte NAL headers.
+    Avc,
+    /// H.265: `hvc1` with an `hvcC`, 2-byte NAL headers.
+    Hevc,
+}
 
-    // Chunk offsets (absolute in the file): every 4 samples.
-    let mut chunks = Vec::new();
-    let mut off = data_at as u32;
-    for (i, &s) in sizes.iter().enumerate() {
-        if i % 4 == 0 {
-            chunks.push(off);
+/// Where a [`camera_video`] keeps its index and its media data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoLayout {
+    /// `ftyp, mdat, moov` (the camera case).
+    MoovAtEnd,
+    /// `ftyp, moov, mdat`.
+    MoovFirst,
+    /// `ftyp, moov, mdat` with the mdat size field 0 (to the end of the file).
+    MoovFirstMdatSizeZero,
+    /// `ftyp, moov (with mvex/trex, empty sample tables), then (moof, mdat)` per fragment of `samples_per_fragment`
+    /// samples (the last one may be shorter).
+    Fragmented { samples_per_fragment: usize },
+}
+
+/// A full box (version 0, `flags`) holding `body`.
+fn full_box(kind: &[u8; 4], flags: u32, body: &[u8]) -> Vec<u8> {
+    let mut p = flags.to_be_bytes().to_vec();
+    p.extend_from_slice(body);
+    bmff_box(kind, &p)
+}
+
+/// The `stsd` payload (after version and flags) of a 1920×1080 video with lengthSizeMinusOne = 3.
+fn video_sample_entry(codec: VideoCodec) -> Vec<u8> {
+    // Visual sample entry: reserved (6), data reference index (2), then 70 bytes of visual fields, then the config box.
+    let mut entry = vec![0u8; 78];
+    entry[7] = 1;
+    entry[24..28].copy_from_slice(&(1920u32 << 16 | 1080).to_be_bytes());
+    entry[74..76].copy_from_slice(&0x18u16.to_be_bytes());
+    entry[76..78].copy_from_slice(&0xFFFFu16.to_be_bytes());
+    let kind = match codec {
+        VideoCodec::Avc => {
+            // avcC: version 1, profile, compatibility, level, lengthSizeMinusOne = 3, no SPS, no PPS.
+            entry.extend(bmff_box(b"avcC", &[1, 0x64, 0, 0x28, 0xFF, 0xE0, 0]));
+            b"avc1"
         }
-        off += s;
-    }
-    let full_box = |kind: &[u8; 4], body: &[u8]| {
-        let mut p = vec![0u8; 4]; // version and flags
-        p.extend_from_slice(body);
-        bmff_box(kind, &p)
+        VideoCodec::Hevc => {
+            // hvcC (ISO/IEC 14496-15 §8.3.3.1), the 23-byte fixed part and no arrays: version 1, Main profile (general
+            // profile space 0, tier 0, idc 1), compatibility flags, progressive/frame-only constraint flags, level 4.0,
+            // min_spatial_segmentation 0, parallelism 0, 4:2:0, 8-bit luma and chroma, average frame rate 0, then
+            // constantFrameRate 0, numTemporalLayers 1, temporalIdNested 1, lengthSizeMinusOne 3; numOfArrays 0.
+            let hvcc = [
+                1, 0x01, 0x60, 0, 0, 0, 0x90, 0, 0, 0, 0, 0, 120, 0xF0, 0, 0xFC, 0xFD, 0xF8, 0xF8,
+                0, 0, 0x0F, 0,
+            ];
+            entry.extend(bmff_box(b"hvcC", &hvcc));
+            b"hvc1"
+        }
     };
+    let mut stsd = 1u32.to_be_bytes().to_vec();
+    stsd.extend(bmff_box(kind, &entry));
+    stsd
+}
+
+/// The `moov` of a [`camera_video`]: `mvhd`, one video `trak` (`tkhd` with `track_id`, `hdlr`, `minf/stbl` with `stsd`,
+/// `stsz`, `stsc`, `stco`), then `mvex` when given.
+fn camera_moov(
+    codec: VideoCodec,
+    sizes: &[u32],
+    chunks: &[u32],
+    track_id: u32,
+    mvex: Option<Vec<u8>>,
+) -> Vec<u8> {
     let mut stsz = 0u32.to_be_bytes().to_vec(); // sample_size 0: a table follows
     stsz.extend_from_slice(&(sizes.len() as u32).to_be_bytes());
     sizes
         .iter()
         .for_each(|s| stsz.extend_from_slice(&s.to_be_bytes()));
-    // 4 samples per chunk; a shorter last chunk gets its own entry.
-    let mut runs = vec![[1u32, 4, 1]];
-    if sizes.len() % 4 != 0 {
+    // 4 samples per chunk; a shorter last chunk gets its own entry. No samples: no entry.
+    let mut runs = Vec::new();
+    if !sizes.is_empty() {
+        runs.push([1u32, 4, 1]);
+    }
+    if !sizes.len().is_multiple_of(4) {
         runs.push([chunks.len() as u32, (sizes.len() % 4) as u32, 1]);
     }
     let mut stsc = (runs.len() as u32).to_be_bytes().to_vec();
@@ -470,23 +513,13 @@ pub fn avc_video(opts: &AvcOptions) -> AvcVideo {
     chunks
         .iter()
         .for_each(|c| stco.extend_from_slice(&c.to_be_bytes()));
-    // avc1: reserved (6), data reference index (2), then 70 bytes of visual fields, then the avcC box.
-    let mut avc1 = vec![0u8; 78];
-    avc1[7] = 1;
-    avc1[24..28].copy_from_slice(&(1920u32 << 16 | 1080).to_be_bytes());
-    avc1[74..76].copy_from_slice(&0x18u16.to_be_bytes());
-    avc1[76..78].copy_from_slice(&0xFFFFu16.to_be_bytes());
-    // avcC: version 1, profile, compatibility, level, lengthSizeMinusOne = 3, no SPS, no PPS.
-    avc1.extend(bmff_box(b"avcC", &[1, 0x64, 0, 0x28, 0xFF, 0xE0, 0]));
-    let mut stsd = 1u32.to_be_bytes().to_vec();
-    stsd.extend(bmff_box(b"avc1", &avc1));
     let stbl = bmff_box(
         b"stbl",
         &[
-            full_box(b"stsd", &stsd),
-            full_box(b"stsz", &stsz),
-            full_box(b"stsc", &stsc),
-            full_box(b"stco", &stco),
+            full_box(b"stsd", 0, &video_sample_entry(codec)),
+            full_box(b"stsz", 0, &stsz),
+            full_box(b"stsc", 0, &stsc),
+            full_box(b"stco", 0, &stco),
         ]
         .concat(),
     );
@@ -497,15 +530,184 @@ pub fn avc_video(opts: &AvcOptions) -> AvcVideo {
         b"mdia",
         &[bmff_box(b"hdlr", &hdlr), bmff_box(b"minf", &stbl)].concat(),
     );
-    let trak = bmff_box(b"trak", &[bmff_box(b"tkhd", &[0; 84]), mdia].concat());
-    let moov = bmff_box(b"moov", &[bmff_box(b"mvhd", &[0; 100]), trak].concat());
+    // tkhd version 0: version/flags (4), creation (4), modification (4), track_ID (4), ...
+    let mut tkhd = [0u8; 84];
+    tkhd[12..16].copy_from_slice(&track_id.to_be_bytes());
+    let trak = bmff_box(b"trak", &[bmff_box(b"tkhd", &tkhd), mdia].concat());
+    let mut body = [bmff_box(b"mvhd", &[0; 100]), trak].concat();
+    body.extend(mvex.unwrap_or_default());
+    bmff_box(b"moov", &body)
+}
 
-    let bytes = [ftyp, mdat, moov].concat();
-    let moov_at = data_at + payload.len();
-    AvcVideo {
-        mdat_payload: data_at..moov_at,
-        moov: moov_at..bytes.len(),
-        bytes,
+/// Decode-time units per sample of a fragmented [`camera_video`] (the `trex` default sample duration).
+pub const FRAGMENT_SAMPLE_DURATION: u32 = 1000;
+
+/// One movie fragment: `moof(mfhd(seq), traf(tfhd(track 1, default-base-is-moof), tfdt(version 1, `time`),
+/// trun(data offset, sample sizes)))` for samples whose data follows in the next `mdat`'s payload.
+fn movie_fragment(seq: u32, time: u64, sizes: &[u32]) -> Vec<u8> {
+    let build = |data_offset: u32| {
+        let mfhd = full_box(b"mfhd", 0, &seq.to_be_bytes());
+        let tfhd = full_box(b"tfhd", 0x02_0000, &1u32.to_be_bytes());
+        let mut tfdt = 0x0100_0000u32.to_be_bytes().to_vec(); // version 1, flags 0
+        tfdt.extend_from_slice(&time.to_be_bytes());
+        let tfdt = bmff_box(b"tfdt", &tfdt);
+        let mut trun = (sizes.len() as u32).to_be_bytes().to_vec();
+        trun.extend_from_slice(&data_offset.to_be_bytes());
+        sizes
+            .iter()
+            .for_each(|s| trun.extend_from_slice(&s.to_be_bytes()));
+        // Flags: data-offset-present (0x1), sample-size-present (0x200).
+        let trun = full_box(b"trun", 0x201, &trun);
+        let traf = bmff_box(b"traf", &[tfhd, tfdt, trun].concat());
+        bmff_box(b"moof", &[mfhd, traf].concat())
+    };
+    // The data offset is from the start of the moof to the first sample, the payload of the mdat right after it.
+    let len = build(0).len() as u32;
+    build(len + 8)
+}
+
+/// A camera video. Each sample holds 1–3 length-prefixed NAL units (4-byte big-endian length, seeded random payload);
+/// sample sizes are in [2 KiB, 24 KiB] from `seed` (with `small_nals`, NAL payloads in [64, 448] bytes instead), then
+/// `mdat_pad` random bytes end the last `mdat`. Avc: `avc1` sample entry with an `avcC` (lengthSizeMinusOne = 3), NAL
+/// header `0x65` for the first sample of a chunk, else `0x41`. Hevc: `hvc1` sample entry with an `hvcC`
+/// (lengthSizeMinusOne = 3), NAL headers of 2 bytes (type 19 for the first sample of a chunk, else 1;
+/// `nuh_layer_id = 0`, `nuh_temporal_id_plus1 = 1`). A chunk is 4 samples (`stsc`), or a fragment's samples when
+/// fragmented. The NAL units are structurally valid and never decode as real video.
+///
+/// Non-fragmented layouts list the samples in `stsz`/`stsc`/`stco` (chunks back to back in one `mdat`) with a `tkhd` of
+/// track ID 0; the fragmented one has empty sample tables, a `tkhd` of track ID 1, an `mvex/trex` for track 1 (default
+/// sample duration [`FRAGMENT_SAMPLE_DURATION`]) and one `moof` (sequence numbers from 1, a `tfdt` with the fragment's
+/// decode time) and `mdat` per fragment. `AvcVideo::moov` is the `moov` box wherever it is;
+/// `mdat_payload` the first `mdat`'s payload.
+pub fn camera_video(opts: &AvcOptions, codec: VideoCodec, layout: VideoLayout) -> AvcVideo {
+    let key_every = match layout {
+        VideoLayout::Fragmented {
+            samples_per_fragment,
+        } => {
+            assert!(samples_per_fragment > 0, "fragments hold samples");
+            samples_per_fragment
+        }
+        _ => 4,
+    };
+    let (key, other, header_len): (&[u8], &[u8], usize) = match codec {
+        VideoCodec::Avc => (&[0x65], &[0x41], 1),
+        // forbidden_zero_bit, nal_unit_type (6), nuh_layer_id (6), nuh_temporal_id_plus1 (3).
+        VideoCodec::Hevc => (&[19 << 1, 1], &[1 << 1, 1], 2),
+    };
+    let mut rng = SplitMix64(opts.seed);
+    let mut samples = Vec::new();
+    let mut sizes = Vec::with_capacity(opts.samples);
+    for i in 0..opts.samples {
+        let header = if i % key_every == 0 { key } else { other };
+        let nals = 1 + (rng.next() % 3) as usize;
+        let start = samples.len();
+        if opts.small_nals {
+            for _ in 0..nals {
+                let len = 64 + (rng.next() % 385) as usize;
+                push_nal(&mut samples, header, len, &mut rng);
+            }
+        } else {
+            let size = 2048 + (rng.next() % (22 * 1024 + 1)) as usize;
+            // Split the sample into `nals` units of about equal size (each unit: 4-byte length, header, payload).
+            let body = size - (4 + header_len) * nals;
+            for j in 0..nals {
+                let len = if j + 1 == nals {
+                    body - (nals - 1) * (body / nals)
+                } else {
+                    body / nals
+                };
+                push_nal(&mut samples, header, len, &mut rng);
+            }
+        }
+        sizes.push((samples.len() - start) as u32);
+    }
+    let mut pad = vec![0u8; opts.mdat_pad];
+    rng.fill(&mut pad);
+
+    let brand: &[u8; 4] = if opts.mov { b"qt  " } else { b"isom" };
+    let mut ftyp = brand.to_vec();
+    ftyp.extend_from_slice(&0u32.to_be_bytes());
+    ftyp.extend_from_slice(brand);
+    let ftyp = bmff_box(b"ftyp", &ftyp);
+
+    // Chunk offsets (absolute in the file) of samples back to back from `data_at`: every 4 samples.
+    let chunks_at = |data_at: usize| {
+        let mut chunks = Vec::new();
+        let mut off = data_at as u32;
+        for (i, &s) in sizes.iter().enumerate() {
+            if i % 4 == 0 {
+                chunks.push(off);
+            }
+            off += s;
+        }
+        chunks
+    };
+    let payload = [samples, pad.clone()].concat();
+    match layout {
+        VideoLayout::MoovAtEnd => {
+            let data_at = ftyp.len() + 8;
+            let moov = camera_moov(codec, &sizes, &chunks_at(data_at), 0, None);
+            let moov_at = data_at + payload.len();
+            let bytes = [ftyp, bmff_box(b"mdat", &payload), moov].concat();
+            AvcVideo {
+                mdat_payload: data_at..moov_at,
+                moov: moov_at..bytes.len(),
+                bytes,
+            }
+        }
+        VideoLayout::MoovFirst | VideoLayout::MoovFirstMdatSizeZero => {
+            // The chunk offsets are 32-bit whatever their value: the moov's length does not depend on them.
+            let moov_len = camera_moov(codec, &sizes, &chunks_at(0), 0, None).len();
+            let data_at = ftyp.len() + moov_len + 8;
+            let moov = camera_moov(codec, &sizes, &chunks_at(data_at), 0, None);
+            assert_eq!(moov.len(), moov_len);
+            let mut mdat = bmff_box(b"mdat", &payload);
+            if layout == VideoLayout::MoovFirstMdatSizeZero {
+                mdat[..4].copy_from_slice(&0u32.to_be_bytes());
+            }
+            let moov_at = ftyp.len();
+            let bytes = [ftyp, moov, mdat].concat();
+            AvcVideo {
+                mdat_payload: data_at..bytes.len(),
+                moov: moov_at..data_at - 8,
+                bytes,
+            }
+        }
+        VideoLayout::Fragmented {
+            samples_per_fragment,
+        } => {
+            // trex: track 1, sample description 1, default duration, then default size and flags 0.
+            let mut trex = 1u32.to_be_bytes().to_vec();
+            trex.extend_from_slice(&1u32.to_be_bytes());
+            trex.extend_from_slice(&FRAGMENT_SAMPLE_DURATION.to_be_bytes());
+            trex.extend_from_slice(&[0; 8]);
+            let mvex = bmff_box(b"mvex", &full_box(b"trex", 0, &trex));
+            let moov = camera_moov(codec, &[], &[], 1, Some(mvex));
+            let moov_at = ftyp.len();
+            let mut bytes = [ftyp, moov].concat();
+            let moov_range = moov_at..bytes.len();
+            let mut first_payload = None;
+            let mut at = 0;
+            let fragments = sizes.chunks(samples_per_fragment).count();
+            for (f, frag) in sizes.chunks(samples_per_fragment).enumerate() {
+                let len = frag.iter().map(|&s| s as usize).sum::<usize>();
+                let mut data = payload[at..at + len].to_vec();
+                at += len;
+                if f + 1 == fragments {
+                    data.extend_from_slice(&pad);
+                }
+                let time = (f * samples_per_fragment) as u64 * u64::from(FRAGMENT_SAMPLE_DURATION);
+                bytes.extend(movie_fragment(f as u32 + 1, time, frag));
+                let data_at = bytes.len() + 8;
+                first_payload.get_or_insert(data_at..data_at + data.len());
+                bytes.extend(bmff_box(b"mdat", &data));
+            }
+            AvcVideo {
+                mdat_payload: first_payload.expect("a fragmented video holds samples"),
+                moov: moov_range,
+                bytes,
+            }
+        }
     }
 }
 
@@ -623,6 +825,10 @@ pub struct TiffRaw {
     pub bytes: Vec<u8>,
     pub preview: Option<std::ops::Range<usize>>,
     pub raw: std::ops::Range<usize>,
+    /// The lossless-JPEG tiles of the raw data, in file order ([`arw`] with [`ArwCompression::Lossless`]); else empty.
+    pub tiles: Vec<std::ops::Range<usize>>,
+    /// The IFD1 thumbnail JPEG ([`arw`] with [`ArwOptions::thumbnail`]); else `None`.
+    pub thumbnail: Option<std::ops::Range<usize>>,
 }
 
 struct TiffEntry {
@@ -681,8 +887,22 @@ impl Enc {
         }
     }
 
+    fn longs(self, tag: u16, v: &[u32]) -> TiffEntry {
+        TiffEntry {
+            tag,
+            typ: 4,
+            count: v.len() as u32,
+            data: v.iter().flat_map(|&x| self.u32(x)).collect(),
+        }
+    }
+
     /// One IFD: entry table, then the values that do not fit in four bytes. `start` is where the IFD will sit.
-    fn ifd(self, start: u32, mut entries: Vec<TiffEntry>) -> Vec<u8> {
+    fn ifd(self, start: u32, entries: Vec<TiffEntry>) -> Vec<u8> {
+        self.ifd_next(start, entries, 0)
+    }
+
+    /// [`Enc::ifd`] whose next-IFD pointer is `next` (0: none).
+    fn ifd_next(self, start: u32, mut entries: Vec<TiffEntry>, next: u32) -> Vec<u8> {
         entries.sort_by_key(|e| e.tag);
         let mut table = Vec::new();
         table.extend_from_slice(&self.u16(entries.len() as u16));
@@ -705,7 +925,7 @@ impl Enc {
                 cursor += (e.data.len() + e.data.len() % 2) as u32;
             }
         }
-        table.extend_from_slice(&[0; 4]); // no next IFD
+        table.extend_from_slice(&self.u32(next));
         table.extend(external);
         table
     }
@@ -825,6 +1045,299 @@ pub fn tiff_raw(opts: &TiffRawOptions) -> TiffRaw {
     TiffRaw {
         preview: preview_bytes.map(|p| prev_at as usize..prev_at as usize + p.len()),
         raw: raw_start..bytes.len(),
+        tiles: Vec::new(),
+        thumbnail: None,
+        bytes,
+    }
+}
+
+/// How [`arw`] stores the sensor data (the three ARW recording modes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArwCompression {
+    /// Compression 1: one strip of 16-bit samples (seeded noise).
+    Uncompressed,
+    /// Compression 7: lossless JPEG (SOF3) tiles.
+    Lossless,
+    /// Compression 32767 (Sony's lossy coding): one strip of seeded bytes, one per pixel.
+    Lossy,
+}
+
+/// Shape of a synthetic Sony ARW built by [`arw`].
+#[derive(Clone, Debug)]
+pub struct ArwOptions {
+    pub compression: ArwCompression,
+    /// Sensor size; a multiple of `tile` in both directions for [`ArwCompression::Lossless`].
+    pub width: u32,
+    pub height: u32,
+    /// Tile side for [`ArwCompression::Lossless`] (each tile one component of 14 bits).
+    pub tile: u32,
+    /// JPEG preview (width, height): the same smooth scene for every seed, shifted by `seed % 16` pixels, as in a burst.
+    pub preview: (u32, u32),
+    pub seed: u64,
+    pub exif: TestExif,
+    /// A 160×120 thumbnail in IFD1, right before the preview, padded with fill bytes (`FF` before its EOI) to a
+    /// multiple of 512 bytes so the preview starts on a sector.
+    pub thumbnail: bool,
+    /// File offset of the first embedded JPEG (the thumbnail, else the preview); 0: the first sector after the IFDs.
+    pub jpegs_at: u32,
+    /// When not 0, the sensor data starts on a multiple of `align` from the start of the file, and each tile of
+    /// `aligned_tiles` is padded with fill bytes before its EOI so that it ends on one too (its declared length
+    /// includes them, as the JPEG syntax allows).
+    pub align: u32,
+    pub aligned_tiles: Vec<usize>,
+    /// Tiles of a flat image ([`lossless_jpeg_flat`]): their data is mostly zero bytes.
+    pub flat_tiles: Vec<usize>,
+    /// With `align`: tiles whose coded data is tuned ([`lossless_jpeg_sized`], real codes, no fill bytes) so that they
+    /// end on a multiple of `align`.
+    pub sized_tiles: Vec<usize>,
+    /// When not 0, zeros after the sensor data up to a multiple of `pad_to` bytes, inside the file (Sony pads its ARWs
+    /// to 4 KiB or 64 KiB); no IFD references them, `raw` ends where the sensor data does.
+    pub pad_to: usize,
+    /// With [`ArwCompression::Lossless`]: the SubIFD also declares one strip (StripOffsets/StripByteCounts) covering all
+    /// the tiles, from the first tile's start to the last one's end, as the ILCE-6700 (and other recent Sony bodies)
+    /// write next to TileOffsets/TileByteCounts.
+    pub strip_over_tiles: bool,
+    /// With [`ArwCompression::Lossless`], when not 0: each tile not aligned nor sized is followed by `FF` fill bytes after
+    /// its EOI up to a multiple of `tile_fill_to` bytes, inside its TileByteCounts (Sony's lossless ARWs pad every tile
+    /// so to 16 bytes).
+    pub tile_fill_to: usize,
+}
+
+impl Default for ArwOptions {
+    /// Lossless, 1024×768 in tiles of 256, a 640×480 preview, seed 1, no thumbnail, nothing aligned, no padding.
+    fn default() -> Self {
+        ArwOptions {
+            compression: ArwCompression::Lossless,
+            width: 1024,
+            height: 768,
+            tile: 256,
+            preview: (640, 480),
+            seed: 1,
+            exif: TestExif::default(),
+            thumbnail: false,
+            jpegs_at: 0,
+            align: 0,
+            aligned_tiles: Vec::new(),
+            flat_tiles: Vec::new(),
+            sized_tiles: Vec::new(),
+            pad_to: 0,
+            strip_over_tiles: false,
+            tile_fill_to: 0,
+        }
+    }
+}
+
+/// `jpeg` with `pad` fill bytes (`FF`) inserted before its EOI.
+fn with_fill(jpeg: &[u8], pad: usize) -> Vec<u8> {
+    let mut out = jpeg[..jpeg.len() - 2].to_vec();
+    out.resize(out.len() + pad, 0xFF);
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
+}
+
+/// A Sony-like ARW, little-endian: IFD0 (Make "SONY", the JPEG preview through JPEGInterchangeFormat, the Exif IFD,
+/// one SubIFD), optionally IFD1 with a thumbnail, then the SubIFD with the sensor data: Compression 1 (one strip), 7
+/// (lossless JPEG tiles of `tile`×`tile`, TileOffsets/TileByteCounts) or 32767 (one strip of seeded bytes). The
+/// embedded JPEGs come before the sensor data, as Sony lays it out, and the sensor data ends the file.
+pub fn arw(opts: &ArwOptions) -> TiffRaw {
+    let enc = Enc(false);
+    let preview = {
+        let (w, h) = opts.preview;
+        encode_rgb(
+            &smooth_pixels(w, h, 0x00A6_7000, (opts.seed % 16) as u32),
+            w,
+            h,
+        )
+    };
+    let thumb = opts.thumbnail.then(|| {
+        let t = jpeg_smooth(160, 120, 0x00A6_7001 ^ opts.seed);
+        let pad = (t.len() + 2).div_ceil(512) * 512 - t.len();
+        with_fill(&t, pad)
+    });
+    let make = opts.exif.make.clone().unwrap_or_else(|| "SONY".into());
+    // Sensor data, before its placement: tiles (unpadded) or one strip.
+    let mut tiles: Vec<Vec<u8>> = Vec::new();
+    let mut strip: Vec<u8> = Vec::new();
+    match opts.compression {
+        ArwCompression::Lossless => {
+            assert!(
+                opts.tile > 0
+                    && opts.width.is_multiple_of(opts.tile)
+                    && opts.height.is_multiple_of(opts.tile)
+            );
+            let n = (opts.width / opts.tile) * (opts.height / opts.tile);
+            tiles = (0..u64::from(n))
+                .map(|k| {
+                    let seed = opts.seed.wrapping_mul(0x9E37) ^ k;
+                    if opts.flat_tiles.contains(&(k as usize)) {
+                        lossless_jpeg_flat(opts.tile, opts.tile, 1, 14, seed)
+                    } else {
+                        lossless_jpeg(opts.tile, opts.tile, 1, 14, seed)
+                    }
+                })
+                .collect();
+        }
+        ArwCompression::Uncompressed => {
+            strip = DiskImage::noise(
+                opts.width as usize * opts.height as usize * 2,
+                opts.seed ^ 0x4152_5731,
+            )
+            .bytes;
+        }
+        ArwCompression::Lossy => {
+            strip = DiskImage::noise(
+                opts.width as usize * opts.height as usize,
+                opts.seed ^ 0x4152_5732,
+            )
+            .bytes;
+        }
+    }
+    let code: u16 = match opts.compression {
+        ArwCompression::Uncompressed => 1,
+        ArwCompression::Lossless => 7,
+        ArwCompression::Lossy => 32767,
+    };
+    let ntiles = tiles.len();
+    let entries = |sub: u32, exif: u32, prev: u32, th: u32, offs: &[u32], cnts: &[u32]| {
+        let mut e0 = vec![
+            enc.long(0x0100, opts.preview.0),
+            enc.long(0x0101, opts.preview.1),
+            enc.ascii(0x010F, &make),
+        ];
+        if let Some(m) = &opts.exif.model {
+            e0.push(enc.ascii(0x0110, m));
+        }
+        e0.push(enc.long(0x014A, sub));
+        e0.push(enc.long(0x0201, prev));
+        e0.push(enc.long(0x0202, preview.len() as u32));
+        let ex = exif_entries(enc, &opts.exif);
+        if !ex.is_empty() {
+            e0.push(enc.long(0x8769, exif));
+        }
+        let e1 = thumb.as_ref().map(|t| {
+            vec![
+                enc.short(0x0103, 6),
+                enc.long(0x0201, th),
+                enc.long(0x0202, t.len() as u32),
+            ]
+        });
+        let mut es = vec![
+            enc.long(0x0100, opts.width),
+            enc.long(0x0101, opts.height),
+            enc.short(0x0102, if code == 32767 { 8 } else { 14 }),
+            enc.short(0x0103, code),
+        ];
+        if code == 7 {
+            if opts.strip_over_tiles {
+                let (first, last) = (offs[0], offs.len() - 1);
+                es.push(enc.long(0x0111, first));
+                es.push(enc.long(0x0117, offs[last] + cnts[last] - first));
+            }
+            es.push(enc.long(0x0142, opts.tile));
+            es.push(enc.long(0x0143, opts.tile));
+            es.push(enc.longs(0x0144, offs));
+            es.push(enc.longs(0x0145, cnts));
+        } else {
+            es.push(enc.long(0x0111, offs[0]));
+            es.push(enc.long(0x0116, opts.height));
+            es.push(enc.long(0x0117, cnts[0]));
+        }
+        (e0, e1, es, ex)
+    };
+    let zeros = vec![0u32; ntiles.max(1)];
+    let (l0, l1, ls, lx) = {
+        let (e0, e1, es, ex) = entries(0, 0, 0, 0, &zeros, &zeros);
+        (
+            enc.ifd(0, e0).len() as u32,
+            e1.map_or(0, |e| enc.ifd(0, e).len() as u32),
+            enc.ifd(0, es).len() as u32,
+            if ex.is_empty() {
+                0
+            } else {
+                enc.ifd(0, ex).len() as u32
+            },
+        )
+    };
+    let ifd0_at = 8u32;
+    let ifd1_at = ifd0_at + l0;
+    let sub_at = ifd1_at + l1;
+    let exif_at = sub_at + ls;
+    let ifds_end = exif_at + lx;
+    let jpegs_at = if opts.jpegs_at == 0 {
+        ifds_end.div_ceil(512) * 512
+    } else {
+        assert!(opts.jpegs_at >= ifds_end, "the IFDs end at {ifds_end}");
+        opts.jpegs_at
+    };
+    let thumb_len = thumb.as_ref().map_or(0, Vec::len) as u32;
+    let thumb_at = jpegs_at;
+    let prev_at = jpegs_at + thumb_len;
+    let mut raw_at = prev_at + preview.len() as u32;
+    if opts.align > 0 {
+        raw_at = raw_at.div_ceil(opts.align) * opts.align;
+    } else {
+        raw_at = raw_at.div_ceil(2) * 2;
+    }
+    // Place the sensor data, padding the aligned tiles.
+    let mut sensor: Vec<u8> = Vec::new();
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    if code == 7 {
+        for (k, t) in tiles.iter().enumerate() {
+            let at = raw_at as usize + sensor.len();
+            let t = if opts.align > 0 && opts.aligned_tiles.contains(&k) {
+                let a = opts.align as usize;
+                let pad = (at + t.len()).div_ceil(a) * a - (at + t.len());
+                with_fill(t, pad)
+            } else if opts.align > 0 && opts.sized_tiles.contains(&k) {
+                let a = opts.align as usize;
+                let seed = opts.seed.wrapping_mul(0x9E37) ^ k as u64;
+                let want = (at + t.len()).div_ceil(a) * a - at;
+                lossless_jpeg_sized(opts.tile, opts.tile, 1, 14, seed, want)
+                    .expect("a tile size within reach of the grid")
+            } else if opts.tile_fill_to > 0 {
+                let mut t = t.clone();
+                t.resize(t.len().next_multiple_of(opts.tile_fill_to), 0xFF);
+                t
+            } else {
+                t.clone()
+            };
+            ranges.push(at..at + t.len());
+            sensor.extend(t);
+        }
+    } else {
+        ranges.push(raw_at as usize..raw_at as usize + strip.len());
+        sensor = strip;
+    }
+    let offs: Vec<u32> = ranges.iter().map(|r| r.start as u32).collect();
+    let cnts: Vec<u32> = ranges.iter().map(|r| r.len() as u32).collect();
+    let (e0, e1, es, ex) = entries(sub_at, exif_at, prev_at, thumb_at, &offs, &cnts);
+    let mut bytes = vec![b'I', b'I', 0x2A, 0];
+    bytes.extend_from_slice(&enc.u32(ifd0_at));
+    bytes.extend(enc.ifd_next(ifd0_at, e0, if e1.is_some() { ifd1_at } else { 0 }));
+    if let Some(e1) = e1 {
+        bytes.extend(enc.ifd(ifd1_at, e1));
+    }
+    bytes.extend(enc.ifd(sub_at, es));
+    if !ex.is_empty() {
+        bytes.extend(enc.ifd(exif_at, ex));
+    }
+    debug_assert_eq!(bytes.len() as u32, ifds_end);
+    bytes.resize(jpegs_at as usize, 0);
+    if let Some(t) = &thumb {
+        bytes.extend_from_slice(t);
+    }
+    bytes.extend_from_slice(&preview);
+    bytes.resize(raw_at as usize, 0);
+    bytes.extend(sensor);
+    let raw_end = bytes.len();
+    if opts.pad_to > 0 {
+        bytes.resize(raw_end.next_multiple_of(opts.pad_to), 0);
+    }
+    TiffRaw {
+        preview: Some(prev_at as usize..prev_at as usize + preview.len()),
+        raw: raw_at as usize..raw_end,
+        tiles: if code == 7 { ranges } else { Vec::new() },
+        thumbnail: thumb.map(|t| thumb_at as usize..thumb_at as usize + t.len()),
         bytes,
     }
 }
@@ -902,6 +1415,8 @@ pub fn panasonic_rw2(opts: &Rw2Options) -> TiffRaw {
     TiffRaw {
         preview: Some(512..512 + preview.len()),
         raw: raw_at as usize..bytes.len(),
+        tiles: Vec::new(),
+        thumbnail: None,
         bytes,
     }
 }
@@ -1021,6 +1536,8 @@ pub fn olympus_orf(om_system: bool, raw_len: usize, seed: u64, exif: &TestExif) 
     TiffRaw {
         preview: Some(big_abs..big_abs + big.len()),
         raw: raw_at as usize..bytes.len(),
+        tiles: Vec::new(),
+        thumbnail: None,
         bytes,
     }
 }
@@ -1161,6 +1678,242 @@ impl BitWriter {
             self.bits(1, 1);
         }
     }
+}
+
+/// A lossless JPEG (SOF3, ITU-T T.81 Annex H): `components` (1–4) of `precision` bits (2–16), predictor 1, point
+/// transform 0, one DC Huffman table covering SSSS 0–16 shared by every component, no restart, seeded smooth samples.
+pub fn lossless_jpeg(width: u32, height: u32, components: u8, precision: u8, seed: u64) -> Vec<u8> {
+    lossless_jpeg_with_restarts(width, height, components, precision, seed, 0)
+}
+
+/// [`lossless_jpeg`] with a restart interval of `interval` samples rows' worth of pixels (MCUs): a DRI segment and an
+/// RSTn marker every `interval` pixels. `interval == 0` means none.
+pub fn lossless_jpeg_with_restarts(
+    width: u32,
+    height: u32,
+    components: u8,
+    precision: u8,
+    seed: u64,
+    interval: u16,
+) -> Vec<u8> {
+    lossless_jpeg_of(
+        width,
+        height,
+        components,
+        precision,
+        seed,
+        interval,
+        false,
+        &[],
+    )
+}
+
+/// [`lossless_jpeg`] of a flat image (every sample the same, as in clipped highlights): after the first sample every
+/// difference is 0, coded `000`, so the entropy-coded data is a long run of zero bytes.
+pub fn lossless_jpeg_flat(
+    width: u32,
+    height: u32,
+    components: u8,
+    precision: u8,
+    seed: u64,
+) -> Vec<u8> {
+    lossless_jpeg_of(width, height, components, precision, seed, 0, true, &[])
+}
+
+/// [`lossless_jpeg`] whose entropy-coded data is tuned to make the JPEG exactly `len` bytes long, without fill bytes:
+/// the differences of the last samples (as many as needed, up to all of them) are replaced by larger ones (real codes,
+/// more bits), the first changed ones sized to the byte. `None` when `len` is shorter than the plain JPEG or out of that reach. The differences
+/// no longer describe the seeded image (the samples wrap), which a structure check never sees.
+pub fn lossless_jpeg_sized(
+    width: u32,
+    height: u32,
+    components: u8,
+    precision: u8,
+    seed: u64,
+    len: usize,
+) -> Option<Vec<u8>> {
+    let of =
+        |tail: &[i32]| lossless_jpeg_of(width, height, components, precision, seed, 0, false, tail);
+    let plain = of(&[]);
+    if plain.len() > len {
+        return None;
+    }
+    if plain.len() == len {
+        return Some(plain);
+    }
+    let total = width as usize * height as usize * usize::from(components);
+    let reach = total;
+    // The fewest samples of category 9 that reach the length (the length grows with their number): its code `11100` and
+    // value `100000000` never make an `FF` byte, so no stuffing upsets the count.
+    let big = 1 << 8;
+    let (mut lo, mut hi) = (1, reach);
+    if of(&vec![big; hi]).len() < len {
+        return None;
+    }
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if of(&vec![big; mid]).len() >= len {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    // Then the first of them, and the one after it, sized down until the length is exact.
+    let m = lo;
+    for c1 in (0..=15u32).rev() {
+        for c2 in (0..=15u32).rev() {
+            let mut tail = vec![big; m];
+            tail[0] = if c1 == 0 { 0 } else { 1 << (c1 - 1) };
+            if m > 1 {
+                tail[1] = if c2 == 0 { 0 } else { 1 << (c2 - 1) };
+            } else if c2 != 15 {
+                break;
+            }
+            let j = of(&tail);
+            if j.len() == len {
+                return Some(j);
+            }
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lossless_jpeg_of(
+    width: u32,
+    height: u32,
+    components: u8,
+    precision: u8,
+    seed: u64,
+    interval: u16,
+    flat: bool,
+    tail: &[i32],
+) -> Vec<u8> {
+    assert!((1..=4).contains(&components) && (2..=16).contains(&precision));
+    assert!((1..=65_535).contains(&width) && (1..=65_535).contains(&height));
+    // Code lengths of SSSS 0..=16: 5 codes of length 3, 4 of 4, 3 of 5, then one each of 6..=10 (never all ones).
+    let counts: [u8; 16] = [0, 0, 5, 4, 3, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
+    let mut codes = [(0u32, 0u32); 17]; // (code, length) by symbol; symbols are 0..=16 in code order
+    let (mut code, mut sym) = (0u32, 0usize);
+    for len in 1..=16u32 {
+        for _ in 0..counts[len as usize - 1] {
+            codes[sym] = (code, len);
+            code += 1;
+            sym += 1;
+        }
+        code <<= 1;
+    }
+    let mut out = vec![0xFF, 0xD8];
+    // DHT: class 0, id 0.
+    out.extend_from_slice(&[0xFF, 0xC4]);
+    out.extend_from_slice(&(2u16 + 1 + 16 + 17).to_be_bytes());
+    out.push(0x00);
+    out.extend_from_slice(&counts);
+    out.extend(0u8..17);
+    // SOF3.
+    out.extend_from_slice(&[0xFF, 0xC3]);
+    out.extend_from_slice(&(8 + 3 * u16::from(components)).to_be_bytes());
+    out.push(precision);
+    out.extend_from_slice(&(height as u16).to_be_bytes());
+    out.extend_from_slice(&(width as u16).to_be_bytes());
+    out.push(components);
+    for c in 0..components {
+        out.extend_from_slice(&[c + 1, 0x11, 0]);
+    }
+    if interval > 0 {
+        out.extend_from_slice(&[0xFF, 0xDD, 0, 4]);
+        out.extend_from_slice(&interval.to_be_bytes());
+    }
+    // SOS: every component, table 0; predictor 1, no point transform.
+    out.extend_from_slice(&[0xFF, 0xDA]);
+    out.extend_from_slice(&(6 + 2 * u16::from(components)).to_be_bytes());
+    out.push(components);
+    for c in 0..components {
+        out.extend_from_slice(&[c + 1, 0x00]);
+    }
+    out.extend_from_slice(&[1, 0, 0]);
+
+    let mut rng = SplitMix64(seed);
+    let max = (1u32 << precision) - 1;
+    let (w, h, n) = (width as usize, height as usize, usize::from(components));
+    // Smooth samples: a seeded gradient plus small noise; a rare outlier exercises the large categories.
+    let base: Vec<(u32, u32)> = (0..n)
+        .map(|_| (rng.next() as u32 % (max + 1), rng.next() as u32 % 5))
+        .collect();
+    let mut samples = vec![0u32; w * h * n];
+    for y in 0..h {
+        for x in 0..w {
+            for c in 0..n {
+                let (b, slope) = base[c];
+                let noise = (rng.next() % 5) as i64 - 2;
+                let mut v = i64::from(b) + (x as i64 * i64::from(slope)) / 8 + y as i64 / 3 + noise;
+                if precision >= 8 && rng.next().is_multiple_of(997) {
+                    v = (rng.next() % (u64::from(max) + 1)) as i64;
+                }
+                if flat {
+                    v = i64::from(b);
+                }
+                samples[(y * w + x) * n + c] = v.rem_euclid(i64::from(max) + 1) as u32;
+            }
+        }
+    }
+    let mut bw = BitWriter::default();
+    let mut rst = 0u8;
+    // Differences of the last samples given by the caller (in coding order).
+    let forced_from = w * h * n - tail.len().min(w * h * n);
+    for y in 0..h {
+        for x in 0..w {
+            let pixel = y * w + x;
+            if interval > 0 && pixel > 0 && pixel % usize::from(interval) == 0 {
+                bw.align();
+                bw.out.extend_from_slice(&[0xFF, 0xD0 + rst]);
+                rst = (rst + 1) % 8;
+            }
+            // After a restart, the first pixel is predicted as at the start of the scan.
+            let fresh = pixel == 0 || (interval > 0 && pixel % usize::from(interval) == 0);
+            for c in 0..n {
+                let s = samples[pixel * n + c];
+                let pred = if fresh {
+                    1u32 << (precision - 1)
+                } else if x == 0 {
+                    samples[(pixel - w) * n + c]
+                } else {
+                    samples[(pixel - 1) * n + c]
+                };
+                let diff = (s.wrapping_sub(pred) & 0xFFFF) as u16 as i16 as i32;
+                let diff = if s.wrapping_sub(pred) & 0xFFFF == 0x8000 {
+                    32768
+                } else {
+                    diff
+                };
+                let k = pixel * n + c;
+                let diff = if k >= forced_from {
+                    tail[k - forced_from]
+                } else {
+                    diff
+                };
+                let ssss = if diff == 32768 {
+                    16
+                } else {
+                    32 - diff.unsigned_abs().leading_zeros()
+                };
+                let (code, len) = codes[ssss as usize];
+                bw.bits(code, len);
+                if ssss > 0 && ssss < 16 {
+                    let v = if diff >= 0 {
+                        diff as u32
+                    } else {
+                        (diff + (1 << ssss) - 1) as u32
+                    };
+                    bw.bits(v, ssss);
+                }
+            }
+        }
+    }
+    bw.align();
+    out.extend(bw.out);
+    out.extend_from_slice(&[0xFF, 0xD9]);
+    out
 }
 
 /// Grayscale baseline JPEG of a flat gray image, standard luminance Huffman tables, DRI = `interval` MCUs, built
@@ -1541,16 +2294,24 @@ pub enum BenchImage {
     /// An exFAT volume in an MBR disk (first LBA 8192) filling the image, holding the `DenseJpeg` files as live files
     /// in `DCIM/100TEST`, every 4th one deleted.
     ExfatCard,
+    /// An exFAT volume (128 KiB clusters, lowest free cluster first) in an MBR disk that a camera used for a long time:
+    /// rounds of shots (lossless ARW + JPEG pairs, JPEG-only shots, a clip), the JPEG-only shots and the clip deleted in
+    /// camera, the next round written into the holes (so its files lie in pieces), and the first pair in pieces of the
+    /// round before deleted in camera too, until the card is full; at last everything on it is deleted on a computer
+    /// that clears the cluster chains, so every file still there is placed by its content. It measures the scan with
+    /// the reassembly at work.
+    ScatteredCard,
 }
 
 impl BenchImage {
-    pub const ALL: [BenchImage; 6] = [
+    pub const ALL: [BenchImage; 7] = [
         BenchImage::Noise,
         BenchImage::DenseJpeg,
         BenchImage::DenseRaw,
         BenchImage::Video,
         BenchImage::CutJpeg,
         BenchImage::ExfatCard,
+        BenchImage::ScatteredCard,
     ];
 
     pub fn name(self) -> &'static str {
@@ -1561,6 +2322,7 @@ impl BenchImage {
             BenchImage::Video => "video",
             BenchImage::CutJpeg => "cut-jpeg",
             BenchImage::ExfatCard => "exfat-card",
+            BenchImage::ScatteredCard => "scattered-card",
         }
     }
 
@@ -1588,13 +2350,15 @@ fn write_noise(rng: &mut SplitMix64, mut n: u64, out: &mut dyn Write) -> std::io
 /// `DenseJpeg`/`CutJpeg` cycle 8 distinct JPEGs (3000×2000, else 320×240); `DenseRaw` cycles 4 RAWs (Arw, Nef, Cr2, Dng;
 /// 24 MiB / 1 MiB of raw data, preview 1616×1080 / 160×120); `Video` writes MP4s with `mdat` of 256 MiB / 8 MiB.
 pub fn write_bench_image(kind: BenchImage, len: u64, out: &mut dyn Write) -> std::io::Result<u64> {
-    if kind == BenchImage::ExfatCard {
-        return write_exfat_card(len, out);
+    match kind {
+        BenchImage::ExfatCard => return write_exfat_card(len, out),
+        BenchImage::ScatteredCard => return write_scattered_card(len, out),
+        _ => {}
     }
     let big = len >= BENCH_BIG;
     let files: Vec<Vec<u8>> = match kind {
         BenchImage::Noise => Vec::new(),
-        BenchImage::ExfatCard => unreachable!("handled above"),
+        BenchImage::ExfatCard | BenchImage::ScatteredCard => unreachable!("handled above"),
         BenchImage::DenseJpeg | BenchImage::CutJpeg => {
             let (w, h) = if big { (3000, 2000) } else { (320, 240) };
             (0..8).map(|s| jpeg(w, h, 100 + s, 30_000)).collect()
@@ -1697,6 +2461,142 @@ fn write_exfat_card(len: u64, out: &mut dyn Write) -> std::io::Result<u64> {
     out.write_all(&mbr_head(&mut volume, CARD_FIRST_LBA))?;
     out.write_all(&volume)?;
     Ok(names.len() as u64)
+}
+
+/// Cluster size of the `ScatteredCard` volume.
+const SCATTERED_CLUSTER: u32 = 128 * 1024;
+
+/// One shot of the `ScatteredCard` camera: the files it writes, as (extension, bytes).
+fn scattered_shot(n: u64, pair: bool, big: bool) -> Vec<(&'static str, Vec<u8>)> {
+    // The JPEG's size changes from shot to shot, as a camera's do, so the new files straddle the holes.
+    let (base, step, arw_size, preview) = if big {
+        (1280, 64, (1536, 1024), (640, 480))
+    } else {
+        (256, 16, (256, 256), (160, 120))
+    };
+    let w = base + step * (n as u32 * 7 % 11);
+    let mut files = Vec::new();
+    if pair {
+        let raw = arw(&ArwOptions {
+            compression: ArwCompression::Lossless,
+            width: arw_size.0,
+            height: arw_size.1,
+            preview,
+            seed: n,
+            ..ArwOptions::default()
+        });
+        files.push(("ARW", raw.bytes));
+    }
+    files.push(("JPG", jpeg_smooth(w, w / 4 * 3, 5000 + n)));
+    files
+}
+
+/// The `ScatteredCard` image (see [`BenchImage::ScatteredCard`]); returns how many files were written on the card
+/// (live or deleted, whole or overwritten since). Built in memory like `ExfatCard`.
+fn write_scattered_card(len: u64, out: &mut dyn Write) -> std::io::Result<u64> {
+    let (image, written) = scattered_card(len, SCATTERED_CLUSTER);
+    out.write_all(&image)?;
+    Ok(written)
+}
+
+/// The disk image of [`BenchImage::ScatteredCard`] (`len` bytes, a multiple of 512 past 4 MiB) with clusters of
+/// `cluster` bytes, and how many files were written on it. From 512 MiB up the shots are a 1536×1024 lossless ARW with a
+/// 640×480 preview and a 1280×960 to 1920×1440 smooth JPEG, the clips 120 frames; below, a 256×256 ARW with a 160×120
+/// preview, a 256×192 to 416×312 JPEG and 8 frames (so a small card with small clusters keeps files in pieces).
+pub fn scattered_card(len: u64, cluster: u32) -> (Vec<u8>, u64) {
+    use fs::{DeleteStyle, FsBuilder, FsType, mbr_head};
+    let head_len = u64::from(CARD_FIRST_LBA) * 512;
+    assert!(
+        len > head_len && len.is_multiple_of(512),
+        "the scattered-card image needs a multiple of 512 bytes past 4 MiB"
+    );
+    let big = len >= BENCH_BIG;
+    let mut b = FsBuilder::new(FsType::Exfat, len - head_len, cluster);
+    b.mkdir("DCIM/100MSDCF");
+    let cluster = u64::from(cluster);
+    // As `ExfatCard`: 2% of the clusters (at least 64) for the file system's own and the rounding.
+    let room = {
+        let all = u64::from(b.cluster_count());
+        all - (all / 50).max(64)
+    };
+    // (path, clusters) of every live file.
+    let mut live: Vec<(String, u64)> = Vec::new();
+    let mut written = 0u64;
+    let mut n = 0u64;
+    let mut fragmented_before: Vec<String> = Vec::new();
+    // Shots are encoded ahead in parallel batches (encoding is most of the time this takes).
+    let mut ahead: std::collections::VecDeque<Vec<(&'static str, Vec<u8>)>> = Default::default();
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    'card: for round in 0u64.. {
+        let mut culled = Vec::new();
+        let mut pairs = Vec::new();
+        for i in 0..6u64 {
+            n += 1;
+            let pair = i % 2 == 1;
+            if ahead.is_empty() {
+                // Shot k is a pair when k is even (i = (k - 1) % 6 is odd).
+                let first = n;
+                ahead = std::thread::scope(|s| {
+                    let handles: Vec<_> = (first..first + 6 * threads as u64)
+                        .map(|k| s.spawn(move || scattered_shot(k, k % 2 == 0, big)))
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+            }
+            let mut files: Vec<(String, Vec<u8>)> = ahead
+                .pop_front()
+                .expect("encoded ahead")
+                .into_iter()
+                .map(|(ext, bytes)| (format!("DCIM/100MSDCF/DSC{n:05}.{ext}"), bytes))
+                .collect();
+            if i == 2 {
+                let samples = if big { 120 } else { 8 };
+                let clip = camera_video(
+                    &AvcOptions {
+                        samples,
+                        seed: 9000 + round,
+                        mov: false,
+                        mdat_pad: 0,
+                        small_nals: false,
+                    },
+                    VideoCodec::Avc,
+                    VideoLayout::MoovAtEnd,
+                );
+                files.push((format!("DCIM/100MSDCF/C{round:04}.MP4"), clip.bytes));
+            }
+            for (path, bytes) in files {
+                let need = (bytes.len() as u64).div_ceil(cluster);
+                if live.iter().map(|f| f.1).sum::<u64>() + need > room {
+                    break 'card;
+                }
+                let clusters = b.add(&path, &bytes);
+                written += 1;
+                live.push((path.clone(), need));
+                if path.ends_with(".MP4") || !pair {
+                    culled.push(path);
+                } else if clusters.windows(2).any(|w| w[1] != w[0] + 1) {
+                    pairs.push(path);
+                }
+            }
+        }
+        // In camera: the JPEG-only shots and the clip of this round, and the first file in pieces of the round before.
+        culled.extend(fragmented_before.first().cloned());
+        for path in &culled {
+            b.delete(path, DeleteStyle::Camera);
+            live.retain(|f| &f.0 != path);
+        }
+        fragmented_before = pairs;
+    }
+    // At last the whole card is deleted on a computer that clears the chains: every file still on it is placed by its
+    // content (the reassembly's work).
+    for (path, _) in &live {
+        b.delete(path, DeleteStyle::ZeroChain);
+    }
+    let mut volume = b.build();
+    drop(b);
+    let mut image = mbr_head(&mut volume, CARD_FIRST_LBA);
+    image.append(&mut volume);
+    (image, written)
 }
 
 #[cfg(test)]

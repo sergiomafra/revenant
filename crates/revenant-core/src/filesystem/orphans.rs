@@ -763,6 +763,76 @@ mod tests {
         assert!(!later(&None, &t("2000-01-01T00:00:00")));
     }
 
+    /// A folder cut at the depth limit is memoized: asked again, it is the same string, with no second walk.
+    #[test]
+    fn depth_cut_folder_is_memoized() {
+        let n = 40;
+        let mut f = Folders {
+            names: (0..n)
+                .map(|i| (i > 0).then(|| (i - 1, format!("D{i}"))))
+                .collect(),
+            memo: vec![None; n],
+            visiting: vec![false; n],
+            left: MAX_PATH_BUDGET,
+            truncated: false,
+            unknown: Arc::from("?"),
+        };
+        let first = f.get(n - 1, 0).unwrap();
+        let spent = f.left;
+        let second = f.get(n - 1, 0).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(f.left, spent, "no second walk");
+        // Cut after 32 levels: the top of the chain starts unknown.
+        assert!(first.starts_with("?/D"), "{first}");
+        assert_eq!(first.matches('/').count(), MAX_DEPTH as usize);
+    }
+
+    /// An exFAT old folder over two clusters is one candidate (the second cluster starts in the middle of an entry
+    /// set): the files of both clusters are named once, under the folder its parent names.
+    #[test]
+    fn multi_cluster_old_folder_continuation_is_one_folder() {
+        let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, 4096);
+        // 60 sets of 3 entries: the folder takes two adjacent clusters, the 43rd set straddling them. The data lies far
+        // away, so nothing but the folder grows into the cluster after its first.
+        for i in 0..60u32 {
+            let at = 1000 + i;
+            b.add_at(
+                &format!("DCIM/OLD/F{i:02}.JPG"),
+                &[i as u8 + 1; 1000],
+                &[at],
+            );
+        }
+        let folder = b.clusters("DCIM/OLD");
+        assert_eq!(folder.len(), 2);
+        assert_eq!(folder[1], folder[0] + 1);
+        let img = Mem(b.build_quick_formatted());
+        let v = crate::filesystem::volumes(&img);
+        let dirs = all_dirs(&img, &v);
+        assert_eq!(dirs.len(), 2, "DCIM and OLD, the continuation is no folder");
+        let mut wanted: Vec<(u64, u8)> = ["F00.JPG", "F59.JPG"]
+            .iter()
+            .map(|n| {
+                (
+                    b.cluster_offset(b.clusters(&format!("DCIM/OLD/{n}"))[0]),
+                    kind_class(FileKind::Jpeg),
+                )
+            })
+            .collect();
+        wanted.sort_unstable();
+        let (e, truncated) =
+            orphan_entries(&img, &v, &dirs, &[], &[], &wanted, &CancelToken::default());
+        assert!(!truncated);
+        let mut got: Vec<(&str, Option<&str>)> = e
+            .iter()
+            .map(|e| (e.name.as_str(), e.folder.as_deref()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [("F00.JPG", Some("?/OLD")), ("F59.JPG", Some("?/OLD"))]
+        );
+    }
+
     #[test]
     fn plausible_entries() {
         let mut b = vec![0u8; 512];

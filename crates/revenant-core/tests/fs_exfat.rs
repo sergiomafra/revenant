@@ -365,9 +365,11 @@ fn deleted_exfat_files() {
     assert_eq!(f.pieces, pieces_of(&b, &c1, one.len() as u64));
     assert_eq!(f.pieces.len(), 1);
     assert!(f.trusted);
+    // A whole old chain in two runs that no other entry claims, the bitmap present: placed by it (D14, part 1.6), not
+    // trusted by the placement alone (the scan's content checks decide).
     let f = file(&l, "DCIM/TWO.JPG");
     assert_eq!(f.origin.state, FsState::Deleted);
-    assert_eq!(f.origin.placement, Placement::Guessed);
+    assert_eq!(f.origin.placement, Placement::OldChain);
     assert_eq!(
         f.pieces,
         pieces_of(&b, &[150, 151, 152, 160, 161], two.len() as u64)

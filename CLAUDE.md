@@ -6,12 +6,12 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 
 ## Onde o desenvolvimento está
 
-**25/10/2026.** Módulo 1 (motor): Partes 1.1 a 1.4 mergeadas (PRs #1 a #5). Parte 1.5 (disco de verdade: aparelho no Mac
-e no Windows, desmontar sem ejetar, conferência prévia, cópia com mapa, sessão retomável, sinais cedo) concluída na branch
-`feat/m1-p5-real-disks`, aguardando PR/merge; decisões e pendências em
-`docs/superpowers/history/2026-10-25-m1-p5-pendencias.md`, roteiro de conferência com hardware (do Sérgio) em
-`docs/superpowers/history/2026-10-25-m1-p5-conferencia-manual.md`. Marco A fechado. Próxima: 1.6 ou o Módulo 2, a decidir
-pelo Sérgio. Roteiro até a 1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`
+**02/11/2026.** Módulo 1 (motor): Partes 1.1 a 1.5 mergeadas (PRs #1 a #6). Parte 1.6 (fragmentação avançada: JPEG,
+vídeo e RAW em 3 ou mais pedaços, apagados fragmentados no FAT/exFAT) concluída na branch `feat/m1-p6-fragments`,
+revisão final feita e corrigida (Q61), aguardando o PR/merge; decisões, resíduos aceitos e o que ficou para depois em
+`docs/superpowers/history/2026-11-02-m1-p6-pendencias.md`, roteiro com a A6700 (do Sérgio) em
+`docs/superpowers/history/2026-11-02-m1-p6-conferencia-manual.md`. Marco A fechado. Próxima: Módulo 2. Roteiro até a
+1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`
 (`bench` mede a velocidade).
 Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.
 
@@ -56,3 +56,7 @@ Regra: todo erro vira uma instrução aqui.
   (`std::os::unix`, `hdiutil`) fica atrás de `#[cfg(target_os = "macos")]` (num arquivo de teste: `#![cfg(...)]` no
   topo). Antes do PR, `grep -rn "os::unix" crates` e conferir que cada uso está protegido. (PR #5: `os_builders.rs`
   quebrou o CI do Windows.)
+- Este Mac fica carregado por outros projetos do Sérgio (carga 30 a 120): um teste com limite de relógio falhou
+  (`fs_fat::hostile_high_word_entries_are_bounded`, 9 s contra 5 s; hoje conta leituras) e o `bench` espalhou mais de
+  40% contra ele mesmo. Teste novo nunca mede relógio (conta passos ou leituras; relógio só como trava anti-travamento
+  folgada, ≤ 30 s); velocidade só se mede com `uptime` baixo e build de controle intercalado. (1.6)

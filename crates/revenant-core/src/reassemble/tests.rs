@@ -1,0 +1,1945 @@
+use super::*;
+use crate::formats::tests::Mem;
+use std::ops::Range;
+
+const U: u64 = 4096;
+const K: u64 = 1024;
+const MIB: u64 = 1 << 20;
+const IMG: u64 = 16 * MIB;
+const GRID: Grid = (MIB, U, IMG);
+const ID: u32 = 0x5EA4;
+const NOISE: u32 = 0xBAD0;
+
+fn units(k: u32) -> u64 {
+    k as u64 * U
+}
+
+fn header(id: u32, i: u32, n: u32) -> [u8; 12] {
+    let mut h = [0u8; 12];
+    h[0..4].copy_from_slice(&id.to_le_bytes());
+    h[4..8].copy_from_slice(&i.to_le_bytes());
+    h[8..12].copy_from_slice(&n.to_le_bytes());
+    h
+}
+
+/// The chain tag of unit `i` of the lineage `seed` (what a decoder predictor carries from one unit to the next).
+fn tag(seed: u32, i: u32) -> u32 {
+    seed.wrapping_mul(0x9E37_79B9) ^ i.wrapping_mul(0x85EB_CA6B) ^ 0x5bd1_e995
+}
+
+/// Unit `i` of a toy file of `n` units: `[id][i][n][previous unit's tag][own tag]` then bytes seeded by `seed` and `i`.
+fn unit(id: u32, i: u32, n: u32, seed: u32, prev: u32) -> Vec<u8> {
+    let mut u = vec![0u8; U as usize];
+    u[..12].copy_from_slice(&header(id, i, n));
+    u[12..16].copy_from_slice(&prev.to_le_bytes());
+    u[16..20].copy_from_slice(&tag(seed, i).to_le_bytes());
+    let mut x = seed.wrapping_mul(2_654_435_761).wrapping_add(i) | 1;
+    for b in &mut u[20..] {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x as u8;
+    }
+    u
+}
+
+/// A 16 MiB card, zeros except where toy units are put.
+struct Card(Vec<u8>);
+
+impl Card {
+    fn new() -> Card {
+        Card(vec![0; IMG as usize])
+    }
+
+    /// Units `units` of a toy file of `n` units with `id`, from `at`; returns their range.
+    fn put(&mut self, at: u64, id: u32, units: Range<u32>, n: u32, seed: u32) -> Fragment {
+        let prev = tag(seed, units.start.wrapping_sub(1));
+        self.put_chained(at, id, units, n, seed, prev)
+    }
+
+    /// As [`Card::put`], the first unit chained from tag `prev` (another lineage's unit), the rest from `seed`.
+    fn put_chained(
+        &mut self,
+        at: u64,
+        id: u32,
+        units: Range<u32>,
+        n: u32,
+        seed: u32,
+        prev: u32,
+    ) -> Fragment {
+        for (k, i) in units.clone().enumerate() {
+            let p = (at + k as u64 * U) as usize;
+            let before = if k == 0 { prev } else { tag(seed, i - 1) };
+            self.0[p..p + U as usize].copy_from_slice(&unit(id, i, n, seed, before));
+        }
+        Fragment {
+            start: at,
+            len: (units.end - units.start) as u64 * U,
+        }
+    }
+
+    /// `count` units of another file.
+    fn noise(&mut self, at: u64, count: u32) {
+        self.put(at, NOISE, 0..count, count, 7);
+    }
+
+    fn mem(self) -> Mem {
+        Mem(self.0)
+    }
+}
+
+/// The toy format: a file of `n` units of 4096 bytes, unit `i` = `[ID][i][n][seeded bytes]`.
+#[derive(Clone, Default)]
+struct Toy {
+    n: u32,
+    /// Units not checked (no evidence either way).
+    blind: Range<u32>,
+    known_len: Option<u64>,
+    anchor: Option<(u64, u64)>,
+    /// The prefilter reads 16 bytes at the candidate.
+    prefilter_reads: bool,
+    /// `prove` ignores blind units (only the search's own rule can lower the proof).
+    trusting: bool,
+    /// The prefilter rejects every candidate.
+    reject_all: bool,
+    /// Prefilter calls so far.
+    prefilter_calls: u64,
+    /// A failed read counts as a good unit (a careless format: only the search's read limit flags it).
+    ignore_errors: bool,
+    /// Each unit must carry the previous unit's tag (a decoder predictor carried across units).
+    chained: bool,
+    /// Break points the uniqueness re-check should try first.
+    suspects: Vec<u64>,
+}
+
+fn toy(n: u32) -> Toy {
+    Toy {
+        n,
+        ..Toy::default()
+    }
+}
+
+impl Seams for Toy {
+    /// The next unit, and the tag of the unit before it.
+    type State = (u32, u32);
+
+    fn begin(&mut self) -> (u32, u32) {
+        (0, 0)
+    }
+
+    fn walk(
+        &mut self,
+        view: &dyn Source,
+        seams: &[u64],
+        from: &(u32, u32),
+        limit: u64,
+    ) -> Walked<(u32, u32)> {
+        let _ = seams;
+        let (mut i, mut prev) = *from;
+        let mut checked = units(i);
+        let mut resume = Vec::new();
+        let limit = limit.min(view.len());
+        loop {
+            if i >= self.n {
+                return Walked {
+                    end: WalkEnd::Complete { len: units(self.n) },
+                    checked,
+                    resume,
+                };
+            }
+            let s = units(i);
+            if s + U > limit {
+                return Walked {
+                    end: WalkEnd::Broken { at: s },
+                    checked,
+                    resume,
+                };
+            }
+            if !self.blind.contains(&i) {
+                let mut h = [0u8; 20];
+                let got = view.read_at(s, &mut h);
+                if got.is_err() && self.ignore_errors {
+                    h[..12].copy_from_slice(&header(ID, i, self.n));
+                } else if got.ok() != Some(20) {
+                    return Walked {
+                        end: WalkEnd::Stopped,
+                        checked,
+                        resume,
+                    };
+                }
+                let chain_ok = !self.chained || i == 0 || h[12..16] == prev.to_le_bytes();
+                if h[..12] != header(ID, i, self.n) || !chain_ok {
+                    return Walked {
+                        end: WalkEnd::Broken { at: s },
+                        checked,
+                        resume,
+                    };
+                }
+                prev = u32::from_le_bytes([h[16], h[17], h[18], h[19]]);
+                checked = s + U;
+                resume.push((s + U, (i + 1, prev)));
+            }
+            i += 1;
+        }
+    }
+
+    fn prove(&mut self, view: &dyn Source, seams: &[u64]) -> Proof {
+        let w = self.walk(view, seams, &(0, 0), view.len());
+        if !matches!(w.end, WalkEnd::Complete { len } if len == view.len()) {
+            return Proof::Failed;
+        }
+        let blind_seam = seams.iter().any(|&p| {
+            let k = (p / U) as u32;
+            self.blind.contains(&k) || (k > 0 && self.blind.contains(&(k - 1)))
+        });
+        if blind_seam && !self.trusting {
+            Proof::Unproven
+        } else {
+            Proof::Proven
+        }
+    }
+
+    fn known_len(&self) -> Option<u64> {
+        self.known_len
+    }
+
+    fn anchor(&self) -> Option<(u64, u64)> {
+        self.anchor
+    }
+
+    fn suspicious_breaks(&mut self, view: &dyn Source, start: u64, end: u64) -> Vec<u64> {
+        let _ = view;
+        self.suspects
+            .iter()
+            .copied()
+            .filter(|&b| start < b && b < end)
+            .collect()
+    }
+
+    fn prefilter(&mut self, r: &mut Reader, g: u64, seam: u64) -> bool {
+        let _ = seam;
+        self.prefilter_calls += 1;
+        if self.prefilter_reads {
+            let mut b = [0u8; 16];
+            r.read(g, &mut b);
+        }
+        !self.reject_all
+    }
+}
+
+/// Searches the toy file starting at `start` on the 1 MiB-heap grid, `live` taken, nothing claimed.
+fn search_on(
+    src: &dyn Source,
+    toy: &mut Toy,
+    start: u64,
+    live: &[Fragment],
+    limits: &Limits,
+    known: Option<u64>,
+) -> (Option<Search>, Budget) {
+    let taken = Taken::new(live, &Runs::default());
+    let starts = [start];
+    let space = Space::new(&[GRID], start, src.len(), &taken, &starts, limits);
+    let mut budget = Budget::new(limits);
+    let found = search(
+        toy,
+        src,
+        &space,
+        start,
+        known,
+        limits,
+        &mut budget,
+        &CancelToken::default(),
+    );
+    (found, budget)
+}
+
+/// Places runs of 8 units of a `n`-unit toy file at `places` (run k = units 8k..8k+8), 4 noise units after each.
+fn runs_at(card: &mut Card, n: u32, places: &[u64]) -> Vec<Fragment> {
+    places
+        .iter()
+        .enumerate()
+        .map(|(k, &p)| {
+            let k = k as u32;
+            let f = card.put(p, ID, 8 * k..8 * k + 8, n, 1);
+            card.noise(p + units(8), 4);
+            f
+        })
+        .collect()
+}
+
+const FIVE: [u64; 5] = [MIB, 3 * MIB, 2 * MIB, 5 * MIB, 4 * MIB];
+
+fn complement(keep: &[Fragment]) -> Vec<Fragment> {
+    let mut keep = keep.to_vec();
+    keep.sort_by_key(|f| f.start);
+    let mut out = Vec::new();
+    let mut pos = MIB;
+    for f in keep {
+        if f.start > pos {
+            out.push(Fragment {
+                start: pos,
+                len: f.start - pos,
+            });
+        }
+        pos = pos.max(f.start + f.len);
+    }
+    if pos < IMG {
+        out.push(Fragment {
+            start: pos,
+            len: IMG - pos,
+        });
+    }
+    out
+}
+
+#[test]
+fn space_lists_free_cluster_starts_in_prior_order() {
+    let live = [Fragment {
+        start: 2 * MIB,
+        len: MIB,
+    }];
+    let mut claimed = Runs::default();
+    claimed.add(5 * MIB, 5 * MIB + 8 * K, usize::MAX);
+    let taken = Taken::new(&live, &claimed);
+    let limits = Limits::DEFAULT;
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &[], &limits);
+    assert!(space.on_grid());
+    assert_eq!(space.unit(), U);
+    assert_eq!(space.max_pieces(), 16);
+
+    // The unit right at the end is the contiguous case, never a candidate.
+    let (c, capped) = space.candidates(4 * MIB, &[], 8, &mut |_| true);
+    assert_eq!(c, (1..9).map(|k| 4 * MIB + k * U).collect::<Vec<_>>());
+    assert!(capped);
+
+    // The claimed range is stepped over.
+    let (c, _) = space.candidates(5 * MIB - 2 * U, &[], 4, &mut |_| true);
+    assert_eq!(
+        c,
+        [
+            5 * MIB - U,
+            5 * MIB + 2 * U,
+            5 * MIB + 3 * U,
+            5 * MIB + 4 * U
+        ]
+    );
+
+    // A used piece is stepped over.
+    let used = [Fragment {
+        start: 4 * MIB + U,
+        len: 2 * U,
+    }];
+    let (c, _) = space.candidates(4 * MIB, &used, 3, &mut |_| true);
+    assert_eq!(c, [4 * MIB + 3 * U, 4 * MIB + 4 * U, 4 * MIB + 5 * U]);
+
+    // Next free forward, then the first hole from the heap start, skipping the live file.
+    let end = IMG - 2 * U;
+    let (c, capped) = space.candidates(end, &[], 1 + 256 + 5, &mut |_| true);
+    let mut want = vec![IMG - U];
+    want.extend((0..256).map(|k| MIB + k * U));
+    want.extend((0..5).map(|k| 3 * MIB + k * U));
+    assert_eq!(c, want);
+    assert!(capped);
+
+    // A unit holding another finding's start is not a candidate.
+    let starts = [4 * MIB + 512];
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &starts, &limits);
+    let (c, _) = space.candidates(4 * MIB, &[], 2, &mut |_| true);
+    assert_eq!(c, [4 * MIB + U, 4 * MIB + 2 * U]);
+}
+
+#[test]
+fn space_without_grid_is_forward_only_on_sectors() {
+    assert_eq!(Limits::DEFAULT.no_grid_window, 64 << 20);
+    let taken = Taken::new(&[], &Runs::default());
+    let limits = Limits {
+        no_grid_window: 8 * K,
+        ..Limits::DEFAULT
+    };
+    // A start off the cluster grid, no grid at all, a grid with clusters under 4096: sectors.
+    for (grids, start) in [
+        (vec![GRID], MIB + 512),
+        (vec![], MIB),
+        (vec![(MIB, 2048, IMG)], MIB),
+    ] {
+        let space = Space::new(&grids, start, IMG, &taken, &[], &limits);
+        assert!(!space.on_grid());
+        assert_eq!(space.unit(), 512);
+        assert_eq!(space.max_pieces(), 4);
+        let (c, capped) = space.candidates(2 * MIB, &[], 100, &mut |_| true);
+        assert_eq!(c, (1..16).map(|k| 2 * MIB + k * 512).collect::<Vec<_>>());
+        assert!(!capped);
+    }
+}
+
+#[test]
+fn candidate_cap_counts_survivors_not_enumerated_units() {
+    let taken = Taken::new(&[], &Runs::default());
+    let keep = |g: u64| ((g - MIB) / U) % 8 == 7;
+    let space_with = |window: u64| Limits {
+        seam_window: window * U,
+        ..Limits::DEFAULT
+    };
+    // From the heap start, so only the forward window is listed.
+    let limits = space_with(64);
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &[], &limits);
+    let (c, capped) = space.candidates(MIB, &[], 8, &mut |g| keep(g));
+    assert_eq!(c.len(), 8);
+    assert_eq!(c[7], MIB + 63 * U);
+    assert!(!capped);
+
+    let limits = space_with(1000);
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &[], &limits);
+    let (c, capped) = space.candidates(MIB, &[], 8, &mut |g| keep(g));
+    assert_eq!(c.len(), 8);
+    assert!(capped);
+
+    let limits = space_with(40);
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &[], &limits);
+    let (c, capped) = space.candidates(MIB, &[], 8, &mut |g| keep(g));
+    assert_eq!(c.len(), 5);
+    assert!(!capped, "a window cut is not a cap hit");
+}
+
+#[test]
+fn prefilter_reads_are_charged_and_memoized() {
+    let src = Mem(vec![0; IMG as usize]);
+    let taken = Taken::new(&[], &Runs::default());
+    let limits = Limits::DEFAULT;
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &[], &limits);
+    let counted = Counted::new(&src);
+    let cancel = CancelToken::default();
+    let mut t = Toy {
+        prefilter_reads: true,
+        ..toy(40)
+    };
+    let mut ctx = Ctx::new(
+        &mut t,
+        &counted,
+        &space,
+        &limits,
+        &cancel,
+        (None, false),
+        (FILE_TRIES, FILE_READ),
+    );
+    // A 16-byte read costs the one sector its reader loads.
+    assert!(ctx.keep(2 * MIB, units(8)));
+    assert_eq!(counted.read(), SECTOR);
+    ctx.keep(2 * MIB + U, units(8));
+    assert_eq!(counted.read(), 2 * SECTOR);
+    ctx.keep(2 * MIB, units(8));
+    assert_eq!(
+        counted.read(),
+        2 * SECTOR,
+        "the same (start, seam) is memoized"
+    );
+    ctx.keep(2 * MIB, units(16));
+    assert_eq!(counted.read(), 3 * SECTOR);
+
+    // Through the search, the prefilter's reads come out of the budget.
+    let spent = |prefilter_reads: bool| {
+        let mut card = Card::new();
+        runs_at(&mut card, 40, &FIVE);
+        let src = card.mem();
+        let mut t = Toy {
+            prefilter_reads,
+            ..toy(40)
+        };
+        let (found, budget) = search_on(&src, &mut t, MIB, &[], &limits, None);
+        assert!(found.unwrap().complete);
+        Budget::new(&limits).read_left() - budget.read_left()
+    };
+    let extra = spent(true) - spent(false);
+    assert!(extra > 0);
+    assert_eq!(extra % SECTOR, 0);
+}
+
+#[test]
+fn a_unit_opened_by_an_own_file_at_its_place_is_a_candidate() {
+    // A claimed photo (two touching findings, merged by `Runs`) starting a unit, with a finding start there: the file's
+    // own embedded files at logical 64 KiB (4 KiB) and 68 KiB (12 KiB). After a seam at logical 64 KiB that unit is a
+    // candidate (D9, D10, Q7); after a seam elsewhere, or for files 512 bytes off, it is not.
+    let g = 6 * MIB;
+    let mut claimed = Runs::default();
+    claimed.add(g, g + 4 * K, usize::MAX);
+    claimed.add(g + 4 * K, g + 16 * K, usize::MAX);
+    let taken = Taken::new(&[], &claimed);
+    let starts = [g, g + 4 * K];
+    let limits = Limits::DEFAULT;
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &starts, &limits);
+    let own = [
+        Fragment {
+            start: 64 * K,
+            len: 4 * K,
+        },
+        Fragment {
+            start: 68 * K,
+            len: 12 * K,
+        },
+    ];
+    let list = |own: &[Fragment], seam: u64| {
+        space
+            .candidates_with_own(g - 2 * U, &[], own, seam, 3, &mut |_| true, &mut 0)
+            .0
+    };
+    // The claimed photos fill the units g to g + 4U: only the first one is opened by them.
+    let after = [g - U, g + 4 * U, g + 5 * U];
+    assert_eq!(list(&own, 64 * K), [g - U, g, g + 4 * U]);
+    assert_eq!(list(&own, 32 * K), after);
+    assert_eq!(list(&[], 64 * K), after);
+    let off: Vec<Fragment> = own
+        .iter()
+        .map(|o| Fragment {
+            start: o.start + 512,
+            len: o.len,
+        })
+        .collect();
+    assert_eq!(list(&off, 64 * K), after);
+    // The plain listing is the one without own files.
+    assert_eq!(space.candidates(g - 2 * U, &[], 3, &mut |_| true).0, after);
+}
+
+#[test]
+fn own_file_checks_while_listing_are_counted_and_capped() {
+    // 1000 claimed units, every other one: listing past them with own files checks each taken range once (I-3),
+    // counted as listing work (charged to the file's tries like prefilter calls), never once per unit.
+    let mut claimed = Runs::default();
+    for k in 0..1000u64 {
+        let at = 2 * MIB + 2 * k * U;
+        claimed.add(at, at + U, usize::MAX);
+    }
+    let taken = Taken::new(&[], &claimed);
+    let limits = Limits::DEFAULT;
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &[], &limits);
+    let own = [Fragment {
+        start: 64 * K,
+        len: 4 * K,
+    }];
+    let mut work = 0;
+    let (c, _) = space.candidates_with_own(
+        2 * MIB - U,
+        &[],
+        &own,
+        64 * K,
+        4096,
+        &mut |_| true,
+        &mut work,
+    );
+    assert_eq!(work, 1000);
+    assert!(c.len() >= 1000);
+    // Past the cap of own files, a file has none (conservative: its previews then stop its runs).
+    let many: Vec<Fragment> = (0..=limits.own_files as u64)
+        .map(|k| Fragment {
+            start: k * U,
+            len: U,
+        })
+        .collect();
+    assert!(super::own_within(many.clone(), &limits).is_empty());
+    assert_eq!(
+        super::own_within(many[1..].to_vec(), &limits).len(),
+        limits.own_files
+    );
+}
+
+#[test]
+fn free_run_stops_at_taken_used_and_finding_starts() {
+    let g = 4 * MIB;
+    let fr =
+        |claimed: &[(u64, u64)], used: &[Fragment], starts: &[u64], own: &[Fragment], max: u64| {
+            let mut runs = Runs::default();
+            for &(s, e) in claimed {
+                runs.add(s, e, usize::MAX);
+            }
+            let live = [Fragment {
+                start: g + 40 * K,
+                len: U,
+            }];
+            let taken = Taken::new(&live, &runs);
+            let space = Space::new(&[GRID], MIB, IMG, &taken, starts, &Limits::DEFAULT);
+            space.free_run(g, used, own, max)
+        };
+    assert_eq!(fr(&[], &[], &[], &[], 32 * K), 32 * K);
+    assert_eq!(
+        fr(&[], &[], &[], &[], 5000),
+        5000,
+        "at most max, even mid-unit"
+    );
+    assert_eq!(fr(&[], &[], &[], &[], 64 * K), 40 * K, "a live file");
+    assert_eq!(
+        fr(&[(g + 20 * K, g + 28 * K)], &[], &[], &[], 64 * K),
+        20 * K
+    );
+    assert_eq!(
+        fr(&[(g + 20 * K + 100, g + 21 * K)], &[], &[], &[], 64 * K),
+        20 * K,
+        "the unit it touches"
+    );
+    let used = [Fragment {
+        start: g + 16 * K,
+        len: U,
+    }];
+    assert_eq!(fr(&[], &used, &[], &[], 64 * K), 16 * K);
+    assert_eq!(fr(&[], &[], &[g + 12 * K], &[], 64 * K), 12 * K);
+    assert_eq!(fr(&[], &[], &[g], &[], 32 * K), 32 * K, "its own start");
+
+    // A claimed range wholly covered by `own` at its exact place is not a stop, nor its start.
+    let own = [Fragment {
+        start: g + 20 * K,
+        len: 8 * K,
+    }];
+    assert_eq!(
+        fr(
+            &[(g + 20 * K, g + 28 * K)],
+            &[],
+            &[g + 20 * K],
+            &own,
+            32 * K
+        ),
+        32 * K
+    );
+    // Two claimed findings touching, merged by `Runs`, each covered by its own range.
+    let own2 = [
+        Fragment {
+            start: g + 20 * K,
+            len: 4 * K,
+        },
+        Fragment {
+            start: g + 24 * K,
+            len: 4 * K,
+        },
+    ];
+    let touching = [(g + 20 * K, g + 24 * K), (g + 24 * K, g + 28 * K)];
+    assert_eq!(fr(&touching, &[], &[], &own2, 32 * K), 32 * K);
+    // 512 bytes off, or only partly covered: a stop.
+    let off = [Fragment {
+        start: g + 20 * K + 512,
+        len: 8 * K,
+    }];
+    assert_eq!(
+        fr(&[(g + 20 * K, g + 28 * K)], &[], &[], &off, 32 * K),
+        20 * K
+    );
+    assert_eq!(fr(&touching, &[], &[], &own2[..1], 32 * K), 20 * K);
+
+    // The heap end.
+    let taken = Taken::new(&[], &Runs::default());
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &[], &Limits::DEFAULT);
+    assert_eq!(space.free_run(IMG - U, &[], &[], 64 * K), U);
+}
+
+#[test]
+fn toy_file_in_five_pieces_is_unique() {
+    let mut card = Card::new();
+    let runs = runs_at(&mut card, 40, &FIVE);
+    let src = card.mem();
+    let (found, _) = search_on(&src, &mut toy(40), MIB, &[], &Limits::DEFAULT, None);
+    assert_eq!(
+        found,
+        Some(Search {
+            pieces: runs,
+            len: units(40),
+            complete: true,
+            unique: true,
+            exhaustive: true,
+            proof: Proof::Proven,
+        })
+    );
+}
+
+#[test]
+fn toy_twin_continuations_are_ambiguous() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    card.put(6 * MIB, ID, 16..24, 40, 1);
+    card.noise(6 * MIB + units(8), 4);
+    let src = card.mem();
+    let s = search_on(&src, &mut toy(40), MIB, &[], &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(!s.unique);
+    assert!(s.exhaustive);
+    assert_eq!(s.pieces[2].start, 6 * MIB, "the copy next free comes first");
+}
+
+#[test]
+fn toy_budget_hit_is_not_exhaustive() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = card.mem();
+    let limits = Limits {
+        file_tries: 3,
+        ..Limits::DEFAULT
+    };
+    let s = search_on(&src, &mut toy(40), MIB, &[], &limits, None)
+        .0
+        .unwrap();
+    assert!(!s.exhaustive);
+    assert!(!s.complete);
+}
+
+#[test]
+fn piece_cap_is_respected() {
+    let mut card = Card::new();
+    let runs = runs_at(
+        &mut card,
+        48,
+        &[MIB, 3 * MIB, 2 * MIB, 5 * MIB, 4 * MIB, 6 * MIB],
+    );
+    let src = card.mem();
+    let limits = Limits {
+        pieces: 4,
+        ..Limits::DEFAULT
+    };
+    let s = search_on(&src, &mut toy(48), MIB, &[], &limits, None)
+        .0
+        .unwrap();
+    assert!(!s.complete);
+    assert!(!s.exhaustive);
+    assert_eq!(s.pieces, runs[..4]);
+}
+
+#[test]
+fn known_len_must_match() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = card.mem();
+    let mut t = Toy {
+        known_len: Some(units(41)),
+        ..toy(40)
+    };
+    let s = search_on(&src, &mut t, MIB, &[], &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(!s.complete);
+}
+
+#[test]
+fn entry_size_must_match_when_known() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = card.mem();
+    let run = |t: &mut Toy, known| {
+        search_on(&src, t, MIB, &[], &Limits::DEFAULT, known)
+            .0
+            .unwrap()
+    };
+    assert!(!run(&mut toy(40), Some(units(41))).complete);
+    let s = run(&mut toy(40), Some(units(40)));
+    assert!(s.complete);
+    assert_eq!(s.len, units(40));
+    let mut t = Toy {
+        known_len: Some(units(41)),
+        ..toy(40)
+    };
+    assert!(
+        !run(&mut t, Some(units(40))).complete,
+        "the two sizes disagree"
+    );
+    let mut t = Toy {
+        known_len: Some(units(40)),
+        ..toy(40)
+    };
+    assert!(
+        !run(&mut t, Some(units(41))).complete,
+        "the two sizes disagree"
+    );
+    assert!(run(&mut t, Some(units(40))).complete);
+}
+
+#[test]
+fn anchor_fixes_the_last_piece() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    // A copy of unit 32 alone, next free: [.., 7 MiB (unit 32), 4 MiB + 1 unit (33..40)] is a second solution.
+    card.put(7 * MIB, ID, 32..33, 40, 1);
+    card.noise(7 * MIB + units(1), 4);
+    let src = card.mem();
+    // Without the anchor the copy next free comes first and the seam is ambiguous.
+    let s = search_on(&src, &mut toy(40), MIB, &[], &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.pieces.iter().any(|p| p.start == 7 * MIB));
+    assert!(!s.unique);
+    let mut t = Toy {
+        anchor: Some((units(32), 4 * MIB)),
+        ..toy(40)
+    };
+    let s = search_on(&src, &mut t, MIB, &[], &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert_eq!(s.pieces.last().unwrap().start, 4 * MIB);
+    assert!(s.unique);
+}
+
+#[test]
+fn blind_seam_is_placed_in_prior_order_and_unproven() {
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..24, 40, 1);
+    let b = card.put(MIB + units(28), ID, 24..40, 40, 1);
+    let src = card.mem();
+    // Q14: the gap between the runs is taken.
+    let live = [Fragment {
+        start: MIB + units(24),
+        len: units(4),
+    }];
+    let mut t = Toy {
+        blind: 16..40,
+        ..toy(40)
+    };
+    let s = search_on(&src, &mut t, MIB, &live, &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert_eq!(s.pieces, [a, b]);
+    assert_eq!(s.proof, Proof::Unproven);
+}
+
+/// Q2's card, start at 4 MiB: A = units 0..8, T = unit 8 alone (blind) on one free cluster, R = units 9..40 two
+/// clusters after T, and (when `look_alike`) L = units 8..40 with correct headers but other bytes, in the first hole at
+/// the heap start. Everything else is taken. With [`q2_limits`] (a 16-unit window) L's own earlier breaks (Q26) cannot
+/// reach R, so only the blind descent through T can make L non-unique.
+fn q2_card(look_alike: bool) -> (Mem, Vec<Fragment>, [Fragment; 4]) {
+    let mut card = Card::new();
+    let a = card.put(4 * MIB, ID, 0..8, 40, 1);
+    let t = card.put(4 * MIB + units(9), ID, 8..9, 40, 1);
+    let r = card.put(4 * MIB + units(11), ID, 9..40, 40, 1);
+    let l = card.put(MIB, ID, 8..40, 40, 99);
+    let free: Vec<Fragment> = if look_alike {
+        vec![a, t, l, r]
+    } else {
+        vec![a, t, r]
+    };
+    (card.mem(), complement(&free), [a, t, l, r])
+}
+
+fn q2_limits() -> Limits {
+    Limits {
+        seam_window: units(16),
+        ..Limits::DEFAULT
+    }
+}
+
+#[test]
+fn blind_true_continuation_next_to_an_evident_look_alike_is_not_unique() {
+    let (src, live, [a, _, l, _]) = q2_card(true);
+    let mut t = Toy {
+        blind: 8..9,
+        ..toy(40)
+    };
+    let s = search_on(&src, &mut t, 4 * MIB, &live, &q2_limits(), None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(!s.unique, "the blind true continuation counts");
+    assert!(s.exhaustive);
+    assert_eq!(s.pieces, [a, l], "evidence before blind");
+    assert!(!(s.unique && s.proof == Proof::Proven));
+
+    // Without the look-alike: unique, but the seam at unit 8 stayed blind.
+    let (src, live, [a, tt, _, r]) = q2_card(false);
+    for trusting in [false, true] {
+        let mut t = Toy {
+            blind: 8..9,
+            trusting,
+            ..toy(40)
+        };
+        let s = search_on(&src, &mut t, 4 * MIB, &live, &q2_limits(), None)
+            .0
+            .unwrap();
+        assert!(s.complete);
+        assert!(s.unique);
+        assert!(s.exhaustive);
+        assert_eq!(s.pieces, [a, tt, r]);
+        assert_eq!(s.proof, Proof::Unproven, "trusting {trusting}");
+    }
+}
+
+#[test]
+fn budget_cut_inside_a_blind_descent_is_not_exhaustive() {
+    let (src, live, [a, _, l, _]) = q2_card(true);
+    let mut t = Toy {
+        blind: 8..9,
+        ..toy(40)
+    };
+    let limits = q2_limits();
+    let (s, budget) = search_on(&src, &mut t, 4 * MIB, &live, &limits, None);
+    assert!(s.unwrap().exhaustive);
+    let tries = Budget::new(&limits).tries_left() - budget.tries_left();
+    // The last try is inside the blind descent (evidence first): one fewer cuts it.
+    let limits = Limits {
+        file_tries: tries - 1,
+        ..q2_limits()
+    };
+    let s = search_on(&src, &mut t, 4 * MIB, &live, &limits, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert_eq!(s.pieces, [a, l]);
+    assert!(!s.exhaustive);
+}
+
+/// The reviewer's probe: A = units 0..8 at 1 MiB, one taken cluster, T = unit 8 (blind) followed by free noise, R =
+/// units 9..40 at 1 MiB + 60 units. With `look_alike` the unit before R is noise too, so (noise) + R is an evident
+/// continuation; without it that cluster is taken.
+fn probe_card(look_alike: bool) -> (Mem, Vec<Fragment>) {
+    let mut card = Card::new();
+    card.put(MIB, ID, 0..8, 40, 1);
+    card.put(MIB + units(9), ID, 8..9, 40, 1);
+    card.noise(MIB + units(10), 50);
+    card.put(MIB + units(60), ID, 9..40, 40, 1);
+    let mut live = vec![Fragment {
+        start: MIB + units(8),
+        len: U,
+    }];
+    if !look_alike {
+        live.push(Fragment {
+            start: MIB + units(59),
+            len: U,
+        });
+    }
+    (card.mem(), live)
+}
+
+#[test]
+fn blind_continuation_broken_later_in_its_run_is_descended() {
+    let limits = Limits {
+        seam_window: units(64),
+        ..Limits::DEFAULT
+    };
+    for look_alike in [true, false] {
+        let (src, live) = probe_card(look_alike);
+        let mut t = Toy {
+            blind: 8..9,
+            ..toy(40)
+        };
+        let s = search_on(&src, &mut t, MIB, &live, &limits, None)
+            .0
+            .unwrap();
+        assert!(s.complete, "look-alike {look_alike}");
+        assert!(
+            !s.unique,
+            "look-alike {look_alike}: T then R is another solution"
+        );
+        assert!(!(s.unique && s.proof == Proof::Proven));
+    }
+}
+
+#[test]
+fn window_bounds_the_distance_not_the_piece() {
+    // Q25: a contiguous file longer than the window is one piece.
+    let limits = Limits {
+        seam_window: units(16),
+        ..Limits::DEFAULT
+    };
+    let mut card = Card::new();
+    let f = card.put(4 * MIB, ID, 0..40, 40, 1);
+    card.noise(4 * MIB + units(40), 4);
+    let src = card.mem();
+    let s = search_on(&src, &mut toy(40), 4 * MIB, &[], &limits, None)
+        .0
+        .unwrap();
+    assert_eq!(s.pieces, [f]);
+    assert!(s.complete);
+    assert!(s.unique);
+    assert!(s.exhaustive);
+    assert_eq!(s.proof, Proof::Proven);
+
+    // A look-alike of its tail in the first hole is another solution (Q26).
+    let mut card = Card::new();
+    card.put(4 * MIB, ID, 0..40, 40, 1);
+    card.noise(4 * MIB + units(40), 4);
+    card.put(MIB, ID, 16..40, 40, 99);
+    let src = card.mem();
+    let s = search_on(&src, &mut toy(40), 4 * MIB, &[], &limits, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(!s.unique);
+}
+
+#[test]
+fn complete_walk_tries_earlier_breaks_of_the_last_piece() {
+    // Q26: T = units 8..16 followed contiguously by a look-alike tail (same headers, other bytes); the true tail R is
+    // free elsewhere. T + tail completes, and so does T cut at unit 16 then R: not unique.
+    let mut card = Card::new();
+    card.put(MIB, ID, 0..8, 40, 1);
+    card.noise(MIB + units(8), 4);
+    card.put(2 * MIB, ID, 8..16, 40, 1);
+    card.put(2 * MIB + units(8), ID, 16..40, 40, 99);
+    card.noise(2 * MIB + units(32), 4);
+    card.put(3 * MIB, ID, 16..40, 40, 1);
+    card.noise(3 * MIB + units(24), 4);
+    let src = card.mem();
+    let s = search_on(&src, &mut toy(40), MIB, &[], &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(!s.unique);
+    assert!(!(s.unique && s.proof == Proof::Proven));
+}
+
+#[test]
+fn seam_candidate_cap_hit_is_not_exhaustive() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = card.mem();
+    let limits = Limits {
+        seam_candidates: 1,
+        ..Limits::DEFAULT
+    };
+    let s = search_on(&src, &mut toy(40), MIB, &[], &limits, None)
+        .0
+        .unwrap();
+    assert!(!s.exhaustive);
+}
+
+#[test]
+fn break_point_cap_hit_is_not_exhaustive() {
+    // The contiguous-continuation card has two valid breaks (7 and 8 units) and is otherwise exhaustive.
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..8, 40, 1);
+    let r = card.put(3 * MIB, ID, 8..40, 40, 1);
+    let src = card.mem();
+    let live = complement(&[a, r]);
+    let limits = Limits {
+        break_points: 1,
+        ..Limits::DEFAULT
+    };
+    let mut t = Toy {
+        blind: 7..8,
+        ..toy(40)
+    };
+    let s = search_on(&src, &mut t, MIB, &live, &limits, None)
+        .0
+        .unwrap();
+    assert!(!s.exhaustive);
+}
+
+/// A source whose reads fail inside `bad`.
+struct Holes(Mem, Range<u64>);
+
+impl Source for Holes {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, EngineError> {
+        if offset < self.1.end && offset + buf.len() as u64 > self.1.start {
+            return Err(EngineError::Read {
+                offset,
+                cause: std::io::Error::other("bad"),
+            });
+        }
+        self.0.read_at(offset, buf)
+    }
+    fn volume(&self) -> Option<VolumeId> {
+        None
+    }
+}
+
+#[test]
+fn stopped_candidate_walk_is_not_exhaustive() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = Holes(card.mem(), 6 * MIB..6 * MIB + U);
+    let s = search_on(&src, &mut toy(40), MIB, &[], &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(!s.exhaustive);
+}
+
+#[test]
+fn prefilter_read_budget_hit_is_not_exhaustive() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = card.mem();
+    let limits = Limits {
+        file_read: 8 * K,
+        ..Limits::DEFAULT
+    };
+    let mut t = Toy {
+        prefilter_reads: true,
+        ..toy(40)
+    };
+    let s = search_on(&src, &mut t, MIB, &[], &limits, None).0.unwrap();
+    assert!(!s.exhaustive);
+    // Once the bytes are spent the prefilter is not asked again (each call reads a 512-byte sector).
+    assert!(
+        t.prefilter_calls <= 8 * K / SECTOR + 1,
+        "{} prefilter calls",
+        t.prefilter_calls
+    );
+}
+
+#[test]
+fn listing_work_is_charged_to_the_try_budget() {
+    // Blind units then noise: 7 break points, each listing ~3800 free units that the prefilter rejects.
+    let mut card = Card::new();
+    card.put(MIB, ID, 0..8, 40, 1);
+    card.noise(MIB + units(8), 4);
+    let src = card.mem();
+    let limits = Limits {
+        file_tries: 50,
+        ..Limits::DEFAULT
+    };
+    let mut t = Toy {
+        blind: 1..8,
+        reject_all: true,
+        ..toy(40)
+    };
+    let (s, budget) = search_on(&src, &mut t, MIB, &[], &limits, None);
+    assert!(!s.unwrap().exhaustive);
+    assert!(Budget::new(&limits).tries_left() - budget.tries_left() <= 50);
+    assert!(
+        t.prefilter_calls <= 50 * LISTED_PER_TRY,
+        "{} prefilter calls",
+        t.prefilter_calls
+    );
+}
+
+#[test]
+fn cancel_stops_the_search() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = card.mem();
+    let limits = Limits::DEFAULT;
+    let taken = Taken::new(&[], &Runs::default());
+    let space = Space::new(&[GRID], MIB, IMG, &taken, &[MIB], &limits);
+    let mut budget = Budget::new(&limits);
+    let cancel = CancelToken::default();
+    cancel.cancel();
+    let found = search(
+        &mut toy(40),
+        &src,
+        &space,
+        MIB,
+        None,
+        &limits,
+        &mut budget,
+        &cancel,
+    );
+    assert_eq!(found, None);
+    assert_eq!(budget.tries_left(), limits.scan_tries);
+    assert_eq!(budget.read_left(), limits.scan_read);
+
+    // Through the format layer's cancel scope too.
+    let mut budget = Budget::new(&limits);
+    let scoped = CancelToken::default();
+    scoped.cancel();
+    let _scope = crate::formats::CancelScope::enter(&scoped);
+    let found = search(
+        &mut toy(40),
+        &src,
+        &space,
+        MIB,
+        None,
+        &limits,
+        &mut budget,
+        &CancelToken::default(),
+    );
+    assert_eq!(found, None);
+    assert_eq!(budget.tries_left(), limits.scan_tries);
+}
+
+#[test]
+fn contiguous_continuation_is_not_a_seam() {
+    // A break point before a blind last unit, continuing at the very next unit, is the same bytes as no seam: it must
+    // not count as a second solution.
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..8, 40, 1);
+    let r = card.put(3 * MIB, ID, 8..40, 40, 1);
+    let src = card.mem();
+    let live = complement(&[a, r]);
+    let mut t = Toy {
+        blind: 7..8,
+        ..toy(40)
+    };
+    let s = search_on(&src, &mut t, MIB, &live, &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(s.exhaustive);
+    assert!(s.unique);
+    assert_eq!(s.pieces, [a, r]);
+}
+
+#[test]
+fn a_walk_cut_by_the_read_limit_is_not_exhaustive() {
+    // One piece allowed, so no later try notices the budget: only the refused read does.
+    let mut card = Card::new();
+    card.put(MIB, ID, 0..8, 8, 1);
+    let src = card.mem();
+    let limits = Limits {
+        pieces: 1,
+        file_read: 24,
+        ..Limits::DEFAULT
+    };
+    let mut t = Toy {
+        ignore_errors: true,
+        ..toy(8)
+    };
+    let s = search_on(&src, &mut t, MIB, &[], &limits, None).0.unwrap();
+    assert!(s.complete);
+    assert!(!s.exhaustive);
+}
+
+#[test]
+fn stopped_walk_is_not_exhaustive() {
+    // The first piece's own walk cannot read its 4th unit.
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    let src = Holes(card.mem(), MIB + units(3)..MIB + units(4));
+    let s = search_on(&src, &mut toy(40), MIB, &[], &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert_eq!(s.len, units(3));
+    assert!(!s.exhaustive);
+}
+
+#[test]
+fn two_piece_files_on_a_free_card_stay_exhaustive() {
+    // RN4: the uniqueness re-check has its own budget; the search's is not spent on it.
+    for tail in [8, 20, 40, 64] {
+        let n = 8 + tail;
+        let mut card = Card::new();
+        let a = card.put(MIB, ID, 0..8, n, 1);
+        card.noise(MIB + units(8), 4);
+        let t = card.put(3 * MIB, ID, 8..n, n, 1);
+        card.noise(3 * MIB + units(tail), 4);
+        let src = card.mem();
+        let (s, budget) = search_on(&src, &mut toy(n), MIB, &[], &Limits::DEFAULT, None);
+        let s = s.unwrap();
+        assert_eq!(s.pieces, [a, t], "tail {tail}");
+        assert!(s.complete && s.unique && s.exhaustive, "tail {tail}");
+        assert_eq!(s.proof, Proof::Proven);
+        let spent = Budget::new(&Limits::DEFAULT).tries_left() - budget.tries_left();
+        assert!(
+            spent <= FILE_TRIES + RECHECK_TRIES,
+            "tail {tail}: {spent} tries"
+        );
+    }
+}
+
+#[test]
+fn recheck_covers_every_piece_not_only_the_last() {
+    // RN3c, chained units: A = true units 0..10, right after it a foreign L1 = units 10..16 chained from A's unit 9,
+    // L1's continuation X = 16..40 elsewhere; the true T = 10..40 elsewhere. The search finds A+L1 then X; the re-check
+    // of the first piece finds A then T: not unique.
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..10, 40, 1);
+    let l1 = card.put_chained(MIB + units(10), ID, 10..16, 40, 5, tag(1, 9));
+    let x = card.put_chained(3 * MIB, ID, 16..40, 40, 5, tag(5, 15));
+    let t = card.put(5 * MIB, ID, 10..40, 40, 1);
+    let src = card.mem();
+    let live = complement(&[a, l1, x, t]);
+    let mut t_ = Toy {
+        chained: true,
+        ..toy(40)
+    };
+    let s = search_on(&src, &mut t_, MIB, &live, &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert_eq!(
+        s.pieces,
+        [
+            Fragment {
+                start: MIB,
+                len: units(16)
+            },
+            x
+        ]
+    );
+    assert!(!s.unique, "the re-check of the first piece finds A + T");
+    assert!(s.exhaustive, "the re-check never clears exhaustive");
+}
+
+#[test]
+fn recheck_tries_the_format_s_suspicious_breaks_first() {
+    // RN2c, chained units: one contiguous run of 100 units where a look-alike lineage takes over at unit 30 (the 70th
+    // break from the end); the true units 30..100 lie elsewhere. With the format's hint the swap point is tried first:
+    // not unique. Without it (default order: the 64 breaks nearest the end) the swap point is never tried and the result
+    // is unique: the accepted residual risk of Q27/Q28 (the format's proof is the guard).
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..30, 100, 1);
+    let l = card.put_chained(MIB + units(30), ID, 30..100, 100, 5, tag(1, 29));
+    let t = card.put(3 * MIB, ID, 30..100, 100, 1);
+    let src = card.mem();
+    let live = complement(&[a, l, t]);
+    let mut hinted = Toy {
+        chained: true,
+        suspects: vec![units(30)],
+        ..toy(100)
+    };
+    let s = search_on(&src, &mut hinted, MIB, &live, &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(!s.unique);
+    let mut plain = Toy {
+        chained: true,
+        ..toy(100)
+    };
+    let s = search_on(&src, &mut plain, MIB, &live, &Limits::DEFAULT, None)
+        .0
+        .unwrap();
+    assert!(s.complete);
+    assert!(
+        s.unique,
+        "residual risk: the swap point lies past the 64 breaks tried"
+    );
+}
+
+#[test]
+fn recheck_spends_its_own_budget_only() {
+    let mut card = Card::new();
+    card.put(MIB, ID, 0..8, 28, 1);
+    card.noise(MIB + units(8), 4);
+    card.put(3 * MIB, ID, 8..28, 28, 1);
+    card.noise(3 * MIB + units(20), 4);
+    let src = card.mem();
+    let spent = |recheck_tries: u64| {
+        let limits = Limits {
+            recheck_tries,
+            ..Limits::DEFAULT
+        };
+        let (s, budget) = search_on(&src, &mut toy(28), MIB, &[], &limits, None);
+        assert!(s.unwrap().exhaustive);
+        Budget::new(&limits).tries_left() - budget.tries_left()
+    };
+    let search = spent(0);
+    let with = spent(10);
+    assert!(with > search && with <= search + 10, "{search} then {with}");
+}
+
+#[test]
+fn recheck_ignores_blind_alternatives() {
+    // Q29: piece 0 holds units the format cannot check (4..8). The re-check breaking there could fill them with any free
+    // run (Z) and resume on the piece's own checked units: not content evidence, so not another solution, whatever the
+    // re-check budget.
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..10, 40, 1);
+    let t = card.put(3 * MIB, ID, 10..40, 40, 1);
+    let z = Fragment {
+        start: 5 * MIB,
+        len: units(16),
+    };
+    let src = card.mem();
+    let live = complement(&[a, t, z]);
+    for recheck_tries in [RECHECK_TRIES, 1 << 20] {
+        let limits = Limits {
+            recheck_tries,
+            ..Limits::DEFAULT
+        };
+        let mut toy_ = Toy {
+            blind: 4..8,
+            ..toy(40)
+        };
+        let s = search_on(&src, &mut toy_, MIB, &live, &limits, None)
+            .0
+            .unwrap();
+        assert_eq!(s.pieces, [a, t]);
+        assert!(
+            s.complete && s.unique && s.exhaustive,
+            "recheck_tries {recheck_tries}"
+        );
+    }
+}
+
+/// A search result that satisfies the whole D6 rule on its own: 3 pieces, complete, unique, exhaustive, `Proven`.
+fn good_search() -> Search {
+    let f = |start, len| Fragment { start, len };
+    Search {
+        pieces: vec![f(MIB, 2 * U), f(4 * MIB, 2 * U), f(2 * MIB, U)],
+        len: 5 * U,
+        complete: true,
+        unique: true,
+        exhaustive: true,
+        proof: Proof::Proven,
+    }
+}
+
+/// What the scan checks besides the search, every one of them passing (placement proven, not by content alone).
+fn good_checks() -> Checks {
+    Checks {
+        capped: false,
+        frags_capped: false,
+        claimed_capped: false,
+        listing_truncated: false,
+        bad: false,
+        size_ok: true,
+        own_ok: true,
+        restarts: false,
+        unnamed: false,
+        content_only: false,
+    }
+}
+
+#[test]
+fn health_needs_every_condition() {
+    use crate::formats::{FileKind, Health};
+    let jpeg = FileKind::Jpeg;
+    let s = good_search();
+    let c = good_checks();
+    // A JPEG in 3 pieces whose placement is proven: the whole rule holds.
+    assert_eq!(health(&s, jpeg, &c), Health::Intact);
+    type Mutation<T> = (&'static str, fn(&mut T));
+    let searches: [Mutation<Search>; 5] = [
+        ("unique", |s| s.unique = false),
+        ("exhaustive", |s| s.exhaustive = false),
+        ("complete", |s| s.complete = false),
+        ("unproven", |s| s.proof = Proof::Unproven),
+        ("failed", |s| s.proof = Proof::Failed),
+    ];
+    for (name, f) in searches {
+        let mut s = good_search();
+        f(&mut s);
+        assert_eq!(health(&s, jpeg, &c), Health::Partial, "{name}");
+        assert_eq!(health(&s, FileKind::Mp4, &c), Health::Partial, "{name}");
+    }
+    let checks: [Mutation<Checks>; 10] = [
+        ("capped", |c| c.capped = true),
+        ("frags_capped", |c| c.frags_capped = true),
+        ("claimed_capped", |c| c.claimed_capped = true),
+        ("listing_truncated", |c| c.listing_truncated = true),
+        ("bad run", |c| c.bad = true),
+        ("known size", |c| c.size_ok = false),
+        ("own check", |c| c.own_ok = false),
+        ("restarts (Q16)", |c| c.restarts = true),
+        ("content only (Q37)", |c| c.content_only = true),
+        ("unnamed (Q55)", |c| c.unnamed = true),
+    ];
+    for (name, f) in checks {
+        let mut c = good_checks();
+        f(&mut c);
+        assert_eq!(health(&s, jpeg, &c), Health::Partial, "{name}");
+    }
+    // A deleted entry's pieces reported without its name are never `Intact`, of any kind, in any number of pieces.
+    let unnamed = Checks {
+        unnamed: true,
+        ..good_checks()
+    };
+    for kind in [FileKind::Arw, FileKind::Mp4] {
+        assert_eq!(health(&s, kind, &unnamed), Health::Partial, "{kind:?}");
+    }
+    // Q16 and Q37 bite only a JPEG in 2 or more pieces: one run placed by content keeps the 1.3 rule, and another
+    // format is not capped by them.
+    let mut one = good_search();
+    one.pieces = vec![Fragment {
+        start: MIB,
+        len: 5 * U,
+    }];
+    let lenient = Checks {
+        restarts: true,
+        content_only: true,
+        ..good_checks()
+    };
+    assert_eq!(health(&one, jpeg, &lenient), Health::Intact);
+    assert_eq!(health(&s, FileKind::Mp4, &lenient), Health::Intact);
+    for kind in [FileKind::Mp4, FileKind::Arw] {
+        let mut c = good_checks();
+        c.bad = true;
+        assert_eq!(health(&s, kind, &c), Health::Partial, "{kind:?}");
+    }
+}
+
+#[test]
+fn a_reassembly_improves_only_on_better_health_or_a_longer_complete_file() {
+    use crate::formats::{FileKind, Health};
+    use crate::scan::Finding;
+    let f = |health, len| Finding {
+        id: 7,
+        start: MIB,
+        len,
+        kind: FileKind::Jpeg,
+        health,
+        fragments: Vec::new(),
+        origin: None,
+    };
+    let (i, p, d) = (Health::Intact, Health::Partial, Health::Damaged);
+    assert!(improves(&f(p, 100), &f(i, 100), true));
+    assert!(improves(&f(d, 100), &f(p, 100), true));
+    assert!(!improves(&f(i, 100), &f(i, 200), true));
+    assert!(!improves(&f(p, 100), &f(d, 200), true));
+    // Both Partial: only a complete and longer one.
+    assert!(improves(&f(p, 100), &f(p, 101), true));
+    assert!(!improves(&f(p, 100), &f(p, 100), true));
+    assert!(!improves(&f(p, 100), &f(p, 200), false));
+    assert!(!improves(&f(p, 100), &f(p, 50), true));
+}
+
+/// [`search_on`] with the file system's pieces `hint` as the first hypothesis (D14).
+fn search_hinted(src: &dyn Source, toy: &mut Toy, start: u64, hint: &[Fragment]) -> Search {
+    let taken = Taken::new(&[], &Runs::default());
+    let starts = [start];
+    let limits = Limits::DEFAULT;
+    let space = Space::new(&[GRID], start, src.len(), &taken, &starts, &limits).with_hint(hint);
+    let mut budget = Budget::new(&limits);
+    search(
+        toy,
+        src,
+        &space,
+        start,
+        None,
+        &limits,
+        &mut budget,
+        &CancelToken::default(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn listing_pieces_are_tried_first() {
+    // As `toy_twin_continuations_are_ambiguous`: a copy of the third run at 6 MiB, the next free after the second run.
+    // With the true runs as the hint, the third piece taken is the true one; the copy still makes it not unique.
+    let mut card = Card::new();
+    let runs = runs_at(&mut card, 40, &FIVE);
+    card.put(6 * MIB, ID, 16..24, 40, 1);
+    card.noise(6 * MIB + units(8), 4);
+    let src = card.mem();
+    let s = search_hinted(&src, &mut toy(40), MIB, &runs);
+    assert!(s.complete);
+    assert!(!s.unique);
+    assert_eq!(s.pieces, runs);
+    // The seam the hint gives is the first break point tried: with units 8 and 9 blind, the first piece's walk breaks
+    // only at unit 10 (noise), and a cut at unit 10 followed by the true run's units 10.. would complete too.
+    let mut card = Card::new();
+    let a = card.put(MIB, ID, 0..8, 40, 1);
+    card.noise(MIB + units(8), 4);
+    let b = card.put(3 * MIB, ID, 8..40, 40, 1);
+    let src = card.mem();
+    let t = || Toy {
+        blind: 8..10,
+        ..toy(40)
+    };
+    let s = search_hinted(&src, &mut t(), MIB, &[a, b]);
+    assert!(s.complete);
+    assert_eq!(s.pieces, [a, b]);
+    let plain = search_hinted(&src, &mut t(), MIB, &[]);
+    assert_ne!(
+        plain.pieces,
+        [a, b],
+        "without the hint the cut at unit 10 comes first"
+    );
+}
+
+#[test]
+fn an_unrefuted_listing_placement_makes_another_solution_not_unique() {
+    // The file whole at 1 MiB, units 16.. blind (a RAW's sensor data): found in one piece, unique, unless the file
+    // system's pieces, elsewhere, are a placement its content cannot refute.
+    let mut card = Card::new();
+    let whole = card.put(MIB, ID, 0..40, 40, 1);
+    card.noise(5 * MIB, 40);
+    let src = card.mem();
+    let t = || Toy {
+        blind: 16..40,
+        ..toy(40)
+    };
+    let alone = search_hinted(&src, &mut t(), MIB, &[]);
+    assert_eq!((alone.pieces.clone(), alone.unique), (vec![whole], true));
+    // The second piece at 5 MiB holds other units where unit 8.. is checked: refuted, the solution stays unique.
+    let refuted = [
+        Fragment {
+            start: MIB,
+            len: units(8),
+        },
+        Fragment {
+            start: 5 * MIB,
+            len: units(32),
+        },
+    ];
+    let s = search_hinted(&src, &mut t(), MIB, &refuted);
+    assert_eq!((s.pieces.clone(), s.unique), (vec![whole], true));
+    // Cut at unit 24, inside the blind units: nothing refutes the file system's placement.
+    let blind = [
+        Fragment {
+            start: MIB,
+            len: units(24),
+        },
+        Fragment {
+            start: 5 * MIB,
+            len: units(16),
+        },
+    ];
+    let s = search_hinted(&src, &mut t(), MIB, &blind);
+    assert_eq!((s.pieces.clone(), s.unique), (vec![whole], false));
+}
+
+/// D14: the whole-file checks of each kind, over a view whose middle may hold other bytes.
+#[test]
+fn content_checks_per_kind() {
+    use revenant_testkit as tk;
+    let cancel = CancelToken::default();
+    let ok = |bytes: &[u8], kind: FileKind| {
+        content_checks(&Mem(bytes.to_vec()), kind, bytes.len() as u64, &cancel)
+    };
+    // `bytes` with `other`'s bytes over `[at, at + 4096)`.
+    let spliced = |bytes: &[u8], other: &[u8], at: usize| {
+        let mut b = bytes.to_vec();
+        b[at..at + 4096].copy_from_slice(&other[at..at + 4096]);
+        b
+    };
+    let j = tk::jpeg_smooth(640, 480, 1);
+    let j2 = tk::jpeg_smooth(640, 480, 2);
+    assert!(ok(&j, FileKind::Jpeg));
+    assert!(!ok(&spliced(&j, &j2, j.len() / 2), FileKind::Jpeg));
+    // A video with its index at the end: every sample checked in place (the scan's measure looks at its index only);
+    // what is checked is the samples' structure (NAL lengths and headers), so small NAL units, many per 4096 bytes.
+    let v = |seed| {
+        tk::avc_video(&tk::AvcOptions {
+            samples: 200,
+            seed,
+            mov: false,
+            mdat_pad: 0,
+            small_nals: true,
+        })
+        .bytes
+    };
+    let (a, b) = (v(1), v(2));
+    assert!(ok(&a, FileKind::Mp4));
+    assert!(!ok(&spliced(&a, &b, a.len() / 2), FileKind::Mp4));
+    // Lossless tiles must decode whole; uncompressed sensor data is not checked.
+    let raw = |compression, seed| {
+        tk::arw(&tk::ArwOptions {
+            compression,
+            seed,
+            ..tk::ArwOptions::default()
+        })
+        .bytes
+    };
+    let (l1, l2) = (
+        raw(tk::ArwCompression::Lossless, 1),
+        raw(tk::ArwCompression::Lossless, 2),
+    );
+    assert!(ok(&l1, FileKind::Arw));
+    let at = l1.len() - 64 * 1024;
+    assert!(!ok(&spliced(&l1, &l2, at), FileKind::Arw));
+    let u1 = raw(tk::ArwCompression::Uncompressed, 1);
+    let u2 = raw(tk::ArwCompression::Uncompressed, 2);
+    assert!(ok(&u1, FileKind::Arw));
+    assert!(ok(&spliced(&u1, &u2, u1.len() - 64 * 1024), FileKind::Arw));
+    // The preview is checked: a foreign middle in it fails.
+    let p = tk::arw(&tk::ArwOptions::default());
+    let preview = p.preview.clone().expect("a preview");
+    let mid = preview.start + preview.len() / 2;
+    let other = raw(tk::ArwCompression::Lossless, 9);
+    assert!(!ok(&spliced(&p.bytes, &other, mid), FileKind::Arw));
+    // No check for the other kinds.
+    assert!(!ok(
+        &tk::raf(50_000, 2, &tk::TestExif::default()),
+        FileKind::Raf
+    ));
+}
+
+/// The hostile image of `tests/reassembly.rs` (Task 4) grown to `len`: a smooth photo's first 64 KiB at 0, then 4096
+/// sectors that each hold the next 510 bytes of it and an `EOI` (every one a passing continuation), zeros after.
+fn hostile_image(len: usize) -> Vec<u8> {
+    let photo = revenant_testkit::jpeg_smooth(2048, 1536, 3);
+    let first = 64 * 1024;
+    let mut img = vec![0u8; len];
+    img[..first].copy_from_slice(&photo[..first]);
+    let mut sector = [0u8; 512];
+    sector[..510].copy_from_slice(&photo[first..first + 510]);
+    sector[510..].copy_from_slice(&[0xFF, 0xD9]);
+    for k in 0..4096 {
+        let at = first + k * 512;
+        img[at..at + 512].copy_from_slice(&sector);
+    }
+    img
+}
+
+/// Scans `img` (default options) recording the reassembly step; prints what it spent and returns it with the scan's
+/// seconds.
+fn measured_scan(name: &str, img: Vec<u8>) -> (measure::Recorded, f64) {
+    let gib = img.len() as f64 / f64::from(1u32 << 30);
+    let src = Mem(img);
+    let guard = measure::record();
+    let t = std::time::Instant::now();
+    let mut events = 0u64;
+    crate::scan::scan(
+        &src,
+        &crate::formats::all_formats(),
+        &crate::scan::ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |_| events += 1,
+    )
+    .expect("scan");
+    let secs = t.elapsed().as_secs_f64();
+    let rec = measure::take();
+    drop(guard);
+    let step: f64 = rec.steps.iter().map(|s| s.secs).sum();
+    let files = &rec.files;
+    let sum = |f: &dyn Fn(&measure::FileStat) -> u64| files.iter().map(f).sum::<u64>();
+    let searches = files.iter().flat_map(|f| f.searches.iter());
+    let hits = files
+        .iter()
+        .filter(|f| f.searches.iter().any(|s| s.budget_hit))
+        .count();
+    let spent = files
+        .iter()
+        .filter(|f| f.searches.iter().any(|s| s.recheck_spent))
+        .count();
+    println!(
+        "== {name}: {gib:.2} GiB, scan {secs:.2} s, {events} events, reassembly step {step:.2} s ({:.2} s per GiB), \
+         {} candidates, {} searched ({} searches), tries {} (re-check {}), read {:.1} MiB (re-check {:.1} MiB), \
+         file budget hit by {hits}, re-check spent by {spent}, improved {}, scan budget left {:?}",
+        step / gib,
+        rec.steps.iter().map(|s| s.candidates).sum::<usize>(),
+        files.len(),
+        searches.clone().count(),
+        sum(&|f| f.tries),
+        searches.clone().map(|s| s.recheck_tries).sum::<u64>(),
+        sum(&|f| f.read) as f64 / MIB as f64,
+        searches.map(|s| s.recheck_read).sum::<u64>() as f64 / MIB as f64,
+        files.iter().filter(|f| f.after.is_some()).count(),
+        rec.steps
+            .iter()
+            .map(|s| (s.tries_left, s.read_left >> 20))
+            .collect::<Vec<_>>(),
+    );
+    let mut kinds: Vec<FileKind> = files.iter().map(|f| f.kind).collect();
+    kinds.sort_by_key(|k| k.as_str());
+    kinds.dedup();
+    for k in kinds {
+        let of: Vec<&measure::FileStat> = files.iter().filter(|f| f.kind == k).collect();
+        let (mut intact, mut partial, mut same) = (0, 0, 0);
+        for f in &of {
+            match f.after {
+                Some(Health::Intact) => intact += 1,
+                Some(_) => partial += 1,
+                None => same += 1,
+            }
+        }
+        println!(
+            "   {:>4}: {} files, {:.2} s, tries {}, read {:.1} MiB, budget hit {}, re-check spent {}, \
+             exhaustive {}, unique {}; now Intact {intact}, improved not Intact {partial}, unchanged {same}",
+            k.as_str(),
+            of.len(),
+            of.iter().map(|f| f.secs).sum::<f64>(),
+            of.iter().map(|f| f.tries).sum::<u64>(),
+            of.iter().map(|f| f.read).sum::<u64>() as f64 / MIB as f64,
+            of.iter()
+                .filter(|f| f.searches.iter().any(|s| s.budget_hit))
+                .count(),
+            of.iter()
+                .filter(|f| f.searches.iter().any(|s| s.recheck_spent))
+                .count(),
+            of.iter()
+                .filter(|f| f.searches.iter().any(|s| s.exhaustive))
+                .count(),
+            of.iter()
+                .filter(|f| f.searches.iter().any(|s| s.unique))
+                .count(),
+        );
+    }
+    let mut slow: Vec<&measure::FileStat> = files.iter().collect();
+    slow.sort_by(|a, b| b.secs.total_cmp(&a.secs));
+    for f in slow.iter().take(8) {
+        println!(
+            "   slowest: #{} {} {:?} at {} len {}: {:.3} s, tries {}, read {:.1} MiB -> {:?} in {} pieces; {:?}",
+            f.id,
+            f.kind.as_str(),
+            f.before,
+            f.start,
+            f.len,
+            f.secs,
+            f.tries,
+            f.read as f64 / MIB as f64,
+            f.after,
+            f.pieces,
+            f.searches,
+        );
+    }
+    (rec, step)
+}
+
+/// Seeded noise (SplitMix64), for the real samples' surroundings.
+struct SplitNoise(u64);
+
+impl SplitNoise {
+    fn fill(&mut self, buf: &mut [u8]) {
+        for chunk in buf.chunks_mut(8) {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            chunk.copy_from_slice(&z.to_le_bytes()[..chunk.len()]);
+        }
+    }
+}
+
+fn events_of(img: &[u8]) -> Vec<String> {
+    let src = Mem(img.to_vec());
+    let mut out = Vec::new();
+    crate::scan::scan(
+        &src,
+        &crate::formats::all_formats(),
+        &crate::scan::ScanOptions::default(),
+        &CancelToken::default(),
+        &mut |e| {
+            if !matches!(e, crate::scan::Event::Rate { .. }) {
+                out.push(format!("{e:?}"))
+            }
+        },
+    )
+    .expect("scan");
+    out
+}
+
+/// A walk reused when its candidate is descended into is charged as if walked again (one try and the bytes it read): for
+/// any try or read budget, the result and the budget left are those of walking it again. The toy format keeps no
+/// memory between walks; for the JPEG, whose second walk replays its lead from memory, the charge is a little higher
+/// (review M-1), so the equality holds here only.
+#[test]
+fn a_reused_walk_is_charged_as_walked_again() {
+    let mut card = Card::new();
+    runs_at(&mut card, 40, &FIVE);
+    // Look-alikes: a copy of run 2 and of run 3 further on, so seams have several evident candidates.
+    card.put(6 * MIB, ID, 16..24, 40, 1);
+    card.noise(6 * MIB + units(8), 4);
+    card.put(7 * MIB, ID, 24..32, 40, 1);
+    card.noise(7 * MIB + units(8), 4);
+    let src = card.mem();
+    let run = |limits: &Limits, reuse: bool| {
+        NO_REUSE.with(|u| u.set(!reuse));
+        let (s, budget) = search_on(&src, &mut toy(40), MIB, &[], limits, None);
+        NO_REUSE.with(|u| u.set(false));
+        (s, budget.tries_left(), budget.read_left())
+    };
+    let mut reused = 0;
+    for file_read in (0..64).map(|k| k * 160).chain([u64::MAX]) {
+        for file_tries in [1, 2, 3, 5, 8, 13, 21, 34, 1 << 16] {
+            let limits = Limits {
+                file_read,
+                file_tries,
+                ..Limits::DEFAULT
+            };
+            let a = run(&limits, true);
+            let b = run(&limits, false);
+            assert_eq!(a, b, "file_read {file_read}, file_tries {file_tries}");
+            reused += usize::from(a.0.as_ref().is_some_and(|s| s.complete));
+        }
+    }
+    assert!(reused > 0, "some searches complete");
+}
+
+/// The scan's events on `img` with the search's pruning on or off ([`UNPRUNED`]), and the tries its reassembly spent.
+fn events_and_tries(img: &[u8], unpruned: bool) -> (Vec<String>, u64) {
+    let guard = measure::record();
+    UNPRUNED.with(|u| u.set(unpruned));
+    let events = events_of(img);
+    UNPRUNED.with(|u| u.set(false));
+    let tries = measure::take().files.iter().map(|f| f.tries).sum();
+    drop(guard);
+    (events, tries)
+}
+
+/// Only the thread holding the measure's guard records: a scan with a reassembly step running on another thread meanwhile
+/// (as the unit tests run in parallel) adds nothing to what it measures (CI: another test's tries counted as pruned).
+#[test]
+fn the_measure_records_only_its_own_thread() {
+    let (card, _) = revenant_testkit::scattered_card(16 << 20, 32 << 10);
+    let guard = measure::record();
+    let other = std::thread::spawn(move || events_of(&card));
+    assert!(
+        other
+            .join()
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_with("Updated"))
+    );
+    let recorded = measure::take();
+    drop(guard);
+    assert!(
+        recorded.files.is_empty() && recorded.steps.is_empty(),
+        "another thread's step was recorded"
+    );
+}
+
+/// The work the search skips since the measure of part 1.6 (each candidate of a seam walked in turn, the evident ones
+/// descended into at once, without walking them twice; a reassembled JPEG settled on its first solution in pieces)
+/// changes no outcome where no budget is hit (the case here; under a hit budget the result may differ, never toward an
+/// `Intact` the whole search would not give): a small scattered card (files in pieces deleted on a computer) scanned
+/// with and without it gives the same events, with files put back in pieces, for fewer tries.
+#[test]
+fn pruned_search_changes_no_outcome() {
+    let (card, _) = revenant_testkit::scattered_card(16 << 20, 32 << 10);
+    let (pruned, fewer) = events_and_tries(&card, false);
+    let (unpruned, more) = events_and_tries(&card, true);
+    let in_pieces = pruned
+        .iter()
+        .filter(|e| e.starts_with("Updated") && e.contains("fragments: [Fragment"))
+        .count();
+    assert!(in_pieces >= 3, "{in_pieces} files put back in pieces");
+    assert!(pruned == unpruned, "the outcomes differ");
+    assert!(fewer < more, "{fewer} tries pruned, {more} not");
+}
+
+/// The reassembly's budgets and time (release only; prints numbers, `REVENANT_MEASURE_MIB` sets the size, 1024 by
+/// default): the hostile image of Task 4 grown to the size, the `scattered-card` bench image (where the step must give
+/// the same events with and without the pruning, [`UNPRUNED`]) and the `cut-jpeg` one (every cut photo a candidate whose
+/// rest is nowhere), and with `REVENANT_SAMPLES` each real sample in noise as `tests/real_samples.rs` scans it. The time
+/// bound of the hostile card lives here (Q8: not in the integration tests' wall clock): at most 10 s per GiB.
+#[test]
+#[ignore = "release-only measure: cargo test --release -p revenant-core --lib reassembly_budget_measure -- --ignored --nocapture"]
+fn reassembly_budget_measure() {
+    let mib: u64 = std::env::var("REVENANT_MEASURE_MIB").map_or(1024, |v| v.parse().expect("MiB"));
+    let len = mib << 20;
+    let gib = len as f64 / f64::from(1u32 << 30);
+    let (hostile, step) = measured_scan("hostile", hostile_image(len as usize));
+    assert!(!hostile.files.is_empty(), "the hostile photo is searched");
+    assert!(step <= 10.0 * gib, "hostile: {step:.2} s for {gib:.2} GiB");
+    let bench = |kind| {
+        let mut img = Vec::with_capacity(len as usize);
+        revenant_testkit::write_bench_image(kind, len, &mut img).expect("in memory");
+        img
+    };
+    let card = bench(revenant_testkit::BenchImage::ScatteredCard);
+    let (scattered, _) = measured_scan("scattered-card", card.clone());
+    assert!(
+        !scattered.files.is_empty(),
+        "the scattered card has candidates"
+    );
+    let pruned = events_of(&card);
+    UNPRUNED.with(|u| u.set(true));
+    let t = std::time::Instant::now();
+    let unpruned = events_of(&card);
+    UNPRUNED.with(|u| u.set(false));
+    println!(
+        "   unpruned scan {:.2} s; same events: {}",
+        t.elapsed().as_secs_f64(),
+        pruned == unpruned
+    );
+    assert!(
+        pruned == unpruned,
+        "the pruning changed the scattered card's outcome"
+    );
+    drop(card);
+    measured_scan("cut-jpeg", bench(revenant_testkit::BenchImage::CutJpeg));
+    // With the real samples at hand, each one in noise as `tests/real_samples.rs` scans it.
+    if let Some(dir) = std::env::var_os("REVENANT_SAMPLES") {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(dir);
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("samples dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file())
+            .collect();
+        names.sort();
+        for path in names {
+            let bytes = std::fs::read(&path).expect("sample");
+            let at = (1 << 20) + 512;
+            let mut img = vec![0u8; at];
+            SplitNoise(0x5A3).fill(&mut img);
+            img.extend_from_slice(&bytes);
+            let mut tail = vec![0u8; 1 << 20];
+            SplitNoise(0x5A4).fill(&mut tail);
+            img.extend_from_slice(&tail);
+            measured_scan(&path.file_name().unwrap().to_string_lossy(), img);
+        }
+    }
+}

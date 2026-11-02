@@ -69,12 +69,12 @@ enum Command {
         /// Scans per image; the best run is reported.
         #[arg(long, value_name = "N", default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
         runs: u32,
-        /// Images to measure: noise, dense-jpeg, dense-raw, video, cut-jpeg, exfat-card.
+        /// Images to measure: noise, dense-jpeg, dense-raw, video, cut-jpeg, exfat-card, scattered-card.
         #[arg(
             long,
             value_delimiter = ',',
             value_parser = parse_bench_image,
-            default_values = ["noise", "dense-jpeg", "dense-raw", "video", "cut-jpeg", "exfat-card"]
+            default_values = ["noise", "dense-jpeg", "dense-raw", "video", "cut-jpeg", "exfat-card", "scattered-card"]
         )]
         images: Vec<BenchImage>,
         /// Folder for the temporary images (default: the system temp dir).

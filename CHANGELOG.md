@@ -131,9 +131,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   earlier on the card than its start, even when the check of its contents never reads that sector. A photo written over part of a deleted RAW is found. Each
   volume found is reported at the start of the scan, with a flag when the listing hit one of its limits (some files may
   then lack their names); the file-system step can be turned off.
+- Photos split into three or more pieces on a card are put back together after the scan, from the card's free space,
+  never over a live file or another intact one; without file-system proof of their placement they are reported as
+  partial, never as intact (a near-identical photo of the same burst could have lent a piece).
+- Camera videos (MP4/MOV, H.264 and H.265) split into three or more pieces, their index (`moov`) written last away
+  from the rest, are put back together after the scan from the card's free space: the index says where every frame
+  must lie, and every frame is checked there. Such a video is intact only when every cut between two pieces lies close
+  enough to checked bytes that no other cut fits and nothing else on the card fits as well; otherwise it is partial
+  (videos with very large slices on small clusters, two copies of the index, or frames of one size around a cut).
+- Videos whose index comes first, whose media box has no size, fragmented MP4, and two copies of a video's start are
+  now put back together too: a video with its index first (in its first piece) or in fragments is checked frame by
+  frame where its index puts each frame, and is intact under the same rule; a fragmented one is intact only when its
+  recorded size (a deleted file's entry) or its closing index says where it ends and every cut lies inside one of its
+  fragments (a cut between fragments cannot be told from another clip's fragment of the same camera), else partial;
+  its fragments must follow each other in order. When two deleted videos
+  start with the same bytes and one index fits both, the one found first is put back and the copy is left as it was.
+- `revenant-dev bench` has a `scattered-card` image: a card a camera used for a long time (photos, RAWs and clips
+  deleted and shot again into the holes), at last deleted on a computer, so the scan puts its files in pieces back
+  together.
+- RAW photos (ARW first; CR2, NEF, DNG, ORF and RW2 the same way) split into pieces on a card are put back together
+  after the scan, from the card's free space: their structure, previews and, in lossless-compressed RAWs, each block of
+  the image are checked where the structure puts them. Most come back with their bytes in place but reported partial:
+  a cut inside the image data of an uncompressed or lossy RAW cannot be checked at all, and a cut inside a lossless
+  block, a preview or anywhere else is placed by its content but never proven. A RAW is intact only when every cut lies
+  exactly between two whole lossless blocks that end where the structure says (and whose size is their own data's, not
+  padding), and nothing else on the card fits.
+- Deleted photos and videos in pieces on FAT and exFAT cards come back in place, with their name, folder, dates and
+  recorded size (the pieces must add up to it): a camera's delete on FAT, or a computer's on exFAT, leaves only the
+  first cluster and the size, and the rest is found by content; a video is intact when its frames prove every cut, a
+  photo placed by its content alone stays partial. On exFAT a camera's delete keeps the cluster chain: a deleted photo
+  or video comes back intact through it when the chain is whole, nothing on the card shows it was overwritten (no other
+  file's record, of any kind, claims its clusters, and no file found on the card runs into them) and every check of its
+  contents passes; otherwise the chain is the first placement tried. A RAW's uncompressed or lossy image data cannot be
+  checked and is trusted to the chain: data written over it that left no record, no file start and no file found (old
+  noise) is not detected.
 
 ### Changed
 
+- A new file-system placement, `old_chain` (`revenant-dev`'s `placement` key): a deleted exFAT file placed and proven by
+  the cluster chain it left. A chain that cannot prove it is reported `guessed`.
+- A deleted RAW whose exFAT chain survives whole in two or more pieces is no longer reported intact from the bytes that
+  follow its first piece (its image data cannot be checked): it is partial unless the chain proves it. When the chain
+  no longer reads whole (another file rewrote part of it in the FAT), the RAW falls back to the guess of one run of free
+  clusters, which can still come out intact with the wrong image data (a known limit of deleted RAWs, as on FAT).
+- Sessions saved by an earlier version can no longer be resumed: scan the card again.
 - Extraction from a whole card or disk refuses a destination on any volume of that device (also an APFS volume whose
   container lives on it), and a destination whose disks cannot be determined (a network folder), so nothing is ever
   written to the card being recovered.
@@ -173,6 +214,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- On a FAT32 card with many deleted files whose cluster number Windows half-erased, looking for the missing half can
+  no longer use up the whole search budget: half of it stays for the other deleted files, and the scan says when the
+  lookups were cut short.
+- An old deleted photo's entry whose spot on the card a newer, shorter photo took (the camera reusing the old entries'
+  slots, the newer entry gone since) gave the newer photo's bytes, plus the empty rest of the space, under the old name
+  and size, reported intact; also when the newer photo had taken the old one's exact pieces in the same order (as a
+  camera filling the freed space does), when the newer photo carried an extra image after it (the preview most cameras
+  append) and when the newer file was a video whose media size says "to the end of the file". The photo found there
+  now comes out on its own, without the old name, and is never reported intact unless its own bytes prove it. A
+  deleted file overwritten by another of exactly the same size (the same camera's uncompressed RAWs, or Sony RAWs
+  padded to the same block) still cannot be told apart: the file comes out whole and exact, but under the older
+  file's name and dates. A RAW that the camera pads with zeros to its usual block (as Sony does) is not mistaken for
+  this: it keeps its name, and a deleted RAW in pieces whose old chain checks out keeps coming back intact.
+- A whole photo or video that a camera wrote over the first piece of an older deleted file, running past it, was never
+  offered: the old entry's name kept the spot. A JPEG or a video whose frames all check out now comes out on its own,
+  without the old name. A RAW, a HEIC or a video whose frames are not checked (ProRes) written that way still does not
+  (nothing checks its data past that piece, so it is never reported intact there), and an older entry whose own bytes
+  end early with other data after them, in the pieces its own record gives, no longer passes that data off under its
+  name.
+- A deleted video's entry over another, shorter clip that the scan put back together from its pieces gave that clip,
+  exact, under the old entry's name, reported intact, though its length was not the entry's. A file put back together
+  whose length is not its entry's now comes out without the name, and at most partial.
+- A deleted video in pieces whose place the card's file system already gave right (only other files between its
+  pieces) came back with its exact bytes but only partial, and one whose piece ran into an old deleted entry's spot
+  could not be put back at all: both now come back intact when every frame checks out across the seams.
+- Two deleted files that once started at the same place on a card, with the same date and time (a camera whose clock
+  was never set, or a photo deleted and re-shot within two seconds), could give one photo's bytes, plus the leftover
+  bytes after them, under the other's name and size, reported intact. Neither name is given now: the photo found there
+  comes out on its own, without a name.
+- A lossless-compressed RAW (ARW, DNG) whose image blocks after its first piece were another file's (a burst
+  neighbour written right after it) was reported intact: every lossless block must now end where the structure says, or
+  the RAW is partial (and put back together when the rest of it is found).
+- A video whose index comes before its frames (`moov` first, or fragmented MP4) with other data written over part of
+  its frames was reported intact: such a video is now intact only when every frame it lists checks out in place and,
+  when fragmented, its fragments follow each other in order, else partial (and put back together when the rest of it
+  is found).
+- A video in three pieces whose middle piece is tiny (a few frames placed elsewhere) is no longer put back together as
+  two pieces and called intact: the pairing of a video with its index now checks every frame, not 32 of them per side.
 - A complete HEIC photo followed by an unreadable sector, or by a stray `moov` box, is now intact and stays a HEIC (it was
   partial, or taken for a video).
 - An MP4 video that lists a HEIC brand and lost its `moov` index is now reported as a damaged MP4, not a damaged HEIC.

@@ -847,3 +847,12 @@ fn a_search_reads_at_most_its_window_and_its_budget() {
         read / MIB as u64
     );
 }
+
+#[test]
+fn burst_photos_are_intact_alone() {
+    for j in testkit::jpeg_burst(512, 384, 7, 3) {
+        let img = DiskImage::zeros(j.len()).put(0, &j).save();
+        let m = measure(&img, 0).unwrap();
+        assert_eq!((m.len, m.health), (j.len() as u64, Health::Intact));
+    }
+}

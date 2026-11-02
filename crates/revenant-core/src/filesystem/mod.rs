@@ -56,6 +56,8 @@ pub(crate) const MAX_WALKED_CLUSTERS: u32 = 1 << 28;
 /// Cluster examinations per volume shared by the deleted-file guesses (ruling C7); once spent, the volume's remaining
 /// deleted files are not listed.
 pub(crate) const MAX_GUESS_STEPS: u64 = 1 << 26;
+/// Steps of the guess budget the FAT32 high-word checks (ruling D10) may spend; the rest stays for the placements.
+pub(crate) const MAX_HIGH_WORD_STEPS: u64 = MAX_GUESS_STEPS / 2;
 /// Most old-directory candidates the scan keeps (ruling D11; 16 B each), the first ones in commit order.
 pub(crate) const MAX_ORPHAN_DIRS: usize = 65_536;
 /// Head checks of 512 bytes through the [`Probe`] per listing (ruling D10/C2): 32 MiB read outside the cache at most.
@@ -76,6 +78,7 @@ pub(crate) struct Limits {
     pub path_bytes: usize,
     pub path_budget: usize,
     pub guess_steps: u64,
+    pub high_word_steps: u64,
     pub probes: usize,
 }
 
@@ -92,6 +95,7 @@ impl Limits {
         path_bytes: MAX_PATH_BYTES,
         path_budget: MAX_PATH_BUDGET,
         guess_steps: MAX_GUESS_STEPS,
+        high_word_steps: MAX_HIGH_WORD_STEPS,
         probes: MAX_PROBES,
     };
 }

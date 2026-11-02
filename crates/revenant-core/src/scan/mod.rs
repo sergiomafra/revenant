@@ -4,6 +4,7 @@
 
 mod fs;
 mod pipeline;
+pub(crate) use pipeline::moov_head;
 mod state;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -20,8 +21,9 @@ use crate::filesystem::{
 };
 use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
 use crate::rate::RateMeter;
+use crate::reassemble;
 use crate::source::Source;
-use fs::{FsJobResult, FsPlan, merge, tail_fits};
+use fs::{FsJobResult, FsPlan, Padded, merge, padded_rule, tail_fits};
 use pipeline::{Block, CloseQueue, Finders, Head, Measured, Outcome, Shared};
 pub(crate) use state::{Checkpoint, Resume, ScanState};
 
@@ -105,7 +107,9 @@ const MAX_THREADS: usize = 64;
 /// findings without origin on a cluster grid they may name (≈ 64 B each, at most 262,144), plus the file-system listing: up to 262,144 files and 2^20
 /// pieces, ≈ 355 MiB kept for the whole scan in the worst case at those caps, with a peak of ≈ 640 MiB while it is read
 /// (on exFAT, plus the allocation bitmap, ≤ 32 MiB, and the root entries waiting for it, ≤ 68 MiB; core README), and,
-/// after the scan, the pairing step's one `moov` and its sample lists (up to about 128 MiB). So with
+/// after the scan, the pairing step's one `moov` and its sample lists (up to about 128 MiB), plus the reassembly's
+/// candidates (at most 4096 findings) and the ranges of the `Intact` findings (at most 2^18 runs, about 16 MiB), and
+/// during the reassembly step one file's search (its prefilter memo, at most 2^16 answers, and the JPEG's DC rows). So with
 /// the defaults on a 16-thread machine, about 256 MiB + 17 × 5 MiB + 512 MiB, plus the measurements' own buffers.
 pub struct ScanOptions {
     /// Granularity of candidate starts and of unreadable-region handling, in bytes. Above 512, the detectors see a sector that
@@ -219,7 +223,8 @@ pub enum Event {
     },
     /// A better version of a finding already reported: it replaces the earlier `Found` with the same `id`. Emitted after
     /// every `Found`, before `scan` returns, one per id in id order (today: a video put back together with its separated
-    /// `moov`, and a finding an old folder of a quick-formatted card names, ruling D11; both merged into one).
+    /// `moov`, a photo put back together from three or more pieces by the reassembly step, and a finding an old folder
+    /// of a quick-formatted card names, ruling D11; all merged into one).
     Updated(Finding),
     /// Once per scan (ruling D20), right after the `Progress` of the first block boundary where the `Unreadable` events
     /// emitted so far reach [`FAILING_RUNS`] runs or [`FAILING_BYTES`] bytes: the disk is failing, make a copy first.
@@ -368,6 +373,18 @@ struct Commit<'a, 's> {
     carved: Vec<Carved>,
     /// A cap dropped old-directory candidates or carved findings: some names may be missing (ruling R7).
     orphans_capped: bool,
+    /// Reassembly candidates (ruling D2), in id order, at most [`reassemble::MAX_CANDIDATES`].
+    frags: Vec<Finding>,
+    /// A candidate was dropped by that cap: no reassembly is `Intact`.
+    frags_capped: bool,
+    /// The ranges of every `Intact` finding emitted (ruling D3), at most [`reassemble::MAX_CLAIMED_RUNS`] runs.
+    claimed: Runs,
+    /// A range was dropped by that cap: no reassembly is `Intact` (ruling D18).
+    claimed_capped: bool,
+    /// The ids, ascending, of the findings reported as a deleted entry's pieces without its name ([`Padded::Unnamed`]):
+    /// at most `Partial` to the end of the scan, whatever the pairing or the reassembly make of them (ruling Q55 (2)).
+    /// One per kept file at most, so within the listing's [`MAX_FILES`].
+    unnamed: Vec<u64>,
 }
 
 #[cfg(test)]
@@ -433,8 +450,23 @@ impl Commit<'_, '_> {
         Ok(())
     }
 
-    fn emit_found(&mut self, p: Pending) -> Result<(), EngineError> {
+    fn emit_found(&mut self, mut p: Pending) -> Result<(), EngineError> {
         self.summary.found += 1;
+        // D14, Q49: a file proven by its old exFAT chain shares no byte with another finding, of any health (one wholly
+        // inside its pieces is its own file: another file starting there would have kept the chain from proving it).
+        // Every finding starting before its end is known by now.
+        if p.finding.health == Health::Intact
+            && p.finding
+                .origin
+                .as_ref()
+                .is_some_and(|o| o.placement == Placement::OldChain)
+            && self.shares_bytes(&p.ranges)
+        {
+            p.finding.health = Health::Partial;
+            if let Some(o) = p.finding.origin.as_mut() {
+                o.placement = Placement::Guessed;
+            }
+        }
         let f = &p.finding;
         if f.origin.is_none()
             && self.grids.iter().any(|&(heap, cluster, end)| {
@@ -461,7 +493,76 @@ impl Commit<'_, '_> {
                 self.capped = true;
             }
         }
+        // The reassembly's accounting (rulings D2, D3, D18): one push per candidate, the ranges of an `Intact` one.
+        if f.health == Health::Intact {
+            for r in &p.ranges {
+                let end = r.start.saturating_add(r.len);
+                if !self.claimed.add(r.start, end, reassemble::MAX_CLAIMED_RUNS) {
+                    self.claimed_capped = true;
+                }
+            }
+        }
+        if reassemble::is_candidate(f) {
+            if self.frags.len() < reassemble::MAX_CANDIDATES {
+                self.frags.push(f.clone());
+            } else {
+                self.frags_capped = true;
+            }
+        }
         self.emit(Event::Found(p.finding))
+    }
+
+    /// Whether a byte of `ranges` (a pending finding's, disjoint) belongs to another finding of any health (ruling Q49):
+    /// an `Intact` one emitted (the claimed ranges; any when some were dropped by their cap), one emitted without origin
+    /// on a cluster grid (the old-directory list, any when it is full), or one still pending; other than one lying
+    /// wholly inside `ranges` (the file's own embedded file). Not seen: an emitted finding off every cluster grid or of a
+    /// listed file (whose entry is a claim of the listing, D14).
+    fn shares_bytes(&self, ranges: &[Fragment]) -> bool {
+        let inside = |s: u64, e: u64| {
+            ranges
+                .iter()
+                .any(|r| r.start <= s && e <= r.start.saturating_add(r.len))
+        };
+        let crossed = |s: u64, e: u64| {
+            ranges
+                .iter()
+                .any(|r| s < r.start.saturating_add(r.len) && r.start < e)
+                && !inside(s, e)
+        };
+        let crosses = |pieces: &[Fragment]| {
+            pieces
+                .iter()
+                .any(|x| crossed(x.start, x.start.saturating_add(x.len)))
+        };
+        if self.claimed_capped || self.carved.len() >= MAX_FILES {
+            return true;
+        }
+        for r in ranges {
+            let end = r.start.saturating_add(r.len);
+            let mut pos = r.start;
+            while let Some((s, e)) = self.claimed.first_ending_after(pos) {
+                if s >= end {
+                    break;
+                }
+                if !inside(s, e) {
+                    return true;
+                }
+                pos = e;
+            }
+        }
+        let end = ranges
+            .iter()
+            .map(|r| r.start.saturating_add(r.len))
+            .max()
+            .unwrap_or(0);
+        self.carved
+            .iter()
+            .take_while(|c| c.start < end)
+            .any(|c| crosses(&self::ranges(c.start, c.len, &c.fragments)))
+            || self
+                .pending
+                .iter()
+                .any(|q| q.ranges.as_slice() != ranges && crosses(&q.ranges))
     }
 
     /// Keeps the `moov` candidates of a block just examined (each header ends in it, so every finding that could hold
@@ -516,11 +617,13 @@ impl Commit<'_, '_> {
         }
     }
 
-    /// After the scan: pairs `Damaged` moov-less videos with orphan `moov`s; returns each video put back together.
-    fn pair(&mut self) -> Result<Vec<Finding>, EngineError> {
+    /// After the scan: pairs `Damaged` moov-less videos with orphan `moov`s; returns each video put back together, and
+    /// what the pairing left of its `moov` load and sample budgets (the reassembly step's videos spend the rest).
+    fn pair(&mut self) -> Result<(Vec<Finding>, crate::pairing::Budget), EngineError> {
         let mut out = Vec::new();
+        let mut budget = crate::pairing::Budget::new();
         if self.videos.is_empty() || self.moovs.is_empty() {
-            return Ok(out);
+            return Ok((out, budget));
         }
         let cancel = self.shared.cancel;
         let paired = crate::pairing::pair_videos(
@@ -530,6 +633,7 @@ impl Commit<'_, '_> {
             &self.starts,
             &self.grids,
             cancel,
+            &mut budget,
         );
         if cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
@@ -541,19 +645,95 @@ impl Commit<'_, '_> {
             if !ok {
                 continue;
             }
-            if self.capped && f.health == Health::Intact {
+            if (self.capped || self.unnamed.binary_search(&f.id).is_ok())
+                && f.health == Health::Intact
+            {
                 f.health = Health::Partial;
             }
+            self.name_only_at_size(&mut f);
             out.push(f);
+        }
+        Ok((out, budget))
+    }
+
+    /// After the pairing: the reassembly step (part 1.6), over the candidates kept, the ranges claimed and the pairing's
+    /// results; returns each finding it improves. `Cancelled` when cancelled, `DeviceGone` when the source vanished
+    /// meanwhile (what it read then may be wrong).
+    fn reassemble(
+        &mut self,
+        paired: &[Finding],
+        moov_budget: crate::pairing::Budget,
+    ) -> Result<Vec<Finding>, EngineError> {
+        if self.frags.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cancel = self.shared.cancel;
+        let ctx = reassemble::Context {
+            grids: &self.grids,
+            live: &self.shared.fs.live,
+            claimed: &self.claimed,
+            starts: &self.starts,
+            moovs: &self.moovs,
+            capped: self.capped,
+            frags_capped: self.frags_capped,
+            claimed_capped: self.claimed_capped,
+            unnamed: &self.unnamed,
+            // Only the listing's flag so far (the old folders come after): live clusters may be unknown (ruling Q5).
+            listing_truncated: self.summary.listing_truncated,
+            moov_budget,
+            limits: &reassemble::Limits::DEFAULT,
+        };
+        let out = reassemble::reassemble(&self.shared.cache, &self.frags, paired, &ctx, cancel);
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        self.shared.check()?;
+        let mut out: Vec<Finding> = out
+            .into_iter()
+            .filter(|f| {
+                // A reassembly bug: caught in debug builds, ignored (no event) in release.
+                let ok = pieces_ok(f.start, f.len, &f.fragments, self.shared.total);
+                debug_assert!(ok, "pieces contract broken by the reassembly: {f:?}");
+                ok
+            })
+            .collect();
+        for f in &mut out {
+            self.name_only_at_size(f);
         }
         Ok(out)
     }
 
-    /// After the pairing: the names the old directories give (ruling D11), merged with the pairing's updates, then one
-    /// `Updated` per id, in id order. A finding named by an entry of another recorded size is at most `Partial` when it
-    /// is longer, or when what follows it up to that size (contiguous) is neither padding nor whole files (ruling D6).
-    fn update(&mut self, paired: Vec<Finding>) -> Result<(), EngineError> {
+    /// Ruling Q57: a pairing or reassembly result of a deleted entry whose length is not the entry's recorded size
+    /// (outside a TIFF RAW's own grain padding, Q54 (b)) is another file than the entry: it carries no name, and is at
+    /// most `Partial` to the end of the scan like any finding reported without its entry's name (Q55 (2)).
+    fn name_only_at_size(&mut self, f: &mut Finding) {
+        let Some(o) = &f.origin else {
+            return;
+        };
+        if o.state != FsState::Deleted || f.len == o.size || fs::raw_padding(f.kind, f.len, o.size)
+        {
+            return;
+        }
+        f.origin = None;
+        if f.health == Health::Intact {
+            f.health = Health::Partial;
+        }
+        if let Err(k) = self.unnamed.binary_search(&f.id) {
+            self.unnamed.insert(k, f.id);
+        }
+    }
+
+    /// After the pairing and the reassembly: the names the old directories give (ruling D11), merged with the pairing's
+    /// and the reassembly's updates (the reassembly's wins for an id both give), then one `Updated` per id, in id order.
+    /// A finding named by an entry of another recorded size is at most `Partial` when it is longer, or when what follows
+    /// it up to that size (contiguous) is neither padding nor whole files (ruling D6).
+    fn update(
+        &mut self,
+        paired: Vec<Finding>,
+        reassembled: Vec<Finding>,
+    ) -> Result<(), EngineError> {
         let mut out: BTreeMap<u64, Finding> = paired.into_iter().map(|f| (f.id, f)).collect();
+        out.extend(reassembled.into_iter().map(|f| (f.id, f)));
         let cancel = self.shared.cancel;
         if !self.dirs.is_empty() && !self.carved.is_empty() {
             let wanted: Vec<(u64, u8)> = self
@@ -650,15 +830,36 @@ impl Commit<'_, '_> {
                 let carved = (!bad && !self.shared.skipped(at))
                     .then_some(r.carved.as_ref())
                     .flatten();
-                let m = merge(&self.shared.fs.kept[k], &r.view, carved);
-                let own = r.own_of(&m);
-                let measurement = Measurement {
-                    len: m.len,
-                    kind: m.kind,
-                    health: m.health,
-                    fragments: m.fragments,
-                };
-                self.add(at, measurement, Some(m.origin), own);
+                let rule = padded_rule(&self.shared.fs.kept[k], &r.view, carved);
+                if let (Padded::Carving, Some(c)) = (rule, carved) {
+                    // Rulings Q53/Q54: the carving, without the entry's name.
+                    let c = c.clone();
+                    self.add(at, c, None, r.carved_own, true);
+                } else {
+                    let m = merge(&self.shared.fs.kept[k], &r.view, carved);
+                    // A file start only where a format recognizes a head: an old entry over clusters another file took
+                    // since is reported, but it is no start that stops a piece (ruling Q52).
+                    let head = r.view.m.is_some() || carved.is_some();
+                    let own = r.own_of(&m);
+                    let mut measurement = Measurement {
+                        len: m.len,
+                        kind: m.kind,
+                        health: m.health,
+                        fragments: m.fragments,
+                    };
+                    // Q54/Q55: the entry's pieces stay, but not its name (`merge` already left it at most `Partial`),
+                    // and nothing after makes it `Intact`.
+                    let unnamed = rule == Padded::Unnamed;
+                    let origin = (!unnamed).then_some(m.origin);
+                    if unnamed && measurement.health == Health::Intact {
+                        measurement.health = Health::Partial;
+                    }
+                    let id = self.next_id;
+                    self.add(at, measurement, origin, own, head);
+                    if unnamed && self.next_id > id {
+                        self.unnamed.push(id);
+                    }
+                }
             }
             if bad {
                 match &mut self.run {
@@ -718,7 +919,7 @@ impl Commit<'_, '_> {
                             self.skip(&ranges(at, m.len, &m.fragments));
                         }
                     }
-                    Some(Measured { m, own }) => self.add(at, m, None, own),
+                    Some(Measured { m, own }) => self.add(at, m, None, own, true),
                     None => {}
                 }
             }
@@ -813,8 +1014,16 @@ impl Commit<'_, '_> {
     /// origin is not a live file and whose ranges overlap a live file is at most `Partial` (ruling D7), and so is one
     /// with a known unreadable sector in a piece below `at`. A `Partial` one
     /// keeps the starts of its `own` files after `at` (sector-aligned ones: no head is examined elsewhere) with its
-    /// ranges, so a carved file found there inside it is not reported (ruling D12).
-    fn add(&mut self, at: u64, mut m: Measurement, origin: Option<FsOrigin>, own: Vec<Fragment>) {
+    /// ranges, so a carved file found there inside it is not reported (ruling D12). Its start counts among the finding
+    /// starts (the pairing's and the reassembly's) only when `head`: a format recognized a head there.
+    fn add(
+        &mut self,
+        at: u64,
+        mut m: Measurement,
+        origin: Option<FsOrigin>,
+        own: Vec<Fragment>,
+        head: bool,
+    ) {
         if m.len == 0 {
             return;
         }
@@ -884,7 +1093,9 @@ impl Commit<'_, '_> {
                 self.own_len += 1;
             }
         }
-        self.starts.push(at);
+        if head {
+            self.starts.push(at);
+        }
         let finding = Finding {
             id: self.next_id,
             start: at,
@@ -927,23 +1138,33 @@ impl Commit<'_, '_> {
 /// first piece ends where another file starts, and a file starting inside its second piece makes it at most
 /// `Partial`; a live file's video is no candidate, and on a volume's cluster grid the break points on the grid are
 /// tried first, ruling D13): each video put back together is emitted as an
-/// [`Event::Updated`] with the same id and 2 pieces, then `scan` returns. An orphan `moov` candidate is a box start whose
+/// [`Event::Updated`] with the same id and 2 pieces. An orphan `moov` candidate is a box start whose
 /// first 16 bytes are a size in `[24, MOOV_MAX_LEN + 8]`, `moov`, any 4 bytes and `mvhd`, found in every block the scan
 /// reads; one whose header overlaps a committed skip range (those blocks may not be read at all) or lies inside a
 /// non-`Damaged` MP4/MOV/CR3/HEIC finding is dropped.
+///
+/// Then the reassembly step (part 1.6, see `reassemble` and the core README, "The reassembly step"): the candidates kept
+/// as findings are emitted (ruling D2: a JPEG not `Intact` with a first piece of at least 16 KiB, videos, `Partial` RAWs
+/// and deleted files' `Partial` photos and videos; never a live file's; at most 4096) are searched one by one in id
+/// order over the free units (not live, not claimed by an `Intact` finding emitted, by the pairing or by an earlier
+/// reassembly), JPEGs and moov-less videos with a fitting orphan `moov` so far (the videos within what the pairing left
+/// of its `moov` budgets). A result that improves its finding comes out as an `Updated` with the same id, merged with
+/// the pairing's and the old folders' (the reassembly's pieces win). It is `Intact` only under the rule of
+/// `reassemble::health` (a JPEG in two or more pieces placed by content alone never is, ruling Q37).
 ///
 /// After a quick format (ruling D11): every block read is also searched for old directories at the cluster starts of
 /// each volume (a FAT `.`/`..` pair, an exFAT entry set), not inside a live range, a walked directory or (head
 /// included) a committed skip range; at most 65,536. After the pairing they are parsed, and each file entry names the
 /// finding without origin that starts at its first cluster with its kind: that finding comes out as an `Updated` with
 /// `origin { state: Orphaned, placement: Carved, .. }` (folder `?` where the old root's name is lost), at most
-/// `Partial` when its recorded size disagrees (ruling D6). One `Updated` per id, pairing and naming merged, in id order.
+/// `Partial` when its recorded size disagrees (ruling D6). One `Updated` per id, pairing, reassembly and naming merged,
+/// in id order.
 /// See the core README ("File systems: after a quick format").
 ///
 /// The scan and every `measure` read through one [`CachedSource`] of `opts.cache_bytes`, so each sector is read from
 /// `source` once and a sector found unreadable is never read again (the pairing step reads the samples it checks and
-/// the `moov`s it loads again, through the same cache). A block wholly inside an `Intact` finding whose bytes
-/// have all gone through the cache already (read by `measure`) is not read again: its unreadable sectors come from the
+/// the `moov`s it loads again, the reassembly step the pieces it tries, through the same cache). A block wholly inside
+/// an `Intact` finding whose bytes have all gone through the cache already (read by `measure`) is not read again: its unreadable sectors come from the
 /// cache's bad map.
 ///
 /// File systems (`opts.filesystems`, ruling D1): before the first block the FAT/exFAT listing is read (metadata through
@@ -959,7 +1180,7 @@ impl Commit<'_, '_> {
 /// `opts.sector` is raised to at least 16 (the head length) and `opts.block` rounded down to whole sectors, so a head
 /// never straddles two blocks. Cancellation is checked before each block examined or read ahead, before and after
 /// every event (a boundary's `Progress`, `DiskFailing` and `Rate` count as one: checked before and after the group),
-/// while waiting for a measurement and during the pairing step: once it is seen no further event is emitted, the measuring threads drop their remaining jobs, and the scan returns `Err(Cancelled)` after they have all
+/// while waiting for a measurement and during the pairing and reassembly steps: once it is seen no further event is emitted, the measuring threads drop their remaining jobs, and the scan returns `Err(Cancelled)` after they have all
 /// stopped; findings still pending and `Updated` events not yet emitted are dropped. The cache also checks it before each
 /// window load and each sector of a sector-by-sector resolution (ruling D3), so a running measurement ends quickly.
 ///
@@ -982,14 +1203,15 @@ pub(crate) type Hook<'h> = &'h mut dyn FnMut(Checkpoint) -> Result<(), EngineErr
 
 /// [`scan`], resumable (ruling D22). `hook` is called at each [`Checkpoint`]: once with the listing (only after a fresh
 /// listing, and only when it was not read during a cancel or after the source vanished: then the scan returns that error
-/// without calling it, ruling P3), at every block boundary, and after the pairing step.
+/// without calling it, ruling P3), at every block boundary, and after the pairing and reassembly steps.
 ///
 /// With `resume`, nothing before `state.position()` is examined again and the listing is not read (ruling D23): the
 /// scan rebuilds what it keeps of the listing from `resume.listing`, emits no `Volume`, and its events continue exactly
 /// after the first `state.events()` events of the scan the state was saved from. For a source that answers the same
 /// every time, those are the events the uninterrupted scan emitted after that point, for any `threads` and
 /// `cache_bytes`. What a resume reads again (ruling D24): the blocks the saved scan had read ahead, the pieces before
-/// the position of file-system files starting after it, and what the pairing loads; never a sector the state's bad
+/// the position of file-system files starting after it, and what the pairing and the reassembly read; never a sector
+/// the state's bad
 /// map holds. A state that cannot belong to this scan (a position past the end or off a block boundary, runs out of
 /// order, a cap passed) gives `SessionCorrupt`.
 pub(crate) fn scan_with(
@@ -1087,6 +1309,11 @@ pub(crate) fn scan_with(
             dirs: Vec::new(),
             carved: Vec::new(),
             orphans_capped: false,
+            frags: Vec::new(),
+            frags_capped: false,
+            claimed: Runs::default(),
+            claimed_capped: false,
+            unnamed: Vec::new(),
         };
         let mut finders = Finders {
             orphan: (!volumes.is_empty()).then(|| OrphanFinder::new(&volumes)),
@@ -1174,9 +1401,10 @@ pub(crate) fn scan_with(
                 })?;
             }
         }
-        let paired = commit.pair()?;
+        let (paired, moov_budget) = commit.pair()?;
+        let reassembled = commit.reassemble(&paired, moov_budget)?;
         if let Some(h) = hook.as_mut() {
-            // A source gone during the pairing: the last boundary stays the point to resume from.
+            // A source gone during the pairing or the reassembly: the last boundary stays the point to resume from.
             shared.check()?;
             let state = || state::capture(&commit, &shared, &ahead, &finders, shape, total);
             h(Checkpoint::Paired {
@@ -1184,7 +1412,7 @@ pub(crate) fn scan_with(
                 state: &state,
             })?;
         }
-        commit.update(paired)?;
+        commit.update(paired, reassembled)?;
         // The pairing and the old directories read through the cache too: a source gone then may have changed them.
         shared.check()?;
         Ok(commit.summary)

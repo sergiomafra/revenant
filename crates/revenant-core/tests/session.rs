@@ -666,13 +666,20 @@ fn a_damaged_or_newer_manifest_is_refused() {
     new_session(&source, dir.path(), &opts(1));
     let manifest = dir.path().join("session.rvs");
     let good = std::fs::read(&manifest).unwrap();
+    // A session saved by part 1.5 (format version 1) is refused like any other version (ruling Q10).
+    for version in [1u16, 3] {
+        let mut other = good.clone();
+        other[9..11].copy_from_slice(&version.to_le_bytes());
+        std::fs::write(&manifest, &other).unwrap();
+        assert_eq!(
+            Session::open(dir.path()).unwrap_err().code(),
+            "session_version",
+            "version {version}"
+        );
+    }
     let mut newer = good.clone();
-    newer[9] = 2;
+    newer[9] = 3;
     std::fs::write(&manifest, &newer).unwrap();
-    assert_eq!(
-        Session::open(dir.path()).unwrap_err().code(),
-        "session_version"
-    );
     assert_eq!(
         check_session(dir.path(), &identity(&source))
             .unwrap_err()

@@ -34,7 +34,7 @@ const MAX_COVERAGE_RUNS: usize = 1 << 16;
 pub(crate) type RunList = Vec<(u64, u64)>;
 
 /// Merged, non-overlapping, non-adjacent half-open runs `start -> end`.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct Runs(BTreeMap<u64, u64>);
 
 impl Runs {
@@ -102,6 +102,19 @@ impl Runs {
 
     pub(crate) fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// The run holding `pos`, else the first run starting after it, as `(start, end)`.
+    pub(crate) fn first_ending_after(&self, pos: u64) -> Option<(u64, u64)> {
+        if let Some((&s, &e)) = self.0.range(..=pos).next_back()
+            && e > pos
+        {
+            return Some((s, e));
+        }
+        self.0
+            .range((std::ops::Bound::Excluded(pos), std::ops::Bound::Unbounded))
+            .next()
+            .map(|(&s, &e)| (s, e))
     }
 
     /// The runs as `(start, end)`, ascending.
