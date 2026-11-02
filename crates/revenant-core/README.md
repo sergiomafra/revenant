@@ -1487,7 +1487,7 @@ heads through a `Probe` over the raw source (see Deleted files); `read` uses the
   cap, a folder dropped by the path cap or budget, a volume whose contested set overflowed, a directory not entered for
   the directory or depth cap, entries not read for the entry cap or a directory chain running past 2 MiB, a volume
   too large to walk, deleted files not listed because the volume's guess steps or the listing's high-word probes ran
-  out, or deleted folders not walked because 65,536 were already waiting.
+  out, the high-word phase reaching its half of the guess budget, or deleted folders not walked because 65,536 were already waiting.
 
 The walk:
 
@@ -1576,11 +1576,12 @@ the deleted photos/videos wait, never more than the photo slots left (a later li
   high-word candidates, then the files) costs one step of 2^26; once spent, the volume's remaining deleted files are
   not listed and no further deleted folder is read (in that order, each in walk order). The allocation is read a FAT
   block at a time, so 2^26 steps of guessing take well under a second; FAT32 high-word lookups are dearer per step,
-  and a hostile volume that spends the whole budget on them took about 10 s on the development Mac, now capped at half (a real card asks
-  a few of them per deleted file). The high-word phase may spend at most half of the budget (2^25 steps, the
-  crate-internal `Limits::high_word_steps`): a round of lookups that would pass it ends the phase, the questions still
-  open stay unanswered (those files are not listed), the listing is marked truncated, and the other half stays for the
-  placements, so a hostile FAT32 volume cannot starve the files whose high word is intact.
+  spending the whole budget on them takes about 10 s on the development Mac, so the cap bounds that to about half (a
+  real card asks a few of them per deleted file). The high-word phase spends at most half of the budget (2^25 steps, the crate-internal
+  `Limits::high_word_steps`), counted over its rounds: a round of lookups that would pass it ends the phase, the
+  questions still open stay unanswered (those files are not listed) and the listing is truncated. The other half stays
+  for the placements, so a hostile FAT32 volume cannot starve the files whose high word is intact. A truncated listing
+  keeps every reassembled file out of `Intact` and no old chain counts as proof, since live clusters may be unknown.
 
 Bounds (each lowerable in unit tests): per volume at most 65,536 directories, 4,000,000 directory entries (every
 32-byte slot read counts, the end marker included), depth 32 (the root is 0), 2 MiB per directory, 65,536 contested

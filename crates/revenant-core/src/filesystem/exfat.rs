@@ -1432,8 +1432,7 @@ mod tests {
         assert!(p.trusted);
         let at = |c: u32| 8192 * 512 + b.cluster_offset(c);
         assert!(covers(&l.live, at(jpg[0])));
-        let t = l.files.iter().find(|f| f.origin.name() == "A.TXT");
-        assert!(t.is_none_or(|t| t.trusted == covers(&l.live, at(txt[0]))));
+        assert!(covers(&l.live, at(txt[0])), "the TXT range is live");
     }
 
     #[test]
