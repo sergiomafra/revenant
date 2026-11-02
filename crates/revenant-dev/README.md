@@ -132,7 +132,9 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
   in `id` order. Today: a file found by its signature on a quick-formatted card that an old folder names (the same line
   with its `name`, `path` such as `?/100MSDCF/DSC01234.JPG`, `state` `orphaned` and `placement` `carved`), and a
   camera video whose index (`moov`) ended up elsewhere on the card, found `damaged` and then put back together from its
-  two pieces (both in one line when both apply):
+  two pieces, and a photo, RAW or video put back together from its pieces by the reassembly after the scan (its
+  `fragments`, `len` and `health`; `partial` unless every cut is proven, see "Reassembly" in the core README). All of
+  these come in one line per `id` when several apply:
 
   ```json
   {"event":"found","id":1,"start":1048576,"len":55090,"kind":"mp4","health":"damaged"}

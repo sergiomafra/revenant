@@ -9,9 +9,17 @@ preview of what can be recovered before you commit, and it never writes to the c
 Under construction. There is no app to download yet. The recovery engine (`revenant-core`) can already find JPEG photos,
 MP4/MOV videos and camera RAW photos (CR2, CR3, NEF, ARW, RAF, DNG, ORF, RW2) and HEIC in a disk image (including
 formatted cards), classify them as intact, partial or damaged, read their photo details (camera, lens, ISO, capture
-time) and embedded preview, and recover them to another folder. It puts back together a JPEG photo split in two pieces
-on the card and a camera video whose index (`moov`) ended up away from its frames. It reads each sector of the card once
-(putting a broken photo or video back together may read parts of it again: up to a 64 MiB window per photo), never
+time) and embedded preview, and recover them to another folder. It puts back together photos (JPEG), RAW photos and
+camera videos (MP4/MOV, H.264 and H.265, with the index at the end, at the start or in fragments) split into pieces on
+the card, around other files or deleted and partly shot over, from the card's free space. A file in pieces comes back
+**intact** only with proof: the file system gives its place (a live file's cluster chain, or a deleted exFAT file's
+surviving chain that nothing on the card contradicts), a video's frames check out across every cut, a lossless RAW is
+cut exactly between its image blocks, or a JPEG in two pieces passes the two-piece rule. Otherwise it comes back
+**partial**, its bytes in the most likely place: a JPEG in more pieces placed by its content alone (a near-identical
+photo of the same burst could have lent a piece), a RAW cut inside its image data or its preview, a video whose cuts
+cannot be checked. A JPEG without restart markers in three or more pieces is often not put back at all, and a piece
+more than 256 MiB away is not looked for. It reads each sector of the card once (putting a file in pieces back
+together reads parts of the card again, within a budget: 512 MiB per file, 16 GiB per scan), never
 retries a known unreadable sector, and checks the files it finds on every core: on an 8-core / 16-thread Intel Core
 i9-9980HK, with the default threads, it scans a photo-dense 1 GiB image at about 500 MB/s (JPEG) to 1,600 MB/s (RAW)
 from the page cache, against 22 and 158 MB/s before, faster than an SD card reader delivers (details in

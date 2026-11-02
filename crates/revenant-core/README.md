@@ -37,6 +37,13 @@ use revenant_core::EngineError;
 assert_eq!(EngineError::Cancelled.code(), "cancelled");
 ```
 
+Part 1.6 (files in pieces) added no error code: a budget that ran out, two placements that both fit or a cut that
+cannot be checked make a file `Partial`, never an error. What the engine puts back together, and when it calls the
+result `Intact`, is under [Reassembly](#reassembly) (the search), [Fragmented JPEG](#fragmented-jpeg),
+[Video in three or more pieces](#video-in-three-or-more-pieces), [Fragmented RAW](#fragmented-raw) and
+[File systems in the scan](#file-systems-in-the-scan) (deleted files in pieces); its known limits and accepted risks
+are stated there, and its measured cost under [Performance](#performance).
+
 ## Source
 
 `source::Source` is the engine's read-only disk-access layer: `len()`, `read_at(offset, buf)` (positional, no shared cursor; fills
