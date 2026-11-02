@@ -1323,6 +1323,119 @@ mod tests {
         assert_eq!(c.pieces.len(), 2);
     }
 
+    /// The listing of `v` placed on an MBR disk at sector 8192, read through `src_of`'s source.
+    fn list_with(
+        v: &[u8],
+        limits: &Limits,
+        bad: Option<u64>,
+    ) -> crate::filesystem::listing::Listing {
+        use crate::filesystem::SourceProbe;
+        use crate::filesystem::listing::read_limited;
+        use crate::formats::tests::{BadSector, Mem};
+        use revenant_testkit::fs::{Partitioning, disk};
+        let len = v.len() + (8 << 20);
+        let mem = Mem(disk(Partitioning::Mbr { first_lba: 8192 }, v, len));
+        match bad {
+            None => read_limited(
+                &mem,
+                &SourceProbe::new(&mem),
+                &CancelToken::default(),
+                limits,
+            ),
+            Some(bad) => {
+                let src = BadSector { inner: mem, bad };
+                read_limited(
+                    &src,
+                    &SourceProbe::new(&src),
+                    &CancelToken::default(),
+                    limits,
+                )
+            }
+        }
+    }
+
+    fn covers(set: &[Fragment], at: u64) -> bool {
+        set.iter().any(|r| r.start <= at && at < r.start + r.len)
+    }
+
+    /// A live NoFatChain folder whose clusters are all claimed and allocated is trusted: its range is in `live`.
+    #[test]
+    fn live_nofatchain_directory_is_trusted() {
+        use revenant_testkit::fs::{FsBuilder, FsType};
+        let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, 4096);
+        b.add("DCIM/A.JPG", &[1; 1000]);
+        let mut v = b.build();
+        // Make DCIM's entry set NoFatChain (flags 0x03) and re-seal its checksum.
+        let root = b.cluster_offset(b.clusters("")[0]) as usize;
+        let at = (3..)
+            .map(|i| root + i * 32)
+            .find(|&at| v[at] == 0x85)
+            .unwrap();
+        let mut set = [[0u8; 32]; 3];
+        for (k, e) in set.iter_mut().enumerate() {
+            e.copy_from_slice(&v[at + 32 * k..at + 32 * k + 32]);
+        }
+        assert_eq!(set[1][0], 0xC0);
+        set[1][1] |= 2;
+        let sum = set_checksum(&set);
+        set[0][2..4].copy_from_slice(&sum.to_le_bytes());
+        for (k, e) in set.iter().enumerate() {
+            v[at + 32 * k..at + 32 * k + 32].copy_from_slice(e);
+        }
+        let l = list_with(&v, &Limits::DEFAULT, None);
+        let dcim = 8192 * 512 + b.cluster_offset(b.clusters("DCIM")[0]);
+        assert!(l.files.iter().any(|f| f.origin.name() == "A.JPG"));
+        assert!(covers(&l.live, dcim), "the folder's range is live");
+    }
+
+    /// A directory chunk the source cannot read costs the volume's entry budget nothing.
+    #[test]
+    fn unreadable_chunk_costs_no_entry_budget() {
+        use revenant_testkit::fs::{FsBuilder, FsType};
+        let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, 4096);
+        b.add("D1/X.JPG", &[1; 1000]);
+        b.add("D2/Y.JPG", &[2; 1000]);
+        let v = b.build();
+        // Budget for the root (3 + 2 sets of 3 entries) and D2's set (3), not for a whole unreadable cluster (128).
+        let limits = Limits {
+            entries: 20,
+            ..Limits::DEFAULT
+        };
+        let bad = 8192 * 512 + b.cluster_offset(b.clusters("D1")[0]);
+        let l = list_with(&v, &limits, Some(bad));
+        assert!(l.files.iter().any(|f| f.origin.name() == "Y.JPG"));
+        assert!(!l.files.iter().any(|f| f.origin.name() == "X.JPG"));
+        assert!(!l.truncated, "the unreadable chunk was not charged");
+    }
+
+    /// A file of another kind met before the bitmap entry (a malformed root) claims its clusters at once; the photo after
+    /// the bitmap is still listed and trusted.
+    #[test]
+    fn non_photo_files_before_the_bitmap_claim_after_it() {
+        use revenant_testkit::fs::{FsBuilder, FsType};
+        let mut b = FsBuilder::new(FsType::Exfat, 32 << 20, 4096);
+        let txt = b.add("A.TXT", &[3; 5000]);
+        let jpg = b.add("P.JPG", &[1; 9000]);
+        let mut v = b.build();
+        // Root: label, [bitmap, up-case], A.TXT (3 entries), P.JPG: move the .TXT set in front of the bitmap.
+        let root = b.cluster_offset(b.clusters("")[0]) as usize;
+        let txt_set: Vec<u8> = v[root + 3 * 32..root + 6 * 32].to_vec();
+        let meta: Vec<u8> = v[root + 32..root + 3 * 32].to_vec();
+        v[root + 32..root + 4 * 32].copy_from_slice(&txt_set);
+        v[root + 4 * 32..root + 6 * 32].copy_from_slice(&meta);
+        let l = list_with(&v, &Limits::DEFAULT, None);
+        let p = l
+            .files
+            .iter()
+            .find(|f| f.origin.name() == "P.JPG")
+            .expect("the photo after the bitmap is listed");
+        assert!(p.trusted);
+        let at = |c: u32| 8192 * 512 + b.cluster_offset(c);
+        assert!(covers(&l.live, at(jpg[0])));
+        let t = l.files.iter().find(|f| f.origin.name() == "A.TXT");
+        assert!(t.is_none_or(|t| t.trusted == covers(&l.live, at(txt[0]))));
+    }
+
     #[test]
     fn utc_offsets_and_ten_millisecond_counts() {
         // 2025-12-14 07:12:04: date (45 << 9 | 12 << 5 | 14), time (7 << 11 | 12 << 5 | 2).

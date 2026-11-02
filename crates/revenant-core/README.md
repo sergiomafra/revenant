@@ -1576,8 +1576,11 @@ the deleted photos/videos wait, never more than the photo slots left (a later li
   high-word candidates, then the files) costs one step of 2^26; once spent, the volume's remaining deleted files are
   not listed and no further deleted folder is read (in that order, each in walk order). The allocation is read a FAT
   block at a time, so 2^26 steps of guessing take well under a second; FAT32 high-word lookups are dearer per step,
-  and a hostile volume that spends the whole budget on them takes about 10 s on the development Mac (a real card asks
-  a few of them per deleted file).
+  and a hostile volume that spends the whole budget on them took about 10 s on the development Mac, now capped at half (a real card asks
+  a few of them per deleted file). The high-word phase may spend at most half of the budget (2^25 steps, the
+  crate-internal `Limits::high_word_steps`): a round of lookups that would pass it ends the phase, the questions still
+  open stay unanswered (those files are not listed), the listing is marked truncated, and the other half stays for the
+  placements, so a hostile FAT32 volume cannot starve the files whose high word is intact.
 
 Bounds (each lowerable in unit tests): per volume at most 65,536 directories, 4,000,000 directory entries (every
 32-byte slot read counts, the end marker included), depth 32 (the root is 0), 2 MiB per directory, 65,536 contested

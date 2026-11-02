@@ -214,6 +214,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- On a FAT32 card with many deleted files whose cluster number Windows half-erased, looking for the missing half can
+  no longer use up the whole search budget: half of it stays for the other deleted files, and the scan says when the
+  lookups were cut short.
 - An old deleted photo's entry whose spot on the card a newer, shorter photo took (the camera reusing the old entries'
   slots, the newer entry gone since) gave the newer photo's bytes, plus the empty rest of the space, under the old name
   and size, reported intact; also when the newer photo had taken the old one's exact pieces in the same order (as a
