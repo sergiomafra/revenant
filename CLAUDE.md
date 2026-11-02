@@ -8,7 +8,7 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 
 **02/11/2026.** Módulo 1 (motor): Partes 1.1 a 1.5 mergeadas (PRs #1 a #6). Parte 1.6 (fragmentação avançada: JPEG,
 vídeo e RAW em 3 ou mais pedaços, apagados fragmentados no FAT/exFAT) concluída na branch `feat/m1-p6-fragments`,
-aguardando a revisão final e o PR/merge; decisões, resíduos aceitos e o que fica para a revisão final em
+revisão final feita e corrigida (Q61), aguardando o PR/merge; decisões, resíduos aceitos e o que ficou para depois em
 `docs/superpowers/history/2026-11-02-m1-p6-pendencias.md`, roteiro com a A6700 (do Sérgio) em
 `docs/superpowers/history/2026-11-02-m1-p6-conferencia-manual.md`. Marco A fechado. Próxima: Módulo 2. Roteiro até a
 1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`

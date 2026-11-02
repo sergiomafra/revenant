@@ -52,7 +52,7 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
     computador e os textos de cada aviso (Módulo 2); copiar e buscar ao mesmo tempo (ideia para depois). Pendências em
     `docs/superpowers/history/2026-10-25-m1-p5-pendencias.md`; conferência com hardware em
     `docs/superpowers/history/2026-10-25-m1-p5-conferencia-manual.md`.
-- **1.6, fragmentação avançada, concluída** (aguardando a revisão final e o PR/merge):
+- **1.6, fragmentação avançada, concluída** (revisão final feita e corrigida; aguardando o PR/merge):
   - JPEG, vídeo e RAW em 3 ou mais pedaços, buscados no espaço livre do cartão na grade de clusters que a 1.4 traz, com
     orçamento por arquivo e por busca.
   - Vídeo de câmera H.264/H.265: com o `moov` no fim, antes do `mdat`, com `mdat` de tamanho 0 e fragmentado (`moof`);
@@ -72,6 +72,9 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
       jeito de achar o corte verdadeiro quando os dados fora de ordem decodificam sem erro.
     - Um apagado sobrescrito por outro arquivo de exatamente o mesmo tamanho sai com os bytes certos e o nome do antigo:
       conferir a identidade pelo EXIF (data da foto contra as datas da entrada).
+    - Um RAW gravado contíguo sobre o primeiro pedaço de um apagado e passando dele não volta inteiro (os dados do sensor
+      depois desse pedaço não são conferidos; a foto e o vídeo voltam, sem nome, Q61); no RAW sem perdas, conferir
+      bloco a bloco resolveria.
     - O padrão de alocação real da Sony: a conferir pelo roteiro com a A6700.
   - Decisões, resíduos aceitos e pendências em `docs/superpowers/history/2026-11-02-m1-p6-pendencias.md`; conferência
     com a câmera em `docs/superpowers/history/2026-11-02-m1-p6-conferencia-manual.md`.

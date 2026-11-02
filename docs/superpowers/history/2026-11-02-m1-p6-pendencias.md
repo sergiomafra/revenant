@@ -207,6 +207,42 @@ Rulings Q20 a Q59 do controlador (do registro de execução). Cada uma com o cus
   listagem truncada, o que tira `Intact` e `OldChain` do cartão inteiro (a mesma troca do teto de passos que já havia);
   `Folders::get` memoriza os nós intermediários pelo corte de profundidade da primeira consulta (determinístico, fechado
   como não defeito, m4). Custo: num FAT32 hostil, a listagem truncada.
+- **Q60 (Tarefa 13):** os 7 menores de documentação da revisão da Tarefa 13 vão para o único despacho de correção final
+  (economiza uma rodada; só texto). Custo: nenhum.
+- **Revisão final (`c9e590a..8f46be1`):** "com correções"; nenhum crítico. Importantes: I-1 (= I-5 do Q57, com a correção
+  guardada já verificada por sonda) e I-2 (os dois testes de relógio). Menores: M-1 (outros limites de relógio de uma
+  rodada só), M-2 (nenhuma checagem de MSRV na CI), M-3 (os menores do Q60), M-4 (a linha "cedo, depois outros bytes" da
+  tabela mantinha o nome de A sobre B + sobra de A, `Partial`), M-5 (o histórico sem o desfecho do I-1). Todo menor
+  adiado das tarefas foi julgado numa tabela: o guarda `uniform` da Tarefa 5 já é local desde a Tarefa 6 (Q39, resíduo Q40
+  com reprodução `#[ignore]`); o menor 4 da Tarefa 1 fecha (nunca descrito, nada visível no código); os da Tarefa 3, 4
+  (CHANGELOG, README), 5 (README), 6 (teste por trilha) e 11 já estavam corrigidos; os demais (Tarefas 4, 5, 6, 7, 8, 9,
+  10) aceitos com motivo (afirmação redundante, piso de retomada igual ao D24, Q38, amostras dentro do trecho medido,
+  leituras limitadas por passos e `MAX_BOXES`, texto cosmético, não é caminho de prova, documentação do testkit, resíduos
+  da classe D14, conservador, defesa em profundidade); o comentário da Tarefa 4 (~1906) era opcional.
+- **Q61 (revisão final):** um só despacho de correção (opus novo). I-1 com os **quatro** guardas (nenhum RAW TIFF cego
+  depois do primeiro pedaço; manter `!view.padded`; excluir a escultura de `mdat` de tamanho 0; um A verdadeiro cuja
+  vista é `Intact` no tamanho fica com os seus pedaços) e testes vistos falhando; o ARW B sem compressão ou com perdas
+  segue perdido, resíduo documentado. I-2 pelos contadores de leitura (fica uma trava de relógio folgada). M-1 não
+  falhou ainda: vai para "Depois", sem converter agora. M-2: `-W clippy::incompatible_msrv` no passo de clippy da CI.
+  M-3 aplicado. M-4: a linha fica sem nome (princípio do Q57: nenhum nome que o tamanho ou a estrutura desmentem),
+  linha de unidade + teste. M-5: este arquivo. Custo: uma mudança tardia na tabela de decisão; mitigado pela revisão
+  restrita em opus e pelas suítes inteiras.
+- **Desfecho do I-1 e do M-4 (correção final):** em `scan::fs::decide`, quando a escultura no início de uma entrada
+  apagada é um arquivo inteiro numa corrida, `Intact`, mais longo que o primeiro pedaço da entrada e de outro tamanho, ela
+  sai sozinha, sem nome (`Padded::Carving`), salvo se um dos quatro guardas vale: a escultura é RAW TIFF (**todos** os RAW
+  TIFF, também o sem perdas: o refinamento por blocos ficou de fora); a vista tem enchimento (decide a regra do Q53); a
+  escultura é um `mdat` de tamanho 0 (`ViewMeasure::open_carving`, calculado no `fs_job` por `size_zero_mdat_end`); ou a
+  vista é `Intact` no tamanho. Cada guarda tem a sua célula vista falhando sem ele: sem o 1, `f_arw_unc_three_same_oldslack`
+  sai `Intact` falso; sem o 3, um clipe de `mdat` 0 contíguo sobre a primeira corrida sai `Intact` com megabytes depois do
+  fim; o 2 é a segunda barreira das células com enchimento (ARW com enchimento de 512 B, ARW sem compressão sobre a cadeia
+  de A, clipe de `mdat` 0 mais curto): elas falham só com o 2 tirado junto com o 1 ou o 3; o 4 só se vê na tabela de
+  unidade (nenhuma célula de integração o alcança). A JPEG e o MP4 contíguos (`q2_jpeg_three_runs_b_contig`, `r5_m8c`)
+  saem `Intact`, exatos, sem nome. M-4: só nos pedaços do próprio registro da entrada (corrida gravada ou cadeia antiga),
+  uma estrutura `Intact` numa corrida que termina antes do tamanho com outros bytes depois perde o nome como no
+  enchimento; num palpite, o fim cedo desmente o palpite, não o nome, e o nome fica (escolha do construtor, para não tirar
+  o nome de um JPEG apagado em pedaços cujo palpite de uma corrida mede cedo). `size_mismatch_is_never_intact` passou a
+  afirmar a foto sem nome. Custo: um JPEG apagado com dados próprios não reconhecidos depois do `EOI` (um trailer de
+  fabricante) perde o nome quando colocado pela cadeia ou corrida gravada; o arquivo continua recuperado.
 
 ### Notas carregadas para este arquivo
 
@@ -250,6 +286,12 @@ Rulings Q20 a Q59 do controlador (do registro de execução). Cada uma com o cus
 - **`cut-jpeg` fora do portão de 5% (Q59):** 25 s contra 2,4 s no `main`; cada foto cortada gasta seus 512 MiB e o orçamento
   de 16 GiB da busca acaba depois de ~32 dos 95 candidatos. Custo: num cartão cheio de fotos cortadas sem o resto, a
   remontagem custa até o tempo de reler 16 GiB e os candidatos do fim não são buscados.
+- **RAW sobre o primeiro pedaço de um apagado (Q61):** um RAW B (ARW, CR2, NEF, DNG, ORF, RW2) que a câmera grava
+  contíguo sobre a primeira corrida de uma entrada apagada A e passa dela não volta inteiro: os dados do sensor depois do
+  primeiro pedaço não são conferidos por nada (sem compressão ou com perdas, cegos; o sem perdas poderia ser conferido
+  bloco a bloco, mas o guarda exclui todo RAW TIFF). O início fica com os pedaços de A, `Partial` (sem nome quando a
+  estrutura de B termina antes do tamanho de A com outros bytes depois, M-4). Custo: um RAW inteiro não oferecido nesse
+  arranjo; nunca um falso `Intact`.
 - **Herdado da 1.4 ("preocupação 3"):** um RAW sem compressão ou com perdas cujo primeiro pedaço é seguido por outros
   dados sem início de arquivo mede `Intact` pelos bytes contíguos e nunca vira candidato; a 1.6 estreitou isso para o
   apagado exFAT com cadeia inteira. Custo: segue para RAW esculpido sem sistema de arquivos e para o palpite de uma corrida.
@@ -366,15 +408,14 @@ rodada:
 
 ## Em aberto, com dono
 
-**A resolver na revisão final antes do PR** (regra "nada de PR com problema conhecido"):
-- **I-5 (Tarefa 10, Q57):** um arquivo B inteiro e contíguo que começa na primeira corrida de uma entrada apagada A,
-  enquanto a cadeia antiga de A ainda lê, nunca é recuperado (JPEG, ARW, MP4): B tem de sair como escultura própria.
-  É perda de recuperação, não falso `Intact`.
-- **Dois testes de relógio instáveis:** `fs_fat::hostile_high_word_entries_are_bounded` (limite de 5 s; deu 9,0 s com a
-  máquina a carga 29–42) e `vanish::cancel_is_prompt_during_a_long_measurement` (1 s): tornar determinísticos (contador
-  de passos ou de leituras), como o R2/R5 da 1.4.
-- **Menores adiados:**
-  - Tarefa 1: o menor 4 da revisão (adiado sem descrição no registro: reavaliar na revisão).
+**Resolvido na correção final (Q61):** o I-5 (JPEG e MP4 voltam; RAW é resíduo, acima); os dois testes de relógio
+(`fs_fat::hostile_high_word_entries_are_bounded` conta as leituras: nenhuma em cluster ≥ 0x10000, onde mora todo
+candidato de palavra alta, e no máximo região de boot + FATs + pastas + 64 KiB; `vanish::cancel_is_prompt_during_a_long_measurement`
+cancela na 24ª leitura dentro do `mdat`, por `SimSource::cancel_after_reads_in`, e limita as leituras dele depois do
+cancelamento ao número de threads; cada um com uma trava de relógio de 30 s só contra travamento); o menor 4 da Tarefa 1
+(fechado pela revisão final).
+
+- **Menores adiados** (todos julgados na tabela da revisão final: aceitos com motivo ou já corrigidos):
   - Tarefa 3: a documentação do ajudante `intact()` sugere que o teto protege corridas únicas (quem protege é a
     reconferência).
   - Tarefa 4: a afirmação de saúde de `reassembly_never_rereads_known_bad_sectors` ficou vazia com o Q37 (afirmar que os
@@ -408,6 +449,10 @@ rodada:
 - decidir o merge do PR da 1.6.
 
 **Depois:**
+- os outros limites de relógio de uma rodada só (M-1 da revisão final; ainda não falharam): `fs_fat.rs:374` e `:1100`,
+  `vanish.rs:215` (`cancel_is_prompt_while_a_window_fails_sector_by_sector`), `fs_exfat.rs:597`, `isobmff.rs:909`,
+  `scan.rs:1482`, `preflight.rs:460` e `:593`, `jpeg.rs:392`: converter quando tocados, com o mesmo padrão de contador de
+  leituras;
 - impressões por cluster durante a busca (desenho §5.1), se cartões reais baterem no orçamento de leitura;
 - JPEG DRI 0 em 3 ou mais pedaços: um jeito de achar o corte verdadeiro quando os dados fora de ordem decodificam sem erro;
 - conferir a identidade de um apagado pelo EXIF (M-7);
