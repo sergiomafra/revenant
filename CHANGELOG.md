@@ -228,9 +228,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   file's name and dates. A RAW that the camera pads with zeros to its usual block (as Sony does) is not mistaken for
   this: it keeps its name, and a deleted RAW in pieces whose old chain checks out keeps coming back intact.
 - A whole photo or video that a camera wrote over the first piece of an older deleted file, running past it, was never
-  offered: the old entry's name kept the spot. It now comes out on its own, without the old name; a RAW written that way
-  still does not (its image data past that piece cannot be checked), and an older entry whose own bytes end early with
-  other data after them, in the pieces its own record gives, no longer passes that data off under its name.
+  offered: the old entry's name kept the spot. A JPEG or a video whose frames all check out now comes out on its own,
+  without the old name. A RAW, a HEIC or a video whose frames are not checked (ProRes) written that way still does not
+  (nothing checks its data past that piece, so it is never reported intact there), and an older entry whose own bytes
+  end early with other data after them, in the pieces its own record gives, no longer passes that data off under its
+  name.
 - A deleted video's entry over another, shorter clip that the scan put back together from its pieces gave that clip,
   exact, under the old entry's name, reported intact, though its length was not the entry's. A file put back together
   whose length is not its entry's now comes out without the name, and at most partial.

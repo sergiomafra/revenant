@@ -223,7 +223,9 @@ Rulings Q20 a Q59 do controlador (do registro de execução). Cada uma com o cus
   depois do primeiro pedaço; manter `!view.padded`; excluir a escultura de `mdat` de tamanho 0; um A verdadeiro cuja
   vista é `Intact` no tamanho fica com os seus pedaços) e testes vistos falhando; o ARW B sem compressão ou com perdas
   segue perdido, resíduo documentado. I-2 pelos contadores de leitura (fica uma trava de relógio folgada). M-1 não
-  falhou ainda: vai para "Depois", sem converter agora. M-2: `-W clippy::incompatible_msrv` no passo de clippy da CI.
+  falhou ainda: vai para "Depois", sem converter agora. M-2: `-W clippy::incompatible_msrv` no passo de clippy da CI
+  (a revisão restrita mostrou que o lint já valia, pelo `clippy::suspicious` com `-D warnings`, e só cobre a API da std:
+  não é uma checagem de MSRV; o job com `toolchain: 1.88` ficou para "Depois").
   M-3 aplicado. M-4: a linha fica sem nome (princípio do Q57: nenhum nome que o tamanho ou a estrutura desmentem),
   linha de unidade + teste. M-5: este arquivo. Custo: uma mudança tardia na tabela de decisão; mitigado pela revisão
   restrita em opus e pelas suítes inteiras.
@@ -231,18 +233,30 @@ Rulings Q20 a Q59 do controlador (do registro de execução). Cada uma com o cus
   apagada é um arquivo inteiro numa corrida, `Intact`, mais longo que o primeiro pedaço da entrada e de outro tamanho, ela
   sai sozinha, sem nome (`Padded::Carving`), salvo se um dos quatro guardas vale: a escultura é RAW TIFF (**todos** os RAW
   TIFF, também o sem perdas: o refinamento por blocos ficou de fora); a vista tem enchimento (decide a regra do Q53); a
-  escultura é um `mdat` de tamanho 0 (`ViewMeasure::open_carving`, calculado no `fs_job` por `size_zero_mdat_end`); ou a
+  escultura é um `mdat` de tamanho 0 (`ViewMeasure::open_carving`, hoje `unchecked_carving`, calculado no `fs_job` por `size_zero_mdat_end`); ou a
   vista é `Intact` no tamanho. Cada guarda tem a sua célula vista falhando sem ele: sem o 1, `f_arw_unc_three_same_oldslack`
   sai `Intact` falso; sem o 3, um clipe de `mdat` 0 contíguo sobre a primeira corrida sai `Intact` com megabytes depois do
   fim; o 2 é a segunda barreira das células com enchimento (ARW com enchimento de 512 B, ARW sem compressão sobre a cadeia
   de A, clipe de `mdat` 0 mais curto): elas falham só com o 2 tirado junto com o 1 ou o 3; o 4 só se vê na tabela de
   unidade (nenhuma célula de integração o alcança). A JPEG e o MP4 contíguos (`q2_jpeg_three_runs_b_contig`, `r5_m8c`)
-  saem `Intact`, exatos, sem nome. M-4: só nos pedaços do próprio registro da entrada (corrida gravada ou cadeia antiga),
+  saem `Intact`, exatos, sem nome (o guarda 1 foi alargado depois pelo Q62, abaixo). M-4: só nos pedaços do próprio
+  registro da entrada (corrida gravada ou cadeia antiga),
   uma estrutura `Intact` numa corrida que termina antes do tamanho com outros bytes depois perde o nome como no
   enchimento; num palpite, o fim cedo desmente o palpite, não o nome, e o nome fica (escolha do construtor, para não tirar
   o nome de um JPEG apagado em pedaços cujo palpite de uma corrida mede cedo). `size_mismatch_is_never_intact` passou a
   afirmar a foto sem nome. Custo: um JPEG apagado com dados próprios não reconhecidos depois do `EOI` (um trailer de
   fabricante) perde o nome quando colocado pela cadeia ou corrida gravada; o arquivo continua recuperado.
+- **Q62 (revisão restrita da correção final):** não aprovada, um crítico aberto pela própria correção (C-1): o guarda 1
+  só tirava o RAW TIFF, mas HEIC, RAF, CR3 e vídeo com trilha sem conferência (ProRes) são tão cegos depois do primeiro
+  pedaço; sobre a cadeia de A com a sobra de A, saíam `Intact` sem nome com bytes alheios (na base, `Partial` com o nome
+  de A). Correção (a candidata do revisor): o guarda passa a ser "todo byte da escultura depois do primeiro pedaço é
+  conferido pelo conteúdo" (`ViewMeasure::unchecked_carving`, no `fs_job`): só o JPEG e o vídeo com `mdat` de tamanho
+  conhecido em que `every_sample_fits`; todo o resto conta como não conferido; o `tiff_raw` no `decide` fica como segunda
+  barreira. Células `a_heic_…`, `a_raf_…`, `a_prores_clip_…_is_no_false_intact`, vistas falhando em `bf6a312`; o controle
+  AVC (`moov` antes, amostras conferidas) segue certo. M-2 da revisão restrita: célula do lado do palpite
+  (`a_guessed_photo_ending_early_over_other_bytes_keeps_its_name`, FAT32, foto que termina cedo sobre outros bytes, fica
+  com o nome, `Partial`), vista falhando com o M-4 estendido ao palpite. M-3: o histórico não afirma checagem de MSRV.
+  Custo: esses tipos ficam perdidos nesse arranjo (como na base), agora sem falso `Intact`.
 
 ### Notas carregadas para este arquivo
 
@@ -286,12 +300,14 @@ Rulings Q20 a Q59 do controlador (do registro de execução). Cada uma com o cus
 - **`cut-jpeg` fora do portão de 5% (Q59):** 25 s contra 2,4 s no `main`; cada foto cortada gasta seus 512 MiB e o orçamento
   de 16 GiB da busca acaba depois de ~32 dos 95 candidatos. Custo: num cartão cheio de fotos cortadas sem o resto, a
   remontagem custa até o tempo de reler 16 GiB e os candidatos do fim não são buscados.
-- **RAW sobre o primeiro pedaço de um apagado (Q61):** um RAW B (ARW, CR2, NEF, DNG, ORF, RW2) que a câmera grava
-  contíguo sobre a primeira corrida de uma entrada apagada A e passa dela não volta inteiro: os dados do sensor depois do
-  primeiro pedaço não são conferidos por nada (sem compressão ou com perdas, cegos; o sem perdas poderia ser conferido
-  bloco a bloco, mas o guarda exclui todo RAW TIFF). O início fica com os pedaços de A, `Partial` (sem nome quando a
-  estrutura de B termina antes do tamanho de A com outros bytes depois, M-4). Custo: um RAW inteiro não oferecido nesse
-  arranjo; nunca um falso `Intact`.
+- **Arquivo não conferido sobre o primeiro pedaço de um apagado (Q61, Q62):** um RAW TIFF (ARW, CR2, NEF, DNG, ORF,
+  RW2), um HEIC, um RAF, um CR3 ou um vídeo com trilha sem conferência de amostras (ProRes, ou `mdat` de tamanho 0) que
+  a câmera grava contíguo sobre a primeira corrida de uma entrada apagada A e passa dela não volta inteiro: os dados
+  depois do primeiro pedaço não são conferidos por nada (o RAW sem perdas poderia ser conferido bloco a bloco, mas o
+  guarda exclui todo RAW TIFF). O início fica com os pedaços de A, `Partial` (sem nome quando a estrutura de B termina
+  antes do tamanho de A com outros bytes depois, M-4). Custo: um arquivo inteiro desses tipos não oferecido nesse
+  arranjo; nunca um falso `Intact` (conferido nas células do Q62 e nas sondas da revisão restrita: HEIC, RAF e ProRes
+  sobre a cadeia com sobra, e contíguos).
 - **Herdado da 1.4 ("preocupação 3"):** um RAW sem compressão ou com perdas cujo primeiro pedaço é seguido por outros
   dados sem início de arquivo mede `Intact` pelos bytes contíguos e nunca vira candidato; a 1.6 estreitou isso para o
   apagado exFAT com cadeia inteira. Custo: segue para RAW esculpido sem sistema de arquivos e para o palpite de uma corrida.
@@ -408,7 +424,8 @@ rodada:
 
 Depois da correção final (Q61, cabeça `91df1dc` mais este texto), carga 6 a 58 durante a rodada: `cargo test --workspace`
 943 passaram, 0 falharam, 23 ignorados (52 min); `cargo test --release -p revenant-core` 854 passaram, 14 ignorados;
-`real_samples` 4 passaram (125 s); clippy com `-W clippy::incompatible_msrv` e fmt limpos; nenhum `os::unix` novo;
+`real_samples` 4 passaram (125 s); clippy (com `-W clippy::incompatible_msrv`, que só cobre a API da std) e fmt limpos;
+nenhum `os::unix` novo;
 `reassembly_cards` (release) com as 25 contagens idênticas à tabela acima; a matriz de sondas da revisão final igual (69
 passam, os mesmos 4 W1/W2 aceitos). `bench` intercalado contra `8f46be1` (melhor de 3 rodadas, carga 7 a 13):
 `exfat-card` 2,17 s contra 2,57 s, `noise` 0,46 contra 0,50, `dense-jpeg` 2,41 contra 2,60; nenhuma perda (a vantagem é
@@ -416,7 +433,8 @@ ruído da carga).
 
 ## Em aberto, com dono
 
-**Resolvido na correção final (Q61):** o I-5 (JPEG e MP4 voltam; RAW é resíduo, acima); os dois testes de relógio
+**Resolvido na correção final (Q61, Q62):** o I-5 (JPEG e vídeo com todas as amostras conferidas voltam; RAW, HEIC,
+RAF, CR3 e vídeo com trilha sem conferência são resíduo, acima); os dois testes de relógio
 (`fs_fat::hostile_high_word_entries_are_bounded` conta as leituras: nenhuma em cluster ≥ 0x10000, onde mora todo
 candidato de palavra alta, e no máximo região de boot + FATs + pastas + 64 KiB; `vanish::cancel_is_prompt_during_a_long_measurement`
 cancela na 24ª leitura dentro do `mdat`, por `SimSource::cancel_after_reads_in`, e limita as leituras dele depois do
@@ -457,6 +475,8 @@ cancelamento ao número de threads; cada um com uma trava de relógio de 30 s s�
 - decidir o merge do PR da 1.6.
 
 **Depois:**
+- um job da CI com `toolchain: 1.88` (`cargo check --workspace --all-targets`): o lint do clippy só cobre a API da std,
+  não recursos da linguagem nem do Cargo mais novos que 1.88 (M-3 da revisão restrita);
 - os outros limites de relógio de uma rodada só (M-1 da revisão final; ainda não falharam): `fs_fat.rs:374` e `:1100`,
   `vanish.rs:215` (`cancel_is_prompt_while_a_window_fails_sector_by_sector`), `fs_exfat.rs:597`, `isobmff.rs:909`,
   `scan.rs:1482`, `preflight.rs:460` e `:593`, `jpeg.rs:392`: converter quando tocados, com o mesmo padrão de contador de

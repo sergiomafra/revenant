@@ -144,11 +144,14 @@ pub(crate) struct ViewMeasure {
     /// view has none. The scan's finding starts cannot tell: those after the file are not known yet when it is merged,
     /// and no head inside an `Intact` finding's pieces is examined.
     pub checks: bool,
-    /// For a deleted file, the carving at its start is a video whose `mdat` has size 0 and that runs past the file's
-    /// first piece ([`fs_job`]): such an `mdat` runs to the next file start or the source's end, so the carving's length
-    /// is no whole file's and it never stands for the entry as another file written over it ([`decide`], final review
-    /// I-1, guard 3). `false` for every other file.
-    pub open_carving: bool,
+    /// For a deleted file, the carving at its start runs past the file's first piece and not every byte of it past that
+    /// piece is checked by content ([`fs_job`]): only a JPEG (entropy-decoded to its EOI) and a video whose `mdat` has
+    /// a size and every sample of whose index fits in place (`isobmff::every_sample_fits`) are. A size-0 `mdat` runs to
+    /// the next file start or the source's end; a HEIC's image, a RAF's or CR3's sensor data, a TIFF RAW's, or a
+    /// track with no sample check (ProRes) are never read for what they are: whatever follows the first piece would
+    /// pass. Such a carving never stands for the entry as another file written over it ([`decide`], final review I-1,
+    /// guards 1 and 3, re-review C-1). `false` for every other file.
+    pub unchecked_carving: bool,
 }
 
 /// What a kept file's job computes: its view measurement and, for a deleted file, the carving at its start.
@@ -375,7 +378,7 @@ pub(crate) fn measure_view(
         at_size,
         own: absolute(&f.pieces, own),
         checks,
-        open_carving: false,
+        unchecked_carving: false,
     }
 }
 
@@ -422,7 +425,7 @@ pub(crate) fn fs_job(
                 at_size,
                 own: carved_own.clone(),
                 checks: false,
-                open_carving: false,
+                unchecked_carving: false,
             },
             carved,
             carved_own,
@@ -430,10 +433,17 @@ pub(crate) fn fs_job(
     }
     let mut view = measure_view(formats, source, f, cancel);
     let first = f.pieces.first().map_or(0, |p| p.len);
-    view.open_carving = carved.as_ref().is_some_and(|c| {
-        matches!(c.kind, FileKind::Mp4 | FileKind::Mov)
-            && c.len > first
-            && crate::formats::isobmff::size_zero_mdat_end(source, at).is_some()
+    view.unchecked_carving = carved.as_ref().is_some_and(|c| {
+        c.len > first
+            && match c.kind {
+                FileKind::Jpeg => false,
+                FileKind::Mp4 | FileKind::Mov => {
+                    crate::formats::isobmff::size_zero_mdat_end(source, at).is_some()
+                        || !crate::formats::isobmff::every_sample_fits(source, at, c.len)
+                }
+                // TIFF RAW, RAF, CR3, HEIC: blind past the first piece.
+                _ => true,
+            }
     });
     FsJobResult {
         view,
@@ -484,9 +494,10 @@ pub(crate) struct Decision {
 /// - **another whole file over the first piece** (final review I-1, ruling Q61): the carving at a deleted entry's start
 ///   is a whole file in one run, `Intact`, that runs past the entry's first piece and is not of its size (a camera
 ///   allocating the next free clusters over the entry's freed runs). It is reported on its own, without the name
-///   ([`Padded::Carving`]), unless one of four guards holds: the carving is a TIFF RAW (its sensor data past the first
-///   piece is not checked: it may be any bytes; an uncompressed or lossy RAW there stays lost, a documented residual);
-///   the view is padded (the fill rule above decides); the carving is a size-0 `mdat` ([`ViewMeasure::open_carving`]);
+///   ([`Padded::Carving`]), unless one of four guards holds: not every byte of the carving past the first piece is
+///   checked by content ([`ViewMeasure::unchecked_carving`]: anything but a JPEG or a video whose `mdat` has a size and
+///   every sample fits; a size-0 `mdat` runs to the next start; such a file there stays lost, a documented residual),
+///   with a TIFF RAW refused in `decide` as well (a second barrier); the view is padded (the fill rule above decides);
 ///   or the view is `Intact` at size (the entry proves itself and keeps its pieces).
 ///
 /// The content's end is the format's full extent, computed once before the fill check ([`ends`], ruling Q56): the
@@ -510,7 +521,7 @@ pub(crate) fn decide(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement
     let view_intact = view.m.as_ref().is_some_and(|m| m.health == Health::Intact);
     let overwritten = deleted
         && !view.padded
-        && !view.open_carving
+        && !view.unchecked_carving
         && !(view.at_size && view_intact)
         && carved.is_some_and(|c| {
             c.health == Health::Intact
@@ -678,7 +689,7 @@ mod tests {
             padded: false,
             own: Vec::new(),
             checks: false,
-            open_carving: false,
+            unchecked_carving: false,
         }
     }
 
@@ -745,7 +756,7 @@ mod tests {
             at_size,
             own: Vec::new(),
             checks: true,
-            open_carving: false,
+            unchecked_carving: false,
         };
         let cells = [
             ("at size", full(1000, true, false, true)),
@@ -853,9 +864,10 @@ mod tests {
                 Padded::Unnamed,
                 "{placement:?}"
             );
-            // Guard 3: a size-0 `mdat` carving runs to the next file start, no whole file's length.
+            // Guard 3 (and C-1): a carving not checked past the first piece (a size-0 `mdat`, a HEIC, a RAF, an unchecked
+            // track) proves nothing there.
             let open = ViewMeasure {
-                open_carving: true,
+                unchecked_carving: true,
                 ..short.clone()
             };
             assert_eq!(rule(&f, &open, &long), Padded::Keep, "{placement:?}");

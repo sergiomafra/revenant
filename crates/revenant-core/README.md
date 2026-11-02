@@ -1941,11 +1941,13 @@ a probe over the raw source that refuses, without reading it, any range the cach
   **Another whole file over the first piece (final review I-1, ruling Q61).** A camera allocating the next free
   clusters may write a whole file over a deleted entry's first run and past it. When the carving at the entry's start
   is `Intact`, in one run, longer than that first piece and not of the recorded size, it comes out on its own, without
-  the name, unless one of four guards holds: the carving is a TIFF RAW (its sensor data past the first piece is
-  checked by nothing, so any bytes would pass: such a RAW stays lost, its start reported as the entry's pieces, a
-  documented residual); the view is padded (the fill rule decides); the carving is a video whose `mdat` has size 0
-  (it runs to the next file start or the source's end, no whole file's length); or the view is `Intact` at the size
-  (the entry proves itself and keeps its pieces).
+  the name, unless one of four guards holds: not every byte of the carving past the first piece is checked by
+  content (re-review C-1: only a JPEG, entropy-decoded to its EOI, and a video whose `mdat` has a size and every sample
+  of whose index fits in place are; a TIFF RAW, RAF or CR3's sensor data, a HEIC's image and a track with no sample
+  check such as ProRes are not, so any bytes would pass, and a size-0 `mdat` runs to the next file start or the
+  source's end: such a file stays lost there, its start reported as the entry's pieces, a documented residual; a TIFF
+  RAW is also refused in `decide`, a second barrier); the view is padded (the fill rule decides); or the view is
+  `Intact` at the size (the entry proves itself and keeps its pieces).
 - **Nothing is skipped because of the file system** (ruling R10): every head the signature rules examine is still
   examined, and only an `Intact` finding skips its pieces, as before.
 - **A listed file's finding** is added at the sector holding its first piece, always (whether a format recognizes the

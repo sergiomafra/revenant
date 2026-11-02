@@ -2636,3 +2636,118 @@ fn a_shorter_file_and_the_entrys_old_bytes_name_nothing() {
     );
     names_nothing_and_is_no_false_intact(&a, &b_file, &pa, start, &src, &ev);
 }
+
+// ---- Final re-review C-1 (ruling Q62): a carving whose bytes past the first piece nothing checks ----
+
+/// A over 3 runs (32 KiB clusters); B, shorter in as many clusters, over A's chain in A's order, the rest of its last
+/// cluster A's old bytes. The finding at A's start is never `Intact` (the contiguous carving there reads B's head, then
+/// whatever follows A's first run as B's data), and no finding is a false `Intact`.
+fn unchecked_over_a_chain_with_old_slack(ext: &str, a: &[u8], b_file: &[u8]) {
+    let cl = 32 * 1024u64;
+    let (pa, start, src, ev) = entry_card(
+        false,
+        cl,
+        ext,
+        a,
+        Some((b_file, Over::SameChainOldSlack)),
+        &[300, 600, 900],
+    );
+    no_false_intact(a, b_file, &[], &pa, start, &src, &ev);
+    let view = final_view(&ev);
+    let f = view
+        .values()
+        .find(|f| f.start == start)
+        .unwrap_or_else(|| panic!("a finding at A's start: {view:#?}"));
+    assert_ne!(f.health, Health::Intact, "{ext}: {f:#?}");
+}
+
+/// A file made by `make(len)` of `len` near `len0`, and a shorter one (from `make(len0 - d)`) in as many 32 KiB
+/// clusters, at least `gap` bytes shorter.
+fn blind_pair(len0: usize, gap: usize, make: impl Fn(usize, u64) -> Vec<u8>) -> (Vec<u8>, Vec<u8>) {
+    let a = make(len0, 1);
+    let need = clusters_in(a.len(), 32 * 1024);
+    let b_file = (gap..40_000)
+        .map(|d| make(len0 - d, 2))
+        .find(|b| clusters_in(b.len(), 32 * 1024) == need && b.len() < a.len())
+        .expect("a shorter file of as many clusters");
+    (a, b_file)
+}
+
+/// A ProRes MOV (`moov` first): a track whose samples no content check reads.
+fn prores_mov(len: usize, seed: u64) -> Vec<u8> {
+    let payload: Vec<u8> = (0..len as u64)
+        .map(|i| (i.wrapping_mul(2_654_435_761).wrapping_add(seed * 977) >> 7) as u8)
+        .collect();
+    revenant_testkit::mp4_with(
+        &Mp4Options {
+            mdat_len: len,
+            moov_at_end: false,
+            mov: true,
+            mdat_64bit: false,
+        },
+        b"apcn",
+        &payload,
+        &[0],
+    )
+}
+
+#[test]
+fn a_heic_over_a_deleted_entrys_chain_and_its_old_bytes_is_no_false_intact() {
+    // Re-review C-1: a HEIC's image data is never decoded. On bf6a312: Intact, nameless, B's head then A's old runs.
+    let ex = TestExif::default();
+    let (a, b_file) = blind_pair(200_000, 3000, |n, s| revenant_testkit::heic(n, s, &ex));
+    unchecked_over_a_chain_with_old_slack("HEIC", &a, &b_file);
+}
+
+#[test]
+fn a_raf_over_a_deleted_entrys_chain_and_its_old_bytes_is_no_false_intact() {
+    // C-1: a RAF's sensor data is never verified. On bf6a312: Intact, nameless, foreign bytes.
+    let ex = TestExif::default();
+    let (a, b_file) = blind_pair(200_000, 3000, |n, s| revenant_testkit::raf(n, s, &ex));
+    unchecked_over_a_chain_with_old_slack("RAF", &a, &b_file);
+}
+
+#[test]
+fn a_prores_clip_over_a_deleted_entrys_chain_and_its_old_bytes_is_no_false_intact() {
+    // C-1: a ProRes track has no sample check (`moov` first). On bf6a312: Intact, nameless, foreign bytes.
+    let (a, b_file) = blind_pair(200_000, 3000, prores_mov);
+    unchecked_over_a_chain_with_old_slack("MOV", &a, &b_file);
+}
+
+#[test]
+fn an_avc_clip_over_a_deleted_entrys_chain_and_its_old_bytes_is_no_false_intact() {
+    // The control of the three above: an AVC clip with its index first has every sample checked, so its contiguous
+    // carving over other bytes is no whole file either way.
+    let a = clip(VideoLayout::MoovFirst, 40, 1);
+    let need = clusters_in(a.len(), 32 * 1024);
+    let b_file = (2..200)
+        .map(|s| clip(VideoLayout::MoovFirst, 38, s))
+        .find(|b| clusters_in(b.len(), 32 * 1024) == need && b.len() < a.len())
+        .expect("a shorter clip of as many clusters");
+    unchecked_over_a_chain_with_old_slack("MP4", &a, &b_file);
+}
+
+#[test]
+fn a_guessed_photo_ending_early_over_other_bytes_keeps_its_name() {
+    // Final re-review M-2: the M-4 row is for the pieces of an entry's own record. A FAT32 deleted photo (its chain
+    // freed: a one-run guess) whose JPEG ends early with other bytes after it up to its size keeps its name, at most
+    // `Partial`: the early end disproves the guess, not the name.
+    let mut b = fat32_4k();
+    let path = format!("{DIR}/DSC00001.JPG");
+    let mut file = jpeg_smooth(1024, 768, 1);
+    let photo = file.len();
+    file.extend(support::cards::noise(3000, 0x7A11).iter().map(|&x| x | 1));
+    let clusters: Vec<u32> = (300..300 + clusters_in(file.len(), 4096)).collect();
+    b.add_at(&path, &file, &clusters);
+    b.delete(&path, DeleteStyle::Camera);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1300, &clusters, 4096);
+    let (src, ev) = scanned(&v);
+    let f = final_named(&ev, &format!("{DIR}/_SC00001.JPG"));
+    assert_eq!(
+        (f.health, deleted_as(&f).0, deleted_as(&f).1),
+        (Health::Partial, FsState::Deleted, Placement::Guessed),
+        "{f:#?}"
+    );
+    same(&extracted(&src, &f)[..photo], &file[..photo]);
+}

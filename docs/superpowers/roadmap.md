@@ -72,9 +72,9 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
       jeito de achar o corte verdadeiro quando os dados fora de ordem decodificam sem erro.
     - Um apagado sobrescrito por outro arquivo de exatamente o mesmo tamanho sai com os bytes certos e o nome do antigo:
       conferir a identidade pelo EXIF (data da foto contra as datas da entrada).
-    - Um RAW gravado contíguo sobre o primeiro pedaço de um apagado e passando dele não volta inteiro (os dados do sensor
-      depois desse pedaço não são conferidos; a foto e o vídeo voltam, sem nome, Q61); no RAW sem perdas, conferir
-      bloco a bloco resolveria.
+    - Um RAW, HEIC, RAF, CR3 ou vídeo com trilha sem conferência (ProRes) gravado contíguo sobre o primeiro pedaço de um
+      apagado e passando dele não volta inteiro (os dados depois desse pedaço não são conferidos; o JPEG e o vídeo com
+      todas as amostras conferidas voltam, sem nome, Q61/Q62); no RAW sem perdas, conferir bloco a bloco resolveria.
     - O padrão de alocação real da Sony: a conferir pelo roteiro com a A6700.
   - Decisões, resíduos aceitos e pendências em `docs/superpowers/history/2026-11-02-m1-p6-pendencias.md`; conferência
     com a câmera em `docs/superpowers/history/2026-11-02-m1-p6-conferencia-manual.md`.
