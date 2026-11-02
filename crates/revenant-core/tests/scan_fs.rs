@@ -1590,7 +1590,7 @@ fn size_mismatch_is_never_intact() {
     assert_ne!(f.health, Health::Intact, "{f:#?}");
     assert_ne!(deleted_as(&f).1, Placement::OldChain, "{f:#?}");
     // With 32 KiB clusters the 4096 bytes fit in the last cluster: the chain fits the size, but those bytes are old
-    // data, neither padding nor whole files (ruling D6).
+    // data, neither padding nor whole files (ruling D6): never `Intact`.
     let mut b = exfat(32 * 1024);
     let path = "DCIM/100MSDCF/DSC00049.JPG";
     let (j, clusters, _) = (49..)
@@ -1613,10 +1613,23 @@ fn size_mismatch_is_never_intact() {
     let last = *clusters.last().unwrap();
     let tail = b.cluster_offset(last) as usize + j.len() % (32 * 1024);
     v[tail..tail + 4096].copy_from_slice(&support::cards::noise(4096, 0x7A11));
-    let (_, ev) = scanned(&v);
-    let f = final_named(&ev, path);
-    assert_eq!(f.len, size);
-    assert_ne!(f.health, Health::Intact, "{f:#?}");
+    let (src, ev) = scanned(&v);
+    // Final review M-4 (ruling Q61): the photo's structure ends before the size, other bytes after it, in the pieces of
+    // the entry's own (old) chain: the structure disproves the name. The entry's pieces stay without it (the photo
+    // exact, then the old bytes up to the size), at most `Partial`.
+    let view = final_view(&ev);
+    assert!(
+        view.values()
+            .all(|f| f.origin.as_ref().is_none_or(|o| o.path() != path)),
+        "{view:#?}"
+    );
+    let start = VOL + b.cluster_offset(clusters[0]);
+    let f = view
+        .values()
+        .find(|f| f.start == start)
+        .unwrap_or_else(|| panic!("a finding at the entry's start: {view:#?}"));
+    assert_eq!((f.len, f.health), (size, Health::Partial), "{f:#?}");
+    same(&extracted(&src, f)[..j.len()], &j);
 }
 
 #[test]
@@ -2089,6 +2102,38 @@ fn deleted_entry_card(
     b_file: Option<&[u8]>,
     firsts: &[u32],
 ) -> (String, u64, SimSource, Vec<Event>) {
+    entry_card(
+        fat,
+        cluster,
+        ext,
+        a,
+        b_file.map(|bf| (bf, Over::SameChain)),
+        firsts,
+    )
+}
+
+/// Where [`entry_card`] writes B, and what lies after its end.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Over {
+    /// Over A's clusters in A's order (as many clusters); the rest of its last cluster zero-filled.
+    SameChain,
+    /// As `SameChain`, but the rest of B's last cluster keeps A's old bytes (the camera wrote B's last cluster
+    /// partly).
+    SameChainOldSlack,
+    /// Contiguously from A's first cluster (the camera allocates the next free clusters, A's freed runs among them):
+    /// B covers A's first run and runs past it.
+    Contiguous,
+}
+
+/// [`deleted_entry_card`] with B written `how`.
+fn entry_card(
+    fat: bool,
+    cluster: u64,
+    ext: &str,
+    a: &[u8],
+    b_file: Option<(&[u8], Over)>,
+    firsts: &[u32],
+) -> (String, u64, SimSource, Vec<Event>) {
     let need = clusters_in(a.len(), cluster);
     let clusters = split(firsts, need);
     let mut b = if fat {
@@ -2105,18 +2150,35 @@ fn deleted_entry_card(
     b.add_at(&path(1), a, &clusters);
     b.delete(&path(0), DeleteStyle::Camera);
     b.delete(&path(1), DeleteStyle::Camera);
-    if let Some(bf) = b_file {
-        assert_eq!(
-            clusters_in(bf.len(), cluster),
-            need,
-            "B in as many clusters as A"
-        );
-        b.add_at(&path(2), bf, &clusters);
+    let mut keep = clusters.clone();
+    let mut slack = None;
+    if let Some((bf, how)) = b_file {
+        let bc = if how == Over::Contiguous {
+            run(clusters[0], bf)
+        } else {
+            assert_eq!(
+                clusters_in(bf.len(), cluster),
+                need,
+                "B in as many clusters as A"
+            );
+            clusters.clone()
+        };
+        b.add_at(&path(2), bf, &bc);
         b.delete(&path(2), DeleteStyle::Camera);
+        keep.extend(&bc);
+        if how == Over::SameChainOldSlack {
+            slack = Some(bf.len());
+        }
     }
     b.add_at(&path(3), &c, &run(40, &c));
     let mut v = b.build();
-    old_data(&b, &mut v, 64..1300, &clusters, cluster);
+    old_data(&b, &mut v, 64..1300, &keep, cluster);
+    if let Some(from) = slack {
+        for off in from..a.len() {
+            let at = b.cluster_offset(clusters[off / cluster as usize]) as usize;
+            v[at + off % cluster as usize] = a[off];
+        }
+    }
     let (src, ev) = scanned(&v);
     let start = VOL + b.cluster_offset(clusters[0]);
     (path(1), start, src, ev)
@@ -2349,4 +2411,228 @@ fn pairing_gives_no_name_to_a_clip_of_another_size() {
             .all(|f| f.origin.as_ref().is_none_or(|o| o.path() != path(1, "MP4"))),
         "A's name is given to nothing"
     );
+}
+
+// ---- Final review I-1 and M-4 (ruling Q61): a whole file over a deleted entry's first piece; B and A's old bytes ----
+
+/// A 1024×768 photo (seed 1) and a shorter one in as many `cluster`-byte clusters.
+fn photo_and_a_shorter_one(cluster: u64) -> (Vec<u8>, Vec<u8>) {
+    let a = jpeg_smooth(1024, 768, 1);
+    let need = clusters_in(a.len(), cluster);
+    let b_file = (2..64)
+        .map(|s| jpeg_smooth(1024, 768, s))
+        .find(|j| j.len() < a.len() && clusters_in(j.len(), cluster) == need)
+        .expect("a shorter photo of as many clusters");
+    (a, b_file)
+}
+
+/// An ARW of `compression` (seed 1) and a shorter one (a smaller preview) in as many `cluster`-byte clusters, padded
+/// to `b_pad` bytes (0: none), and that shorter one unpadded.
+fn arw_and_a_shorter_one(
+    compression: ArwCompression,
+    b_pad: usize,
+    cluster: u64,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let options = |seed: u64, preview: (u32, u32), pad_to: usize| ArwOptions {
+        compression,
+        seed,
+        preview,
+        pad_to,
+        ..ArwOptions::default()
+    };
+    let a = arw(&options(1, ArwOptions::default().preview, 0)).bytes;
+    let need = clusters_in(a.len(), cluster);
+    let preview = |s: u64| {
+        let w = 640 - 8 * (s as u32 % 60);
+        (w, w * 3 / 4)
+    };
+    let seed = (2..200u64)
+        .find(|&s| {
+            let r = arw(&options(s, preview(s), b_pad)).bytes;
+            r.len() < a.len() && clusters_in(r.len(), cluster) == need
+        })
+        .expect("a shorter ARW of as many clusters");
+    let b_file = arw(&options(seed, preview(seed), b_pad)).bytes;
+    let unpadded = arw(&options(seed, preview(seed), 0)).bytes;
+    (a, b_file, unpadded)
+}
+
+/// A clip of `layout` with `samples` samples of `seed`.
+fn clip(layout: VideoLayout, samples: usize, seed: u64) -> Vec<u8> {
+    camera_video(
+        &AvcOptions {
+            samples,
+            seed,
+            mov: false,
+            mdat_pad: 0,
+            small_nals: false,
+        },
+        VideoCodec::Avc,
+        layout,
+    )
+    .bytes
+}
+
+/// The finding at A's start is B, whole, `Intact`, exact, without a name; A's name is given to nothing.
+fn comes_out_on_its_own(b_file: &[u8], pa: &str, start: u64, src: &SimSource, ev: &[Event]) {
+    let view = final_view(ev);
+    assert!(
+        view.values()
+            .all(|f| f.origin.as_ref().is_none_or(|o| o.path() != pa)),
+        "A's name is given to nothing: {view:#?}"
+    );
+    let f = view
+        .values()
+        .find(|f| f.start == start)
+        .unwrap_or_else(|| panic!("a finding at A's start: {view:#?}"));
+    assert_eq!(
+        (f.health, f.origin.as_ref(), f.fragments.len()),
+        (Health::Intact, None, 0),
+        "{f:#?}"
+    );
+    same(&extracted(src, f), b_file);
+}
+
+#[test]
+fn a_whole_photo_over_a_deleted_entrys_first_piece_comes_out_on_its_own() {
+    // Final review I-1 (ruling Q61): A, a deleted photo in 3 runs whose old chain still reads; B, a shorter photo the
+    // camera wrote contiguously from A's first cluster (next free), running past A's first run; B deleted, its slot
+    // reused. On 8f46be1: A's pieces (B's head, then A's old runs) keep the start, `Partial` under A's name, and B,
+    // whole on the card, is never reported.
+    let cl = 4096u64;
+    let (a, b_file) = photo_and_a_shorter_one(cl);
+    let (pa, start, src, ev) = entry_card(
+        false,
+        cl,
+        "JPG",
+        &a,
+        Some((&b_file, Over::Contiguous)),
+        &[300, 600, 900],
+    );
+    comes_out_on_its_own(&b_file, &pa, start, &src, &ev);
+}
+
+#[test]
+fn a_whole_clip_over_a_deleted_entrys_first_piece_comes_out_on_its_own() {
+    // I-1 for a clip (moov at the end), on 32 KiB clusters. On 8f46be1: A's pieces under A's name, B never reported.
+    let cl = 32 * 1024u64;
+    let a = clip(VideoLayout::MoovAtEnd, 40, 1);
+    let b_file = clip(VideoLayout::MoovAtEnd, 30, 2);
+    let (pa, start, src, ev) = entry_card(
+        false,
+        cl,
+        "MP4",
+        &a,
+        Some((&b_file, Over::Contiguous)),
+        &[300, 600, 900],
+    );
+    comes_out_on_its_own(&b_file, &pa, start, &src, &ev);
+}
+
+#[test]
+fn an_uncompressed_arw_over_a_deleted_entrys_old_bytes_is_no_false_intact() {
+    // I-1 guard 1: an uncompressed ARW B over A's chain, the rest of its last cluster A's old bytes. A carving at A's
+    // start reads B's structure, then whatever lies after A's first run as B's sensor data, which nothing checks: it
+    // never stands for the entry (without the guard: `Intact`, B's length, other bytes).
+    let cl = 32 * 1024u64;
+    let (a, b_file, _) = arw_and_a_shorter_one(ArwCompression::Uncompressed, 0, cl);
+    let (pa, start, src, ev) = entry_card(
+        false,
+        cl,
+        "ARW",
+        &a,
+        Some((&b_file, Over::SameChainOldSlack)),
+        &[300, 600, 900],
+    );
+    no_false_intact(&a, &b_file, &[], &pa, start, &src, &ev);
+}
+
+#[test]
+fn an_uncompressed_arw_over_a_deleted_entrys_first_piece_stays_partial() {
+    // The documented residual of I-1 (ruling Q61): an uncompressed ARW B written contiguously over A's first run is
+    // not recovered whole (its sensor data past A's first run is blind: no content check places it). The finding at
+    // A's start is no `Intact` file, and carries no name (its structure ends before A's size, other bytes after, M-4).
+    let cl = 32 * 1024u64;
+    let (a, b_file, _) = arw_and_a_shorter_one(ArwCompression::Uncompressed, 0, cl);
+    let (pa, start, src, ev) = entry_card(
+        false,
+        cl,
+        "ARW",
+        &a,
+        Some((&b_file, Over::Contiguous)),
+        &[300, 600, 900],
+    );
+    no_false_intact(&a, &b_file, &[], &pa, start, &src, &ev);
+    let view = final_view(&ev);
+    let f = view
+        .values()
+        .find(|f| f.start == start)
+        .unwrap_or_else(|| panic!("a finding at A's start: {view:#?}"));
+    assert_eq!(
+        (f.health, f.origin.as_ref()),
+        (Health::Partial, None),
+        "{f:#?}"
+    );
+}
+
+#[test]
+fn an_arw_padded_to_no_grain_over_a_deleted_entrys_chain_is_no_false_intact() {
+    // I-1 guard 2 (a padded view keeps rulings Q53–Q55): B an uncompressed ARW padded to 512 bytes (no camera grain),
+    // over A's chain in 1 and 3 runs, zeros after. Without the guard: a false `Intact` at A's start. In one run, the
+    // carving within A's run stands for the entry without a name: B's structure, its zero padding left out (Q53).
+    let cl = 32 * 1024u64;
+    let (a, b_file, b_structure) = arw_and_a_shorter_one(ArwCompression::Uncompressed, 512, cl);
+    assert!(b_file.starts_with(&b_structure) && b_file.len() > b_structure.len());
+    for firsts in [&[300u32][..], &[300, 600, 900][..]] {
+        let (pa, start, src, ev) = deleted_entry_card(false, cl, "ARW", &a, Some(&b_file), firsts);
+        no_false_intact(&a, &b_file, &[&b_structure], &pa, start, &src, &ev);
+    }
+}
+
+#[test]
+fn a_size_zero_mdat_clip_over_a_deleted_entrys_first_piece_is_no_false_intact() {
+    // I-1 guard 3: B a clip whose `mdat` has size 0, written contiguously over A's first run. Its carving runs to the
+    // next file start or the source's end (the 1.4 measure), so it is no whole file that may stand for the entry
+    // (without the guard: `Intact`, megabytes past B's end).
+    let cl = 32 * 1024u64;
+    let a = clip(VideoLayout::MoovAtEnd, 40, 1);
+    let b_file = clip(VideoLayout::MoovFirstMdatSizeZero, 30, 2);
+    let (pa, start, src, ev) = entry_card(
+        false,
+        cl,
+        "MP4",
+        &a,
+        Some((&b_file, Over::Contiguous)),
+        &[300, 600, 900],
+    );
+    no_false_intact(&a, &b_file, &[], &pa, start, &src, &ev);
+}
+
+#[test]
+fn a_shorter_file_and_the_entrys_old_bytes_name_nothing() {
+    // Final review M-4 (ruling Q61, the Q57 principle): B, shorter than A, over A's chain in 3 runs; the rest of B's
+    // last cluster keeps A's old bytes (not fill). B's structure ends before A's size, other bytes after: the
+    // structure disproves A's name. On 8f46be1: `Partial` under A's name (B's bytes, then A's old ones).
+    let cl = 4096u64;
+    let (a, b_file) = photo_and_a_shorter_one(cl);
+    let (pa, start, src, ev) = entry_card(
+        false,
+        cl,
+        "JPG",
+        &a,
+        Some((&b_file, Over::SameChainOldSlack)),
+        &[300, 600, 900],
+    );
+    names_nothing_and_is_no_false_intact(&a, &b_file, &pa, start, &src, &ev);
+    let cl = 32 * 1024u64;
+    let (a, b_file, _) = arw_and_a_shorter_one(ArwCompression::Lossless, 0, cl);
+    let (pa, start, src, ev) = entry_card(
+        false,
+        cl,
+        "ARW",
+        &a,
+        Some((&b_file, Over::SameChainOldSlack)),
+        &[300, 600, 900],
+    );
+    names_nothing_and_is_no_false_intact(&a, &b_file, &pa, start, &src, &ev);
 }

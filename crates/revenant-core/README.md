@@ -1932,7 +1932,20 @@ a probe over the raw source that refuses, without reading it, any range the cach
   | at the size, or a RAW's own grain padding fills the rest | name kept; D3/D5 (`Intact` when trusted: a recorded run or a one-run guess of free clusters) | name kept; `Intact`, `old_chain` when every check passes, else `guessed`, `Partial` |
   | early, then fill only | no name: the carving at the start, or the entry's pieces at most `Partial` | the same |
   | at the end of pieces cut short of the size | name kept; D3/D5 | name kept; `guessed`, `Partial` |
-  | early, then other bytes | name kept; at most `Partial` | name kept; `guessed`, `Partial` |
+  | early, then other bytes | a recorded run whose structure is `Intact`: no name, as for fill; else name kept, at most `Partial` | an `Intact` structure: no name, as for fill; else name kept, `guessed`, `Partial` |
+
+  The "early, then other bytes" row (final review M-4, the Q57 principle: no name the structure disproves): in the
+  pieces the entry's own record gives (a recorded run or an old chain), a structure `Intact` in one run that ends
+  before the size with other bytes after it is a shorter file over the clusters (the rest of its last cluster the
+  entry's old bytes), so the name goes as for fill; a guess's early end disproves only the guess, and keeps the name.
+  **Another whole file over the first piece (final review I-1, ruling Q61).** A camera allocating the next free
+  clusters may write a whole file over a deleted entry's first run and past it. When the carving at the entry's start
+  is `Intact`, in one run, longer than that first piece and not of the recorded size, it comes out on its own, without
+  the name, unless one of four guards holds: the carving is a TIFF RAW (its sensor data past the first piece is
+  checked by nothing, so any bytes would pass: such a RAW stays lost, its start reported as the entry's pieces, a
+  documented residual); the view is padded (the fill rule decides); the carving is a video whose `mdat` has size 0
+  (it runs to the next file start or the source's end, no whole file's length); or the view is `Intact` at the size
+  (the entry proves itself and keeps its pieces).
 - **Nothing is skipped because of the file system** (ruling R10): every head the signature rules examine is still
   examined, and only an `Intact` finding skips its pieces, as before.
 - **A listed file's finding** is added at the sector holding its first piece, always (whether a format recognizes the

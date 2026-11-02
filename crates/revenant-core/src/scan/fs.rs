@@ -144,6 +144,11 @@ pub(crate) struct ViewMeasure {
     /// view has none. The scan's finding starts cannot tell: those after the file are not known yet when it is merged,
     /// and no head inside an `Intact` finding's pieces is examined.
     pub checks: bool,
+    /// For a deleted file, the carving at its start is a video whose `mdat` has size 0 and that runs past the file's
+    /// first piece ([`fs_job`]): such an `mdat` runs to the next file start or the source's end, so the carving's length
+    /// is no whole file's and it never stands for the entry as another file written over it ([`decide`], final review
+    /// I-1, guard 3). `false` for every other file.
+    pub open_carving: bool,
 }
 
 /// What a kept file's job computes: its view measurement and, for a deleted file, the carving at its start.
@@ -261,6 +266,11 @@ fn ends(
 /// Ruling Q54 (b): the padding a camera writes into its own TIFF-based RAWs (Sony pads ARWs with zeros to a 4 KiB or
 /// 64 KiB multiple): a recorded `size` that is the structure's end `l` rounded up to one of those grains.
 pub(crate) fn raw_padding(kind: FileKind, l: u64, size: u64) -> bool {
+    tiff_raw(kind) && [4096, 65536].iter().any(|&g| size == l.next_multiple_of(g))
+}
+
+/// A TIFF-based RAW (or TIFF), whose sensor data is uncompressed, lossy or lossless.
+fn tiff_raw(kind: FileKind) -> bool {
     matches!(
         kind,
         FileKind::Arw
@@ -270,7 +280,7 @@ pub(crate) fn raw_padding(kind: FileKind, l: u64, size: u64) -> bool {
             | FileKind::Orf
             | FileKind::Rw2
             | FileKind::Tiff
-    ) && [4096, 65536].iter().any(|&g| size == l.next_multiple_of(g))
+    )
 }
 
 /// Ruling D6 over a view of `S` bytes whose structure ends at `l`: `l == S`, or the rest is padding, or up to
@@ -365,6 +375,7 @@ pub(crate) fn measure_view(
         at_size,
         own: absolute(&f.pieces, own),
         checks,
+        open_carving: false,
     }
 }
 
@@ -411,13 +422,21 @@ pub(crate) fn fs_job(
                 at_size,
                 own: carved_own.clone(),
                 checks: false,
+                open_carving: false,
             },
             carved,
             carved_own,
         };
     }
+    let mut view = measure_view(formats, source, f, cancel);
+    let first = f.pieces.first().map_or(0, |p| p.len);
+    view.open_carving = carved.as_ref().is_some_and(|c| {
+        matches!(c.kind, FileKind::Mp4 | FileKind::Mov)
+            && c.len > first
+            && crate::formats::isobmff::size_zero_mdat_end(source, at).is_some()
+    });
     FsJobResult {
-        view: measure_view(formats, source, f, cancel),
+        view,
         carved,
         carved_own,
     }
@@ -456,7 +475,19 @@ pub(crate) struct Decision {
 ///   chain too (Q55: no exemption). The carving at the start replaces the entry, without a name, when it reads the same
 ///   bytes as the view (contiguous, within the entry's first piece: a carving that runs past it, as a size-0 `mdat` to
 ///   the end of the source, does not); otherwise the entry's pieces stay without the name ([`Padded::Unnamed`]).
-/// - **early, then other bytes** (not `tail_ok`): the name stays, at most `Partial`; an old chain is no proof.
+/// - **early, then other bytes** (not `tail_ok`, only for a deleted file whose pieces are its file system's record,
+///   `Recorded` or `OldChain`): the structure, `Intact` in one run, ends before the size and other bytes follow (a
+///   shorter file over the clusters, the rest of its last cluster the entry's old bytes): the structure disproves the
+///   name (final review M-4, the Q57 principle). Without the name as for fill: the carving when it reads the view's
+///   bytes, else the entry's pieces ([`Padded::Unnamed`]). Any other view that is not `tail_ok` keeps the name, at most
+///   `Partial` (a guess's early end disproves the guess, not the name); an old chain is no proof.
+/// - **another whole file over the first piece** (final review I-1, ruling Q61): the carving at a deleted entry's start
+///   is a whole file in one run, `Intact`, that runs past the entry's first piece and is not of its size (a camera
+///   allocating the next free clusters over the entry's freed runs). It is reported on its own, without the name
+///   ([`Padded::Carving`]), unless one of four guards holds: the carving is a TIFF RAW (its sensor data past the first
+///   piece is not checked: it may be any bytes; an uncompressed or lossy RAW there stays lost, a documented residual);
+///   the view is padded (the fill rule above decides); the carving is a size-0 `mdat` ([`ViewMeasure::open_carving`]);
+///   or the view is `Intact` at size (the entry proves itself and keeps its pieces).
 ///
 /// The content's end is the format's full extent, computed once before the fill check ([`ends`], ruling Q56): the
 /// structure (for a video with a size-0 `mdat`, its highest sample end), then the whole files D6 allows after it (an
@@ -475,10 +506,34 @@ pub(crate) fn decide(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement
         && view.at_size
         && !joined
         && len == f.origin.size;
-    let rule = if !deleted || !view.padded {
+    let first = f.pieces.first().map_or(0, |p| p.len);
+    let view_intact = view.m.as_ref().is_some_and(|m| m.health == Health::Intact);
+    let overwritten = deleted
+        && !view.padded
+        && !view.open_carving
+        && !(view.at_size && view_intact)
+        && carved.is_some_and(|c| {
+            c.health == Health::Intact
+                && c.fragments.is_empty()
+                && c.len > first
+                && c.len != f.origin.size
+                && !tiff_raw(c.kind)
+        });
+    let record = matches!(
+        f.origin.placement,
+        Placement::Recorded | Placement::OldChain
+    );
+    let early = deleted
+        && record
+        && !view.tail_ok
+        && view.m.as_ref().is_some_and(|m| {
+            m.health == Health::Intact && m.fragments.is_empty() && m.len < f.origin.size
+        });
+    let rule = if overwritten {
+        Padded::Carving
+    } else if !deleted || !(view.padded || early) {
         Padded::Keep
     } else {
-        let first = f.pieces.first().map_or(0, |p| p.len);
         match carved {
             Some(c) if c.fragments.is_empty() && c.len <= first => Padded::Carving,
             _ => Padded::Unnamed,
@@ -623,6 +678,7 @@ mod tests {
             padded: false,
             own: Vec::new(),
             checks: false,
+            open_carving: false,
         }
     }
 
@@ -689,6 +745,7 @@ mod tests {
             at_size,
             own: Vec::new(),
             checks: true,
+            open_carving: false,
         };
         let cells = [
             ("at size", full(1000, true, false, true)),
@@ -706,14 +763,17 @@ mod tests {
         ] {
             let mut f = file(FsState::Deleted, trusted, &[(4096, 600), (65536, 400)]);
             f.origin.placement = placement;
+            // M-4 (ruling Q61): in the pieces of the entry's own record, a structure ending early over other bytes
+            // disproves the name; a guess's early end disproves only the guess.
+            let record = matches!(placement, Placement::Recorded | Placement::OldChain);
             for (cell, v) in &cells {
                 let d = decide(&f, v, Some(&carved));
                 let r = merge(&f, v, Some(&carved));
                 let named = d.rule == Padded::Keep;
-                let want_named = *cell != "fill";
-                assert_eq!(named, want_named, "{placement:?} {cell}");
+                let nameless = *cell == "fill" || (*cell == "foreign" && record);
+                assert_eq!(named, !nameless, "{placement:?} {cell}");
                 // Carving within the first piece (500 ≤ 600): the carving stands for the entry, nameless.
-                if *cell == "fill" {
+                if nameless {
                     assert_eq!(d.rule, Padded::Carving, "{placement:?} {cell}");
                     let none = decide(&f, v, None).rule;
                     assert_eq!(none, Padded::Unnamed, "{placement:?} {cell}");
@@ -742,6 +802,73 @@ mod tests {
         for (cell, v) in &cells {
             assert_eq!(decide(&live, v, None).rule, Padded::Keep, "live {cell}");
         }
+
+        // Final review I-1 (ruling Q61): another whole file over the first piece, a carving `Intact` in one run that
+        // runs past it (1500 > 600) and is not of the size, is reported on its own, whatever placed the entry, unless
+        // a guard holds. "short view" (no fill, no proof) keeps the name without it.
+        let short = &cells[3].1;
+        let long = m(1500, Health::Intact);
+        let rule = |f: &FsFile, v: &ViewMeasure, c: &Measurement| decide(f, v, Some(c)).rule;
+        for (placement, trusted) in [
+            (Placement::Recorded, true),
+            (Placement::Guessed, false),
+            (Placement::OldChain, false),
+        ] {
+            let mut f = file(FsState::Deleted, trusted, &[(4096, 600), (65536, 400)]);
+            f.origin.placement = placement;
+            assert_eq!(rule(&f, short, &long), Padded::Carving, "{placement:?}");
+            assert_eq!(
+                rule(&f, &cells[4].1, &long),
+                Padded::Carving,
+                "{placement:?}"
+            );
+            // The carving must be a whole other file: `Intact`, in one run, past the first piece, not of the size.
+            assert_eq!(rule(&f, short, &m(1500, Health::Partial)), Padded::Keep);
+            let mut joined = long.clone();
+            joined.fragments = vec![
+                Fragment { start: 0, len: 700 },
+                Fragment {
+                    start: 9000,
+                    len: 800,
+                },
+            ];
+            assert_eq!(rule(&f, short, &joined), Padded::Keep, "{placement:?}");
+            assert_eq!(rule(&f, short, &m(600, Health::Intact)), Padded::Keep);
+            assert_eq!(rule(&f, short, &m(1000, Health::Intact)), Padded::Keep);
+            // Guard 1: a TIFF RAW's sensor data past the first piece is unchecked.
+            for kind in [FileKind::Arw, FileKind::Cr2, FileKind::Dng, FileKind::Tiff] {
+                let raw = Measurement {
+                    kind,
+                    ..long.clone()
+                };
+                assert_eq!(
+                    rule(&f, short, &raw),
+                    Padded::Keep,
+                    "{placement:?} {kind:?}"
+                );
+            }
+            // Guard 2: a padded view keeps the fill rule (the carving runs past the first piece: unnamed pieces).
+            assert_eq!(
+                rule(&f, &cells[2].1, &long),
+                Padded::Unnamed,
+                "{placement:?}"
+            );
+            // Guard 3: a size-0 `mdat` carving runs to the next file start, no whole file's length.
+            let open = ViewMeasure {
+                open_carving: true,
+                ..short.clone()
+            };
+            assert_eq!(rule(&f, &open, &long), Padded::Keep, "{placement:?}");
+            // Guard 4: a view `Intact` at size proves the entry: it keeps its pieces and name.
+            assert_eq!(rule(&f, &cells[0].1, &long), Padded::Keep, "{placement:?}");
+            assert_eq!(rule(&f, &cells[1].1, &long), Padded::Keep, "{placement:?}");
+            let damaged = ViewMeasure {
+                m: Some(m(1000, Health::Partial)),
+                ..cells[0].1.clone()
+            };
+            assert_eq!(rule(&f, &damaged, &long), Padded::Carving, "{placement:?}");
+        }
+        assert_eq!(rule(&live, short, &long), Padded::Keep);
     }
 
     #[test]
