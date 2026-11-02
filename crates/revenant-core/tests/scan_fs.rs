@@ -1873,3 +1873,55 @@ fn stale_entry_over_a_shorter_photo_and_zeros_names_nothing() {
         "A's name is given to nothing"
     );
 }
+
+/// An ARW of `compression` zero-padded to 64 KiB (as Sony's ILCE-7S pads them), deleted in camera on exFAT (32 KiB
+/// clusters, its chain kept) in runs from `firsts`, old data around it; the final finding at its start and the source.
+fn padded_deleted_arw(
+    compression: ArwCompression,
+    firsts: &[u32],
+) -> (Vec<u8>, Finding, SimSource) {
+    let cl = 32 * 1024u64;
+    let a = arw(&ArwOptions {
+        compression,
+        pad_to: 64 * 1024,
+        ..ArwOptions::default()
+    })
+    .bytes;
+    let mut b = exfat(cl as u32);
+    let path = "DCIM/100MSDCF/DSC00045.ARW";
+    let clusters = split(firsts, clusters_in(a.len(), cl));
+    b.add_at(path, &a, &clusters);
+    b.delete(path, DeleteStyle::Camera);
+    let mut v = b.build();
+    old_data(&b, &mut v, 64..1300, &clusters, cl);
+    let (src, ev) = scanned(&v);
+    let f = final_named(&ev, path);
+    assert_eq!(f.start, VOL + b.cluster_offset(clusters[0]), "{f:#?}");
+    (a, f, src)
+}
+
+#[test]
+fn padded_arw_in_three_runs_keeps_its_old_chain() {
+    // Sony's own padding is no sign of another file (Q54): the old chain proves the placement, as for an unpadded ARW.
+    for compression in [ArwCompression::Uncompressed, ArwCompression::Lossless] {
+        let (a, f, src) = padded_deleted_arw(compression, &[300, 600, 900]);
+        assert_eq!(f.fragments.len(), 3, "{compression:?}: {f:#?}");
+        assert_eq!(
+            (f.health, deleted_as(&f).1),
+            (Health::Intact, Placement::OldChain),
+            "{compression:?}: {f:#?}"
+        );
+        same(&extracted(&src, &f), &a);
+    }
+}
+
+#[test]
+fn padded_arw_in_one_run_keeps_its_name() {
+    let (a, f, src) = padded_deleted_arw(ArwCompression::Uncompressed, &[300]);
+    assert_eq!(
+        (f.health, f.len),
+        (Health::Intact, a.len() as u64),
+        "{f:#?}"
+    );
+    same(&extracted(&src, &f), &a);
+}

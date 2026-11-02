@@ -1832,8 +1832,13 @@ a probe over the raw source that refuses, without reading it, any range the cach
   bytes are that entry's: a camera reusing directory slots may have written another, shorter photo over its clusters
   and zero-filled the rest of the last one, its own entry gone since. The finding there is then the carving at that
   start (its length and health), without the entry's name or size; with no carving there (unreadable or skipped start)
-  the entry's finding is at most `Partial`. A live file keeps the D6 rule. Cost: a deleted photo that really was
-  zero-padded inside its recorded size loses its name (it is still recovered).
+  the entry's finding is at most `Partial`. A live file keeps the D6 rule. Ruling Q54 bounds it: a format's own
+  padding is no such sign (a TIFF-based RAW whose recorded size is its structure's end rounded up to 4 KiB or 64 KiB,
+  as Sony pads its ARWs, keeps its name and placement); an `OldChain` entry whose view passes its checks keeps its
+  placement, name and health; and the carving replaces a fragmented entry only when it reads the same bytes as the
+  view (contiguous, within the first piece), else the entry's pieces stay, without the name, at most `Partial`. Cost:
+  a deleted photo that really was zero-padded inside its recorded size loses its name (it is still recovered), and an
+  ARW over another whose sizes match a grain rounding by coincidence keeps the older name.
 - **Nothing is skipped because of the file system** (ruling R10): every head the signature rules examine is still
   examined, and only an `Intact` finding skips its pieces, as before.
 - **A listed file's finding** is added at the sector holding its first piece, always (whether a format recognizes the

@@ -219,6 +219,21 @@ fn is_padded(view: &dyn Source, l: u64) -> bool {
     l < view.len() && padding(view, l, view.len())
 }
 
+/// Ruling Q54 (b): the padding a camera writes into its own TIFF-based RAWs (Sony pads ARWs with zeros to a 4 KiB or
+/// 64 KiB multiple): a recorded `size` that is the structure's end `l` rounded up to one of those grains.
+fn raw_padding(kind: FileKind, l: u64, size: u64) -> bool {
+    matches!(
+        kind,
+        FileKind::Arw
+            | FileKind::Cr2
+            | FileKind::Nef
+            | FileKind::Dng
+            | FileKind::Orf
+            | FileKind::Rw2
+            | FileKind::Tiff
+    ) && [4096, 65536].iter().any(|&g| size == l.next_multiple_of(g))
+}
+
 /// Ruling D6 over a view of `S` bytes whose structure ends at `l`: `l == S`, or the rest is padding, or up to
 /// [`MAX_TAIL_FILES`] files measured one after another (contiguous, not `Damaged`, inside the view), then padding.
 fn tail_ok(
@@ -283,7 +298,9 @@ pub(crate) fn measure_view(
     let tail_ok = m
         .as_ref()
         .is_some_and(|m| tail_ok(formats, &view, m.len, cancel));
-    let padded = m.as_ref().is_some_and(|m| is_padded(&view, m.len));
+    let padded = m
+        .as_ref()
+        .is_some_and(|m| is_padded(&view, m.len) && !raw_padding(m.kind, m.len, f.origin.size));
     let old_chain = f.origin.state == FsState::Deleted && f.origin.placement == Placement::OldChain;
     let checks = old_chain
         && tail_ok
@@ -330,7 +347,7 @@ pub(crate) fn fs_job(
     {
         let view = Fragmented::new(source, f.pieces.clone());
         let tail_ok = tail_ok(formats, &view, c.len, cancel);
-        let padded = is_padded(&view, c.len);
+        let padded = is_padded(&view, c.len) && !raw_padding(c.kind, c.len, f.origin.size);
         return FsJobResult {
             view: ViewMeasure {
                 m: Some(c.clone()),
@@ -350,11 +367,35 @@ pub(crate) fn fs_job(
     }
 }
 
-/// Ruling Q53: the kept file `f` is reported as the carving `carved` at its start, without its name: a deleted entry
-/// whose structure ends before its recorded size with only padding after it (the bytes may be another, shorter file
-/// written over its clusters, the rest of the last cluster zero-filled). Live files keep their name.
-pub(crate) fn nameless(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement>) -> bool {
-    f.origin.state == FsState::Deleted && view.padded && carved.is_some()
+/// What rulings Q53 and Q54 make of a kept file whose structure ends early over padding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Padded {
+    /// The rule does not apply: the merge as usual.
+    Keep,
+    /// Reported as the carving at its start, without the entry's name.
+    Carving,
+    /// Its own pieces, without the entry's name, at most `Partial` (the carving cannot stand for them).
+    Unnamed,
+}
+
+/// Rulings Q53/Q54 for the kept file `f`: a deleted entry whose structure ends before its recorded size with only
+/// padding after it (`view.padded`; a RAW's own padding to its grain is not, Q54 b) proves nothing about which file the
+/// bytes are (another, shorter one may have been written over its clusters, the rest of the last cluster zero-filled),
+/// unless its old chain proves its placement (`OldChain` whose view passes its checks: kept as is). The carving at its
+/// start replaces it only when it reads the same bytes as the view: contiguous and within the first piece; otherwise
+/// the entry's pieces stay, without the name. Live files keep their name.
+pub(crate) fn padded_rule(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement>) -> Padded {
+    let proven = f.origin.placement == Placement::OldChain && view.checks;
+    if f.origin.state != FsState::Deleted || !view.padded || proven {
+        return Padded::Keep;
+    }
+    let first = f.pieces.first().map_or(0, |p| p.len);
+    match carved {
+        Some(c) if c.fragments.is_empty() && (f.pieces.len() == 1 || c.len <= first) => {
+            Padded::Carving
+        }
+        _ => Padded::Unnamed,
+    }
 }
 
 /// A kept file's finding.
@@ -392,8 +433,9 @@ pub(crate) fn merge(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement>
     let proven = old_chain && view.checks && view.tail_ok && !joined && len == f.origin.size;
     // Q53: a deleted entry whose structure ends before its size with only padding after it proves nothing about which
     // file the bytes are (another, shorter one may have been written over its clusters); the scan reports the carving
-    // there without the entry's name instead ([`nameless`]); never `Intact` under the name.
-    let padded = f.origin.state == FsState::Deleted && view.padded;
+    // there without the entry's name instead ([`padded_rule`]); never `Intact` under the name, unless its old chain
+    // proves the placement (Q54).
+    let padded = f.origin.state == FsState::Deleted && view.padded && !proven;
     if ((!f.trusted && !proven) || !view.tail_ok || joined || padded) && health == Health::Intact {
         health = Health::Partial;
     }
@@ -503,14 +545,34 @@ mod tests {
         assert_eq!(merge(&live, &padded, None).health, Health::Intact);
         assert_eq!(merge(&deleted, &padded, None).health, Health::Partial);
         let carved = m(900, Health::Intact);
-        assert!(nameless(&deleted, &padded, Some(&carved)));
-        assert!(!nameless(&deleted, &padded, None));
-        assert!(!nameless(&live, &padded, Some(&carved)));
-        assert!(!nameless(
-            &deleted,
-            &view(Some(m(900, Health::Intact)), true),
-            Some(&carved)
-        ));
+        assert_eq!(
+            padded_rule(&deleted, &padded, Some(&carved)),
+            Padded::Carving
+        );
+        assert_eq!(padded_rule(&deleted, &padded, None), Padded::Unnamed);
+        assert_eq!(padded_rule(&live, &padded, Some(&carved)), Padded::Keep);
+        let plain = view(Some(m(900, Health::Intact)), true);
+        assert_eq!(padded_rule(&deleted, &plain, Some(&carved)), Padded::Keep);
+        // Q54: in pieces, a carving longer than the first piece is not the view's bytes; an old chain whose view passes
+        // its checks keeps its placement.
+        let mut chain = file(FsState::Deleted, false, &[(4096, 600), (65536, 400)]);
+        assert_eq!(padded_rule(&chain, &padded, Some(&carved)), Padded::Unnamed);
+        assert_eq!(
+            padded_rule(&chain, &padded, Some(&m(500, Health::Partial))),
+            Padded::Carving
+        );
+        chain.origin.placement = Placement::OldChain;
+        let checked = ViewMeasure {
+            checks: true,
+            ..padded.clone()
+        };
+        assert_eq!(padded_rule(&chain, &checked, Some(&carved)), Padded::Keep);
+        assert_eq!(padded_rule(&chain, &padded, Some(&carved)), Padded::Unnamed);
+        // Q54 (b): a RAW's own padding to 4 KiB or 64 KiB is not the rule's padding.
+        assert!(raw_padding(FileKind::Arw, 900_000, 917_504));
+        assert!(raw_padding(FileKind::Arw, 900_000, 901_120));
+        assert!(!raw_padding(FileKind::Arw, 900_000, 905_000));
+        assert!(!raw_padding(FileKind::Jpeg, 900_000, 917_504));
     }
 
     #[test]

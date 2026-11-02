@@ -23,7 +23,7 @@ use crate::formats::{FileKind, Format, Fragment, Health, Measurement};
 use crate::rate::RateMeter;
 use crate::reassemble;
 use crate::source::Source;
-use fs::{FsJobResult, FsPlan, merge, nameless, tail_fits};
+use fs::{FsJobResult, FsPlan, Padded, merge, padded_rule, tail_fits};
 use pipeline::{Block, CloseQueue, Finders, Head, Measured, Outcome, Shared};
 pub(crate) use state::{Checkpoint, Resume, ScanState};
 
@@ -798,10 +798,9 @@ impl Commit<'_, '_> {
                 let carved = (!bad && !self.shared.skipped(at))
                     .then_some(r.carved.as_ref())
                     .flatten();
-                if let Some(c) =
-                    carved.filter(|_| nameless(&self.shared.fs.kept[k], &r.view, carved))
-                {
-                    // Ruling Q53: the carving, without the entry's name.
+                let rule = padded_rule(&self.shared.fs.kept[k], &r.view, carved);
+                if let (Padded::Carving, Some(c)) = (rule, carved) {
+                    // Rulings Q53/Q54: the carving, without the entry's name.
                     let c = c.clone();
                     self.add(at, c, None, r.carved_own, true);
                 } else {
@@ -810,13 +809,18 @@ impl Commit<'_, '_> {
                     // since is reported, but it is no start that stops a piece (ruling Q52).
                     let head = r.view.m.is_some() || carved.is_some();
                     let own = r.own_of(&m);
-                    let measurement = Measurement {
+                    let mut measurement = Measurement {
                         len: m.len,
                         kind: m.kind,
                         health: m.health,
                         fragments: m.fragments,
                     };
-                    self.add(at, measurement, Some(m.origin), own, head);
+                    // Q54: the entry's pieces stay, but not its name (`merge` already left it at most `Partial`).
+                    let origin = (rule != Padded::Unnamed).then_some(m.origin);
+                    if origin.is_none() && measurement.health == Health::Intact {
+                        measurement.health = Health::Partial;
+                    }
+                    self.add(at, measurement, origin, own, head);
                 }
             }
             if bad {
