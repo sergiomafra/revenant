@@ -733,9 +733,10 @@ impl Walker<'_, '_> {
         } else {
             (&t.strip_offsets, &t.strip_counts)
         };
-        // An IFD with tiles and strips (the ILCE-6700 writes one strip over all its lossless tiles): the tiles win, and a
-        // strip that overlaps the IFD's own tiles is no range of its own (it would be one lossless JPEG ending at its
-        // first tile's EOI, not where declared).
+        // An IFD with tiles and strips (the ILCE-6700 writes one strip over all its lossless tiles): the tiles win. A
+        // strip lying wholly inside the IFD's own tiles is no range of its own (it would be one lossless JPEG ending at
+        // its first tile's EOI, not where declared); any other strip stays a range, and counts toward the extent, but is
+        // never a lossless unit (review I-1: dropping one that reaches past the tiles would cut the file short).
         // The tiles' extent as disjoint runs in order, so each strip is looked up in O(log n).
         let mut tiles: Vec<(u64, u64)> = t
             .tile_offsets
@@ -752,18 +753,19 @@ impl Walker<'_, '_> {
                 _ => runs.push((o, e)),
             }
         }
-        let over_tiles = |o: u64, l: u64| {
+        let inside_tiles = |o: u64, l: u64| {
             let e = o.saturating_add(l);
-            // The first run ending after `o` is the only one that can start before `e`.
+            // The first run ending after `o` is the only one that can hold `[o, e)`.
             let i = runs.partition_point(|&(_, re)| re <= o);
-            runs.get(i).is_some_and(|&(ro, _)| ro < e)
+            runs.get(i).is_some_and(|&(ro, re)| ro <= o && e <= re)
         };
         let (strip_offsets, strip_counts): (Vec<u64>, Vec<u64>) = strip_offsets
             .iter()
             .zip(strip_counts.iter())
-            .filter(|&(&o, &l)| !over_tiles(o, l))
+            .filter(|&(&o, &l)| !inside_tiles(o, l))
             .map(|(&o, &l)| (o, l))
             .unzip();
+        let has_tiles = !runs.is_empty();
         let (strip_offsets, strip_counts) = (&strip_offsets, &strip_counts);
         if let (Some(o), Some(l)) = (t.jpeg_offset, t.jpeg_len)
             && l > 0
@@ -782,9 +784,9 @@ impl Walker<'_, '_> {
         let jpeg_coded = matches!(t.compression, Some(6 | 7 | 34892));
         // What the first range of the IFD is, once: `(lossy JPEG, lossless JPEG)`.
         let mut kind: Option<(bool, bool)> = None;
-        for (offsets, counts) in [
-            (strip_offsets, strip_counts),
-            (&t.tile_offsets, &t.tile_counts),
+        for (offsets, counts, strips) in [
+            (strip_offsets, strip_counts, true),
+            (&t.tile_offsets, &t.tile_counts, false),
         ] {
             for (&o, &l) in offsets.iter().zip(counts.iter()) {
                 if l == 0 {
@@ -824,7 +826,7 @@ impl Walker<'_, '_> {
                     self.info.jpegs.push((o, l));
                 } else {
                     self.info.data.push((o, l));
-                    if lossless {
+                    if lossless && !(strips && has_tiles) {
                         self.info.lossless.push((o, l));
                     }
                     if jpeg_coded {
@@ -1359,6 +1361,19 @@ mod tests {
         let starts: Vec<u64> = ranges.iter().map(|r| r.0).collect();
         assert_eq!(i.jpeg_data_starts, starts);
         assert_eq!(i.end, (data + n * tile.len()) as u64);
+        // A strip reaching 100 bytes past the tiles (review I-1): still a range and the extent, never a lossless unit.
+        let long = (n * tile.len() + 100) as u32;
+        let e = 8 + 2 + 12 * 2;
+        b[e + 8..e + 12].copy_from_slice(&long.to_le_bytes());
+        b.resize(data + long as usize, 0);
+        let i = walk_all(&b).unwrap();
+        assert_eq!(i.lossless, ranges);
+        assert!(
+            i.data.contains(&(data as u64, u64::from(long))),
+            "{:?}",
+            i.data
+        );
+        assert_eq!(i.end, data as u64 + u64::from(long));
     }
 
     #[test]

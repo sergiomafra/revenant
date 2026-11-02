@@ -1179,17 +1179,23 @@ unique. A solution through a blind seam is at most `Unproven`.
 
 **Walking candidates in turn (part 1.6, measured in Task 11).** The candidates of a seam are listed first (the listing
 and the prefilter as above), then walked one at a time: an evident one is descended into at once, its walk reused for
-the descent (not walked again, but charged again: one walk and the bytes it read, so the budget is spent exactly as if
-it had been walked twice), a blind one is kept for after the evident ones, one broken at the seam is dropped. The
-descents are those of walking every candidate first, in the same order; only the candidates after the point where the
-search stops (a second solution, a first one it settles for, the budget) are never walked. A format whose prefilter
+the descent (not walked again, but charged again: one walk and the bytes the first walk read, so it costs at least what
+walking it again would; exactly that for a format with no memory between walks, a little more for the JPEG, whose
+second walk would replay the phase up to its first seam from memory and read less), a blind one is kept for after the
+evident ones, one broken at the seam is dropped. Where no budget is hit, the descents are those of walking every
+candidate first, in the same order, and the result is the same; only the candidates after the point where the search
+stops (a second solution, a first one it settles for) are never walked. Under a hit budget (a file's, or the scan's
+when the pruned search leaves more of it to later files) the result may differ: another `Partial` best path, or a
+later candidate searched that would not have been; never an `Intact` the whole search did not earn (an `Intact` needs
+every candidate walked with no budget hit, the same walks either way). A format whose prefilter
 remembers what its earlier walks saw (`Seams::memo_prefilter` false: fragmented MP4) keeps the old order, every
 candidate walked before the first descent; the TIFF RAW's prefilter reads the structure of the file as found at its
 start, never the last view walked, so its answers are the candidate's and the seam's alone (ruling Q59, unit test
 `the_prefilter_does_not_depend_on_earlier_walks`). On the `scattered-card` bench image at 512 MiB, walking every candidate first
 spent 80 843 candidate walks for 6 902 descents (29 of the reassembly's 34 s on its 83 lossless ARWs); in turn, the
 same events come out in 11.4 s. The unit test `pruned_search_changes_no_outcome` scans a small scattered card both ways
-and needs the same events, and `a_reused_walk_is_charged_as_walked_again` the same result and budget left for any try
+and needs the same events (no budget is hit there), and `a_reused_walk_is_charged_as_walked_again`, on a format with no
+memory between walks, the same result and budget left for any try
 or read budget.
 
 **Settling on a first solution.** A format whose seams are mostly unprovable (a RAW) settles on its first complete
@@ -1307,8 +1313,8 @@ A known limit: a piece followed at once on the card by a run of another photo wh
 similar photos with the same tables) can give the walk no break at that cluster boundary; the search then goes on
 through the other photo's run and may find no complete solution, and the photo keeps its earlier result (or comes out
 `Partial` with what fitted), never `Intact`. In particular, a JPEG with no restart markers (DRI 0) in three or more
-pieces, placed by content alone, is often not put back (5 of the 8 real camera previews of `real_previews_split_in_three`,
-and the ILCE-6700's): it stays the `Partial` one-run guess of the file system or the carving, which holds the bytes of
+pieces, placed by content alone, is often not put back (6 of the 9 real camera previews of `real_previews_split_in_three`,
+the ILCE-6700's among them): it stays the `Partial` one-run guess of the file system or the carving, which holds the bytes of
 whatever follows its first piece (the 1.4 behaviour; never `Intact`, ruling Q59).
 
 ### Realistic cards (`tests/reassembly_cards.rs`)
@@ -2331,12 +2337,13 @@ device against the image of the same card, as the opt-in `os_devices` test print
 against 148 to 154 in the part's first run, so reading the raw device costs a little, not a multiple.
 
 **End of 1.6 (reassembly, Task 11).** Against `main` (`c9e590a`, the 1.5 head, which has no reassembly step) built in a
-separate worktree and target, and the 1.6 head before Task 11 (`ca6aacb`), interleaved, three rounds with a pause, best
-of 5 scans (3 for `exfat-card`, `cut-jpeg` and `scattered-card`), load average 3 to 4 (the first two rounds of the day, at load 15 to 88, spread
+separate worktree and target, and the 1.6 head before Task 11 (`ca6aacb`), interleaved, three rounds with a pause, the
+best round of each, a round being the best of 5 scans (of 3 for `exfat-card`, `cut-jpeg` and `scattered-card`); the
+"end of 1.6" columns are Task 11's first commit (`e84adf4`), load average 3 to 4 (the first two rounds of the day, at load 15 to 88, spread
 by more than 40% against themselves and are not used):
 
-| Image            | `main` (s) | before Task 11 (s) | end of 1.6 (s) | end of 1.6 (MB/s) |
-| ---------------- | ---------: | -----------------: | -------------: | ----------------: |
+| Image            | `main` (s) | before Task 11 (s) | `e84adf4` (s) | `e84adf4` (MB/s) |
+| ---------------- | ---------: | -----------------: | ------------: | ---------------: |
 | `noise`          |       0.42 |               0.45 |           0.43 |            2473.4 |
 | `dense-jpeg`     |       2.02 |               2.03 |           1.92 |             560.0 |
 | `dense-raw`      |       0.66 |               0.66 |           0.63 |            1710.3 |
@@ -2344,6 +2351,14 @@ by more than 40% against themselves and are not used):
 | `exfat-card`     |       1.98 |               1.99 |           1.88 |             569.8 |
 | `cut-jpeg`       |       2.41 |              81.17 |          25.08 |              42.8 |
 | `scattered-card` |          - |                  - |          26.93 |              39.9 |
+
+Its two fix rounds changed the scan path (the TIFF reader's strip rule, the lossless tile's fill after its EOI) and
+were measured again against `main`, interleaved, three rounds of best of 3 (best of 5 for `dense-raw`, with `e84adf4`
+as control): `noise` 0.45 on `main` / 0.46 at fix round 1 (`df19183`), `dense-jpeg` 2.01 / 1.98, `video` 0.45 / 0.45,
+`exfat-card` 2.31 / 2.34, `dense-raw` 0.65 / 0.65 (`e84adf4` 0.62), all within 5%; fix round 2 changes only which
+strips the TIFF reader drops (one comparison per strip) and was not measured again except `scattered-card`: 23.07 s
+(46.5 MB/s) at its head, 25.0 s at fix round 1 and 26.93 s at `e84adf4` (this machine spreads that much between
+runs).
 
 The images with no reassembly candidate (all but the last two: the step does not run) are within 5% of `main`
 (`video` 0.44 against 0.42 s is 0.02 s, inside `main`'s own spread of 0.42 to 0.45 s between rounds). `cut-jpeg` is outside the

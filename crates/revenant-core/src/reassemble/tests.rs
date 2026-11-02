@@ -1790,7 +1790,9 @@ fn events_of(img: &[u8]) -> Vec<String> {
 }
 
 /// A walk reused when its candidate is descended into is charged as if walked again (one try and the bytes it read): for
-/// any try or read budget, the result and the budget left are those of walking it again.
+/// any try or read budget, the result and the budget left are those of walking it again. The toy format keeps no
+/// memory between walks; for the JPEG, whose second walk replays its lead from memory, the charge is a little higher
+/// (review M-1), so the equality holds here only.
 #[test]
 fn a_reused_walk_is_charged_as_walked_again() {
     let mut card = Card::new();
@@ -1837,8 +1839,9 @@ fn events_and_tries(img: &[u8], unpruned: bool) -> (Vec<String>, u64) {
 
 /// The work the search skips since the measure of part 1.6 (each candidate of a seam walked in turn, the evident ones
 /// descended into at once, without walking them twice; a reassembled JPEG settled on its first solution in pieces)
-/// changes no outcome: a small scattered card (files in pieces deleted on a computer) scanned with and without it gives
-/// the same events, with files put back in pieces, for fewer tries.
+/// changes no outcome where no budget is hit (the case here; under a hit budget the result may differ, never toward an
+/// `Intact` the whole search would not give): a small scattered card (files in pieces deleted on a computer) scanned
+/// with and without it gives the same events, with files put back in pieces, for fewer tries.
 #[test]
 fn pruned_search_changes_no_outcome() {
     let (card, _) = revenant_testkit::scattered_card(16 << 20, 32 << 10);

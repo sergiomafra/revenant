@@ -2297,7 +2297,9 @@ pub enum BenchImage {
     /// An exFAT volume (128 KiB clusters, lowest free cluster first) in an MBR disk that a camera used for a long time:
     /// rounds of shots (lossless ARW + JPEG pairs, JPEG-only shots, a clip), the JPEG-only shots and the clip deleted in
     /// camera, the next round written into the holes (so its files lie in pieces), and the first pair in pieces of the
-    /// round before deleted in camera too, until the card is full. It measures the scan with the reassembly at work.
+    /// round before deleted in camera too, until the card is full; at last everything on it is deleted on a computer
+    /// that clears the cluster chains, so every file still there is placed by its content. It measures the scan with
+    /// the reassembly at work.
     ScatteredCard,
 }
 

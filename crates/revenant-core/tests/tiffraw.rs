@@ -951,6 +951,23 @@ fn lossless_arw_with_a_strip_over_its_tiles_is_intact() {
 }
 
 #[test]
+fn a_strip_reaching_past_the_tiles_keeps_its_extent() {
+    // Review I-1: a strip that starts with the tiles but declares 64 KiB more than they cover. The structure says the
+    // file is that long: the finding must not stop at the tiles' end (a truncated file reported Intact).
+    let a = testkit::arw(&testkit::ArwOptions {
+        strip_over_tiles: true,
+        ..testkit::ArwOptions::default()
+    });
+    let sub = entry_value(&a.bytes, 8, 0x014A) as usize;
+    let count = entry_value(&a.bytes, sub, 0x0117);
+    let mut b = a.bytes.clone();
+    patch_entry(&mut b, sub, 0x0117, count + (64 << 10));
+    b.resize(b.len() + (64 << 10), 0x5A);
+    let m = TiffRaw.measure(&Bytes(b.clone()), 0).unwrap();
+    assert_eq!(m.len, b.len() as u64, "{:?}", (m.kind, m.health, m.len));
+}
+
+#[test]
 fn raw_preview_crossing_a_piece_is_not_reported_twice() {
     // A live ARW in two runs on an exFAT card, its preview crossing from the first cluster into the second run (part 1.4,
     // T9): the chain places the RAW, and its preview is not a second finding (D12 of part 1.4: its own files).

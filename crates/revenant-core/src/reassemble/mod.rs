@@ -1046,7 +1046,8 @@ impl<'c, S: Seams> Ctx<'c, S> {
 
     /// [`Ctx::dfs`], with the walk of the candidate just made by [`Ctx::class_of`] (same pieces, start, state and
     /// limit) when there is one: it is not walked again, but charged again as the walk it stands for (one try and the
-    /// bytes it read), so the budget and the result are those of walking it again.
+    /// bytes the first walk read): at least what walking it again would cost (exactly, for a format with no memory
+    /// between walks; the JPEG's second walk would replay its lead to the first seam and read less), and the same result.
     fn dfs_walked(
         &mut self,
         pieces: &mut Vec<Fragment>,
