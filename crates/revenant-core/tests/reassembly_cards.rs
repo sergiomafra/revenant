@@ -16,7 +16,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 use revenant_core::formats::{FileKind, Health, all_formats};
-use revenant_core::{CancelToken, Event, Finding, Fragment, ScanOptions, extract, scan};
+use revenant_core::{CancelToken, Event, Finding, Fragment, Placement, ScanOptions, extract, scan};
 use revenant_testkit::fs::{Alloc, DeleteStyle, FsBuilder, FsStamp, FsType};
 use revenant_testkit::{
     ArwCompression, ArwOptions, AvcOptions, TiffRaw, VideoCodec, VideoLayout, arw, camera_video,
@@ -28,7 +28,7 @@ const KIB: u64 = 1 << 10;
 const MIB: u64 = 1 << 20;
 const DIR: &str = "DCIM/100MSDCF";
 /// Shots numbered 1..=SHOTS (their files are encoded once).
-const SHOTS: usize = 40;
+const SHOTS: usize = 44;
 
 // ---- The files a camera writes (encoded once: a debug build encodes a 2048×1536 JPEG in about 2 s) ----
 
@@ -263,6 +263,8 @@ struct Cam {
     reuse: bool,
     /// The files' entries in directory order (indexes in `files`).
     entries: Vec<usize>,
+    /// Deleted files whose old chain a later file rewrote: the scan must place them by the one-run guess (Q50 N-1).
+    guessed: Vec<String>,
 }
 
 impl Cam {
@@ -283,6 +285,7 @@ impl Cam {
             stamps: true,
             reuse: false,
             entries: Vec::new(),
+            guessed: Vec::new(),
         }
     }
 
@@ -360,52 +363,66 @@ impl Cam {
         assert!(gone(b) && !gone(a), "B's slots taken again, A's left");
     }
 
-    /// Free clusters now (no live file holds them), ascending, but those of files a computer deleted (kept whole for the
-    /// reassembly).
-    fn free_clusters(&self) -> Vec<u32> {
-        let live: HashSet<u32> = self
+    /// Q50 N-1 with reused slots (ruling Q55 (3)): X, photo `x` alone in 2 runs (FAT-chained: its first `h` clusters,
+    /// 2 skipped, the rest) over clusters no standing entry claims, deleted in camera; then an edited copy Y (a longer
+    /// name: an entry set of more slots, so it takes no deleted one), FAT-chained, from X's last `t` clusters on (then
+    /// free clusters elsewhere): Y's chain rewrites X's last FAT entries, so X's old chain no longer reads whole (it runs
+    /// into Y's live clusters). X's start, its first run and the 2 skipped clusters stay free: the listing places X by
+    /// the D4 guess, one run of free clusters from its start over the 2 skipped ones, trusted. The scan's check
+    /// ([`Card::guessed`]) asserts that path. X's last clusters are Y's now: X is not whole, so the oracle wants no
+    /// health of it, and the glued oracle forbids any `Intact` finding of other bytes (under X's name or not).
+    fn chain_rewritten_under_an_entry(&mut self, numbers: Range<u32>) {
+        // Clusters free today that no standing entry (live, or deleted with its entry left) claims.
+        let standing: HashSet<u32> = self
             .files
             .iter()
-            .filter(|f| matches!(f.deleted, None | Some(DeleteStyle::ZeroChain)))
+            .filter(|f| !f.overwritten)
             .flat_map(|f| f.clusters.iter().copied())
             .collect();
-        (self.first..self.b.cluster_count() + 2)
-            .filter(|c| !live.contains(c))
-            .collect()
-    }
-
-    /// Q50 N-1 with reused slots: X, shot `x`'s RAW alone in 2 runs of free clusters (FAT-chained), deleted in camera;
-    /// then an edited copy Y (a longer name: an entry set of more slots, so it takes no deleted one) written over X's
-    /// first run and on, its own chain through X's clusters: X's entry stays over a chain that is no longer its own.
-    fn chain_rewritten_under_an_entry(&mut self, x: u32, y: u32) {
-        let free = self.free_clusters();
-        let raw = &raw_of(ArwCompression::Lossless, x).bytes;
-        let nx = self.need(raw.len()) as usize;
-        let ny = self.need(jpeg_of(y).len()) as usize;
-        let h = nx / 2;
-        assert!(free.len() > nx + ny + 4, "room for X and Y");
-        // X: the first h free clusters, then 2 free ones skipped, then the rest.
-        let xc: Vec<u32> = free[..h]
-            .iter()
-            .chain(&free[h + 2..nx + 2])
-            .copied()
+        let free: Vec<u32> = (self.first..self.b.cluster_count() + 2)
+            .filter(|c| !standing.contains(c))
             .collect();
-        let px = format!("{DIR}/DSC0{x:04}.ARW");
-        self.add_at(px.clone(), FileKind::Arw, Cow::Borrowed(raw), xc);
-        let k = self.file(&px);
-        self.files[k].preview = raw_of(ArwCompression::Lossless, x).preview.clone();
-        self.files[k].tiles = raw_of(ArwCompression::Lossless, x).tiles.clone();
+        // X: the first photo of `numbers` of 2 clusters or more; Y: the next one of more clusters than X leaves it.
+        let need = |n: u32| self.need(jpeg_of(n).len()) as u32;
+        let x = numbers
+            .clone()
+            .find(|&n| need(n) >= 2)
+            .expect("a photo of 2 clusters");
+        let nx = need(x);
+        let (h, t) = (nx.div_ceil(2), (nx / 2).min(2));
+        let y = numbers
+            .clone()
+            .find(|&n| n != x && need(n) > t)
+            .expect("a photo for Y");
+        let photo = jpeg_of(x);
+        let ny = need(y) as usize;
+        // X's span (its clusters and the 2 skipped) in consecutive free clusters, so the guess is one run.
+        let span = nx + 2;
+        let first = (0..free.len().saturating_sub(span as usize))
+            .map(|i| free[i])
+            .find(|&c| (c..c + span).all(|k| free.binary_search(&k).is_ok()))
+            .expect("room for X in consecutive free clusters");
+        let xc: Vec<u32> = (first..first + h)
+            .chain(first + h + 2..first + span)
+            .collect();
+        let px = format!("{DIR}/DSC0{x:04}.JPG");
+        self.add_at(px.clone(), FileKind::Jpeg, Cow::Borrowed(photo), xc);
         self.delete(&px, DeleteStyle::Camera);
-        // Y: X's first run, the 2 skipped clusters, then free clusters after X.
-        let yc: Vec<u32> = free[..h + 2]
-            .iter()
-            .chain(&free[nx + 2..])
+        // Y: X's last `t` clusters, then free clusters away from X's span.
+        let yc: Vec<u32> = (first + span - t..first + span)
+            .chain(
+                free.iter()
+                    .copied()
+                    .filter(|&c| c + 1 < first || c > first + span),
+            )
             .take(ny)
-            .copied()
             .collect();
+        assert_eq!(yc.len(), ny, "room for Y");
+        assert!(yc.windows(2).any(|w| w[1] != w[0] + 1), "Y is FAT-chained");
         let py = format!("{DIR}/DSC0{y:04}-EDITED.JPG");
         self.add_at(py, FileKind::Jpeg, Cow::Borrowed(jpeg_of(y)), yc);
         assert!(!self.files[self.file(&px)].overwritten, "X's entry stays");
+        self.guessed.push(px);
     }
 
     /// New entries take the slots of deleted ones, as cameras do.
@@ -576,6 +593,8 @@ struct Card {
     cluster: u64,
     disk: Vec<u8>,
     files: Vec<File>,
+    /// Paths the listing must place by the one-run D4 guess, their old chain rewritten ([`Cam::chain_rewritten_under_an_entry`]).
+    guessed: Vec<String>,
 }
 
 /// The finished card of `files` on `volume` (built by `b`), each file with whether a quick format took its entry.
@@ -644,6 +663,7 @@ fn finish(
         cluster,
         disk,
         files,
+        guessed: Vec::new(),
     }
 }
 
@@ -652,7 +672,9 @@ impl Cam {
     fn card(self, name: String) -> Card {
         let v = self.volume();
         let files = self.files.into_iter().map(|p| (p, false)).collect();
-        finish(name, self.fs, &self.b, self.cluster, v, files)
+        let mut card = finish(name, self.fs, &self.b, self.cluster, v, files);
+        card.guessed = self.guessed;
+        card
     }
 
     /// Quick-formats the card in the camera, then shoots `seq` on it: the new files go from the start of the heap (the
@@ -890,6 +912,28 @@ fn scanned(mut card: Card) -> Outcome {
             "only {placed_by_content} files whole in pieces the file system does not place (3 wanted)"
         ));
     }
+    // The N-1 path was taken (ruling Q55 (3)): the file's first finding is its entry's, placed by the one-run guess from
+    // its start, of the entry's size.
+    for p in &card.guessed {
+        let o = &card.files[card.files.iter().rposition(|o| &o.path == p).unwrap()];
+        let first = events.iter().find_map(|e| match e {
+            Event::Found(f) if f.start == o.pieces[0].start => Some(f),
+            _ => None,
+        });
+        let guessed = first.is_some_and(|f| {
+            f.fragments.is_empty()
+                && f.len == o.bytes.len() as u64
+                && f.origin.as_ref().is_some_and(|g| {
+                    g.path() == *p && g.placement == Placement::Guessed && !o.whole
+                })
+        });
+        if !guessed {
+            recovered.push(format!(
+                "{p}: not placed by the one-run guess (N-1): {:?}",
+                first.map(describe)
+            ));
+        }
+    }
     let mut joined = Vec::new();
     for o in card.files.iter().filter(|o| o.whole) {
         let want = want(&card, o);
@@ -1111,7 +1155,7 @@ fn delete_in_camera_cards(raw: ArwCompression, variants: &[(u64, Alloc, Camera)]
                 for p in cam.in_pieces(19..28, 3).iter().flatten() {
                     cam.delete(p, DeleteStyle::ZeroChain);
                 }
-                cam.chain_rewritten_under_an_entry(39, 40);
+                cam.chain_rewritten_under_an_entry(39..45);
             }
             cam.card(format!(
                 "delete in camera, {raw:?}, {}{}{}",
