@@ -1,7 +1,6 @@
 //! What the reassembly step spends, for the budget measure (`tests::reassembly_budget_measure`, ruling Q9): built only
 //! for the crate's unit tests, recording only while [`record`] holds its guard. Nothing here changes what the step does.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -9,7 +8,11 @@ use super::Budget;
 use crate::formats::{FileKind, Health};
 use crate::scan::Finding;
 
-static ON: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// Recording on this thread: only the thread holding [`record`]'s guard records, so the unit tests running beside it
+    /// (other scans, other reassembly steps) never add to what it measures.
+    static ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 /// One recording at a time (the unit tests run in parallel).
 static ONE: Mutex<()> = Mutex::new(());
 static SEARCHES: Mutex<Vec<SearchStat>> = Mutex::new(Vec::new());
@@ -74,13 +77,13 @@ pub(crate) fn record() -> MutexGuard<'static, ()> {
     lock(&SEARCHES).clear();
     lock(&FILES).clear();
     lock(&STEPS).clear();
-    ON.store(true, Ordering::SeqCst);
+    ON.with(|o| o.set(true));
     g
 }
 
 /// Stops recording and returns what was recorded.
 pub(crate) fn take() -> Recorded {
-    ON.store(false, Ordering::SeqCst);
+    ON.with(|o| o.set(false));
     Recorded {
         files: std::mem::take(&mut lock(&FILES)),
         steps: std::mem::take(&mut lock(&STEPS)),
@@ -88,7 +91,7 @@ pub(crate) fn take() -> Recorded {
 }
 
 fn on() -> bool {
-    ON.load(Ordering::SeqCst)
+    ON.with(std::cell::Cell::get)
 }
 
 pub(crate) fn search(s: SearchStat) {

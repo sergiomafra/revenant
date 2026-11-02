@@ -1837,6 +1837,28 @@ fn events_and_tries(img: &[u8], unpruned: bool) -> (Vec<String>, u64) {
     (events, tries)
 }
 
+/// Only the thread holding the measure's guard records: a scan with a reassembly step running on another thread meanwhile
+/// (as the unit tests run in parallel) adds nothing to what it measures (CI: another test's tries counted as pruned).
+#[test]
+fn the_measure_records_only_its_own_thread() {
+    let (card, _) = revenant_testkit::scattered_card(16 << 20, 32 << 10);
+    let guard = measure::record();
+    let other = std::thread::spawn(move || events_of(&card));
+    assert!(
+        other
+            .join()
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_with("Updated"))
+    );
+    let recorded = measure::take();
+    drop(guard);
+    assert!(
+        recorded.files.is_empty() && recorded.steps.is_empty(),
+        "another thread's step was recorded"
+    );
+}
+
 /// The work the search skips since the measure of part 1.6 (each candidate of a seam walked in turn, the evident ones
 /// descended into at once, without walking them twice; a reassembled JPEG settled on its first solution in pieces)
 /// changes no outcome where no budget is hit (the case here; under a hit budget the result may differ, never toward an
