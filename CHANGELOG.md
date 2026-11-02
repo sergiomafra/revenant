@@ -214,10 +214,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - An old deleted photo's entry whose spot on the card a newer, shorter photo took (the camera reusing the old entries'
   slots, the newer entry gone since) gave the newer photo's bytes, plus the empty rest of the space, under the old name
   and size, reported intact; also when the newer photo had taken the old one's exact pieces in the same order (as a
-  camera filling the freed space does). The photo found there now comes out on its own, without the old name, and is
-  never reported intact unless its own bytes prove it. A RAW that the camera pads with zeros to its usual block (as
-  Sony does) is not mistaken for this: it keeps its name, and a deleted RAW in pieces whose old chain checks out keeps
-  coming back intact.
+  camera filling the freed space does), when the newer photo carried an extra image after it (the preview most cameras
+  append) and when the newer file was a video whose media size says "to the end of the file". The photo found there
+  now comes out on its own, without the old name, and is never reported intact unless its own bytes prove it. A
+  deleted file overwritten by another of exactly the same size (the same camera's uncompressed RAWs, or Sony RAWs
+  padded to the same block) still cannot be told apart: the file comes out whole and exact, but under the older
+  file's name and dates. A RAW that the camera pads with zeros to its usual block (as Sony does) is not mistaken for
+  this: it keeps its name, and a deleted RAW in pieces whose old chain checks out keeps coming back intact.
 - A deleted video in pieces whose place the card's file system already gave right (only other files between its
   pieces) came back with its exact bytes but only partial, and one whose piece ran into an old deleted entry's spot
   could not be put back at all: both now come back intact when every frame checks out across the seams.

@@ -217,19 +217,40 @@ fn padding(view: &dyn Source, from: u64, to: u64) -> bool {
     true
 }
 
-/// Ruling Q53: the structure ends at `l`, before the end of `view`, and only padding follows.
-fn is_padded(view: &dyn Source, l: u64) -> bool {
-    l < view.len() && padding(view, l, view.len())
+/// Where the content of a file of `kind` whose structure measures `l` bytes of `view` really ends (ruling Q56): `l`,
+/// but for a video whose `mdat` has size 0 (it runs to the end of the view, whatever the clip), the highest sample end
+/// its index lists.
+fn content_end(view: &dyn Source, kind: FileKind, l: u64) -> u64 {
+    match kind {
+        FileKind::Mp4 | FileKind::Mov => {
+            crate::formats::isobmff::size_zero_mdat_end(view, 0).map_or(l, |e| e.min(l))
+        }
+        _ => l,
+    }
 }
 
-/// How a structure of `kind` ending at `l` of `view` ends against the recorded `size`: `(padded, at_size)` of
-/// [`ViewMeasure`].
-fn ends(view: &dyn Source, kind: FileKind, l: u64, size: u64) -> (bool, bool) {
-    let own = raw_padding(kind, l, size);
-    let fill = is_padded(view, l);
+/// How a file of `kind` measured `l` bytes into `view` ends against the recorded `size` (rulings D6, Q53–Q56):
+/// `(tail_ok, padded, at_size)` of [`ViewMeasure`]. The content's end is the format's full extent: its structure's
+/// ([`content_end`]), then the whole files D6 allows after it (an MPF image, a motion photo's video), up to where only
+/// fill follows. `at_size`: that end is the size, or a TIFF RAW's own grain padding fills the rest ([`raw_padding`]);
+/// `padded`: fill follows it before the view's end, and it is no such RAW padding.
+fn ends(
+    formats: &[Box<dyn Format>],
+    view: &dyn Source,
+    kind: FileKind,
+    l: u64,
+    size: u64,
+    cancel: &CancelToken,
+) -> (bool, bool, bool) {
+    let l = content_end(view, kind, l);
+    let Some(end) = tail_end(formats, view, l, cancel) else {
+        return (false, false, false);
+    };
+    let own = end == l && raw_padding(kind, l, size);
     (
-        fill && !own,
-        l == size || (own && fill && view.len() == size),
+        true,
+        end < view.len() && !own,
+        end == size || (own && view.len() == size),
     )
 }
 
@@ -250,19 +271,25 @@ fn raw_padding(kind: FileKind, l: u64, size: u64) -> bool {
 
 /// Ruling D6 over a view of `S` bytes whose structure ends at `l`: `l == S`, or the rest is padding, or up to
 /// [`MAX_TAIL_FILES`] files measured one after another (contiguous, not `Damaged`, inside the view), then padding.
-fn tail_ok(
+fn tail_ok(formats: &[Box<dyn Format>], view: &dyn Source, l: u64, cancel: &CancelToken) -> bool {
+    tail_end(formats, view, l, cancel).is_some()
+}
+
+/// [`tail_ok`]'s walk: where the last whole file after `l` ends and only padding follows; `None` when the tail is not
+/// coherent.
+fn tail_end(
     formats: &[Box<dyn Format>],
     view: &dyn Source,
     mut l: u64,
     cancel: &CancelToken,
-) -> bool {
+) -> Option<u64> {
     let s = view.len();
     for i in 0..=MAX_TAIL_FILES {
         if l > s {
-            return false;
+            return None;
         }
         if padding(view, l, s) {
-            return true;
+            return Some(l);
         }
         if i == MAX_TAIL_FILES {
             break;
@@ -276,10 +303,10 @@ fn tail_ok(
             {
                 l += m2.len
             }
-            _ => return false,
+            _ => return None,
         }
     }
-    false
+    None
 }
 
 /// Ruling D6 for a name from an old directory (D11): the `len` bytes at `start` (contiguous, inside the source) are
@@ -309,11 +336,8 @@ pub(crate) fn measure_view(
     let view = Fragmented::new(source, f.pieces.clone());
     let (m, own) =
         measure_at(formats, &view, 0, cancel).map_or((None, Vec::new()), |x| (Some(x.m), x.own));
-    let tail_ok = m
-        .as_ref()
-        .is_some_and(|m| tail_ok(formats, &view, m.len, cancel));
-    let (padded, at_size) = m.as_ref().map_or((false, false), |m| {
-        ends(&view, m.kind, m.len, f.origin.size)
+    let (tail_ok, padded, at_size) = m.as_ref().map_or((false, false, false), |m| {
+        ends(formats, &view, m.kind, m.len, f.origin.size, cancel)
     });
     let old_chain = f.origin.state == FsState::Deleted && f.origin.placement == Placement::OldChain;
     let checks = old_chain
@@ -361,8 +385,7 @@ pub(crate) fn fs_job(
         && c.len <= piece.len
     {
         let view = Fragmented::new(source, f.pieces.clone());
-        let tail_ok = tail_ok(formats, &view, c.len, cancel);
-        let (padded, at_size) = ends(&view, c.kind, c.len, f.origin.size);
+        let (tail_ok, padded, at_size) = ends(formats, &view, c.kind, c.len, f.origin.size, cancel);
         return FsJobResult {
             view: ViewMeasure {
                 m: Some(c.clone()),
@@ -408,16 +431,20 @@ pub(crate) struct Decision {
 /// The one decision table for a kept file `f` (part 1.6, rulings D6, D14, Q53, Q54 (b), Q55), from how its structure,
 /// measured over its pieces, ends against the recorded size:
 ///
-/// - **at size** (`view.at_size`: the structure ends exactly at the size, or a TIFF RAW's own padding to its 4 KiB or
+/// - **at size** (`view.at_size`: the content ends exactly at the size, or a TIFF RAW's own padding to its 4 KiB or
 ///   64 KiB grain fills the rest): the name stays. An old chain is proof when its view is `Intact` in one run, every
 ///   content check passes and its pieces sum to the size; a recorded run or a guess keeps the D3/D5 rules.
 /// - **early, then fill** (`view.padded`, only for a deleted file): no proof of which file the bytes are (a shorter one
 ///   may have been written over the clusters, the rest of its last cluster zero-filled), whatever placed them, an old
 ///   chain too (Q55: no exemption). The carving at the start replaces the entry, without a name, when it reads the same
-///   bytes as the view (contiguous, the entry one piece or the carving within its first piece); otherwise the entry's
-///   pieces stay without the name ([`Padded::Unnamed`]).
-/// - **early, then whole files then fill** (D6 `tail_ok`): the name stays, by the 1.4 rule; an old chain is no proof.
+///   bytes as the view (contiguous, within the entry's first piece: a carving that runs past it, as a size-0 `mdat` to
+///   the end of the source, does not); otherwise the entry's pieces stay without the name ([`Padded::Unnamed`]).
 /// - **early, then other bytes** (not `tail_ok`): the name stays, at most `Partial`; an old chain is no proof.
+///
+/// The content's end is the format's full extent, computed once before the fill check ([`ends`], ruling Q56): the
+/// structure (for a video with a size-0 `mdat`, its highest sample end), then the whole files D6 allows after it (an
+/// MPF image, a motion photo's video). So "whole files, then fill" is fill, and "whole files ending at the size" is at
+/// size.
 ///
 /// A live file always keeps its name (its chain says where it is): only D6 applies.
 pub(crate) fn decide(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement>) -> Decision {
@@ -436,9 +463,7 @@ pub(crate) fn decide(f: &FsFile, view: &ViewMeasure, carved: Option<&Measurement
     } else {
         let first = f.pieces.first().map_or(0, |p| p.len);
         match carved {
-            Some(c) if c.fragments.is_empty() && (f.pieces.len() == 1 || c.len <= first) => {
-                Padded::Carving
-            }
+            Some(c) if c.fragments.is_empty() && c.len <= first => Padded::Carving,
             _ => Padded::Unnamed,
         }
     };
@@ -635,8 +660,9 @@ mod tests {
         assert!(!raw_padding(FileKind::Jpeg, 900_000, 917_504));
     }
 
-    /// The decision table of [`decide`] (ruling Q55), cell by cell, for a deleted entry in 2 pieces of 1000 bytes: each
-    /// placement × how the structure ends → name kept, placement, best health.
+    /// The decision table of [`decide`] (rulings Q55, Q56), cell by cell, for a deleted entry in 2 pieces of 1000 bytes:
+    /// each placement (a guess trusted or not) × how the content ends ([`ends`]) → name kept, placement, best health.
+    /// "short view": the content runs to the end of pieces that stop short of the size (cut at the source's end).
     #[test]
     fn decision_table_for_a_deleted_entry() {
         let full = |m_len: u64, tail_ok, padded, at_size| ViewMeasure {
@@ -651,12 +677,13 @@ mod tests {
             ("at size", full(1000, true, false, true)),
             ("RAW grain", full(900, true, false, true)),
             ("fill", full(900, true, true, false)),
-            ("whole files", full(900, true, false, false)),
+            ("short view", full(900, true, false, false)),
             ("foreign", full(900, false, false, false)),
         ];
         let carved = m(500, Health::Intact);
         for (placement, trusted) in [
             (Placement::Recorded, true),
+            (Placement::Guessed, true),
             (Placement::Guessed, false),
             (Placement::OldChain, false),
         ] {
@@ -676,11 +703,12 @@ mod tests {
                 }
                 let proof = matches!(*cell, "at size" | "RAW grain");
                 let want = match placement {
-                    Placement::Recorded if proof || *cell == "whole files" => {
-                        (Health::Intact, Placement::Recorded)
+                    Placement::Recorded | Placement::Guessed
+                        if trusted && (proof || *cell == "short view") =>
+                    {
+                        (Health::Intact, placement)
                     }
-                    Placement::Recorded => (Health::Partial, Placement::Recorded),
-                    Placement::Guessed => (Health::Partial, Placement::Guessed),
+                    Placement::Recorded | Placement::Guessed => (Health::Partial, placement),
                     _ if proof => (Health::Intact, Placement::OldChain),
                     _ => (Health::Partial, Placement::Guessed),
                 };
@@ -999,6 +1027,74 @@ mod tests {
                 fragments,
             })
         }
+    }
+
+    /// Ruling Q56: the content's end is the format's full extent, computed before the fill check: a JPEG's appended
+    /// whole images count, and a video whose `mdat` has size 0 ends at its highest sample end, not at the view's end.
+    #[test]
+    fn content_end_is_the_full_extent() {
+        use revenant_testkit as tk;
+        let formats = all_formats();
+        let ends_of = |bytes: Vec<u8>, size: u64| {
+            let src = Mem(bytes);
+            let at = measure_at(&formats, &src, 0, &CancelToken::default()).unwrap();
+            ends(
+                &formats,
+                &src,
+                at.m.kind,
+                at.m.len,
+                size,
+                &CancelToken::default(),
+            )
+        };
+        let mut photo = tk::jpeg_smooth(320, 240, 1);
+        photo.extend_from_slice(&tk::jpeg(64, 64, 77, 0));
+        let n = photo.len() as u64;
+        // (tail_ok, padded, at_size)
+        assert_eq!(
+            ends_of(photo.clone(), n),
+            (true, false, true),
+            "appended, at size"
+        );
+        let mut zeros = photo.clone();
+        zeros.resize(photo.len() + 3000, 0);
+        assert_eq!(
+            ends_of(zeros, n + 3000),
+            (true, true, false),
+            "appended, then fill"
+        );
+        let mut foreign = photo.clone();
+        foreign.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(
+            ends_of(foreign, n + 3),
+            (false, false, false),
+            "then other bytes"
+        );
+        let clip = tk::camera_video(
+            &tk::AvcOptions {
+                samples: 20,
+                seed: 1,
+                mov: false,
+                mdat_pad: 0,
+                small_nals: false,
+            },
+            tk::VideoCodec::Avc,
+            tk::VideoLayout::MoovFirstMdatSizeZero,
+        )
+        .bytes;
+        let n = clip.len() as u64;
+        assert_eq!(
+            ends_of(clip.clone(), n),
+            (true, false, true),
+            "size-0 mdat, at size"
+        );
+        let mut zeros = clip.clone();
+        zeros.resize(clip.len() + 3000, 0);
+        assert_eq!(
+            ends_of(zeros, n + 3000),
+            (true, true, false),
+            "size-0 mdat, then fill"
+        );
     }
 
     #[test]

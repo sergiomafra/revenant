@@ -1834,27 +1834,37 @@ a probe over the raw source that refuses, without reading it, any range the cach
   clock, a re-shot within the 2-second resolution), which one the clusters hold cannot be told, so none is kept: the
   head there is carved like any other, without a name (ruling Q52). Before, the first in listing order was kept, and
   its size could place another photo's bytes with the slack after them as `Intact` under the wrong name.
-- **A deleted entry whose structure ends early over padding (ruling Q53).** When a deleted file's measurement through
-  its pieces ends before its recorded size and only padding (`00`/`FF`) follows up to that size, nothing shows the
+- **A deleted entry whose content ends early over padding (rulings Q53–Q56).** When a deleted file's content, measured
+  through its pieces, ends before its recorded size and only padding (`00`/`FF`) follows up to that size, nothing shows the
   bytes are that entry's: a camera reusing directory slots may have written another, shorter photo over its clusters
   and zero-filled the rest of the last one, its own entry gone since. The finding there is then the carving at that
   start (its length and health), without the entry's name or size; with no carving there (unreadable or skipped start)
   the entry's finding is at most `Partial`. A live file keeps the D6 rule. Ruling Q54 bounds it: a format's own
   padding is no such sign (a TIFF-based RAW whose recorded size is its structure's end rounded up to 4 KiB or 64 KiB,
-  as Sony pads its ARWs, keeps its name and placement); and the carving replaces a fragmented entry only when it reads
-  the same bytes as the view (contiguous, within the first piece), else the entry's pieces stay, without the name,
+  as Sony pads its ARWs, keeps its name and placement); and the carving replaces the entry only when it reads the same
+  bytes as the view (contiguous, within the first piece: one that runs past it, as a size-0 `mdat` carved to the end
+  of the source, does not), else the entry's pieces stay, without the name,
   at most `Partial` **to the end of the scan**: the pairing and the reassembly may move its pieces, never make it
   `Intact` (ruling Q55 (2); the ids of these findings are part of a session's checkpoints). An old exFAT chain is no
   exemption (Q55 (1)): a camera that allocates next-free fills a deleted file's freed runs in order, so a shorter
   photo can take its exact chain. Cost: a deleted photo that really was zero-padded inside its recorded size loses its
-  name (it is still recovered), and an ARW over another whose sizes match a grain rounding by coincidence keeps the
-  older name. The whole decision, in one place (`scan::fs::decide`), for a deleted entry by how its structure ends:
+  name (it is still recovered); a clip with a size-0 `mdat` whose own padding follows its last sample loses it too.
+  **The content's end** (ruling Q56) is the format's full extent, taken once before the fill check: the structure's
+  end (for a video whose index comes first and whose `mdat` has size 0, "to the end of the file", the highest sample
+  end its index lists: otherwise such an `mdat` would run to the entry's size whatever the clip), then the whole files
+  D6 allows after it (an MPF image, a motion photo's video, as most camera JPEGs carry). So a shorter camera JPEG with
+  its MPF image over an older entry's clusters is no proof of the older entry either. **A limit (Q56, M-7):** a deleted
+  file overwritten by another of exactly the same size (the same camera's uncompressed ARWs, or ARWs padded to the
+  same 64 KiB multiple, which is common for Sony) cannot be told apart by size: the bytes come out exactly one
+  original file, `Intact`, but under the older entry's name and dates. An identity check (the EXIF DateTimeOriginal
+  against the entry's stamps) is on the roadmap. The whole decision, in one place (`scan::fs::decide`), for a deleted
+  entry by how its content ends:
 
-  | Structure ends | Recorded run / guess | Old chain (`old_chain`) |
+  | Content ends | Recorded run / guess | Old chain (`old_chain`) |
   | --- | --- | --- |
-  | at the size, or a RAW's own grain padding fills the rest | name kept; D3/D5 (`Intact` when trusted) | name kept; `Intact`, `old_chain` when every check passes, else `guessed`, `Partial` |
+  | at the size, or a RAW's own grain padding fills the rest | name kept; D3/D5 (`Intact` when trusted: a recorded run or a one-run guess of free clusters) | name kept; `Intact`, `old_chain` when every check passes, else `guessed`, `Partial` |
   | early, then fill only | no name: the carving at the start, or the entry's pieces at most `Partial` | the same |
-  | early, then whole files, then fill (D6) | name kept; D3/D5 (the 1.4 rule) | name kept; `guessed`, `Partial` (no proof) |
+  | at the end of pieces cut short of the size | name kept; D3/D5 | name kept; `guessed`, `Partial` |
   | early, then other bytes | name kept; at most `Partial` | name kept; `guessed`, `Partial` |
 - **Nothing is skipped because of the file system** (ruling R10): every head the signature rules examine is still
   examined, and only an `Intact` finding skips its pieces, as before.
@@ -2174,9 +2184,9 @@ merge (rulings D3, D5, D6), from the measurement through the view of the file's 
    when every content check its format has passes over the view (a JPEG: the strict decode; a video: its index
    `Intact` and every checkable sample in place, whatever its layout, at least one checked; a TIFF RAW: its structure,
    its largest preview strict, every IFD, embedded JPEG and lossless tile whole), its tail is coherent, its pieces
-   sum to the entry's size and its structure ends exactly at that size (ruling Q55: the JPEG's EOI, a video's last
-   box, at the size; or a TIFF RAW's own zero padding to its 4 KiB or 64 KiB grain fills the rest, Q54 (b)). A
-   structure that ends early, over fill or whole files, proves nothing about the entry: a shorter file may have been
+   sum to the entry's size and its content ends exactly at that size (rulings Q55, Q56: the format's full extent, a
+   JPEG's appended MPF images included, a size-0 `mdat` at its last sample; or a TIFF RAW's own zero padding to its
+   4 KiB or 64 KiB grain fills the rest, Q54 (b)). Content that ends early over fill proves nothing about the entry: a shorter file may have been
    written over its exact chain (see the Q53 rule in [File systems in the scan](#file-systems-in-the-scan)). The
    view's measure also stands for "no other file starts inside" where it looks: every
    format ends a file at a sector start where another header is recognized and confirmed (its own embedded files

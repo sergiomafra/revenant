@@ -972,6 +972,30 @@ pub(crate) fn index_first_layout(r: &mut Reader, start: u64) -> Option<IndexFirs
     None
 }
 
+/// Where the media of a video whose index comes first and whose `mdat` has size 0 ("to the end of the file") really
+/// ends: the highest sample end its `moov` lists, relative to `start` (the end `VideoSeams::with_own_moov` takes for
+/// such a file). `None` for any other layout, a `moov` larger than [`MOOV_MAX_LEN`] or unreadable, or a track whose
+/// samples cannot be bounded. A size-0 `mdat` runs to the end of what is read, so its measured length says nothing
+/// about where the content ends (part 1.6, ruling Q56).
+pub(crate) fn size_zero_mdat_end(source: &dyn Source, start: u64) -> Option<u64> {
+    let mut r = Reader::new(source);
+    let l = index_first_layout(&mut r, start)?;
+    let (_, None) = l.mdat? else {
+        return None;
+    };
+    let (moov_at, hl, size) = l.moov;
+    let len = size.checked_sub(hl).filter(|&n| n <= MOOV_MAX_LEN)?;
+    let payload = r.load_box(moov_at + hl, len);
+    if r.bad_in(moov_at, moov_at + size) || (payload.len() as u64) < len {
+        return None;
+    }
+    let mut end = 0u64;
+    for t in index_tracks(&payload)?.iter().filter(|t| t.count > 0) {
+        end = end.max(t.bounds()?.1);
+    }
+    Some(end)
+}
+
 /// One sample of a track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Sample {
