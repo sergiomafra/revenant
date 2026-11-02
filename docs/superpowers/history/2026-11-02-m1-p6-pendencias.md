@@ -406,6 +406,14 @@ rodada:
   não do código (desde a Tarefa 11 só a Tarefa 12 mexeu no motor, na listagem FAT); a tabela do README não foi
   reescrita.
 
+Depois da correção final (Q61, cabeça `91df1dc` mais este texto), carga 6 a 58 durante a rodada: `cargo test --workspace`
+943 passaram, 0 falharam, 23 ignorados (52 min); `cargo test --release -p revenant-core` 854 passaram, 14 ignorados;
+`real_samples` 4 passaram (125 s); clippy com `-W clippy::incompatible_msrv` e fmt limpos; nenhum `os::unix` novo;
+`reassembly_cards` (release) com as 25 contagens idênticas à tabela acima; a matriz de sondas da revisão final igual (69
+passam, os mesmos 4 W1/W2 aceitos). `bench` intercalado contra `8f46be1` (melhor de 3 rodadas, carga 7 a 13):
+`exfat-card` 2,17 s contra 2,57 s, `noise` 0,46 contra 0,50, `dense-jpeg` 2,41 contra 2,60; nenhuma perda (a vantagem é
+ruído da carga).
+
 ## Em aberto, com dono
 
 **Resolvido na correção final (Q61):** o I-5 (JPEG e MP4 voltam; RAW é resíduo, acima); os dois testes de relógio
