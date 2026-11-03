@@ -4,7 +4,7 @@ import { Check, ChevronRight, HardDrive, Info, Usb } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { EngineErrorView } from '../bridge';
-import { diskName, diskSubtitle, fsLabel, sizeText } from '../disks/diskName';
+import { diskName, diskSubtitle, fsLabel, ownName, sizeText } from '../disks/diskName';
 import type { DiskView } from '../disks/types';
 import { useDisks } from '../disks/useDisks';
 import { Button } from '../kit/Button';
@@ -67,6 +67,12 @@ export default function ChooseDisk({ onContinue, onError, initialSelected = null
     setWhyOpen(d.solid_state);
   };
 
+  // The own name and the size; a disk without a name already reads "Disk" and the size.
+  const title = (d: DiskView) => {
+    const name = ownName(d);
+    return name ? t('disk.named', { name, size: sizeText(d.size) }) : diskName(d, t);
+  };
+  const sub = (d: DiskView) => diskSubtitle(d, t);
   const pickable = disks?.filter((d) => d.selectable) ?? [];
   const system = disks?.filter((d) => !d.selectable) ?? [];
   const footer = (
@@ -123,8 +129,8 @@ export default function ChooseDisk({ onContinue, onError, initialSelected = null
                   <Tag fs={d.fs} />
                 </div>
                 <div>
-                  <b>{t('disk.named', { name: diskName(d, t), size: sizeText(d.size) })}</b>
-                  <small>{diskSubtitle(d, t)}</small>
+                  <b>{title(d)}</b>
+                  {sub(d) ? <small>{sub(d)}</small> : null}
                 </div>
                 <span className="pick">
                   <Check className="i" aria-hidden />

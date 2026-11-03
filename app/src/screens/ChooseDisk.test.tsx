@@ -184,6 +184,22 @@ describe('ChooseDisk', () => {
     expect(onError).toHaveBeenCalledWith({ code: 'system_tool_failed' });
   });
 
+  it('an unnamed disk shows "Disk" and the size once', async () => {
+    disks([{ ...HD, name: { label: null, vendor: null, model: null } }]);
+    open();
+    await tick();
+    const card = screen.getByRole('radio');
+    expect(within(card).getByText('Disco de 2 TB')).toBeInTheDocument();
+    expect(card).not.toHaveTextContent('· 2 TB');
+  });
+
+  it('no empty line under the name when there is nothing to say', async () => {
+    disks([{ ...HD, connection: 'unknown', name: { label: 'X', vendor: null, model: null } }]);
+    open();
+    await tick();
+    expect(screen.getByRole('radio').querySelector('small')).toBeNull();
+  });
+
   it('shows the notice it is given (the chosen disk was not found)', async () => {
     disks([SD]);
     render(<ChooseDisk notice="disk_gone" onContinue={() => {}} onError={() => {}} />);

@@ -31,6 +31,9 @@ type Props = {
 
 const P = { mac: 'permission.mac', windows: 'permission.win' } as const;
 
+/** One system prompt at a time, across remounts too (Back, then Continue, while the first prompt is still open). */
+let asking = false;
+
 export default function Permission({ disk, os, onGranted, onBack, onGone, onError }: Props) {
   const { t } = useTranslation();
   const [denied, setDenied] = useState(false);
@@ -43,7 +46,10 @@ export default function Permission({ disk, os, onGranted, onBack, onGone, onErro
     };
   }, []);
 
+  // Back stays enabled while the prompt is open; a prompt opened before leaving is released when it answers.
   const ask = async () => {
+    if (asking) return;
+    asking = true;
     setBusy(true);
     try {
       const access = await invoke<AccessView>('request_access', { diskId: disk.id });
@@ -55,6 +61,8 @@ export default function Permission({ disk, os, onGranted, onBack, onGone, onErro
       if (err.code === 'permission_denied') setDenied(true);
       else if (err.code === 'device_not_found') onGone();
       else onError(err);
+    } finally {
+      asking = false;
     }
   };
 

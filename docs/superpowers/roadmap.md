@@ -92,8 +92,8 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
   - Ajudante privilegiado só de leitura: senha de administrador no Mac, UAC no Windows.
   - Ponte entre o app e o motor.
 - **2.2, o caminho** (telas: `inicio.html` — retomar, conferência prévia; `busca.html` — cópia, procurando,
-  cartão desconectado): escolher o disco, dar a permissão, fazer a cópia opcional e acompanhar a busca com a galeria se
-  enchendo ao vivo.
+  cartão desconectado): retomar uma busca, a conferência prévia, a cópia opcional e acompanhar a busca com a galeria se
+  enchendo ao vivo (escolher o disco e dar a permissão já vêm da 2.1).
 - **2.3, resultados e recuperação** (telas: `resultados.html`, `recuperar.html`):
   - Galeria, Linha do tempo e Detalhes.
   - "Selecionar tudo" por grupo.

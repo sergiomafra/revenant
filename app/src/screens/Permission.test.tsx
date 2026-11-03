@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { SD } from '../test-disks';
@@ -62,6 +62,22 @@ describe('Permission', () => {
     expect(screen.getByRole('button', { name: 'Voltar' })).toBeEnabled();
     answer({ id: 'disk4', size: 64_000_000_000 });
     await vi.waitFor(() => expect(onGranted).toHaveBeenCalledWith({ id: 'disk4', size: 64_000_000_000 }));
+  });
+
+  it('two quick clicks ask the system once', async () => {
+    let answer: (v: unknown) => void = () => {};
+    const calls = fakeBackend({ request_access: () => new Promise((r) => (answer = r)) });
+    const onGranted = vi.fn();
+    show('mac', { onGranted });
+    const ask = screen.getByRole('button', { name: 'Pedir a senha de administrador' });
+    act(() => {
+      ask.click();
+      ask.click();
+    });
+    await vi.waitFor(() => expect(calls.filter((c) => c.cmd === 'request_access')).toHaveLength(1));
+    answer({ id: 'disk4', size: 1 });
+    await vi.waitFor(() => expect(onGranted).toHaveBeenCalledTimes(1));
+    expect(calls.filter((c) => c.cmd === 'request_access')).toHaveLength(1);
   });
 
   it('another error code goes to the error screen', async () => {

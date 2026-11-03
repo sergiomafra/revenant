@@ -102,7 +102,8 @@ when the background task itself fails (a panic).
   solid_state, camera_card, selectable, highlighted }`: `kind` is `card`, `external`, `internal` or `system`;
   `connection` is `usb`, `sd_card`, `thunderbolt`, `internal` or `unknown`; `camera_card` is true when a mounted
   volume has a `DCIM` folder; `selectable` is false only for the system disk. `label` and `fs` come from the first
-  volume that has one, the EFI system partition left out (its `EFI` label says nothing about the disk). The interface
+  volume that has one, the EFI system partition left out (its `EFI` label says nothing about the disk). The rule
+  matches the volume label only: an EFI partition without a label (common on Windows) can still give a FAT32 tag. The interface
   builds the display name (label; else brand and model; else "Disk" and the size).
 - `request_access(disk_id) -> { id, size }` (`src/access.rs`): refuses the system disk (`system_disk`) and a disk
   that is not listed (`device_not_found`), then shows the system's own permission prompt (macOS password dialog,
@@ -129,7 +130,8 @@ Tests use a fake `DeviceOps` and an in-memory device: they never touch a real di
    `navigator.userAgent`/`navigator.platform` (`platformOf`). The button calls `request_access`; while the system
    prompt is open the button is busy and the rest of the window still answers. `permission_denied` shows the "Refused"
    state with Try again (which asks again); `device_not_found` goes back to the list with the note "The disk was not
-   found"; any other code goes to screen 13 (Try again there asks again).
+   found"; any other code goes to screen 13 (Try again there returns to the Permission screen, where the user asks again).
+   Only one prompt runs at a time, also after Back and Continue while a prompt is still open.
 3. **Access granted** (`screens/AccessGranted.tsx`, provisional, no mockup): "Revenant can read <name> (<size>)" and
    "The search comes in the next version", with Back to the list. Part 2.2 replaces it with the pre-check.
 
