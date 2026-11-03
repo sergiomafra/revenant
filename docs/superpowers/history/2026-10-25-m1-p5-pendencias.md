@@ -235,6 +235,10 @@ Cada uma com o custo se estiver errada.
   iguais) → pode esperar → Módulo 2: calcular e expor um `IdentityStrength`/marca de identidade fraca só se for trivial;
   o comportamento da retomada não muda agora (retomar no cartão errado mistura resultados, mas nunca grava num cartão).
   Custo: com dois cartões do mesmo modelo morrendo e sem número de série, uma retomada poderia seguir no cartão errado.
+- **P58:** a listagem da sessão e os arquivos de ponto de retomada têm teto de 256 MiB; um cartão hostil montado para
+  passar disso fica sem sessão retomável, mas a busca simples segue funcionando. (Antes só na descrição do PR #6.)
+- **P59:** um cartão puxado durante a leitura de uma prévia para a busca com `device_gone`, como na extração. (Antes só
+  na descrição do PR #6.)
 
 ### Notas carregadas para este arquivo
 

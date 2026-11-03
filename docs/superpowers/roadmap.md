@@ -52,7 +52,7 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
     computador e os textos de cada aviso (Módulo 2); copiar e buscar ao mesmo tempo (ideia para depois). Pendências em
     `docs/superpowers/history/2026-10-25-m1-p5-pendencias.md`; conferência com hardware em
     `docs/superpowers/history/2026-10-25-m1-p5-conferencia-manual.md`.
-- **1.6, fragmentação avançada, concluída** (revisão final feita e corrigida; aguardando o PR/merge):
+- **1.6, fragmentação avançada, concluída** (PR #7):
   - JPEG, vídeo e RAW em 3 ou mais pedaços, buscados no espaço livre do cartão na grade de clusters que a 1.4 traz, com
     orçamento por arquivo e por busca.
   - Vídeo de câmera H.264/H.265: com o `moov` no fim, antes do `mdat`, com `mdat` de tamanho 0 e fragmentado (`moof`);
