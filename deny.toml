@@ -1,3 +1,18 @@
+# Revenant ships only for macOS and Windows: the Linux-only GTK crates Tauri pulls in are
+# never built into the app, so they are left out of the graph.
+[graph]
+targets = [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
+[advisories]
+# Vulnerabilities and unsound code fail for any crate; "unmaintained" fails only for our
+# direct dependencies (transitive ones, like Tauri's unic-* crates, are not ours to swap).
+unmaintained = "workspace"
+
 [licenses]
 allow = [
     "MIT",
@@ -12,6 +27,8 @@ allow = [
     "BSL-1.0",
     # MPL-2.0 only for unmodified runtime dependencies (Sergio, 2026-11-03; spec 2.1 design).
     "MPL-2.0",
+    # The exception only grants extra permission on top of Apache-2.0 (target-lexicon).
+    "Apache-2.0 WITH LLVM-exception",
 ]
 
 [licenses.private]
