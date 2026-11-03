@@ -119,12 +119,12 @@
   var SAFE_FOOT = '<span class="t">Nada é alterado no cartão</span>';
 
   // ---- screen 9: where to save ----
-  var NEED_GB = 3.1;
+  var NEED_GB = 18.6;
   var DESTS = [
     { key: 'lacie', icon: 'hdd', name: 'HD externo · LaCie', sub: '2 TB · ligado por USB', free: '1,4 TB livres', ok: true },
     { key: 't7', icon: 'usb', name: 'SSD externo T7', sub: '1 TB · ligado por USB', free: '812 GB livres', ok: true },
     { key: 'mac', icon: 'folder', name: 'Pasta Documentos neste Mac', sub: 'Macintosh HD', free: '210 GB livres', ok: true },
-    { key: 'pen', icon: 'usb', name: 'Pen drive KINGSTON', sub: '4 GB · ligado por USB', free: '1,9 GB livres', ok: false }
+    { key: 'pen', icon: 'usb', name: 'Pen drive KINGSTON', sub: '16 GB · ligado por USB', free: '14,2 GB livres', ok: false }
   ];
   function destKey(k) { return DESTS.filter(function (d) { return d.key === k; })[0]; }
   // o: { sel: key|null, refuse: bool }
@@ -143,22 +143,22 @@
       alert = Kit.note('bad', '<b>Não dá para salvar no próprio cartão:</b> gravar nele pode apagar fotos que ainda não voltaram. Escolha outro disco.')
         .replace('class="note bad"', 'class="note bad alert" data-code="destination_on_source" role="alert"');
     } else if (low) {
-      alert = Kit.note('mid', '<b>Faltam 1,2 GB nesse disco.</b> Escolha outro ou recupere menos arquivos.')
+      alert = Kit.note('mid', '<b>Faltam 4,4 GB nesse disco.</b> Escolha outro ou recupere menos arquivos.')
         .replace('class="note mid"', 'class="note mid alert" data-code="destination_too_small" role="alert"');
     }
     var src = '<div class="card off srcoff' + (o.refuse ? ' hit' : '') + '" data-source-disk><span class="tile">' + I('sd') + '</span><div><b data-t>Cartão SD 64 GB</b>'
       + '<small>' + I('x') + '<span data-t>Os arquivos não podem ser salvos no próprio cartão</span></small>'
       + Kit.tech('destination_on_source', 'Gravar no cartão poderia apagar o que ainda dá para recuperar.') + '</div></div>';
     var body = '<div class="wrap tight"><div class="thead"><div><h2 class="ttl">Onde salvar os arquivos?</h2><p class="lead" style="margin-top:4px">Escolha um disco com espaço livre. Os arquivos vão para uma pasta nova, a Revenant.</p></div>'
-      + '<span class="pick">' + I('image') + '<span data-t>24 arquivos escolhidos · 3,1 GB</span></span></div>'
+      + '<span class="pick">' + I('image') + '<span data-t>1.284 arquivos escolhidos · 18,6 GB</span></span></div>'
       + alert
       + '<div class="dests" role="radiogroup">' + rows + other + '</div>'
       + src + '</div>';
     var ready = d && d.ok;
     var foot = '<button class="btn ghost">Voltar aos resultados</button>' + SAFE_FOOT + '<span class="sp"></span>'
       + (ready ? '<span class="t" data-t>Salvando em: ' + d.name + '</span>' : '')
-      + '<button class="btn" data-go' + (ready ? '' : ' disabled') + '>' + I('dl') + 'Recuperar 24 arquivos</button>';
-    return page(5, body, foot);
+      + '<button class="btn" data-go' + (ready ? '' : ' disabled') + '>' + I('dl') + 'Recuperar 1.284 arquivos</button>';
+    return page(6, body, foot);
   }
   function wireWhere(app, o) {
     Array.prototype.forEach.call(app.querySelectorAll('[data-dest]'), function (c) {
