@@ -35,7 +35,8 @@ Cada decisão traz o custo se estiver errada.
   Custo: um disco interno ligado por SD aparecer como leitor de cartão (raro).
 - **Mudanças nos mockups feitas na 2.1** (a regra é mudar o mockup primeiro): a abertura da tela 13 virou "Nada foi
   gravado no cartão." e a frase de explicação nos detalhes técnicos saiu; os botões **Ajustes** e **Sobre** entraram no
-  canto superior direito do cabeçalho; o texto da dica da tela 1 foi acertado. O mapa do `index.html` leva a tela 1 para a 2.1.
+  canto superior direito do cabeçalho; a dica de "janela fechada" do `app.html` passou de "use o menu Revenant" para
+  "use os botões no alto da janela, à direita". O mapa do `index.html` leva a tela 1 para a 2.1.
 - **Modal próprio, sem Radix Dialog**: o Radix puxa `tslib` (0BSD), licença que não está na lista do Sérgio.
 
 ## Perguntas para o Sérgio

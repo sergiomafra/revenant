@@ -31,7 +31,7 @@ só o app aberto mostra. Nada aqui apaga ou grava no cartão: o app só lê. Os 
 6. **Escolher o cartão.** Clique no cartão e em **Continuar**. Aparece a tela da permissão (texto do Mac). Clique no
    botão que pede a senha.
 7. **Cancelar a senha.** No pedido de senha do Mac, cancele. A tela deve mostrar o estado "Recusada", com
-   **Tentar de novo**. (Foi nunca visto com o pedido de verdade: é o ponto principal deste roteiro.)
+   **Tentar de novo**. (Nunca foi visto com o pedido de verdade: é o ponto principal deste roteiro.)
 8. **Tentar de novo.** Clique em **Tentar de novo** e digite a senha de administrador. Deve aparecer a tela provisória
    "O Revenant consegue ler <nome do cartão> (<tamanho>)" e "a busca chega na próxima versão", com **Voltar**. Anote se
    o pedido de senha mostra o nome do `authopen` ou outro texto estranho.
