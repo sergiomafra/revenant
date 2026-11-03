@@ -102,6 +102,41 @@ left (macOS `ENOENT`/`ENXIO`/`ENODEV`; Windows `ERROR_DEVICE_NOT_CONNECTED`, `ER
 `IOCTL_STORAGE_CHECK_VERIFY2` fails); otherwise it is a bad sector (`read_failed`). `source::RawDevice` (aligned reads
 and the geometry) is what `DeviceSource::new(raw, disk)` wraps, for a privileged helper or a test double.
 
+#### Opening with the system's permission prompt
+
+An app that does not run as root or Administrator opens a disk with `source::open_with_system_prompt(&disk)`: the
+operating system asks the user, and the call blocks until they answer. It returns the same `RawDevice` as `open`:
+
+```rust,ignore
+use revenant_core::source::{DeviceSource, DiskId, open_with_system_prompt};
+let disk = DiskId::parse("disk4")?;
+let source = DeviceSource::new(open_with_system_prompt(&disk)?, disk);
+```
+
+- **macOS:** runs `/usr/libexec/authopen -stdoutpipe /dev/rdisk4` (never `-w`, `-c`, `-a`, `-x` or `-o`: read-only),
+  its stdout one end of a socket pair. `authopen` shows the system's password prompt, opens the raw node read-only and
+  sends the open descriptor back over the socket (`SCM_RIGHTS`); the engine receives exactly one descriptor (extras are
+  closed) and checks it is open read-only and is the raw node asked for. The rest is `open`'s: the node must exist, the
+  geometry comes from `diskutil` before the prompt, and after it `diskutil` is asked again, so a card swapped while the
+  prompt was up is `device_not_found`. `authopen` exiting non-zero or sending nothing (the user cancelled) is
+  `permission_denied`; `authopen` not starting is `system_tool_failed`.
+- **Windows:** relaunches the running program elevated (`ShellExecuteExW` with the `runas` verb: the UAC prompt) with
+  `--revenant-elevated-open PhysicalDrive2 <app pid>` and waits for it. The app's `main` must call
+  `source::elevated_entry(&args)` before anything else and exit with the code it returns when it is `Some`
+  (`std::process::exit`); otherwise it is `None` (always `None` off Windows). The elevated process opens the disk as
+  `open` does (`GENERIC_READ` only), duplicates the handle into the app with the same access (`DuplicateHandle`,
+  `DUPLICATE_SAME_ACCESS`, not inheritable) and exits with the handle's value; the app adopts the handle and reads the
+  geometry from it. Handle values are positive multiples of 4, so failures are odd exit codes: 1 `permission_denied`,
+  3 `device_not_found`, 5 `open_failed`, 7 bad arguments (`open_failed`); any other code (a crash) is `open_failed`.
+  Declining the UAC prompt is `permission_denied`; the relaunch failing otherwise is `system_tool_failed`.
+- Other systems answer `unsupported_platform`.
+
+`unsafe` exists only in `source/windows.rs` and `source/macos_fd.rs` (receiving the descriptor), each block with a
+`// SAFETY:` comment; a test (`unsafe_only_in_allowed_files`) scans every crate's sources for it.
+
+The prompt paths themselves are not run by the tests (they would need a real disk and a person to answer): the tests
+cover the `authopen` arguments, receiving a descriptor over a socket, the exit codes and the relaunch arguments.
+
 ### Disks
 
 `device::DeviceOps` is what the engine asks the operating system about disks (`list`, `open`, `destination`), so a

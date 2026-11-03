@@ -31,7 +31,9 @@ Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.s
 - Licenças: só MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, Unlicense, CC0-1.0, BSL-1.0. Proibido
   GPL/AGPL/LGPL/MPL de terceiros e qualquer código copiado do PhotoRec/TestDisk. O Revenant é GPL-3.0-only.
 - Erros por código: todo erro do motor tem `code() -> &'static str` em `snake_case`; nenhum texto de UI no motor.
-- Rust edição 2024, `rust-version = "1.88"`. Sem `unsafe` fora de `source/windows.rs`, cada bloco com `// SAFETY:`.
+- Rust edição 2024, `rust-version = "1.88"`. Sem `unsafe` fora de `source/windows.rs` e `source/macos_fd.rs`
+  (Sérgio, 2.1: receber o disco aberto pelo `authopen`), cada bloco com `// SAFETY:` (o teste `unsafe_only_in_allowed_files`
+  confere).
 - Testes nunca tocam dados reais nem discos físicos: só imagens sintéticas em `tempfile`. Três exceções opcionais: `real_samples`, que só lê as
   amostras CC0 baixadas para `samples/cache/`; `os_filesystems`/`os_builders` (`REVENANT_OS_FS=1`, só macOS, rodar com
   `--test-threads=1`), que usam o `hdiutil` para criar imagens FAT/exFAT numa pasta temporária e montá-las só leitura:
