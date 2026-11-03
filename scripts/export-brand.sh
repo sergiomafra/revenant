@@ -10,13 +10,18 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 # render <svg> <png> <size>: the SVG is shown at exactly size x size on a transparent page.
+# The SVG is copied next to the page and referenced by relative name, so odd characters in
+# the repo path (spaces, %) never end up in a file:// URL.
 render() {
-  local svg="$1" png="$2" n="$3" page="$tmp/page-$(basename "$2").html"
+  local svg="$1" png="$2" n="$3" name; name="$(basename "$2" .png)"
   [ -f "$svg" ] || { echo "missing SVG: $svg" >&2; exit 1; }
-  printf '<!doctype html><html><body style="margin:0;background:transparent"><img src="file://%s" width="%s" height="%s" style="display:block"></body></html>' \
-    "$svg" "$n" "$n" > "$page"
+  cp "$svg" "$tmp/$name.svg"
+  printf '<!doctype html><html><body style="margin:0;background:transparent"><img src="%s.svg" width="%s" height="%s" style="display:block"></body></html>' \
+    "$name" "$n" "$n" > "$tmp/$name.html"
+  rm -f "$png"  # Chrome can exit 0 without writing; never let a stale PNG pass
   "$chrome" --headless=new --disable-gpu --hide-scrollbars --default-background-color=00000000 \
-    --window-size="$n,$n" --screenshot="$png" "file://$page" >/dev/null 2>&1
+    --window-size="$n,$n" --screenshot="$png" "file://$tmp/$name.html" >/dev/null 2>&1 || true
+  [ -s "$png" ] || { echo "FAIL: Chrome did not write $png" >&2; exit 1; }
 }
 
 # Flat tile (full-bleed rounded square, no shadow) with the small symbol, for 32 and 16 px.

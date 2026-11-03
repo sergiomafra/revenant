@@ -5,7 +5,7 @@
     </filter>
   </defs>
   <rect x="100" y="100" width="824" height="824" rx="185" fill="#2f5d50" filter="url(#shadow)"/>
-  <svg x="257.28" y="257.28" width="509.44" height="509.44" viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" style="color:#f6f3ec;--d:#e9c27a">
+  <svg x="190.65" y="190.65" width="642.7" height="642.7" viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" style="color:#f6f3ec;--d:#e9c27a">
     <path d="M17.1 31 A38 38 0 1 0 48 12.05" stroke-width="6"/>
     <polyline points="56 4 48 12 56 20" stroke-width="6" style="stroke:var(--d, #b9822a)"/>
     <g transform="translate(50 51) scale(.58) translate(-52 -51)" stroke-width="12">
