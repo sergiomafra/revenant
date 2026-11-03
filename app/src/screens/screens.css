@@ -1,0 +1,41 @@
+/* Styles of screens 11 (Settings), 12 (About) and 13 (Unexpected error), ported from the page-local styles of
+   docs/superpowers/mockups/m2/app.html. Colors only through tokens. Radix radios mark the choice with
+   data-state="checked" where the mockup used the class "on". */
+
+/* screen 11 */
+.dlg.set{width:min(540px,100%);gap:0}
+.dlg.set h3{margin-bottom:4px}
+.dlg.set .row{display:flex;flex-direction:column;gap:8px;padding:14px 0;border-bottom:1px solid var(--line-soft)}
+.dlg.set .row:last-of-type{border-bottom:0}
+.dlg.set .row b{font-weight:650;font-size:14px}
+.dlg.set .row small{color:var(--ink-2);font-size:12.5px}
+.dlg.set .acts{margin-top:8px}
+.langs{display:flex;flex-direction:column;gap:6px}
+.lang{display:flex;align-items:center;gap:12px;padding:8px 12px;border:1px solid var(--line);border-radius:9px;background:var(--surface);cursor:pointer;text-align:left;width:100%;font-weight:600}
+.lang .rd{width:18px;height:18px;border-radius:50%;border:1.5px solid var(--ink-3);display:grid;place-items:center;color:var(--accent-ink);flex:none}
+.lang .rd svg{width:10px;height:10px;stroke-width:3;opacity:0}
+.lang[data-state="checked"]{border:1.5px solid var(--accent);padding:7.5px 11.5px;background:var(--accent-soft)}
+.lang[data-state="checked"] .rd{background:var(--accent);border-color:var(--accent)}
+.lang[data-state="checked"] .rd svg{opacity:1}
+.lang small{margin-left:auto;color:var(--ink-2);font-weight:400}
+
+/* screen 12 */
+.dlg.about{width:min(440px,100%);align-items:center;text-align:center;gap:8px;padding:30px 28px 24px}
+.dlg.about .logo{width:104px;height:104px;margin-bottom:6px}
+.dlg.about .brand{font-size:26px;font-weight:700;letter-spacing:-.02em}
+.dlg.about .ver{color:var(--ink-2);font-size:13.5px}
+.dlg.about .lic{color:var(--ink-2);font-size:13.5px;margin-top:6px}
+.links{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:10px}
+.links a{display:inline-flex;align-items:center;gap:7px;padding:7px 14px;border-radius:8px;background:var(--surface-2);color:var(--ink);font-weight:620;text-decoration:none}
+.links a:hover{background:var(--accent-soft)}
+.dlg.about .acts{justify-content:center;margin-top:10px}
+
+/* screen 13 */
+.err{width:100%;max-width:560px;text-align:left;display:flex;flex-direction:column;gap:10px}
+.err .next{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:10px;background:var(--surface);border:1px solid var(--line);font-size:13.5px}
+.err .next svg{margin-top:3px;color:var(--accent)}
+.err .next b{font-weight:650}
+.err details.tech{padding:10px 12px;border-radius:10px;background:var(--surface);border:1px solid var(--line)}
+.err details.tech summary{color:var(--ink-2)}
+.err details.tech .copy{margin-top:10px}
+.acts-row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}

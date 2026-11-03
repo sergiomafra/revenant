@@ -1,8 +1,11 @@
 //! Read-only positional access to the data being recovered.
 
 mod device;
+mod elevated;
 mod file;
 mod fragmented;
+#[cfg(target_os = "macos")]
+mod macos_fd;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -17,6 +20,7 @@ use crate::EngineError;
 
 pub(crate) use device::open_raw;
 pub use device::{DeviceSource, DiskId, Geometry, RawDevice};
+pub use elevated::{elevated_entry, open_with_system_prompt};
 pub use file::FileSource;
 pub use fragmented::Fragmented;
 

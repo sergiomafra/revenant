@@ -49,7 +49,7 @@ impl DiskId {
         }
     }
 
-    fn is_windows(&self) -> bool {
+    pub(crate) fn is_windows(&self) -> bool {
         self.0.starts_with("PhysicalDrive")
     }
 }
@@ -200,6 +200,31 @@ pub(crate) fn open_raw(disk: &DiskId) -> Result<Box<dyn RawDevice>, EngineError>
     Ok(Box::new(os::open(disk)?))
 }
 
+/// macOS: opens `disk` like [`open_raw`] (the node must exist, the geometry is asked of `diskutil`, and the medium must
+/// still be the one measured once open, else `device_not_found`), with `opener` doing the open in between, read-only
+/// (`authopen`, after the system's permission prompt).
+#[cfg(target_os = "macos")]
+pub(crate) fn open_raw_with(
+    disk: &DiskId,
+    opener: impl FnOnce(&DiskId) -> Result<std::fs::File, EngineError>,
+) -> Result<Box<dyn RawDevice>, EngineError> {
+    Ok(Box::new(os::open_with(disk, opener)?))
+}
+
+/// Windows: a whole disk already open read-only (the handle the elevated process duplicated into this one); the
+/// geometry comes from the handle.
+#[cfg(windows)]
+pub(crate) fn raw_from_file(file: std::fs::File) -> Result<Box<dyn RawDevice>, EngineError> {
+    Ok(Box::new(os::from_file(file)?))
+}
+
+/// Windows: opens the whole disk `disk` read-only like [`open_raw`] and returns its handle (what the elevated process
+/// duplicates into the app).
+#[cfg(windows)]
+pub(crate) fn open_device_file(disk: &DiskId) -> Result<std::fs::File, EngineError> {
+    Ok(os::open(disk)?.into_file())
+}
+
 /// The operating system's devices: opening `/dev/rdiskN` or `\\.\PhysicalDriveN` read-only and classifying read errors
 /// (ruling D2).
 #[cfg(any(target_os = "macos", windows))]
@@ -238,6 +263,17 @@ mod os {
 
     #[cfg(target_os = "macos")]
     pub(super) fn open(disk: &DiskId) -> Result<OsDevice, EngineError> {
+        open_with(disk, |disk| {
+            platform::open_device(&disk.device_path()).map_err(open_error)
+        })
+    }
+
+    /// Opens `disk` with `opener` between the geometry query and the confirmation that the medium did not change.
+    #[cfg(target_os = "macos")]
+    pub(super) fn open_with(
+        disk: &DiskId,
+        opener: impl FnOnce(&DiskId) -> Result<File, EngineError>,
+    ) -> Result<OsDevice, EngineError> {
         if !disk.as_str().starts_with("disk") {
             return Err(EngineError::DeviceNotFound);
         }
@@ -246,7 +282,7 @@ mod os {
             return Err(EngineError::DeviceNotFound);
         }
         let (geometry, info) = crate::device::macos::geometry(disk.as_str())?;
-        let file = platform::open_device(&disk.device_path()).map_err(open_error)?;
+        let file = opener(disk)?;
         // The node may name another medium by now (a card swapped meanwhile): the geometry must be the opened one's.
         crate::device::macos::confirm(disk.as_str(), &info)?;
         Ok(OsDevice {
@@ -262,12 +298,23 @@ mod os {
             return Err(EngineError::DeviceNotFound);
         }
         let file = platform::open_device(&disk.device_path()).map_err(open_error)?;
+        from_file(file)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn from_file(file: File) -> Result<OsDevice, EngineError> {
         let geometry =
             platform::device_geometry(&file).map_err(|cause| EngineError::Open { cause })?;
         Ok(OsDevice { file, geometry })
     }
 
     impl OsDevice {
+        /// The open handle, for the elevated process to duplicate into the app.
+        #[cfg(windows)]
+        pub(super) fn into_file(self) -> File {
+            self.file
+        }
+
         #[cfg(target_os = "macos")]
         fn present(&self) -> bool {
             self.node.exists()

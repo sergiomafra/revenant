@@ -1,6 +1,6 @@
 # Revenant — roteiro até a versão 1.0
 
-Atualizado em 02/11/2026. Cada parte segue o mesmo caminho: spec, depois telas (quando houver tela), depois plano, execução por
+Atualizado em 03/11/2026. Cada parte segue o mesmo caminho: spec, depois telas (quando houver tela), depois plano, execução por
 subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizada em toda parte.
 
 ## Marcos
@@ -87,13 +87,15 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
     `node scripts/check-mockups.mjs`; capturas de cada estado por `bash scripts/shoot-mockups.sh`.
   - Logo (o anel com a seta de volta e o R em pedaços) e ícone do app: `assets/brand/`.
   - Spec: `docs/superpowers/specs/2026-11-02-m2-p0-telas-identidade-design.md`.
-- **2.1, esqueleto** (telas: `app.html` — Ajustes, Sobre, erro inesperado; a permissão de `inicio.html`):
+- **2.1, esqueleto, concluída** (PR aberto na branch `feat/m2-p1-skeleton`; telas: `app.html` — Ajustes, Sobre, erro inesperado; `inicio.html` — escolher o disco e a permissão):
   - Janela, temas e 3 idiomas.
   - Ajudante privilegiado só de leitura: senha de administrador no Mac, UAC no Windows.
-  - Ponte entre o app e o motor.
-- **2.2, o caminho** (telas: `inicio.html` — retomar, disco, conferência prévia; `busca.html` — cópia, procurando,
-  cartão desconectado): escolher o disco, dar a permissão, fazer a cópia opcional e acompanhar a busca com a galeria se
-  enchendo ao vivo.
+  - Ponte entre o app e o motor: lista de discos que acompanha o plugar e o tirar, e o pedido de permissão.
+  - Pendências, decisões e perguntas ao Sérgio em `docs/superpowers/history/2026-11-03-m2-p1-pendencias.md`; conferência
+    no Mac (e no Windows, quando houver um PC) em `docs/superpowers/history/2026-11-03-m2-p1-conferencia-manual.md`.
+- **2.2, o caminho** (telas: `inicio.html` — retomar, conferência prévia; `busca.html` — cópia, procurando,
+  cartão desconectado): retomar uma busca, a conferência prévia, a cópia opcional e acompanhar a busca com a galeria se
+  enchendo ao vivo (escolher o disco e dar a permissão já vêm da 2.1).
 - **2.3, resultados e recuperação** (telas: `resultados.html`, `recuperar.html`):
   - Galeria, Linha do tempo e Detalhes.
   - "Selecionar tudo" por grupo.

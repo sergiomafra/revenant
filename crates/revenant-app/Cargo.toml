@@ -1,0 +1,31 @@
+[package]
+name = "revenant-app"
+description = "Revenant desktop app (Tauri shell around the engine)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "revenant_app"
+
+[[bin]]
+name = "revenant"
+path = "src/main.rs"
+
+[dependencies]
+revenant-core = { path = "../revenant-core" }
+# Tauri 2.12 needs Rust 1.90; 2.11 is the newest line that builds on the workspace MSRV (1.88).
+tauri = { version = "~2.11", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Opens the About links in the browser. 2.6+ needs Rust 1.90; 2.5 builds on the workspace MSRV (1.88).
+tauri-plugin-opener = "~2.5"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[build-dependencies]
+tauri-build = { version = "~2.6", features = [] }

@@ -32,8 +32,10 @@ connected disks, refuses the one holding the system, unmounts the card without e
 knows to be wrong before a long read (permission, a disk that does not answer, room for a copy), copies a failing card into
 an image with a rescue map that tolerates bad sectors and can be resumed, warns early when a card is failing, and saves a
 scan so it resumes with the same results after a crash or a pulled cable. It is tested against real camera files as well
-as synthetic ones and, optionally, against disk images attached to the computer. A graphical app comes next: its logo
-and app icon are in [assets/brand](assets/brand/README.md).
+as synthetic ones and, optionally, against disk images attached to the computer. The graphical app has started: it
+opens on the list of connected cards and disks, asks for the system's permission to read the one you choose
+(read-only; the search itself comes next), and has Settings (theme and language: Português, Español, English), About
+and an error screen (Tauri 2 and React, in [crates/revenant-app](crates/revenant-app/README.md) and `app/`); its logo and app icon are in [assets/brand](assets/brand/README.md).
 
 ## Trying the engine (developers)
 
@@ -51,6 +53,17 @@ with a rescue map (`revenant-dev copy disk4 card.img`) and save a scan to resume
 [crates/revenant-dev](crates/revenant-dev/README.md) for the output format, reading a card directly, copying a card and
 saved scans.
 
+## Running the app (developers)
+
+```sh
+cd app
+npm ci
+npm run tauri dev                       # the window, with live reload
+npm run tauri build -- --bundles app    # target/release/bundle/macos/Revenant.app
+```
+
+See [crates/revenant-app](crates/revenant-app/README.md).
+
 ## License
 
 [GPL-3.0-only](LICENSE), copyright Sérgio Mafra.
@@ -59,4 +72,6 @@ saved scans.
 
 Issues and pull requests are welcome. Everything in the repository (code, comments, commits, docs) is in English. Before
 opening a pull request, run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --workspace`.
-Dependencies must be under permissive licenses (see `deny.toml`).
+Dependencies that ship inside the app must be under permissive licenses, or MPL-2.0 if unmodified (see `deny.toml`;
+`node scripts/check-npm-licenses.mjs app` checks the npm side). Build-only npm tools may use any open license except
+GPL and AGPL.

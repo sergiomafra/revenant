@@ -1,0 +1,147 @@
+{
+  "app": { "name": "Revenant" },
+  "steps": {
+    "label": "Pasos",
+    "disk": "Disco",
+    "permission": "Permiso",
+    "check": "Revisión",
+    "copy": "Copia",
+    "search": "Búsqueda",
+    "results": "Resultados",
+    "recover": "Recuperar"
+  },
+  "footer": {
+    "nothing_changes": "No se cambia nada en la tarjeta",
+    "nothing_changed": "No se cambió nada en la tarjeta"
+  },
+  "tech": {
+    "summary": "Detalles técnicos",
+    "copy": "Copiar detalles",
+    "copied": "Detalles copiados"
+  },
+  "settings": {
+    "title": "Ajustes",
+    "theme": "Tema",
+    "theme_light": "Claro",
+    "theme_dark": "Oscuro",
+    "theme_auto": "Automático",
+    "theme_hint": "Automático sigue el tema de tu computadora.",
+    "language": "Idioma",
+    "language_default": "Predeterminado",
+    "save_failed": "No se pudo guardar la elección. Vale hasta que cierres Revenant.",
+    "done": "Listo"
+  },
+  "languages": {
+    "pt-BR": "Português (Brasil)",
+    "es": "Español",
+    "en": "English"
+  },
+  "about": {
+    "version": "Versión {{version}}",
+    "license": "Gratuito y de código abierto (GPL-3.0)",
+    "source": "Código fuente",
+    "guide": "Guía de uso",
+    "close": "Cerrar"
+  },
+  "error": {
+    "lead": "No se escribió nada en la tarjeta. Los archivos que ya recuperaste siguen guardados.",
+    "what_to_do": "Qué hacer:",
+    "home": "Volver al inicio",
+    "retry": "Intentar de nuevo",
+    "read_failed": {
+      "title": "Algo salió mal al leer la tarjeta",
+      "action": "intenta de nuevo. Si sigue pasando, primero haz una copia de la tarjeta y busca los archivos en ella."
+    },
+    "open_failed": {
+      "title": "No se pudo abrir la tarjeta",
+      "action": "revisa que siga conectada e intenta de nuevo. Si sigue pasando, saca la tarjeta, vuelve a ponerla y espera unos segundos."
+    },
+    "permission_denied": {
+      "title": "Revenant no recibió el permiso",
+      "action": "intenta de nuevo y acepta el pedido de permiso en la ventana del sistema."
+    },
+    "device_not_found": {
+      "title": "No se encontró el disco",
+      "action": "revisa que siga conectado y vuelve a elegirlo."
+    },
+    "system_tool_failed": {
+      "title": "No se pudieron ver los discos conectados",
+      "action": "intenta de nuevo en un momento. Si sigue pasando, cierra Revenant y vuelve a abrirlo."
+    },
+    "unsupported_platform": {
+      "title": "Revenant no funciona en esta computadora",
+      "action": "usa Revenant en una Mac o en una PC con Windows."
+    },
+    "system_disk": {
+      "title": "Este es el disco del sistema",
+      "action": "elige la tarjeta o el disco externo de donde desaparecieron las fotos y los videos. En el disco del sistema no se puede buscar."
+    },
+    "not_whole_disk": {
+      "title": "Elige el disco entero",
+      "action": "vuelve y elige la tarjeta o el disco en la lista, y no solo una parte."
+    },
+    "unknown": {
+      "title": "Algo salió mal",
+      "action": "intenta de nuevo. Si sigue pasando, cierra Revenant y vuelve a abrirlo."
+    }
+  },
+  "header": {
+    "settings": "Ajustes",
+    "about": "Acerca de"
+  },
+  "disk": {
+    "fallback_name": "Disco de {{size}}",
+    "named": "{{name}} · {{size}}",
+    "camera_card": "parece una tarjeta de cámara",
+    "via_usb": "conectado por USB",
+    "via_sd_card": "en un lector de tarjetas",
+    "via_thunderbolt": "conectado por Thunderbolt",
+    "system": "Disco del sistema: no se puede buscar en él",
+    "chosen": "Elegido"
+  },
+  "disks": {
+    "title": "¿Qué quieres recuperar?",
+    "lead": "Elige la tarjeta o el disco de donde desaparecieron las fotos y los videos.",
+    "list_label": "Discos conectados",
+    "ssd_caution": "SSD y tarjetas CFexpress: los archivos borrados suelen desaparecer en minutos. Busca cuanto antes.",
+    "why": "Saber por qué",
+    "why_text": "En estos discos, el sistema limpia solo el espacio de los archivos borrados, en pocos minutos. Cuanto antes busques, más probable es encontrarlo todo. No uses el disco hasta entonces.",
+    "empty_title": "Conecta la tarjeta o el disco",
+    "empty_lead": "Pon la tarjeta en el lector o conecta el disco al puerto USB. Aparece aquí solo, sin que tengas que hacer nada más.",
+    "hint_card": "Deja de usar la tarjeta ahora.",
+    "hint_card_rest": "No guardes nada en ella.",
+    "hint_disk": "Deja de usar el disco ahora.",
+    "hint_disk_rest": "No guardes nada en él.",
+    "gone": "No se encontró el disco. Comprueba que siga conectado.",
+    "continue": "Continuar"
+  },
+  "permission": {
+    "read_only": "Revenant solo lee. Nunca escribe en la tarjeta.",
+    "how": "Cómo funciona",
+    "private": "Tus datos no salen de la computadora",
+    "back": "Volver",
+    "waiting": "Esperando la respuesta del sistema",
+    "mac_title": "Solo falta un permiso de la Mac",
+    "mac_lead": "Para leer la tarjeta completa, y no solo las carpetas visibles, la Mac necesita la contraseña de administrador. Escribes la contraseña en la ventana del sistema, no aquí.",
+    "mac_step1": "<b>Haz clic en el botón</b> “Pedir la contraseña de administrador”.",
+    "mac_step2": "Escribe la contraseña que usas para entrar en la Mac.",
+    "mac_step3": "Listo. La revisión de la tarjeta empieza sola.",
+    "mac_ask": "Pedir la contraseña de administrador",
+    "win_title": "Windows te va a pedir que confirmes",
+    "win_lead": "Para leer la tarjeta completa, Windows necesita que autorices a Revenant como administrador. Es una pregunta normal del sistema, con Sí y No.",
+    "win_step1": "<b>Haz clic en Continuar.</b>",
+    "win_step2": "Windows pregunta si puede permitirlo. Haz clic en Sí.",
+    "win_step3": "Listo. La revisión de la tarjeta empieza sola.",
+    "win_ask": "Continuar",
+    "denied_title": "Sin el permiso no se puede leer la tarjeta",
+    "denied_lead": "La solicitud de autorización se canceló o no se aceptó. No se cambió nada en la tarjeta. Haz clic en Intentar de nuevo y confirma como administrador.",
+    "denied_tech": "Se rechazó el permiso de administrador.",
+    "retry": "Intentar de nuevo"
+  },
+  "granted": {
+    "title": "Revenant puede leer {{name}} ({{size}}).",
+    "title_unnamed": "Revenant puede leer el disco de {{size}}.",
+    "lead": "La búsqueda llega en la próxima versión.",
+    "back": "Volver"
+  }
+}

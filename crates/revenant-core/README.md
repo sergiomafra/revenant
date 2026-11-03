@@ -102,6 +102,47 @@ left (macOS `ENOENT`/`ENXIO`/`ENODEV`; Windows `ERROR_DEVICE_NOT_CONNECTED`, `ER
 `IOCTL_STORAGE_CHECK_VERIFY2` fails); otherwise it is a bad sector (`read_failed`). `source::RawDevice` (aligned reads
 and the geometry) is what `DeviceSource::new(raw, disk)` wraps, for a privileged helper or a test double.
 
+#### Opening with the system's permission prompt
+
+An app that does not run as root or Administrator opens a disk with `source::open_with_system_prompt(&disk)`: the
+operating system asks the user, and the call blocks until they answer. It returns the same `RawDevice` as `open`:
+
+```rust,ignore
+use revenant_core::source::{DeviceSource, DiskId, open_with_system_prompt};
+let disk = DiskId::parse("disk4")?;
+let source = DeviceSource::new(open_with_system_prompt(&disk)?, disk);
+```
+
+- **macOS:** runs `/usr/libexec/authopen -stdoutpipe /dev/rdisk4` (never `-w`, `-c`, `-a`, `-x` or `-o`: read-only),
+  its stdout one end of a socket pair. `authopen` shows the system's password prompt, opens the raw node read-only and
+  sends the open descriptor back over the socket (`SCM_RIGHTS`); the engine receives exactly one descriptor (extras are
+  closed), marks it close-on-exec at once (macOS hands it over inheritable, and `diskutil` runs while it is open) and
+  checks it is open read-only and is the raw node asked for. The rest is `open`'s: the node must exist, the
+  geometry comes from `diskutil` before the prompt, and after it `diskutil` is asked again, so a card swapped while the
+  prompt was up is `device_not_found`. `authopen` exiting non-zero or sending nothing (the user cancelled) is
+  `permission_denied`, except that a non-zero exit once the node is gone (the card pulled while the prompt was up) is
+  `device_not_found`; `authopen` not starting is `system_tool_failed`.
+- **Windows:** relaunches the running program elevated (`ShellExecuteExW` with the `runas` verb: the UAC prompt) with
+  `--revenant-elevated-open PhysicalDrive2 <app pid>` and waits for it. The app's `main` must call
+  `source::elevated_entry(&args)` before anything else and exit with the code it returns when it is `Some`
+  (`std::process::exit`); otherwise it is `None` (always `None` off Windows). The elevated process does not take its
+  caller's word: the process it hands the disk to must run this same program (its image path,
+  `QueryFullProcessImageNameW`, and `current_exe`, both canonicalized, compared without case), and the disk must be in
+  its own listing and not the system disk; only then does it open the disk as
+  `open` does (`GENERIC_READ` only), duplicates the handle into the app with the same access (`DuplicateHandle`,
+  `DUPLICATE_SAME_ACCESS`, not inheritable) and exits with the handle's value; the app adopts the handle and reads the
+  geometry from it. Handle values are positive multiples of 4, so failures are odd exit codes: 1 `permission_denied`,
+  3 `device_not_found`, 5 `open_failed`, 7 bad arguments (`open_failed`), 9 `system_disk`, 11 the caller is not this
+  program (`open_failed`); any other code (a crash) is `open_failed`.
+  Declining the UAC prompt is `permission_denied`; the relaunch failing otherwise is `system_tool_failed`.
+- Other systems answer `unsupported_platform`.
+
+`unsafe` exists only in `source/windows.rs` and `source/macos_fd.rs` (receiving the descriptor), each block with a
+`// SAFETY:` comment; a test (`unsafe_only_in_allowed_files`) scans every crate's sources for it.
+
+The prompt paths themselves are not run by the tests (they would need a real disk and a person to answer): the tests
+cover the `authopen` arguments, receiving a descriptor over a socket, the exit codes and the relaunch arguments.
+
 ### Disks
 
 `device::DeviceOps` is what the engine asks the operating system about disks (`list`, `open`, `destination`), so a
@@ -109,8 +150,15 @@ privileged helper (Module 2.1) or a test double can serve it; `device::SystemDev
 Windows; elsewhere every call is `unsupported_platform`). `destination` needs no privilege and may stay outside the helper.
 
 `list()` returns the connected whole disks, sorted by id (`disk2` before `disk10`), each a `DiskInfo`: `id`, `geometry`,
-`vendor`, `model`, `serial` (often the card reader's, not the card's), `removable`, `internal`, `system`, `virtual_disk`,
-`solid_state` (`None` when the system does not say) and its `volumes` (`VolumeInfo { id, fs, label, mount_point, size }`).
+`vendor`, `model`, `serial` (often the card reader's, not the card's), `removable`, `internal`, `connection`, `system`,
+`virtual_disk`, `solid_state` (`None` when the system does not say) and its `volumes` (`VolumeInfo { id, fs, label, mount_point, size }`).
+
+`connection` is a `Connection` (`Usb`, `SdCard`, `Thunderbolt`, `Internal`, `Unknown`; `code()` gives `usb`, `sd_card`,
+`thunderbolt`, `internal`, `unknown`): macOS reads `BusProtocol` of `diskutil info` (`USB`, `Secure Digital`,
+`Thunderbolt`), Windows reads the `BusType` already queried (USB, SD and MMC). An SD or MMC card is `SdCard` even in a
+built-in slot that the system calls internal; any other disk marked internal is `Internal` whatever its protocol.
+`device::looks_like_camera_card(&DiskInfo)` is `true` when a mounted volume has a `DCIM` folder (any letter case) at
+its root: it only lists the mounted folder and never opens the disk.
 
 - macOS: the whole disks of `diskutil list -plist`, each completed by `diskutil info -plist` of the disk and of each of
   its partitions, plus one `ioreg -a -r -c IOBlockStorageDevice -l` (vendor, product, serial, physical sector). APFS

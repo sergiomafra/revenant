@@ -168,6 +168,7 @@ struct DiskLine<'a> {
     serial: Option<&'a str>,
     removable: bool,
     internal: bool,
+    connection: &'static str,
     system: bool,
     #[serde(rename = "virtual")]
     virtual_disk: bool,
@@ -197,6 +198,7 @@ fn disk_line(d: &DiskInfo) -> DiskLine<'_> {
         serial: d.serial.as_deref(),
         removable: d.removable,
         internal: d.internal,
+        connection: d.connection.code(),
         system: d.system,
         virtual_disk: d.virtual_disk,
         solid_state: d.solid_state,

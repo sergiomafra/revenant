@@ -7,6 +7,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The desktop app's first build: a `Revenant.app` (Mac) that opens the Revenant window (1280×800, at least 1024×700)
+  with the app icon.
+- The app in three languages (Português (Brasil), Español, English), starting in the computer's language (English when
+  it is none of the three), and in a light, dark or automatic theme (automatic follows the computer). The Settings
+  screen changes both at once, and the choice is kept for the next time the app opens.
+- The About screen (version, license, links to the source code and the user guide, opened in the browser) and a calm
+  error screen that says what went wrong and what to do, with the error code under "Technical details".
+- The first steps of the path in the app: it opens on "What do you want to recover?", with the connected cards and
+  disks as large cards (name, size, file system, brand and how each one is connected, or "looks like a camera card"),
+  the system disk greyed out with the reason, a caution with "Learn why" when an SSD or CFexpress card is chosen, and
+  "Connect the card or the disk" when there is none. The list follows disks being plugged in and out by itself, without
+  losing the choice. Continue explains the system's permission prompt (the administrator password on the Mac, the
+  Windows confirmation), asks for it and, once granted, says that Revenant can read the disk (the search comes in the
+  next version). A refused prompt can be tried again; a disk that went away, even while the permission prompt was up or
+  just after it, sends you back to the list with a note. Settings and About open from the buttons at the top right of every screen.
+- A disk can be opened through the system's own permission prompt (the password prompt on macOS, the UAC prompt on
+  Windows), read-only, so the app never has to run as administrator.
+- The disk list tells how each disk is connected (USB, SD card, Thunderbolt, internal) and whether it looks like a
+  camera card (a `DCIM` folder on a mounted volume); `revenant-dev disks` prints `connection`.
 - `revenant-dev` lists the connected disks, runs the pre-flight check, unmounts and remounts a card, copies a card into
   an image with its rescue map (resumable, checked first: it stops before writing anything when the destination cannot
   hold the card or is on it), prints a digest of a card or image, and scans a card directly, an image with its map (what

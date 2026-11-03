@@ -104,6 +104,11 @@ var Kit = (function () {
     var small = !!(opts && opts.small);
     return (small ? SYMBOL_SMALL : SYMBOL).replace('<svg ', '<svg class="logo" role="img" aria-label="Revenant" style="' + (opts && opts.onTile ? '--d:var(--tile-gold);color:var(--tile-ink)' : '--d:var(--brand-gold)') + '" ');
   };
+  // The buttons at the right of every page header: Settings (screen 11) and About (screen 12).
+  K.headerActions = function () {
+    return '<span class="hd-acts"><button class="icb" aria-label="Ajustes" title="Ajustes">' + K.icon('settings') + '</button>'
+      + '<button class="icb" aria-label="Sobre" title="Sobre">' + K.icon('info') + '</button></span>';
+  };
   // opts: { i, tag: 'RAW'|'JPG'|'VÍDEO', state: 'ok'|'mid'|'bad', sel, dur, w, nobadge }
   K.thumb = function (o) {
     o = o || {};

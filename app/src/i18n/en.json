@@ -1,0 +1,147 @@
+{
+  "app": { "name": "Revenant" },
+  "steps": {
+    "label": "Steps",
+    "disk": "Disk",
+    "permission": "Permission",
+    "check": "Check",
+    "copy": "Copy",
+    "search": "Search",
+    "results": "Results",
+    "recover": "Recover"
+  },
+  "footer": {
+    "nothing_changes": "Nothing on the card is changed",
+    "nothing_changed": "Nothing on the card was changed"
+  },
+  "tech": {
+    "summary": "Technical details",
+    "copy": "Copy details",
+    "copied": "Details copied"
+  },
+  "settings": {
+    "title": "Settings",
+    "theme": "Theme",
+    "theme_light": "Light",
+    "theme_dark": "Dark",
+    "theme_auto": "Automatic",
+    "theme_hint": "Automatic follows your computer's theme.",
+    "language": "Language",
+    "language_default": "Default",
+    "save_failed": "Your choice could not be saved. It lasts until you close Revenant.",
+    "done": "Done"
+  },
+  "languages": {
+    "pt-BR": "Português (Brasil)",
+    "es": "Español",
+    "en": "English"
+  },
+  "about": {
+    "version": "Version {{version}}",
+    "license": "Free and open source (GPL-3.0)",
+    "source": "Source code",
+    "guide": "User guide",
+    "close": "Close"
+  },
+  "error": {
+    "lead": "Nothing was written to the card. The files you already recovered are still saved.",
+    "what_to_do": "What to do:",
+    "home": "Back to start",
+    "retry": "Try again",
+    "read_failed": {
+      "title": "Something went wrong while reading the card",
+      "action": "try again. If it keeps happening, make a copy of the card first and look for the files in the copy."
+    },
+    "open_failed": {
+      "title": "The card could not be opened",
+      "action": "check that it is still connected and try again. If it keeps happening, take the card out, put it back and wait a few seconds."
+    },
+    "permission_denied": {
+      "title": "Revenant did not get permission",
+      "action": "try again and accept the permission request in the system window."
+    },
+    "device_not_found": {
+      "title": "The disk was not found",
+      "action": "check that it is still connected and choose it again."
+    },
+    "system_tool_failed": {
+      "title": "The connected disks could not be listed",
+      "action": "try again in a moment. If it keeps happening, close Revenant and open it again."
+    },
+    "unsupported_platform": {
+      "title": "Revenant does not work on this computer",
+      "action": "use Revenant on a Mac or on a Windows PC."
+    },
+    "system_disk": {
+      "title": "This is the system disk",
+      "action": "choose the card or the external disk the photos and videos disappeared from. The system disk cannot be searched."
+    },
+    "not_whole_disk": {
+      "title": "Choose the whole disk",
+      "action": "go back and choose the card or the disk in the list, not just one part of it."
+    },
+    "unknown": {
+      "title": "Something went wrong",
+      "action": "try again. If it keeps happening, close Revenant and open it again."
+    }
+  },
+  "header": {
+    "settings": "Settings",
+    "about": "About"
+  },
+  "disk": {
+    "fallback_name": "{{size}} disk",
+    "named": "{{name}} · {{size}}",
+    "camera_card": "looks like a camera card",
+    "via_usb": "connected by USB",
+    "via_sd_card": "in a card reader",
+    "via_thunderbolt": "connected by Thunderbolt",
+    "system": "System disk: it cannot be searched",
+    "chosen": "Chosen"
+  },
+  "disks": {
+    "title": "What do you want to recover?",
+    "lead": "Choose the card or disk the photos and videos disappeared from.",
+    "list_label": "Connected disks",
+    "ssd_caution": "SSDs and CFexpress cards: deleted files often vanish within minutes. Search as soon as you can.",
+    "why": "Learn why",
+    "why_text": "On these disks, the system clears the space of deleted files by itself, within a few minutes. The sooner you search, the better the chance of finding everything. Do not use the disk until then.",
+    "empty_title": "Connect the card or the disk",
+    "empty_lead": "Put the card in the reader or plug the disk into the USB port. It shows up here by itself, with nothing else to do.",
+    "hint_card": "Stop using the card now.",
+    "hint_card_rest": "Do not save anything on it.",
+    "hint_disk": "Stop using the disk now.",
+    "hint_disk_rest": "Do not save anything on it.",
+    "gone": "The disk was not found. Check that it is still connected.",
+    "continue": "Continue"
+  },
+  "permission": {
+    "read_only": "Revenant only reads. It never writes to the card.",
+    "how": "How it works",
+    "private": "Your data never leaves the computer",
+    "back": "Back",
+    "waiting": "Waiting for the system to answer",
+    "mac_title": "Just one Mac permission left",
+    "mac_lead": "To read the whole card, not just the visible folders, the Mac needs the administrator password. You type the password in the system window, not here.",
+    "mac_step1": "<b>Click the button</b> “Ask for the administrator password”.",
+    "mac_step2": "Type the password you use to log in to the Mac.",
+    "mac_step3": "Done. The card check starts by itself.",
+    "mac_ask": "Ask for the administrator password",
+    "win_title": "Windows will ask you to confirm",
+    "win_lead": "To read the whole card, Windows needs you to allow Revenant as an administrator. It is a normal system question, with Yes and No.",
+    "win_step1": "<b>Click Continue.</b>",
+    "win_step2": "Windows asks whether to allow it. Click Yes.",
+    "win_step3": "Done. The card check starts by itself.",
+    "win_ask": "Continue",
+    "denied_title": "Without permission the card cannot be read",
+    "denied_lead": "The authorization request was cancelled or not accepted. Nothing on the card was changed. Click Try again and confirm as an administrator.",
+    "denied_tech": "The administrator permission was refused.",
+    "retry": "Try again"
+  },
+  "granted": {
+    "title": "Revenant can read {{name}} ({{size}}).",
+    "title_unnamed": "Revenant can read the {{size}} disk.",
+    "lead": "The search comes in the next version.",
+    "back": "Back"
+  }
+}

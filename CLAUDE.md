@@ -6,12 +6,16 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 
 ## Onde o desenvolvimento está
 
-**02/11/2026.** Módulo 1 (motor) concluído: Partes 1.1 a 1.6 mergeadas (PRs #1 a #7). Decisões e o que ficou para
+**03/11/2026.** Módulo 1 (motor) concluído: Partes 1.1 a 1.6 mergeadas (PRs #1 a #7). Decisões e o que ficou para
 depois de cada parte em `docs/superpowers/history/`; roteiros manuais com hardware (do Sérgio, ainda a fazer) em
-`2026-10-25-m1-p5-conferencia-manual.md` e `2026-11-02-m1-p6-conferencia-manual.md`. Marco A fechado. Módulo 2,
-Parte 2.0 (telas e identidade) concluída e aprovada pelo Sérgio (03/11/2026), PR aberto na branch `feat/m2-p0-screens`:
-mockups em `docs/superpowers/mockups/m2/`, logo e ícone em `assets/brand/`. Próxima: 2.1. Roteiro até a 1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`
-(`bench` mede a velocidade).
+`2026-10-25-m1-p5-conferencia-manual.md`, `2026-11-02-m1-p6-conferencia-manual.md` e
+`2026-11-03-m2-p1-conferencia-manual.md`. Marco A fechado. Módulo 2: Parte 2.0 (telas e identidade) mergeada (PR #8;
+mockups em `docs/superpowers/mockups/m2/`, logo e ícone em `assets/brand/`). Parte 2.1 (esqueleto do app: janela, temas,
+3 idiomas, lista de discos, permissão) pronta, em PR na branch `feat/m2-p1-skeleton`; o que ficou para a 2.2 e as
+perguntas ao Sérgio em `docs/superpowers/history/2026-11-03-m2-p1-pendencias.md`. Próxima: 2.2. Ponto de partida do app:
+`cd app && npm ci && npm run tauri dev` (ou `npm run tauri build -- --bundles app`); detalhes em
+`crates/revenant-app/README.md`. Roteiro até a 1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de
+desenvolvimento do motor: `revenant-dev` (`bench` mede a velocidade).
 Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.
 
 ## Diretrizes fixas
@@ -28,10 +32,14 @@ Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.s
 - Exceção única (Sérgio, 1.5): no Windows, uma alça de **volume** pode ser aberta com escrita só para `FSCTL_LOCK_VOLUME`/
   `FSCTL_DISMOUNT_VOLUME`, quando a alça só leitura é recusada, nunca para ler ou gravar dados; fica em
   `source/windows.rs` (`lock_volume_for_dismount`), marcada, e o teste `source_has_no_write_path` confere.
-- Licenças: só MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, Unlicense, CC0-1.0, BSL-1.0. Proibido
-  GPL/AGPL/LGPL/MPL de terceiros e qualquer código copiado do PhotoRec/TestDisk. O Revenant é GPL-3.0-only.
+- Licenças do que vai dentro do app: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, Unlicense, CC0-1.0,
+  BSL-1.0, mais MPL-2.0 sem modificação (Sérgio, 2.1). Ferramentas só de montagem (devDependencies do npm): qualquer licença
+  aberta, menos GPL e AGPL. Proibido GPL/AGPL/LGPL de terceiros no que vai dentro e qualquer código copiado do
+  PhotoRec/TestDisk. O Revenant é GPL-3.0-only.
 - Erros por código: todo erro do motor tem `code() -> &'static str` em `snake_case`; nenhum texto de UI no motor.
-- Rust edição 2024, `rust-version = "1.88"`. Sem `unsafe` fora de `source/windows.rs`, cada bloco com `// SAFETY:`.
+- Rust edição 2024, `rust-version = "1.88"`. Sem `unsafe` fora de `source/windows.rs` e `source/macos_fd.rs`
+  (Sérgio, 2.1: receber o disco aberto pelo `authopen`), cada bloco com `// SAFETY:` (o teste `unsafe_only_in_allowed_files`
+  confere).
 - Testes nunca tocam dados reais nem discos físicos: só imagens sintéticas em `tempfile`. Três exceções opcionais: `real_samples`, que só lê as
   amostras CC0 baixadas para `samples/cache/`; `os_filesystems`/`os_builders` (`REVENANT_OS_FS=1`, só macOS, rodar com
   `--test-threads=1`), que usam o `hdiutil` para criar imagens FAT/exFAT numa pasta temporária e montá-las só leitura:

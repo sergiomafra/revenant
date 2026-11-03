@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::plist::Plist;
-use super::{DestInfo, DiskInfo, FAT_MAX_FILE, VolumeInfo, push_unique, sort_disks};
+use super::{Connection, DestInfo, DiskInfo, FAT_MAX_FILE, VolumeInfo, push_unique, sort_disks};
 use crate::source::{DiskId, Geometry};
 
 /// Largest sector size believed (anything above, or not a power of two from 512, is a misread).
@@ -214,6 +214,10 @@ pub(crate) fn disks(
             serial: characteristic("Serial Number"),
             removable: flag(info, "Removable") || flag(info, "RemovableMedia"),
             internal: flag(info, "Internal"),
+            connection: connection_from_bus_protocol(
+                info.get("BusProtocol").and_then(Plist::as_str),
+                flag(info, "Internal"),
+            ),
             virtual_disk: info.get("VirtualOrPhysical").and_then(Plist::as_str) == Some("Virtual")
                 || info.get("BusProtocol").and_then(Plist::as_str) == Some("Disk Image"),
             solid_state: info.get("SolidState").and_then(Plist::as_bool),
@@ -222,6 +226,22 @@ pub(crate) fn disks(
     }
     sort_disks(&mut out);
     Some(out)
+}
+
+/// How a disk is connected, from `diskutil info`'s `BusProtocol`. `Secure Digital` is always an SD card (a built-in
+/// slot reports `Internal`); any other disk built into the computer is `Internal` whatever its protocol says.
+pub(crate) fn connection_from_bus_protocol(protocol: Option<&str>, internal: bool) -> Connection {
+    if protocol == Some("Secure Digital") {
+        return Connection::SdCard;
+    }
+    if internal {
+        return Connection::Internal;
+    }
+    match protocol {
+        Some("USB") => Connection::Usb,
+        Some("Thunderbolt") => Connection::Thunderbolt,
+        _ => Connection::Unknown,
+    }
 }
 
 /// A partition of a `diskutil list` entry, completed by its `diskutil info` when there is one.
@@ -655,5 +675,22 @@ mod tests {
             unmount_result(true, &unmounted, &id("disk7")),
             Err(Vec::new())
         );
+    }
+
+    #[test]
+    fn connection_from_bus_protocol_maps_the_bus() {
+        let c = |p: Option<&str>, internal| connection_from_bus_protocol(p, internal);
+        assert_eq!(c(Some("USB"), false), Connection::Usb);
+        assert_eq!(c(Some("Secure Digital"), false), Connection::SdCard);
+        assert_eq!(c(Some("Thunderbolt"), false), Connection::Thunderbolt);
+        for p in ["PCI-Express", "SATA", "Apple Fabric"] {
+            assert_eq!(c(Some(p), true), Connection::Internal, "{p}");
+        }
+        assert_eq!(c(Some("USB"), true), Connection::Internal);
+        // A built-in SD slot is Internal, yet the card is an SD card.
+        assert_eq!(c(Some("Secure Digital"), true), Connection::SdCard);
+        assert_eq!(c(None, false), Connection::Unknown);
+        assert_eq!(c(Some("Fibre Channel"), false), Connection::Unknown);
+        assert_eq!(c(None, true), Connection::Internal);
     }
 }

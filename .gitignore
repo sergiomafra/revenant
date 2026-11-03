@@ -1,3 +1,6 @@
 /.superpowers/
 /target/
 /samples/cache/
+/app/node_modules/
+/app/dist/
+/crates/revenant-app/gen/

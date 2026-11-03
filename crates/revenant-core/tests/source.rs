@@ -202,6 +202,265 @@ fn write_path_check_finds_misplaced_write_access() {
     assert_eq!(write_paths(&create, true), ["create(true)"]);
 }
 
+/// The only files allowed `unsafe` (CLAUDE.md), relative to a crate's `src/`.
+const UNSAFE_FILES: [&str; 2] = ["source/windows.rs", "source/macos_fd.rs"];
+
+/// `text` with every comment and string or char literal blanked to spaces (newlines kept, so line numbers hold): what is
+/// left is code. A lexer only as deep as the guard needs: line and nested block comments, plain, byte and raw strings,
+/// char literals told from lifetimes.
+fn code_only(text: &str) -> String {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let blank = |out: &mut String, ch: char| out.push(if ch == '\n' { '\n' } else { ' ' });
+    let mut i = 0;
+    while i < c.len() {
+        let next = c.get(i + 1).copied();
+        if c[i] == '/' && next == Some('/') {
+            while i < c.len() && c[i] != '\n' {
+                blank(&mut out, c[i]);
+                i += 1;
+            }
+        } else if c[i] == '/' && next == Some('*') {
+            let mut depth = 0;
+            while i < c.len() {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    blank(&mut out, c[i]);
+                    i += 1;
+                }
+            }
+        } else if c[i] == 'r'
+            && matches!(next, Some('"') | Some('#'))
+            && (!ident_before(&c, i) || (c[i - 1] == 'b' && !ident_before(&c, i - 1)))
+        {
+            // A raw string r"…", r#"…"# or br"…" (the `b` stays as code, harmlessly).
+            let mut j = i + 1;
+            while c.get(j) == Some(&'#') {
+                j += 1;
+            }
+            if c.get(j) != Some(&'"') {
+                out.push(c[i]);
+                i += 1;
+                continue;
+            }
+            let hashes = j - i - 1;
+            let close: Vec<char> = std::iter::once('"')
+                .chain("#".repeat(hashes).chars())
+                .collect();
+            let mut k = j + 1;
+            while k < c.len() && !c[k..].starts_with(&close) {
+                k += 1;
+            }
+            let end = (k + close.len()).min(c.len());
+            for &ch in &c[i..end] {
+                blank(&mut out, ch);
+            }
+            i = end;
+        } else if c[i] == '"' {
+            blank(&mut out, c[i]);
+            i += 1;
+            while i < c.len() && c[i] != '"' {
+                if c[i] == '\\' && i + 1 < c.len() {
+                    blank(&mut out, c[i]);
+                    i += 1;
+                }
+                blank(&mut out, c[i]);
+                i += 1;
+            }
+            if i < c.len() {
+                blank(&mut out, c[i]);
+                i += 1;
+            }
+        } else if c[i] == '\'' {
+            // A char literal ('x', '\n', '\u{…}'), else a lifetime or label ('a) left as code.
+            let end = if next == Some('\\') {
+                (i + 2..c.len()).find(|&k| c[k] == '\'').map(|k| k + 1)
+            } else if c.get(i + 2) == Some(&'\'') {
+                Some(i + 3)
+            } else {
+                None
+            };
+            match end {
+                Some(end) => {
+                    for &ch in &c[i..end] {
+                        blank(&mut out, ch);
+                    }
+                    i = end;
+                }
+                None => {
+                    out.push(c[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(c[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Whether the char before `i` continues an identifier (so an `r` there is not a raw-string prefix).
+fn ident_before(c: &[char], i: usize) -> bool {
+    i > 0 && (c[i - 1].is_alphanumeric() || c[i - 1] == '_')
+}
+
+/// Every use of the `unsafe` keyword in `text` that breaks the rule: anywhere when the file is not `allowed`; in an
+/// allowed file, one without a `// SAFETY:` comment on one of the 3 lines above it. Comments and literals do not count,
+/// nor identifiers that merely contain the word (`is_unsafe_char`).
+fn unsafe_uses(text: &str, allowed: bool) -> Vec<String> {
+    let code = code_only(text);
+    let original: Vec<&str> = text.lines().collect();
+    let mut found = Vec::new();
+    for (n, line) in code.lines().enumerate() {
+        let c: Vec<char> = line.chars().collect();
+        let word: Vec<char> = "unsafe".chars().collect();
+        let is_ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+        let hit = (0..c.len()).any(|i| {
+            c[i..].starts_with(&word)
+                && (i == 0 || !is_ident(c[i - 1]))
+                && c.get(i + word.len()).is_none_or(|&ch| !is_ident(ch))
+        });
+        if !hit {
+            continue;
+        }
+        let justified = original[n.saturating_sub(3)..n]
+            .iter()
+            .any(|l| l.trim_start().starts_with("// SAFETY:"));
+        if !allowed {
+            found.push(format!("line {}: unsafe outside the allowed files", n + 1));
+        } else if !justified {
+            found.push(format!("line {}: unsafe without // SAFETY: above", n + 1));
+        }
+    }
+    found
+}
+
+/// Every `.rs` file under `dir`, recursively.
+fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// The rule broken in each crate source under `crates_dir` (`<crate>/src/**/*.rs`): `(file, problems)`.
+fn unsafe_report(crates_dir: &Path) -> Vec<(PathBuf, Vec<String>)> {
+    let mut files = Vec::new();
+    for krate in std::fs::read_dir(crates_dir).unwrap() {
+        let src = krate.unwrap().path().join("src");
+        if src.is_dir() {
+            rust_files(&src, &mut files);
+        }
+    }
+    files.sort();
+    let mut report = Vec::new();
+    for path in files {
+        let rel = path
+            .components()
+            .skip_while(|c| c.as_os_str() != "src")
+            .skip(1)
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let in_core = path.starts_with(crates_dir.join("revenant-core"));
+        let allowed = in_core && UNSAFE_FILES.contains(&rel.as_str());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let problems = unsafe_uses(&text, allowed);
+        if !problems.is_empty() {
+            report.push((path, problems));
+        }
+    }
+    report
+}
+
+#[test]
+fn unsafe_only_in_allowed_files() {
+    let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let report = unsafe_report(crates_dir);
+    assert!(report.is_empty(), "{report:#?}");
+    // The allowed files exist and do use `unsafe`, each block justified (a rename would silently drop the check).
+    for file in UNSAFE_FILES {
+        let path = crates_dir.join("revenant-core/src").join(file);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!unsafe_uses(&text, false).is_empty(), "{file}");
+    }
+}
+
+#[test]
+fn unsafe_check_finds_misplaced_unsafe() {
+    // A crate tree on disk: one allowed file (justified and not), one file that must have none.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("demo/src/source");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(dir.path().join("revenant-core/src/source")).unwrap();
+    std::fs::write(
+        dir.path().join("revenant-core/src/source/macos_fd.rs"),
+        "fn a() {\n    // SAFETY: fine.\n    unsafe { x() };\n}\n",
+    )
+    .unwrap();
+    std::fs::write(src.join("macos_fd.rs"), "fn b() { unsafe { x() } }\n").unwrap();
+    let report = unsafe_report(dir.path());
+    // The same file name in another crate is not allowed.
+    assert_eq!(report.len(), 1, "{report:#?}");
+    assert!(report[0].0.ends_with("demo/src/source/macos_fd.rs"));
+
+    let ok = "fn a() {\n    // SAFETY: the pointer is valid.\n    let v = unsafe { *p };\n}\n";
+    assert!(unsafe_uses(ok, true).is_empty());
+    assert_eq!(unsafe_uses(ok, false).len(), 1);
+    // The SAFETY comment up to 3 lines above, not 4.
+    let three = "// SAFETY: a\n// b\n// c\nunsafe { x() };\n";
+    assert!(unsafe_uses(three, true).is_empty());
+    let four = "// SAFETY: a\n// b\n// c\n// d\nunsafe { x() };\n";
+    assert_eq!(unsafe_uses(four, true).len(), 1);
+    // Not justified by a SAFETY that is not a comment line of its own.
+    let inline = "let s = \"// SAFETY: no\";\nunsafe { x() };\n";
+    assert_eq!(unsafe_uses(inline, true).len(), 1);
+    // Every form of the keyword counts.
+    for form in [
+        "unsafe fn f() {}",
+        "unsafe impl Send for X {}",
+        "x = unsafe{y};",
+    ] {
+        assert_eq!(unsafe_uses(form, false).len(), 1, "{form}");
+    }
+    // Comments, strings, chars and identifiers do not (ruling P3).
+    for not_code in [
+        "// unsafe { x() }\n",
+        "/// unsafe here\n",
+        "//! unsafe here\n",
+        "/* unsafe /* nested */ unsafe */ fn a() {}\n",
+        "let s = \"unsafe { x }\";\n",
+        "let s = \"a \\\" unsafe\";\n",
+        "let s = r#\"unsafe \" unsafe\"#;\n",
+        "let s = b\"unsafe\";\n",
+        "let s = br\"\\\"; let t = \"unsafe\";\n",
+        "fn is_unsafe_char(c: char) -> bool { c == '\"' }\nfn f<'a>(x: &'a str) {}\n",
+        "let unsafe_count = 1; let x = not_unsafe;\n",
+    ] {
+        assert!(unsafe_uses(not_code, false).is_empty(), "{not_code}");
+    }
+    // A char literal holding a quote does not hide code after it.
+    assert_eq!(
+        unsafe_uses("let q = '\"'; unsafe { x() };\n", false).len(),
+        1
+    );
+}
+
 /// Fails every read that touches `[bad, bad + 1)`, reporting the first bad byte as the error offset.
 struct FailsAt {
     inner: FileSource,

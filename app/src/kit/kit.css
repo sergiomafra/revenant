@@ -1,0 +1,84 @@
+/* The Kit: component styles ported from docs/superpowers/mockups/m2/kit.css (and the page header, layout and tiles
+   shared by inicio.html and app.html). Colors only through the tokens in src/styles/tokens.css. */
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+a{color:var(--accent)}
+h2{font-size:28px;font-weight:650;letter-spacing:-.02em}
+svg.i{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.logo{display:inline-block;width:56px;height:56px;color:var(--accent);flex:none}
+
+/* ---- page: header with the step trail, scrolling content, footer ---- */
+.page{height:100%;display:flex;flex-direction:column;position:relative}
+.hd{flex:none;display:flex;align-items:center;gap:12px;padding:12px 24px;border-bottom:1px solid var(--line-soft);background:var(--surface)}
+.hd .logo{width:26px;height:26px}
+.hd .name{font-weight:650;letter-spacing:-.01em}
+.path{display:flex;align-items:center;gap:6px;margin-left:auto;font-size:12px;color:var(--ink-3);font-weight:560}
+.path span{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+.path span::after{content:"";width:14px;height:1px;background:var(--line)}
+.path span:last-child::after{display:none}
+.path .done{color:var(--ink-2)}
+.path .now{color:var(--accent);font-weight:700}
+.main{flex:1;min-height:0;display:flex;flex-direction:column}
+.content{flex:1;overflow:auto;min-height:0}
+.foot{flex:none;display:flex;align-items:center;gap:14px;padding:11px 16px;border-top:1px solid var(--line);background:var(--surface)}
+.foot span.t{color:var(--ink-2)}
+.sp{flex:1}
+.wrap{width:100%;max-width:1000px;margin:0 auto;padding:26px 32px 20px;display:flex;flex-direction:column;gap:14px}
+.wrap.center{align-items:center;text-align:center;justify-content:center;min-height:100%}
+.ttl{font-size:26px;font-weight:650;letter-spacing:-.02em;line-height:1.2}
+.lead{color:var(--ink-2);font-size:14px;max-width:560px}
+.tile{width:56px;height:56px;border-radius:15px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;flex:none}
+.tile svg.i{width:28px;height:28px;stroke-width:1.6}
+.tile.mid{background:var(--warn-bg);color:var(--warn)}
+.tile.big{width:88px;height:88px;border-radius:24px}
+.tile.big svg.i{width:44px;height:44px;stroke-width:1.5}
+
+/* ---- controls ---- */
+.seg{display:flex;background:var(--surface-2);border-radius:8px;padding:2px;width:max-content}
+.seg button{padding:5px 12px;border-radius:6px;color:var(--ink-2);font-weight:550;display:inline-flex;gap:6px;align-items:center;white-space:nowrap}
+.seg button.on,.seg button[data-state="checked"]{background:var(--surface);color:var(--ink);box-shadow:var(--shadow-sm)}
+.seg button[disabled]{opacity:.45;cursor:not-allowed}
+.btn{background:var(--accent);color:var(--accent-ink);border-radius:8px;padding:7px 14px;font-weight:620;display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap}
+.btn.ghost{background:var(--surface-2);color:var(--ink)}
+.btn.sm{padding:5px 10px;font-size:12px}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+
+/* ---- cards ---- */
+.card{background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:11px 12px}
+.card.sel{border:2px solid var(--accent);padding:10px 11px;box-shadow:0 0 0 3px var(--accent-soft)}
+.card.off{background:var(--surface-2);border-style:dashed}
+
+/* ---- notes and technical details ---- */
+.note{border-radius:8px;padding:8px 10px;font-size:12px;display:flex;gap:8px;line-height:1.4}
+.note.ok{background:var(--ok-bg);color:var(--ok)}
+.note.mid{background:var(--warn-bg);color:var(--warn)}
+.note.bad{background:var(--bad-bg);color:var(--bad)}
+.note.info{background:var(--info-bg);color:var(--info)}
+.note svg{margin-top:2px}
+.note a{color:inherit;font-weight:650;text-decoration:underline}
+details.tech{font-size:12px;color:var(--ink-2)}
+details.tech summary{cursor:pointer;color:var(--ink-3);font-weight:600;list-style:none;display:inline-flex;align-items:center;gap:6px}
+details.tech summary::-webkit-details-marker{display:none}
+details.tech summary::before{content:"";border:4px solid transparent;border-left-color:currentColor;margin-right:2px}
+details.tech[open] summary::before{border:4px solid transparent;border-top-color:currentColor;margin:4px 2px 0 0}
+details.tech code{display:block;margin-top:6px;padding:6px 8px;border-radius:6px;background:var(--surface-2);color:var(--ink-2);font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all}
+details.tech p{margin-top:6px}
+
+/* ---- modal layer: .modal covers the window; the dialog inside is .dlg ---- */
+.modal{position:fixed;inset:0;z-index:20;background:var(--overlay);display:grid;place-items:center;padding:24px}
+.modal .dlg{background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:22px;width:min(480px,100%);max-height:100%;overflow:auto;display:flex;flex-direction:column;gap:12px}
+.modal .dlg:focus{outline:none}
+.modal .dlg h3{font-size:18px;font-weight:650;letter-spacing:-.01em}
+.modal .dlg .acts{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
+
+/* ---- header buttons (Settings, About), tags, link buttons, the busy spinner ---- */
+.hd-acts{display:flex;align-items:center;gap:2px;margin-left:auto}
+.path+.hd-acts{margin-left:14px}
+.icb{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;color:var(--ink-2)}
+.icb:hover{background:var(--surface-2);color:var(--ink)}
+.icb svg.i{width:16px;height:16px}
+.tg{display:inline-block;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:650;letter-spacing:.03em;background:var(--surface-2);color:var(--ink-2)}
+.note .lnk{color:inherit;font-weight:650;text-decoration:underline}
+.tile.ok{background:var(--ok-bg);color:var(--ok);border-radius:50%}
+svg.i.spin{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){svg.i.spin{animation:none}}

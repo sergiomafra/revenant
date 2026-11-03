@@ -241,6 +241,7 @@ mod tests {
                 serial: None,
                 removable: true,
                 internal: false,
+                connection: revenant_core::device::Connection::Unknown,
                 system: false,
                 virtual_disk: false,
                 solid_state: None,

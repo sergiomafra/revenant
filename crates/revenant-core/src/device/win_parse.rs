@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use super::{DestInfo, DiskInfo, FAT_MAX_FILE, VolumeInfo, push_unique, sort_disks};
+use super::{Connection, DestInfo, DiskInfo, FAT_MAX_FILE, VolumeInfo, push_unique, sort_disks};
 use crate::source::{DiskId, Geometry};
 
 /// `STORAGE_BUS_TYPE` values that mean an external or removable bus: 1394, USB, SD, MMC.
@@ -158,6 +158,7 @@ pub(crate) fn disks(
         }
         let desc = &d.descriptor;
         let virtual_disk = VIRTUAL_BUSES.contains(&desc.bus);
+        let internal = !desc.removable && !virtual_disk && !EXTERNAL_BUSES.contains(&desc.bus);
         let volumes = volumes
             .iter()
             .filter(|v| v.extents.iter().any(|e| e.disk == d.number))
@@ -176,7 +177,8 @@ pub(crate) fn disks(
             model: desc.product.clone(),
             serial: desc.serial.clone(),
             removable: desc.removable,
-            internal: !desc.removable && !virtual_disk && !EXTERNAL_BUSES.contains(&desc.bus),
+            internal,
+            connection: connection_from_bus_type(desc.bus, internal),
             system: system.contains(&d.number),
             virtual_disk,
             solid_state: d.seek_penalty.map(|p| !p),
@@ -185,6 +187,17 @@ pub(crate) fn disks(
     }
     sort_disks(&mut out);
     Some(out)
+}
+
+/// How a disk is connected, from the `STORAGE_BUS_TYPE` of its descriptor: USB (7), SD (12) and MMC (13), even on a disk marked
+/// internal; any other disk already marked internal is `Internal`.
+pub(crate) fn connection_from_bus_type(bus: i32, internal: bool) -> Connection {
+    match bus {
+        7 => Connection::Usb,
+        12 | 13 => Connection::SdCard,
+        _ if internal => Connection::Internal,
+        _ => Connection::Unknown,
+    }
 }
 
 /// Where a folder lives (ruling D12): the disks of its volume's extents, its file system (`FAT`/`FAT32` cap a file at
@@ -690,5 +703,18 @@ mod tests {
             3,
             "unknown volumes are never guessed onto a disk"
         );
+    }
+
+    #[test]
+    fn connection_from_bus_type_maps_the_bus() {
+        assert_eq!(connection_from_bus_type(7, false), Connection::Usb);
+        assert_eq!(connection_from_bus_type(12, false), Connection::SdCard);
+        assert_eq!(connection_from_bus_type(13, false), Connection::SdCard);
+        assert_eq!(connection_from_bus_type(12, true), Connection::SdCard);
+        assert_eq!(connection_from_bus_type(13, true), Connection::SdCard);
+        assert_eq!(connection_from_bus_type(11, true), Connection::Internal);
+        assert_eq!(connection_from_bus_type(17, true), Connection::Internal);
+        assert_eq!(connection_from_bus_type(11, false), Connection::Unknown);
+        assert_eq!(connection_from_bus_type(0, false), Connection::Unknown);
     }
 }

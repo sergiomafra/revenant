@@ -131,7 +131,7 @@
     var p = STEPS.map(function (s, i) {
       return '<span class="' + (i < now ? 'done' : i === now ? 'now' : '') + '">' + s + '</span>';
     }).join('');
-    return '<div class="hd">' + Kit.logo({ small: true }) + '<span class="name">Revenant</span><nav class="path" aria-label="Etapas">' + p + '</nav></div>';
+    return '<div class="hd">' + Kit.logo({ small: true }) + '<span class="name">Revenant</span><nav class="path" aria-label="Etapas">' + p + '</nav>' + Kit.headerActions() + '</div>';
   }
   function page(now, body, foot, top) {
     return header(now) + (top || '') + '<div class="main"><div class="content">' + body + '</div></div>' + (foot ? '<div class="foot">' + foot + '</div>' : '');

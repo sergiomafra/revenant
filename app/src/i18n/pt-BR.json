@@ -1,0 +1,147 @@
+{
+  "app": { "name": "Revenant" },
+  "steps": {
+    "label": "Etapas",
+    "disk": "Disco",
+    "permission": "Permissão",
+    "check": "Conferência",
+    "copy": "Cópia",
+    "search": "Busca",
+    "results": "Resultados",
+    "recover": "Recuperar"
+  },
+  "footer": {
+    "nothing_changes": "Nada é alterado no cartão",
+    "nothing_changed": "Nada foi alterado no cartão"
+  },
+  "tech": {
+    "summary": "Detalhes técnicos",
+    "copy": "Copiar detalhes",
+    "copied": "Detalhes copiados"
+  },
+  "settings": {
+    "title": "Ajustes",
+    "theme": "Tema",
+    "theme_light": "Claro",
+    "theme_dark": "Escuro",
+    "theme_auto": "Automático",
+    "theme_hint": "Automático acompanha o tema do seu computador.",
+    "language": "Idioma",
+    "language_default": "Padrão",
+    "save_failed": "Não deu para guardar a escolha. Ela vale até você fechar o Revenant.",
+    "done": "Concluir"
+  },
+  "languages": {
+    "pt-BR": "Português (Brasil)",
+    "es": "Español",
+    "en": "English"
+  },
+  "about": {
+    "version": "Versão {{version}}",
+    "license": "Gratuito e de código aberto (GPL-3.0)",
+    "source": "Código-fonte",
+    "guide": "Guia de uso",
+    "close": "Fechar"
+  },
+  "error": {
+    "lead": "Nada foi gravado no cartão. Os arquivos que você já recuperou continuam salvos.",
+    "what_to_do": "O que fazer:",
+    "home": "Voltar ao início",
+    "retry": "Tentar de novo",
+    "read_failed": {
+      "title": "Algo deu errado ao ler o cartão",
+      "action": "tente de novo. Se continuar, faça uma cópia do cartão primeiro e procure os arquivos nela."
+    },
+    "open_failed": {
+      "title": "Não deu para abrir o cartão",
+      "action": "confira se ele continua conectado e tente de novo. Se continuar, tire o cartão, encaixe de novo e espere uns segundos."
+    },
+    "permission_denied": {
+      "title": "O Revenant não recebeu a permissão",
+      "action": "tente de novo e aceite o pedido de permissão na janela do sistema."
+    },
+    "device_not_found": {
+      "title": "O disco não foi encontrado",
+      "action": "confira se ele continua conectado e escolha de novo."
+    },
+    "system_tool_failed": {
+      "title": "Não deu para ver os discos conectados",
+      "action": "tente de novo daqui a pouco. Se continuar, feche o Revenant e abra de novo."
+    },
+    "unsupported_platform": {
+      "title": "O Revenant não funciona neste computador",
+      "action": "use o Revenant num Mac ou num PC com Windows."
+    },
+    "system_disk": {
+      "title": "Este é o disco do sistema",
+      "action": "escolha o cartão ou o disco externo de onde as fotos e vídeos sumiram. No disco do sistema não dá para procurar."
+    },
+    "not_whole_disk": {
+      "title": "Escolha o disco inteiro",
+      "action": "volte e escolha o cartão ou o disco na lista, e não só uma parte dele."
+    },
+    "unknown": {
+      "title": "Algo deu errado",
+      "action": "tente de novo. Se continuar, feche o Revenant e abra de novo."
+    }
+  },
+  "header": {
+    "settings": "Ajustes",
+    "about": "Sobre"
+  },
+  "disk": {
+    "fallback_name": "Disco de {{size}}",
+    "named": "{{name}} · {{size}}",
+    "camera_card": "parece um cartão de câmera",
+    "via_usb": "ligado por USB",
+    "via_sd_card": "num leitor de cartão",
+    "via_thunderbolt": "ligado por Thunderbolt",
+    "system": "Disco do sistema: não dá para procurar nele",
+    "chosen": "Escolhido"
+  },
+  "disks": {
+    "title": "O que você quer recuperar?",
+    "lead": "Escolha o cartão ou disco de onde as fotos e vídeos sumiram.",
+    "list_label": "Discos conectados",
+    "ssd_caution": "SSD e cartões CFexpress: os arquivos apagados costumam sumir em minutos. Procure o quanto antes.",
+    "why": "Saiba por quê",
+    "why_text": "Nesses discos, o sistema limpa sozinho o espaço dos arquivos apagados, em poucos minutos. Quanto antes você procurar, maior a chance de achar tudo. Não use o disco até lá.",
+    "empty_title": "Conecte o cartão ou o disco",
+    "empty_lead": "Encaixe o cartão no leitor ou ligue o disco na porta USB. Ele aparece aqui sozinho, sem precisar fazer mais nada.",
+    "hint_card": "Pare de usar o cartão agora.",
+    "hint_card_rest": "Não grave nada nele.",
+    "hint_disk": "Pare de usar o disco agora.",
+    "hint_disk_rest": "Não grave nada nele.",
+    "gone": "O disco não foi encontrado. Confira se ele continua conectado.",
+    "continue": "Continuar"
+  },
+  "permission": {
+    "read_only": "O Revenant só lê. Ele nunca escreve no cartão.",
+    "how": "Como funciona",
+    "private": "Seus dados não saem do computador",
+    "back": "Voltar",
+    "waiting": "Esperando a resposta do sistema",
+    "mac_title": "Só falta uma permissão do Mac",
+    "mac_lead": "Para ler o cartão por inteiro, e não só as pastas visíveis, o Mac precisa da senha de administrador. Você digita a senha na janela do sistema, não aqui.",
+    "mac_step1": "<b>Clique no botão</b> “Pedir a senha de administrador”.",
+    "mac_step2": "Digite a senha que você usa para entrar no Mac.",
+    "mac_step3": "Pronto. A conferência do cartão começa sozinha.",
+    "mac_ask": "Pedir a senha de administrador",
+    "win_title": "O Windows vai pedir a sua confirmação",
+    "win_lead": "Para ler o cartão por inteiro, o Windows precisa que você autorize o Revenant como administrador. É uma pergunta normal do sistema, com Sim e Não.",
+    "win_step1": "<b>Clique em Continuar.</b>",
+    "win_step2": "O Windows pergunta se pode permitir. Clique em Sim.",
+    "win_step3": "Pronto. A conferência do cartão começa sozinha.",
+    "win_ask": "Continuar",
+    "denied_title": "Sem a permissão não dá para ler o cartão",
+    "denied_lead": "O pedido de autorização foi cancelado ou não foi aceito. Nada foi alterado no cartão. Clique em Tentar de novo e confirme como administrador.",
+    "denied_tech": "A permissão de administrador foi recusada.",
+    "retry": "Tentar de novo"
+  },
+  "granted": {
+    "title": "O Revenant consegue ler o {{name}} ({{size}}).",
+    "title_unnamed": "O Revenant consegue ler o disco de {{size}}.",
+    "lead": "A busca chega na próxima versão.",
+    "back": "Voltar"
+  }
+}

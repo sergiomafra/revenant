@@ -134,7 +134,7 @@
     var p = STEPS.map(function (s, i) {
       return '<span class="' + (i < now ? 'done' : i === now ? 'now' : '') + '">' + s + '</span>';
     }).join('');
-    return '<div class="hd">' + Kit.logo({ small: true }) + '<span class="name">Revenant</span><nav class="path" aria-label="Etapas">' + p + '</nav></div>';
+    return '<div class="hd">' + Kit.logo({ small: true }) + '<span class="name">Revenant</span><nav class="path" aria-label="Etapas">' + p + '</nav>' + Kit.headerActions() + '</div>';
   }
   function isLong() { return document.documentElement.hasAttribute('data-long'); }
   function pad(n) { return (n < 10 ? '0' : '') + n; }

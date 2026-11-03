@@ -5,11 +5,13 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::{FileExt, OpenOptionsExt};
-use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_DEV_NOT_EXIST, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND,
-    ERROR_MORE_DATA, ERROR_NO_SUCH_DEVICE, ERROR_NOT_READY, GENERIC_READ, INVALID_HANDLE_VALUE,
+    DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED,
+    ERROR_CANCELLED, ERROR_DEV_NOT_EXIST, ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND,
+    ERROR_MORE_DATA, ERROR_NO_SUCH_DEVICE, ERROR_NOT_READY, GENERIC_READ, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
@@ -27,6 +29,14 @@ use windows_sys::Win32::System::Ioctl::{
     StorageDeviceProperty, StorageDeviceSeekPenaltyProperty,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_DUP_HANDLE,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    WaitForSingleObject,
+};
+use windows_sys::Win32::UI::Shell::{
+    SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+};
 
 use super::Geometry;
 use crate::device::win_parse::{
@@ -505,6 +515,140 @@ pub(crate) fn system_windows_directory() -> io::Result<PathBuf> {
         return Err(io::Error::last_os_error());
     }
     Ok(PathBuf::from(until_nul(&buf)))
+}
+
+/// `ShowWindow` command for no window (`SW_HIDE`; the constant lives in a `windows-sys` feature not enabled).
+const SW_HIDE: i32 = 0;
+
+/// Runs `exe` with `params` elevated (the `runas` verb, which shows the UAC prompt and blocks until the user answers),
+/// waits for the process to end and returns its exit code. The user declining is `ERROR_CANCELLED` ([`was_cancelled`]).
+pub(crate) fn run_elevated(exe: &Path, params: &str) -> io::Result<u32> {
+    let verb = wide(OsStr::new("runas"));
+    let file = wide(exe.as_os_str());
+    let params = wide(OsStr::new(params));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        lpParameters: params.as_ptr(),
+        nShow: SW_HIDE,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a SHELLEXECUTEINFOW with its size set and every other field zero or valid; the strings it points
+    // at are NUL-terminated UTF-16 and outlive the call (synchronous: SEE_MASK_NOASYNC).
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if info.hProcess.is_null() {
+        return Err(io::Error::other("no elevated process to wait for"));
+    }
+    // SAFETY: with SEE_MASK_NOCLOSEPROCESS, `hProcess` is a process handle this process now owns; `OwnedHandle` closes it
+    // exactly once.
+    let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess as _) };
+    // SAFETY: `process` is a valid process handle for the call.
+    let waited = unsafe { WaitForSingleObject(process.as_raw_handle() as _, INFINITE) };
+    if waited != WAIT_OBJECT_0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut code = 0u32;
+    // SAFETY: `process` is a valid process handle; `code` is a valid out-pointer.
+    if unsafe { GetExitCodeProcess(process.as_raw_handle() as _, &mut code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(code)
+}
+
+/// Whether `run_elevated` failed because the user declined the UAC prompt (`ERROR_CANCELLED`).
+pub(crate) fn was_cancelled(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(ERROR_CANCELLED as i32)
+}
+
+/// Duplicates `file`'s handle into the process `pid` with the same (read-only) access, not inheritable, and returns its
+/// value there (the elevated process's exit code). A value an exit code cannot carry (zero, above `i32::MAX`, or not a
+/// multiple of 4: never seen) is closed in that process again and is an error.
+pub(crate) fn duplicate_into_process(file: &File, pid: u32) -> io::Result<u32> {
+    // SAFETY: plain call with no pointers; a null result is checked below.
+    let target = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
+    if target.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `target` is a process handle this process just opened and owns; `OwnedHandle` closes it exactly once.
+    let target = unsafe { OwnedHandle::from_raw_handle(target as _) };
+    let mut out: HANDLE = std::ptr::null_mut();
+    // SAFETY: the source handle is valid for the lifetime of `file`; `GetCurrentProcess` is a pseudo-handle that needs no
+    // closing; `target` is a valid process handle with PROCESS_DUP_HANDLE; `out` is a valid out-pointer.
+    let ok = unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            file.as_raw_handle() as _,
+            target.as_raw_handle() as _,
+            &mut out,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    match u32::try_from(out as usize) {
+        Ok(v) if v > 0 && v.is_multiple_of(4) && v <= i32::MAX as u32 => Ok(v),
+        _ => {
+            // SAFETY: `out` is the handle just made in `target` and known to nothing else; DUPLICATE_CLOSE_SOURCE with no
+            // target process closes it there; the null out-pointer is allowed with no target process.
+            unsafe {
+                DuplicateHandle(
+                    target.as_raw_handle() as _,
+                    out,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    DUPLICATE_CLOSE_SOURCE,
+                )
+            };
+            Err(io::Error::other("handle value an exit code cannot carry"))
+        }
+    }
+}
+
+/// The full path of the executable process `pid` runs (`QueryFullProcessImageNameW`, Win32 form), opened with
+/// `PROCESS_QUERY_LIMITED_INFORMATION` only.
+pub(crate) fn process_image_path(pid: u32) -> io::Result<PathBuf> {
+    // SAFETY: plain call with no pointers; a null result is checked below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `process` is a process handle this process just opened and owns; `OwnedHandle` closes it exactly once.
+    let process = unsafe { OwnedHandle::from_raw_handle(process as _) };
+    let mut buf = [0u16; NAME_LEN];
+    let mut len = NAME_LEN as u32;
+    // SAFETY: `process` is a valid process handle with PROCESS_QUERY_LIMITED_INFORMATION; `buf` is a writable buffer of
+    // `len` UTF-16 units and `len` a valid in/out pointer (on success, the units written, without the NUL).
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            process.as_raw_handle() as _,
+            PROCESS_NAME_WIN32,
+            buf.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = (len as usize).min(NAME_LEN);
+    Ok(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+}
+
+/// The whole-disk handle the elevated process duplicated into this one, by the value it reported.
+pub(crate) fn file_from_handle_value(value: u32) -> File {
+    let raw = std::ptr::without_provenance_mut::<std::ffi::c_void>(value as usize);
+    // SAFETY: the elevated process (this program, relaunched by `run_elevated` and waited for) duplicated a handle into
+    // this process and reported its value as its exit code; nothing else in this process knows that handle, so this
+    // `File` is its only owner and closes it exactly once.
+    unsafe { File::from_raw_handle(raw) }
 }
 
 #[cfg(test)]
