@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revenant · ajustes, sobre e erro</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="kit.css">
+<style>
+  /* Page-local styles for screens 11, 12 and 13. Colors only through tokens. */
+  .hd{flex:none;display:flex;align-items:center;gap:12px;padding:12px 24px;border-bottom:1px solid var(--line-soft);background:var(--surface)}
+  .hd .logo{width:26px;height:26px}
+  .hd .name{font-weight:650;letter-spacing:-.01em}
+  .wrap{width:100%;max-width:1000px;margin:0 auto;padding:26px 32px 20px;display:flex;flex-direction:column;gap:14px}
+  .wrap.center{align-items:center;text-align:center;justify-content:center;min-height:100%}
+  .ttl{font-size:26px;font-weight:650;letter-spacing:-.02em;line-height:1.2}
+  .lead{color:var(--ink-2);font-size:14px;max-width:560px}
+  .tile{width:56px;height:56px;border-radius:15px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;flex:none}
+  .tile svg.i{width:28px;height:28px;stroke-width:1.6}
+  .tile.mid{background:var(--warn-bg);color:var(--warn)}
+  .tile.big{width:88px;height:88px;border-radius:24px}
+  .tile.big svg.i{width:44px;height:44px;stroke-width:1.5}
+
+  /* dimmed backdrop behind the dialogs: a quiet stand-in for the results screen */
+  .back{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;padding:20px 24px}
+  .back i{display:block;aspect-ratio:3/2;border-radius:7px;background:var(--img-bg)}
+
+  /* screen 11 */
+  .dlg.set{width:min(540px,100%);gap:0}
+  .dlg.set h3{margin-bottom:4px}
+  .dlg.set .row{display:flex;flex-direction:column;gap:8px;padding:14px 0;border-bottom:1px solid var(--line-soft)}
+  .dlg.set .row:last-of-type{border-bottom:0}
+  .dlg.set .row b{font-weight:650;font-size:14px}
+  .dlg.set .row small{color:var(--ink-2);font-size:12.5px}
+  .dlg.set .acts{margin-top:8px}
+  .langs{display:flex;flex-direction:column;gap:6px}
+  .lang{display:flex;align-items:center;gap:12px;padding:8px 12px;border:1px solid var(--line);border-radius:9px;background:var(--surface);cursor:pointer;text-align:left;width:100%;font-weight:600}
+  .lang .rd{width:18px;height:18px;border-radius:50%;border:1.5px solid var(--ink-3);display:grid;place-items:center;color:var(--accent-ink);flex:none}
+  .lang .rd svg{width:10px;height:10px;stroke-width:3;opacity:0}
+  .lang.on{border:1.5px solid var(--accent);padding:7.5px 11.5px;background:var(--accent-soft)}
+  .lang.on .rd{background:var(--accent);border-color:var(--accent)}
+  .lang.on .rd svg{opacity:1}
+  .lang small{margin-left:auto;color:var(--ink-2);font-weight:400}
+
+  /* screen 12 */
+  .dlg.about{width:min(440px,100%);align-items:center;text-align:center;gap:8px;padding:30px 28px 24px}
+  .dlg.about .logo{width:104px;height:104px;margin-bottom:6px}
+  .dlg.about .brand{font-size:26px;font-weight:700;letter-spacing:-.02em}
+  .dlg.about .ver{color:var(--ink-2);font-size:13.5px}
+  .dlg.about .lic{color:var(--ink-2);font-size:13.5px;margin-top:6px}
+  .links{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:10px}
+  .links a{display:inline-flex;align-items:center;gap:7px;padding:7px 14px;border-radius:8px;background:var(--surface-2);color:var(--ink);font-weight:620;text-decoration:none}
+  .links a:hover{background:var(--accent-soft)}
+  .dlg.about .acts{justify-content:center;margin-top:10px}
+
+  /* screen 13 */
+  .err{width:100%;max-width:560px;text-align:left;display:flex;flex-direction:column;gap:10px}
+  .err .next{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;border-radius:10px;background:var(--surface);border:1px solid var(--line);font-size:13.5px}
+  .err .next svg{margin-top:3px;color:var(--accent)}
+  .err .next b{font-weight:650}
+  .err details.tech{padding:10px 12px;border-radius:10px;background:var(--surface);border:1px solid var(--line)}
+  .err details.tech summary{color:var(--ink-2)}
+  .err details.tech .copy{margin-top:10px}
+  .acts-row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
+</style>
+</head>
+<body>
+<script src="kit.js"></script>
+<script>
+(function () {
+  var I = Kit.icon;
+
+  function header() {
+    return '<div class="hd">' + Kit.logo({ small: true }) + '<span class="name">Revenant</span></div>';
+  }
+  function backdrop() {
+    var cells = '';
+    for (var k = 0; k < 15; k++) cells += '<i></i>';
+    return header() + '<div class="main"><div class="content"><div class="back">' + cells + '</div></div></div>'
+      + '<div class="foot"><span class="t">Nada é alterado no cartão</span></div>';
+  }
+  function modal(inner, cls) {
+    return '<div class="modal"><div class="dlg ' + cls + '" role="dialog">' + inner + '</div></div>';
+  }
+  function closeModal(app) {
+    Array.prototype.forEach.call(app.querySelectorAll('.modal .acts button'), function (b) {
+      b.addEventListener('click', function () { var m = app.querySelector('.modal'); if (m) m.remove(); });
+    });
+  }
+
+  // ---- screen 11: settings ----
+  // The Tema control really switches the page theme, like the simulation bar does, and both stay in sync.
+  var themeChoice = (function () {
+    var t = document.documentElement.getAttribute('data-theme');
+    return t === 'light' || t === 'dark' ? t : 'auto';
+  })();
+  var lang = 'pt';
+  function applyTheme(t) {
+    var r = document.documentElement;
+    themeChoice = t;
+    if (t === 'light' || t === 'dark') r.setAttribute('data-theme', t); else r.removeAttribute('data-theme');
+    Array.prototype.forEach.call(document.querySelectorAll('[data-tema]'), function (b) { b.classList.toggle('on', b.dataset.tema === t); });
+    Array.prototype.forEach.call(document.querySelectorAll('.sim [data-theme-set]'), function (b) { b.classList.toggle('on', b.dataset.themeSet === t); });
+  }
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest('.sim [data-theme-set]');
+    if (b) { // the Kit already applied the theme; mirror it in the dialog
+      themeChoice = b.dataset.themeSet;
+      Array.prototype.forEach.call(document.querySelectorAll('[data-tema]'), function (x) { x.classList.toggle('on', x.dataset.tema === themeChoice); });
+    }
+  });
+  var LANGS = [
+    { key: 'pt', name: 'Português (Brasil)', note: 'Padrão' },
+    { key: 'es', name: 'Español', note: '' },
+    { key: 'en', name: 'English', note: '' }
+  ];
+  function settings() {
+    var seg = [['light', 'Claro'], ['dark', 'Escuro'], ['auto', 'Automático']].map(function (t) {
+      return '<button data-tema="' + t[0] + '" aria-pressed="' + (themeChoice === t[0]) + '" class="' + (themeChoice === t[0] ? 'on' : '') + '">' + t[1] + '</button>';
+    }).join('');
+    var langs = LANGS.map(function (l) {
+      return '<button class="lang' + (lang === l.key ? ' on' : '') + '" data-lang="' + l.key + '" role="radio" aria-checked="' + (lang === l.key) + '"><span class="rd">' + I('check') + '</span><span data-t>' + l.name + '</span>' + (l.note ? '<small>' + l.note + '</small>' : '') + '</button>';
+    }).join('');
+    var inner = '<h3>Ajustes</h3>'
+      + '<div class="row"><b>Tema</b><div class="seg" role="group" aria-label="Tema">' + seg + '</div><small>Automático acompanha o tema do seu computador.</small></div>'
+      + '<div class="row"><b>Idioma</b><div class="langs" role="radiogroup">' + langs + '</div></div>'
+      + '<div class="acts"><button class="btn">Concluir</button></div>';
+    return backdrop() + modal(inner, 'set');
+  }
+  function wireSettings(app) {
+    closeModal(app);
+    app.querySelector('[aria-label="Tema"]').addEventListener('click', function (e) {
+      var b = e.target.closest('[data-tema]');
+      if (b) applyTheme(b.dataset.tema);
+    });
+    app.querySelector('.langs').addEventListener('click', function (e) {
+      var b = e.target.closest('[data-lang]');
+      if (!b) return;
+      lang = b.dataset.lang; // visual selector only: the mockup stays in pt-BR
+      Array.prototype.forEach.call(app.querySelectorAll('[data-lang]'), function (x) {
+        var on = x === b;
+        x.classList.toggle('on', on);
+        x.setAttribute('aria-checked', String(on));
+      });
+    });
+  }
+
+  // ---- screen 12: about ----
+  function about() {
+    var inner = Kit.logo()
+      + '<div class="brand">Revenant</div>'
+      + '<div class="ver">Versão 0.9.0-beta</div>'
+      + '<div class="lic">Gratuito e de código aberto (GPL-3.0)</div>'
+      + '<div class="links"><a href="#" data-link="source">' + I('external-link') + 'Código-fonte</a><a href="#" data-link="guide">' + I('external-link') + 'Guia de uso</a></div>'
+      + '<div class="acts"><button class="btn ghost">Fechar</button></div>';
+    return backdrop() + modal(inner, 'about');
+  }
+
+  // ---- screen 13: unexpected error ----
+  function error(open) {
+    var tech = Kit.tech('read_failed', 'O Revenant não conseguiu continuar lendo o cartão. Nada foi gravado nele.');
+    if (open) {
+      tech = tech.replace('<details class="tech">', '<details class="tech" open>')
+        .replace('</details>', '<button class="btn ghost sm copy" data-copy>' + I('copy') + 'Copiar detalhes</button></details>');
+    }
+    var body = '<div class="wrap center"><span class="tile mid big">' + I('alert') + '</span>'
+      + '<h2 class="ttl">Algo deu errado ao ler o cartão</h2>'
+      + '<p class="lead">Nada foi gravado nele. Os arquivos que você já recuperou continuam salvos.</p>'
+      + '<div class="err">'
+      + '<div class="next">' + I('info') + '<span><b>O que fazer:</b> tente de novo. Se continuar, faça uma cópia do cartão primeiro e procure os arquivos nela.</span></div>'
+      + tech + '</div>'
+      + '<div class="acts-row"><button class="btn ghost">Voltar ao início</button><button class="btn">' + I('refresh') + 'Tentar de novo</button></div></div>';
+    return header() + '<div class="main"><div class="content">' + body + '</div></div>'
+      + '<div class="foot"><span class="t">Nada foi alterado no cartão</span></div>';
+  }
+  function wireError(app) {
+    var c = app.querySelector('[data-copy]');
+    if (!c) return;
+    c.addEventListener('click', function () {
+      c.innerHTML = I('check') + 'Detalhes copiados';
+    });
+  }
+
+  Kit.init({
+    page: 'app',
+    screens: [
+      { id: 11, name: 'Ajustes', title: 'Revenant', states: [
+        { key: 'geral', label: 'Geral', render: settings, after: wireSettings }
+      ] },
+      { id: 12, name: 'Sobre', title: 'Revenant', states: [
+        { key: 'sobre', label: 'Sobre', render: about, after: closeModal }
+      ] },
+      { id: 13, name: 'Erro inesperado', title: 'Revenant', states: [
+        { key: 'erro', label: 'Erro', render: function () { return error(false); }, after: wireError },
+        { key: 'aberto', label: 'Detalhes abertos', render: function () { return error(true); }, after: wireError }
+      ] }
+    ]
+  });
+})();
+</script>
+</body>
+</html>
