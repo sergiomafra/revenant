@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The desktop app's first build: a `Revenant.app` (Mac) that opens the Revenant window (1280×800, at least 1024×700)
+  with the app icon; no screens yet.
 - A disk can be opened through the system's own permission prompt (the password prompt on macOS, the UAC prompt on
   Windows), read-only, so the app never has to run as administrator.
 - The disk list tells how each disk is connected (USB, SD card, Thunderbolt, internal) and whether it looks like a

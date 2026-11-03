@@ -1,0 +1,18 @@
+/* Tailwind 4 plus the design tokens. Colors come only from tokens.css (a copy of docs/superpowers/mockups/m2/tokens.css,
+   same names and values). */
+@import 'tailwindcss';
+@import './tokens.css';
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font: 13px/1.4 var(--font);
+  -webkit-font-smoothing: antialiased;
+}
