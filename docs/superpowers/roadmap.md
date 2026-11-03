@@ -81,17 +81,20 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
 
 ## Módulo 2: App (Tauri 2 + React; telas aprovadas antes de cada parte)
 
-- **2.0, telas e identidade:**
-  - Mockups em horizontal de todas as telas, em claro e escuro.
-  - Logo e ícone.
-  - Aprovação do Sérgio.
-- **2.1, esqueleto:**
+- **2.0, telas e identidade, concluída (aguardando a aprovação do Sérgio e o PR):**
+  - Mockups clicáveis, na horizontal, em claro e escuro, das 13 telas: `docs/superpowers/mockups/m2/` (abrir o
+    `index.html`, que liga as telas às partes e aos códigos do motor). Regras conferidas por
+    `node scripts/check-mockups.mjs`; capturas de cada estado por `bash scripts/shoot-mockups.sh`.
+  - Logo (o anel com a seta de volta e o R em pedaços) e ícone do app: `assets/brand/`.
+  - Spec: `docs/superpowers/specs/2026-11-02-m2-p0-telas-identidade-design.md`.
+- **2.1, esqueleto** (telas: `app.html` — Ajustes, Sobre, erro inesperado; a permissão de `inicio.html`):
   - Janela, temas e 3 idiomas.
   - Ajudante privilegiado só de leitura: senha de administrador no Mac, UAC no Windows.
   - Ponte entre o app e o motor.
-- **2.2, o caminho:** escolher o disco, dar a permissão, fazer a cópia opcional e acompanhar a busca com a galeria se enchendo
-  ao vivo.
-- **2.3, resultados e recuperação:**
+- **2.2, o caminho** (telas: `inicio.html` — retomar, disco, conferência prévia; `busca.html` — cópia, procurando,
+  cartão desconectado): escolher o disco, dar a permissão, fazer a cópia opcional e acompanhar a busca com a galeria se
+  enchendo ao vivo.
+- **2.3, resultados e recuperação** (telas: `resultados.html`, `recuperar.html`):
   - Galeria, Linha do tempo e Detalhes.
   - "Selecionar tudo" por grupo.
   - Prévia real das fotos e dos vídeos pelos decodificadores do sistema.
