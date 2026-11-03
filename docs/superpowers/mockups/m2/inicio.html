@@ -46,7 +46,7 @@
   .sys .tile{width:40px;height:40px;border-radius:10px;background:var(--line-soft);color:var(--ink-3)}
   .sys .tile svg.i{width:20px;height:20px}
   .sys b{font-weight:620;color:var(--ink-2)}
-  .sys small{display:block;color:var(--ink-3);font-size:12.5px}
+  .sys small{display:block;color:var(--ink-2);font-size:12.5px}
   .sys .tg{margin-left:auto}
   .why{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:12.5px;color:var(--ink-2);display:flex;gap:8px}
   .why[hidden]{display:none}
@@ -122,7 +122,7 @@
   function page(now, body, foot) {
     return header(now) + '<div class="main"><div class="content">' + body + '</div></div>' + (foot ? '<div class="foot">' + foot + '</div>' : '');
   }
-  var HINT = Kit.note('ok', '<span class="hint"><b>Pare de usar o cartão agora.</b> Não grave nada nele.</span>');
+  function hint(noun) { return Kit.note('ok', '<span class="hint"><b>Pare de usar o ' + noun + ' agora.</b> Não grave nada nele.</span>'); }
 
   // ---- screen 1: disk list ----
   var WHY_TEXT = 'Nesses discos, o sistema limpa sozinho o espaço dos arquivos apagados, em poucos minutos. Quanto antes você procurar, maior a chance de achar tudo. Não use o disco até lá.';
@@ -144,14 +144,14 @@
     if (o.empty) {
       body = '<div class="empty"><span class="tile big">' + I('sd') + '</span>'
         + '<h2 class="ttl">Conecte o cartão ou o disco</h2>'
-        + '<p class="lead">Encaixe o cartão no leitor ou ligue o disco na porta USB. Ele aparece aqui sozinho, sem precisar fazer mais nada.</p></div>' + '<div class="hint-wrap">' + HINT + '</div>';
+        + '<p class="lead">Encaixe o cartão no leitor ou ligue o disco na porta USB. Ele aparece aqui sozinho, sem precisar fazer mais nada.</p></div>' + '<div class="hint-wrap">' + hint(o.sel === 'hd' || o.sel === 'ssd' ? 'disco' : 'cartão') + '</div>';
     } else {
       body = '<div><h2 class="ttl">O que você quer recuperar?</h2><p class="lead" style="margin-top:4px">Escolha o cartão ou disco de onde as fotos e vídeos sumiram.</p></div>'
         + '<div class="disks">' + diskCard('sd', o.sel) + diskCard('hd', o.sel) + diskCard('ssd', o.sel) + '</div>'
         + '<div class="card off sys" data-code="system_disk"><span class="tile">' + I('hdd') + '</span><div><b data-t>Macintosh HD</b><small data-t>Disco do sistema: não dá para procurar nele</small></div><span class="tg">APFS</span></div>'
         + '<div>' + Kit.note('mid', 'SSD e cartões CFexpress: os arquivos apagados costumam sumir em minutos. Procure o quanto antes. <a href="#" data-why>Saiba por quê</a>') + '</div>'
         + '<div class="why" data-why-box' + (o.open ? '' : ' hidden') + '>' + I('info') + '<span>' + WHY_TEXT + '</span></div>'
-        + '<div class="hint-wrap">' + HINT + '</div>';
+        + '<div class="hint-wrap">' + hint(o.sel === 'hd' || o.sel === 'ssd' ? 'disco' : 'cartão') + '</div>';
     }
     var foot = '<span class="t">Nada é alterado no cartão</span><span class="sp"></span>'
       + '<button class="btn" data-go' + (o.sel ? '' : ' disabled') + '>Continuar' + I('chevron-right') + '</button>';
@@ -238,7 +238,7 @@
   };
   function checkFoot() { return '<button class="btn ghost">Voltar</button><span class="sp"></span><button class="btn">' + I('refresh') + 'Conferir de novo</button>'; }
   function issuesPage(title, lead, items, two) {
-    return page(2, '<div class="wrap' + (two ? '' : ' narrow') + ' scroll"><div><h2 class="ttl">' + title + '</h2><p class="lead" style="margin-top:4px">' + lead + '</p></div>'
+    return page(2, '<div class="wrap scroll"><div><h2 class="ttl">' + title + '</h2><p class="lead" style="margin-top:4px">' + lead + '</p></div>'
       + '<div class="issues' + (two ? ' two' : '') + '">' + items.join('') + '</div></div>', checkFoot());
   }
 
@@ -281,7 +281,7 @@
         { key: 'recusada', label: 'Recusada', after: function (app) { setFrame(app, 'mac'); }, render: function () {
           return page(1, '<div class="wrap narrow center"><span class="tile mid big">' + I('lock') + '</span>'
             + '<h2 class="ttl">Sem a permissão não dá para ler o cartão</h2>'
-            + '<p class="lead">O pedido de senha foi cancelado ou a senha não foi aceita. Nada foi alterado no cartão. Toque em Tentar de novo e digite a senha de administrador.</p>'
+            + '<p class="lead">O pedido de autorização foi cancelado ou não foi aceito. Nada foi alterado no cartão. Clique em Tentar de novo e confirme como administrador.</p>'
             + Kit.tech('permission_denied', 'A permissão de administrador foi recusada.') + '</div>',
             '<button class="btn ghost">Voltar</button><span class="sp"></span><button class="btn">' + I('refresh') + 'Tentar de novo</button>');
         } }
@@ -295,7 +295,7 @@
         { key: 'ok', label: 'Tudo certo', render: function () {
           return page(2, '<div class="wrap center"><span class="tile ok big">' + I('check') + '</span>'
             + '<h2 class="ttl">Tudo certo</h2><p class="lead">O cartão responde e a pasta para salvar está livre. Já vamos para o próximo passo.</p>'
-            + '<div class="progress ind spin" aria-hidden="true"><i></i></div></div>');
+            + '</div>');
         } },
         { key: 'problemas', label: 'Com problemas', render: function () {
           return issuesPage('Antes de procurar, vamos resolver duas coisas', 'Nada foi alterado no cartão. Resolva e confira de novo.', [ISS.notResponding(), ISS.onSource()]);
