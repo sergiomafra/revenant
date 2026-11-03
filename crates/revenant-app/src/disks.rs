@@ -1,7 +1,7 @@
 //! The disk list the interface shows: the engine's disks, classified and ordered.
 
 use revenant_core::device::{
-    Connection, DeviceOps, DiskInfo, SystemDevices, looks_like_camera_card,
+    Connection, DeviceOps, DiskInfo, SystemDevices, VolumeInfo, looks_like_camera_card,
 };
 use serde::Serialize;
 
@@ -43,6 +43,13 @@ pub struct DiskView {
     pub highlighted: bool,
 }
 
+/// The EFI system partition (every GPT disk has one, labelled `EFI`): it names nothing about the disk.
+fn is_efi(v: &VolumeInfo) -> bool {
+    v.label
+        .as_deref()
+        .is_some_and(|l| l.trim().eq_ignore_ascii_case("EFI"))
+}
+
 /// Classifies a disk; `None` for disk images the system attached (they are never offered).
 pub fn classify(disk: &DiskInfo, camera_card: bool) -> Option<DiskView> {
     if disk.virtual_disk {
@@ -58,15 +65,16 @@ pub fn classify(disk: &DiskInfo, camera_card: bool) -> Option<DiskView> {
     } else {
         DiskKind::Internal
     };
+    let volumes = || disk.volumes.iter().filter(|v| !is_efi(v));
     Some(DiskView {
         id: disk.id.as_str().to_string(),
         name: DiskName {
-            label: disk.volumes.iter().find_map(|v| v.label.clone()),
+            label: volumes().find_map(|v| v.label.clone()),
             vendor: disk.vendor.clone(),
             model: disk.model.clone(),
         },
         size: disk.geometry.size,
-        fs: disk.volumes.iter().find_map(|v| v.fs.clone()),
+        fs: volumes().find_map(|v| v.fs.clone()),
         connection: disk.connection.code(),
         kind,
         solid_state,
@@ -269,6 +277,26 @@ mod tests {
     fn list_hides_virtual_disks() {
         let list = list_with(&mixed(), |_| false).unwrap();
         assert!(list.iter().all(|d| d.id != "disk4"));
+    }
+
+    #[test]
+    fn efi_partition_names_nothing() {
+        // A Mac's internal disk: the EFI system partition, then the APFS store (no label).
+        let mut d = disk("disk0");
+        let mut efi = volume(Some("EFI"));
+        efi.fs = Some("msdos".into());
+        let mut store = volume(None);
+        store.fs = Some("apfs".into());
+        d.volumes = vec![efi, store];
+        let v = view(&d);
+        assert_eq!(v.name.label, None, "EFI is not the disk's name");
+        assert_eq!(v.fs.as_deref(), Some("apfs"), "nor its file system");
+
+        let mut efi = volume(Some("efi"));
+        efi.fs = Some("FAT32".into());
+        d.volumes = vec![efi];
+        let v = view(&d);
+        assert_eq!((v.name.label, v.fs), (None, None));
     }
 
     #[test]

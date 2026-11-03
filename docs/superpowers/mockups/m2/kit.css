@@ -125,3 +125,10 @@ html.shot body{padding:0;overflow:hidden}
 html.shot .win{border:0;border-radius:0;box-shadow:none;position:absolute;left:0;top:0}
 html.shot .win.is-win{border-radius:0}
 #manifest{display:none}
+
+/* ---- header buttons: Settings and About, at the right of every page header ---- */
+.hd-acts{display:flex;align-items:center;gap:2px;margin-left:auto}
+.path+.hd-acts{margin-left:14px}
+.icb{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;color:var(--ink-2)}
+.icb:hover{background:var(--surface-2);color:var(--ink)}
+.icb svg.i{width:16px;height:16px}

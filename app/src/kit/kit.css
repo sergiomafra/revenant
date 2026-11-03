@@ -69,3 +69,16 @@ details.tech p{margin-top:6px}
 .modal .dlg:focus{outline:none}
 .modal .dlg h3{font-size:18px;font-weight:650;letter-spacing:-.01em}
 .modal .dlg .acts{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
+
+/* ---- header buttons (Settings, About), tags, link buttons, the busy spinner ---- */
+.hd-acts{display:flex;align-items:center;gap:2px;margin-left:auto}
+.path+.hd-acts{margin-left:14px}
+.icb{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;color:var(--ink-2)}
+.icb:hover{background:var(--surface-2);color:var(--ink)}
+.icb svg.i{width:16px;height:16px}
+.tg{display:inline-block;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:650;letter-spacing:.03em;background:var(--surface-2);color:var(--ink-2)}
+.note .lnk{color:inherit;font-weight:650;text-decoration:underline}
+.tile.ok{background:var(--ok-bg);color:var(--ok);border-radius:50%}
+svg.i.spin{animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){svg.i.spin{animation:none}}

@@ -84,5 +84,64 @@
       "title": "Algo salió mal",
       "action": "intenta de nuevo. Si sigue pasando, cierra Revenant y vuelve a abrirlo."
     }
+  },
+  "header": {
+    "settings": "Ajustes",
+    "about": "Acerca de"
+  },
+  "disk": {
+    "fallback_name": "Disco de {{size}}",
+    "named": "{{name}} · {{size}}",
+    "camera_card": "parece una tarjeta de cámara",
+    "via_usb": "conectado por USB",
+    "via_sd_card": "en un lector de tarjetas",
+    "via_thunderbolt": "conectado por Thunderbolt",
+    "system": "Disco del sistema: no se puede buscar en él",
+    "chosen": "Elegido"
+  },
+  "disks": {
+    "title": "¿Qué quieres recuperar?",
+    "lead": "Elige la tarjeta o el disco de donde desaparecieron las fotos y los videos.",
+    "list_label": "Discos conectados",
+    "ssd_caution": "SSD y tarjetas CFexpress: los archivos borrados suelen desaparecer en minutos. Busca cuanto antes.",
+    "why": "Saber por qué",
+    "why_text": "En estos discos, el sistema limpia solo el espacio de los archivos borrados, en pocos minutos. Cuanto antes busques, más probable es encontrarlo todo. No uses el disco hasta entonces.",
+    "empty_title": "Conecta la tarjeta o el disco",
+    "empty_lead": "Pon la tarjeta en el lector o conecta el disco al puerto USB. Aparece aquí solo, sin que tengas que hacer nada más.",
+    "hint_card": "Deja de usar la tarjeta ahora.",
+    "hint_card_rest": "No guardes nada en ella.",
+    "hint_disk": "Deja de usar el disco ahora.",
+    "hint_disk_rest": "No guardes nada en él.",
+    "gone": "No se encontró el disco. Comprueba que siga conectado.",
+    "continue": "Continuar"
+  },
+  "permission": {
+    "read_only": "Revenant solo lee. Nunca escribe en la tarjeta.",
+    "how": "Cómo funciona",
+    "private": "Tus datos no salen de la computadora",
+    "back": "Volver",
+    "waiting": "Esperando la respuesta del sistema",
+    "mac_title": "Solo falta un permiso de la Mac",
+    "mac_lead": "Para leer la tarjeta completa, y no solo las carpetas visibles, la Mac necesita la contraseña de administrador. Escribes la contraseña en la ventana del sistema, no aquí.",
+    "mac_step1": "<b>Haz clic en el botón</b> “Pedir la contraseña de administrador”.",
+    "mac_step2": "Escribe la contraseña que usas para entrar en la Mac.",
+    "mac_step3": "Listo. La revisión de la tarjeta empieza sola.",
+    "mac_ask": "Pedir la contraseña de administrador",
+    "win_title": "Windows te va a pedir que confirmes",
+    "win_lead": "Para leer la tarjeta completa, Windows necesita que autorices a Revenant como administrador. Es una pregunta normal del sistema, con Sí y No.",
+    "win_step1": "<b>Haz clic en Continuar.</b>",
+    "win_step2": "Windows pregunta si puede permitirlo. Haz clic en Sí.",
+    "win_step3": "Listo. La revisión de la tarjeta empieza sola.",
+    "win_ask": "Continuar",
+    "denied_title": "Sin el permiso no se puede leer la tarjeta",
+    "denied_lead": "La solicitud de autorización se canceló o no se aceptó. No se cambió nada en la tarjeta. Haz clic en Intentar de nuevo y confirma como administrador.",
+    "denied_tech": "Se rechazó el permiso de administrador.",
+    "retry": "Intentar de nuevo"
+  },
+  "granted": {
+    "title": "Revenant puede leer {{name}} ({{size}}).",
+    "title_unnamed": "Revenant puede leer el disco de {{size}}.",
+    "lead": "La búsqueda llega en la próxima versión.",
+    "back": "Volver"
   }
 }

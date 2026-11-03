@@ -4,6 +4,7 @@
 @import './tokens.css';
 @import '../kit/kit.css';
 @import '../screens/screens.css';
+@import '../screens/path.css';
 
 html,
 body,

@@ -1,6 +1,6 @@
-// The Kit page: the header (logo, name and, on the path screens, the step trail), the scrolling content and the
-// footer with the actions.
-import type { ReactNode } from 'react';
+// The Kit page: the header (logo, name, on the path screens the step trail, and the app's buttons: Settings and
+// About), the scrolling content and the footer with the actions.
+import { createContext, useContext, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Logo } from './Logo';
 
@@ -26,13 +26,18 @@ export function StepTrail({ now }: { now: Step }) {
   );
 }
 
+/** The buttons at the right of every header (the app shell provides them: Settings and About). */
+export const HeaderActions = createContext<ReactNode>(null);
+
 export function Header({ step }: { step?: Step }) {
   const { t } = useTranslation();
+  const actions = useContext(HeaderActions);
   return (
     <header className="hd">
       <Logo small />
       <span className="name">{t('app.name')}</span>
       {step ? <StepTrail now={step} /> : null}
+      {actions ? <div className="hd-acts">{actions}</div> : null}
     </header>
   );
 }

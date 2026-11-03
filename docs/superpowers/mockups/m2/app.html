@@ -73,7 +73,7 @@
   var I = Kit.icon;
 
   function header() {
-    return '<div class="hd">' + Kit.logo({ small: true }) + '<span class="name">Revenant</span></div>';
+    return '<div class="hd">' + Kit.logo({ small: true }) + '<span class="name">Revenant</span>' + Kit.headerActions() + '</div>';
   }
   function backdrop() {
     var cells = '';
@@ -93,7 +93,7 @@
         // Closed dialog: say how to get it back instead of leaving a bare grid.
         var h = document.createElement('div');
         h.className = 'hint';
-        h.innerHTML = '<div class="card">' + I('info') + '<span>Janela fechada. Para abrir de novo, use o menu Revenant.</span></div>';
+        h.innerHTML = '<div class="card">' + I('info') + '<span>Janela fechada. Para abrir de novo, use os botões no alto da janela, à direita.</span></div>';
         app.appendChild(h);
       });
     });

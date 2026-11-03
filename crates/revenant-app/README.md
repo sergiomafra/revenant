@@ -2,8 +2,9 @@
 
 The Revenant desktop app: a [Tauri 2](https://tauri.app/) window around the engine (`revenant-core`). This crate is the
 Rust side; the interface (React, Vite, TypeScript, Tailwind) lives in [`app/`](../../app). For now it has the base of
-the interface (themes, languages, the Kit, Settings, About and the error screen) and the commands that list the
-disks and ask for access to one; the path screens come next.
+the interface (themes, languages, the Kit, Settings, About and the error screen), the commands that list the disks and
+ask for access to one, and the start of the path: choose the disk, give the permission, and a provisional screen that
+confirms the access (the search comes in Part 2.2).
 
 ## Requirements
 
@@ -100,8 +101,9 @@ when the background task itself fails (a panic).
   group, the engine's order. A `DiskView` is `{ id, name: { label, vendor, model }, size, fs, connection, kind,
   solid_state, camera_card, selectable, highlighted }`: `kind` is `card`, `external`, `internal` or `system`;
   `connection` is `usb`, `sd_card`, `thunderbolt`, `internal` or `unknown`; `camera_card` is true when a mounted
-  volume has a `DCIM` folder; `selectable` is false only for the system disk. The interface builds the display name
-  (label; else brand and model; else "Disk" and the size).
+  volume has a `DCIM` folder; `selectable` is false only for the system disk. `label` and `fs` come from the first
+  volume that has one, the EFI system partition left out (its `EFI` label says nothing about the disk). The interface
+  builds the display name (label; else brand and model; else "Disk" and the size).
 - `request_access(disk_id) -> { id, size }` (`src/access.rs`): refuses the system disk (`system_disk`) and a disk
   that is not listed (`device_not_found`), then shows the system's own permission prompt (macOS password dialog,
   Windows UAC), reads the first sector to prove the access works, checks the disk is still listed (the prompt can
@@ -109,10 +111,36 @@ when the background task itself fails (a panic).
 
 Tests use a fake `DeviceOps` and an in-memory device: they never touch a real disk.
 
+## The path so far
+
+`app/src/App.tsx` routes the screens; Settings and About open from the two buttons at the right of every header.
+
+1. **Choose the disk** (screen 1, `screens/ChooseDisk.tsx`, mockup `inicio.html#tela-1`), the first screen. It calls
+   `list_disks` on opening and again every 2 seconds (`disks/useDisks.ts`; the next call waits for the answer). The
+   cards redraw only when the list changed, and the chosen disk stays chosen while it is listed (when it leaves, the
+   choice is cleared). Each card shows the name (`disks/diskName.ts`), the size (powers of 1000, as disks are sold),
+   the file system tag, and a line with the brand and "looks like a camera card" or how the disk is connected; the
+   icon is a card for `card`, the USB drive for an external SSD, a hard drive otherwise. The system disk is greyed out
+   with the reason and cannot be chosen. When a disk that can be chosen is an SSD, the caution note shows, and choosing
+   the SSD opens its "Learn why" (Continue still works). No disk to choose: "Connect the card or the disk". The first
+   listing failing goes to screen 13 with its code; a later failure keeps the last list and tries again on the next
+   round.
+2. **Permission** (screen 3, `screens/Permission.tsx`, `inicio.html#tela-3`): the Mac or the Windows text, from
+   `navigator.userAgent`/`navigator.platform` (`platformOf`). The button calls `request_access`; while the system
+   prompt is open the button is busy and the rest of the window still answers. `permission_denied` shows the "Refused"
+   state with Try again (which asks again); `device_not_found` goes back to the list with the note "The disk was not
+   found"; any other code goes to screen 13 (Try again there asks again).
+3. **Access granted** (`screens/AccessGranted.tsx`, provisional, no mockup): "Revenant can read <name> (<size>)" and
+   "The search comes in the next version", with Back to the list. Part 2.2 replaces it with the pre-check.
+
 ## Content security policy
 
 `tauri.conf.json` sets a strict policy: everything from the app itself, inline styles allowed (React sets style
 attributes), images from the app, `data:` and `asset:`, and the commands' channel; no remote code and no `eval`.
+Tauri adds a nonce or hash to `style-src` only for `<style>` elements in the built HTML (which would make browsers
+ignore `'unsafe-inline'`); the Vite build has none (`app/dist/index.html` links one CSS file), the screens style with
+classes, and the one `style` the interface sets (the logo's CSS variables) is written by React through the CSSOM,
+which the policy does not block.
 `devCsp` adds what the Vite dev server needs (inline scripts for hot reload, its address and WebSocket). The test
 `csp_is_strict` checks the release policy.
 
@@ -135,9 +163,12 @@ It parses TSX with rolldown's parser from `app/node_modules`, so run `npm ci` fi
 
 `app/src/kit/` holds the components of the mockup kit (`docs/superpowers/mockups/m2/kit.css`, `kit.js`): `Button`,
 `Card`, `Note`, `Logo`, `TechDetails` ("Technical details", the only place for codes and jargon), `Modal` and `Page`
-(the header with the step trail, the content and the footer with the actions). Their styles are in `kit/kit.css`,
-ported from the mockups' CSS; screen styles are in `src/screens/screens.css`. The screens: `Settings` (11),
-`About` (12) and `UnexpectedError` (13). The About links open in the browser through `tauri-plugin-opener`; the
+(the header with the step trail, the content and the footer with the actions; the buttons at the right of the header
+come from the `HeaderActions` context, which the app shell fills with Settings and About). `kit/icons.tsx` draws the
+Lucide icons that `lucide-react` no longer ships (the SD card), with Lucide's geometry. Their styles are in
+`kit/kit.css`, ported from the mockups' CSS; screen styles are in `src/screens/screens.css` (11 to 13) and
+`src/screens/path.css` (1, 3 and the provisional screen). The screens: `ChooseDisk` (1), `Permission` (3),
+`AccessGranted` (provisional), `Settings` (11), `About` (12) and `UnexpectedError` (13). The About links open in the browser through `tauri-plugin-opener`; the
 capability allows only those two addresses.
 
 ## Icons

@@ -84,5 +84,64 @@
       "title": "Something went wrong",
       "action": "try again. If it keeps happening, close Revenant and open it again."
     }
+  },
+  "header": {
+    "settings": "Settings",
+    "about": "About"
+  },
+  "disk": {
+    "fallback_name": "{{size}} disk",
+    "named": "{{name}} · {{size}}",
+    "camera_card": "looks like a camera card",
+    "via_usb": "connected by USB",
+    "via_sd_card": "in a card reader",
+    "via_thunderbolt": "connected by Thunderbolt",
+    "system": "System disk: it cannot be searched",
+    "chosen": "Chosen"
+  },
+  "disks": {
+    "title": "What do you want to recover?",
+    "lead": "Choose the card or disk the photos and videos disappeared from.",
+    "list_label": "Connected disks",
+    "ssd_caution": "SSDs and CFexpress cards: deleted files often vanish within minutes. Search as soon as you can.",
+    "why": "Learn why",
+    "why_text": "On these disks, the system clears the space of deleted files by itself, within a few minutes. The sooner you search, the better the chance of finding everything. Do not use the disk until then.",
+    "empty_title": "Connect the card or the disk",
+    "empty_lead": "Put the card in the reader or plug the disk into the USB port. It shows up here by itself, with nothing else to do.",
+    "hint_card": "Stop using the card now.",
+    "hint_card_rest": "Do not save anything on it.",
+    "hint_disk": "Stop using the disk now.",
+    "hint_disk_rest": "Do not save anything on it.",
+    "gone": "The disk was not found. Check that it is still connected.",
+    "continue": "Continue"
+  },
+  "permission": {
+    "read_only": "Revenant only reads. It never writes to the card.",
+    "how": "How it works",
+    "private": "Your data never leaves the computer",
+    "back": "Back",
+    "waiting": "Waiting for the system to answer",
+    "mac_title": "Just one Mac permission left",
+    "mac_lead": "To read the whole card, not just the visible folders, the Mac needs the administrator password. You type the password in the system window, not here.",
+    "mac_step1": "<b>Click the button</b> “Ask for the administrator password”.",
+    "mac_step2": "Type the password you use to log in to the Mac.",
+    "mac_step3": "Done. The card check starts by itself.",
+    "mac_ask": "Ask for the administrator password",
+    "win_title": "Windows will ask you to confirm",
+    "win_lead": "To read the whole card, Windows needs you to allow Revenant as an administrator. It is a normal system question, with Yes and No.",
+    "win_step1": "<b>Click Continue.</b>",
+    "win_step2": "Windows asks whether to allow it. Click Yes.",
+    "win_step3": "Done. The card check starts by itself.",
+    "win_ask": "Continue",
+    "denied_title": "Without permission the card cannot be read",
+    "denied_lead": "The authorization request was cancelled or not accepted. Nothing on the card was changed. Click Try again and confirm as an administrator.",
+    "denied_tech": "The administrator permission was refused.",
+    "retry": "Try again"
+  },
+  "granted": {
+    "title": "Revenant can read {{name}} ({{size}}).",
+    "title_unnamed": "Revenant can read the {{size}} disk.",
+    "lead": "The search comes in the next version.",
+    "back": "Back"
   }
 }

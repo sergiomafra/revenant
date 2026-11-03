@@ -87,11 +87,11 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
     `node scripts/check-mockups.mjs`; capturas de cada estado por `bash scripts/shoot-mockups.sh`.
   - Logo (o anel com a seta de volta e o R em pedaços) e ícone do app: `assets/brand/`.
   - Spec: `docs/superpowers/specs/2026-11-02-m2-p0-telas-identidade-design.md`.
-- **2.1, esqueleto** (telas: `app.html` — Ajustes, Sobre, erro inesperado; a permissão de `inicio.html`):
+- **2.1, esqueleto** (telas: `app.html` — Ajustes, Sobre, erro inesperado; o disco e a permissão de `inicio.html`):
   - Janela, temas e 3 idiomas.
   - Ajudante privilegiado só de leitura: senha de administrador no Mac, UAC no Windows.
   - Ponte entre o app e o motor.
-- **2.2, o caminho** (telas: `inicio.html` — retomar, disco, conferência prévia; `busca.html` — cópia, procurando,
+- **2.2, o caminho** (telas: `inicio.html` — retomar, conferência prévia; `busca.html` — cópia, procurando,
   cartão desconectado): escolher o disco, dar a permissão, fazer a cópia opcional e acompanhar a busca com a galeria se
   enchendo ao vivo.
 - **2.3, resultados e recuperação** (telas: `resultados.html`, `recuperar.html`):
