@@ -1,8 +1,26 @@
 name: CI
 
+# One run per change: pushes only on main (a PR's commits run through pull_request), and changes that only touch
+# prose (docs and Markdown) skip the tests. The mockups are still checked: they are the reference for the app's screens.
 on:
   push:
+    branches: [main]
+    paths:
+      - '**'
+      - '!docs/**'
+      - 'docs/superpowers/mockups/**'
+      - '!**.md'
   pull_request:
+    paths:
+      - '**'
+      - '!docs/**'
+      - 'docs/superpowers/mockups/**'
+      - '!**.md'
+
+# A new commit on a PR cancels the run still going for the older one; runs on main always finish.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
@@ -58,6 +76,8 @@ jobs:
       - name: Script tests
         # Quoted so node expands the glob itself (the same on Windows); `node --test scripts/` does not take a folder.
         run: node --test "scripts/*.test.mjs"
+      - name: Mockup rules
+        run: node scripts/check-mockups.mjs
       - name: Interface rules
         # Texts only from the catalogs, the same keys in the three languages, colors only from the tokens, no emoji.
         working-directory: app
