@@ -22,6 +22,8 @@ Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.s
 
 - Um módulo por vez: spec → telas → plano → subagentes. O Sérgio decide o merge.
 - Fim de parte = push + PR; o merge é do Sérgio.
+- CI: roda uma vez por PR (o `push` só dispara na `main`); PR que só mexe em `docs/**` (fora os mockups) e em `*.md`
+  não roda testes, e não há check para esperar.
 - Telas do app: os mockups em `docs/superpowers/mockups/m2/` são a referência; mudar uma tela começa por mudar o mockup
   (e `node scripts/check-mockups.mjs` tem de passar).
 - Código e repositório em inglês (identificadores, comentários, códigos de erro, commits, READMEs, CHANGELOG). Exceções:
