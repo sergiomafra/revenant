@@ -129,7 +129,7 @@
 (function () {
   var I = Kit.icon, nf = Kit.nf, sz = Kit.sz;
 
-  var STEPS = ['Disco', 'Permissão', 'Conferência', 'Cópia', 'Busca', 'Resultados'];
+  var STEPS = ['Disco', 'Permissão', 'Conferência', 'Cópia', 'Busca', 'Resultados', 'Recuperar'];
   function header(now) {
     var p = STEPS.map(function (s, i) {
       return '<span class="' + (i < now ? 'done' : i === now ? 'now' : '') + '">' + s + '</span>';
