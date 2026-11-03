@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M19 33 A36 36 0 1 0 47 14.2" stroke-width="9"/>
+  <polyline points="57 5 47 14 57 23" stroke-width="9" style="stroke:var(--d, #b9822a)"/>
+  <g transform="translate(50 51) scale(.56) translate(-52 -51)" stroke-width="17">
+    <path d="M32 84 V18 H52 A16 16 0 0 1 52 50 H32"/>
+    <path d="M54 56 L70 84" style="stroke:var(--d, #b9822a)"/>
+  </g>
+</svg>
