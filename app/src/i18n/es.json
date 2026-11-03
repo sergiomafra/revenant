@@ -1,0 +1,88 @@
+{
+  "app": { "name": "Revenant" },
+  "steps": {
+    "label": "Pasos",
+    "disk": "Disco",
+    "permission": "Permiso",
+    "check": "Revisión",
+    "copy": "Copia",
+    "search": "Búsqueda",
+    "results": "Resultados",
+    "recover": "Recuperar"
+  },
+  "footer": {
+    "nothing_changes": "No se cambia nada en la tarjeta",
+    "nothing_changed": "No se cambió nada en la tarjeta"
+  },
+  "tech": {
+    "summary": "Detalles técnicos",
+    "copy": "Copiar detalles",
+    "copied": "Detalles copiados"
+  },
+  "settings": {
+    "title": "Ajustes",
+    "theme": "Tema",
+    "theme_light": "Claro",
+    "theme_dark": "Oscuro",
+    "theme_auto": "Automático",
+    "theme_hint": "Automático sigue el tema de tu computadora.",
+    "language": "Idioma",
+    "language_default": "Predeterminado",
+    "save_failed": "No se pudo guardar la elección. Vale hasta que cierres Revenant.",
+    "done": "Listo"
+  },
+  "languages": {
+    "pt-BR": "Português (Brasil)",
+    "es": "Español",
+    "en": "English"
+  },
+  "about": {
+    "version": "Versión {{version}}",
+    "license": "Gratuito y de código abierto (GPL-3.0)",
+    "source": "Código fuente",
+    "guide": "Guía de uso",
+    "close": "Cerrar"
+  },
+  "error": {
+    "lead": "No se escribió nada en la tarjeta. Los archivos que ya recuperaste siguen guardados.",
+    "what_to_do": "Qué hacer:",
+    "home": "Volver al inicio",
+    "retry": "Intentar de nuevo",
+    "read_failed": {
+      "title": "Algo salió mal al leer la tarjeta",
+      "action": "intenta de nuevo. Si sigue pasando, primero haz una copia de la tarjeta y busca los archivos en ella."
+    },
+    "open_failed": {
+      "title": "No se pudo abrir la tarjeta",
+      "action": "revisa que siga conectada e intenta de nuevo. Si sigue pasando, saca la tarjeta, vuelve a ponerla y espera unos segundos."
+    },
+    "permission_denied": {
+      "title": "Revenant no recibió el permiso",
+      "action": "intenta de nuevo y acepta el pedido de permiso en la ventana del sistema."
+    },
+    "device_not_found": {
+      "title": "No se encontró el disco",
+      "action": "revisa que siga conectado y vuelve a elegirlo."
+    },
+    "system_tool_failed": {
+      "title": "No se pudieron ver los discos conectados",
+      "action": "intenta de nuevo en un momento. Si sigue pasando, cierra Revenant y vuelve a abrirlo."
+    },
+    "unsupported_platform": {
+      "title": "Revenant no funciona en esta computadora",
+      "action": "usa Revenant en una Mac o en una PC con Windows."
+    },
+    "system_disk": {
+      "title": "Este es el disco del sistema",
+      "action": "elige la tarjeta o el disco externo de donde desaparecieron las fotos y los videos. En el disco del sistema no se puede buscar."
+    },
+    "not_whole_disk": {
+      "title": "Elige el disco entero",
+      "action": "vuelve y elige la tarjeta o el disco en la lista, y no solo una parte."
+    },
+    "unknown": {
+      "title": "Algo salió mal",
+      "action": "intenta de nuevo. Si sigue pasando, cierra Revenant y vuelve a abrirlo."
+    }
+  }
+}

@@ -33,8 +33,9 @@ knows to be wrong before a long read (permission, a disk that does not answer, r
 an image with a rescue map that tolerates bad sectors and can be resumed, warns early when a card is failing, and saves a
 scan so it resumes with the same results after a crash or a pulled cable. It is tested against real camera files as well
 as synthetic ones and, optionally, against disk images attached to the computer. The graphical app has started: for
-now it opens its window (Tauri 2 and React, in [crates/revenant-app](crates/revenant-app/README.md) and `app/`); its
-logo and app icon are in [assets/brand](assets/brand/README.md).
+now it opens its window, with Settings (theme and language: Português, Español, English), About and the error screen
+(Tauri 2 and React, in [crates/revenant-app](crates/revenant-app/README.md) and `app/`); its logo and app icon are in
+[assets/brand](assets/brand/README.md).
 
 ## Trying the engine (developers)
 

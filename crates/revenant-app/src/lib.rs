@@ -1,8 +1,41 @@
-//! The Revenant desktop app: the Tauri shell that hosts the interface in `app/` and, later, the engine commands.
+//! The Revenant desktop app: the Tauri shell that hosts the interface in `app/` and the commands it calls.
+
+pub mod settings;
+
+use serde::Serialize;
+use tauri::{AppHandle, Manager};
+
+use settings::Settings;
+
+/// An error as the interface sees it: only a `snake_case` code, which the interface translates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ErrorView {
+    pub code: &'static str,
+}
+
+/// The stored settings, or the defaults when there are none (or the config folder is unknown).
+#[tauri::command]
+fn get_settings(app: AppHandle) -> Settings {
+    match app.path().app_config_dir() {
+        Ok(dir) => settings::load(&dir),
+        Err(_) => Settings::default(),
+    }
+}
+
+/// Stores the settings in the app's config folder.
+#[tauri::command]
+fn set_settings(app: AppHandle, settings: Settings) -> Result<(), ErrorView> {
+    let dir = app.path().app_config_dir().map_err(|_| ErrorView {
+        code: settings::WRITE_FAILED,
+    })?;
+    settings::save(&dir, &settings)
+}
 
 /// Opens the main window and runs the app until it is closed.
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![get_settings, set_settings])
         .run(tauri::generate_context!())
         .expect("error while running the Revenant app");
 }

@@ -1,0 +1,88 @@
+{
+  "app": { "name": "Revenant" },
+  "steps": {
+    "label": "Steps",
+    "disk": "Disk",
+    "permission": "Permission",
+    "check": "Check",
+    "copy": "Copy",
+    "search": "Search",
+    "results": "Results",
+    "recover": "Recover"
+  },
+  "footer": {
+    "nothing_changes": "Nothing on the card is changed",
+    "nothing_changed": "Nothing on the card was changed"
+  },
+  "tech": {
+    "summary": "Technical details",
+    "copy": "Copy details",
+    "copied": "Details copied"
+  },
+  "settings": {
+    "title": "Settings",
+    "theme": "Theme",
+    "theme_light": "Light",
+    "theme_dark": "Dark",
+    "theme_auto": "Automatic",
+    "theme_hint": "Automatic follows your computer's theme.",
+    "language": "Language",
+    "language_default": "Default",
+    "save_failed": "Your choice could not be saved. It lasts until you close Revenant.",
+    "done": "Done"
+  },
+  "languages": {
+    "pt-BR": "Português (Brasil)",
+    "es": "Español",
+    "en": "English"
+  },
+  "about": {
+    "version": "Version {{version}}",
+    "license": "Free and open source (GPL-3.0)",
+    "source": "Source code",
+    "guide": "User guide",
+    "close": "Close"
+  },
+  "error": {
+    "lead": "Nothing was written to the card. The files you already recovered are still saved.",
+    "what_to_do": "What to do:",
+    "home": "Back to start",
+    "retry": "Try again",
+    "read_failed": {
+      "title": "Something went wrong while reading the card",
+      "action": "try again. If it keeps happening, make a copy of the card first and look for the files in the copy."
+    },
+    "open_failed": {
+      "title": "The card could not be opened",
+      "action": "check that it is still connected and try again. If it keeps happening, take the card out, put it back and wait a few seconds."
+    },
+    "permission_denied": {
+      "title": "Revenant did not get permission",
+      "action": "try again and accept the permission request in the system window."
+    },
+    "device_not_found": {
+      "title": "The disk was not found",
+      "action": "check that it is still connected and choose it again."
+    },
+    "system_tool_failed": {
+      "title": "The connected disks could not be listed",
+      "action": "try again in a moment. If it keeps happening, close Revenant and open it again."
+    },
+    "unsupported_platform": {
+      "title": "Revenant does not work on this computer",
+      "action": "use Revenant on a Mac or on a Windows PC."
+    },
+    "system_disk": {
+      "title": "This is the system disk",
+      "action": "choose the card or the external disk the photos and videos disappeared from. The system disk cannot be searched."
+    },
+    "not_whole_disk": {
+      "title": "Choose the whole disk",
+      "action": "go back and choose the card or the disk in the list, not just one part of it."
+    },
+    "unknown": {
+      "title": "Something went wrong",
+      "action": "try again. If it keeps happening, close Revenant and open it again."
+    }
+  }
+}

@@ -35,7 +35,7 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  # The interface (app/): its npm licenses, the scripts' own tests, its tests and its build.
+  # The interface (app/): its npm licenses, the scripts' own tests, its rules, its tests and its build.
   app:
     name: app (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -58,6 +58,10 @@ jobs:
       - name: Script tests
         # Quoted so node expands the glob itself (the same on Windows); `node --test scripts/` does not take a folder.
         run: node --test "scripts/*.test.mjs"
+      - name: Interface rules
+        # Texts only from the catalogs, the same keys in the three languages, colors only from the tokens, no emoji.
+        working-directory: app
+        run: npm run check
       - name: Test
         working-directory: app
         run: npm test

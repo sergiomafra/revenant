@@ -8,7 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - The desktop app's first build: a `Revenant.app` (Mac) that opens the Revenant window (1280×800, at least 1024×700)
-  with the app icon; no screens yet.
+  with the app icon.
+- The app in three languages (Português (Brasil), Español, English), starting in the computer's language (English when
+  it is none of the three), and in a light, dark or automatic theme (automatic follows the computer). The Settings
+  screen changes both at once, and the choice is kept for the next time the app opens.
+- The About screen (version, license, links to the source code and the user guide, opened in the browser) and a calm
+  error screen that says what went wrong and what to do, with the error code under "Technical details".
 - A disk can be opened through the system's own permission prompt (the password prompt on macOS, the UAC prompt on
   Windows), read-only, so the app never has to run as administrator.
 - The disk list tells how each disk is connected (USB, SD card, Thunderbolt, internal) and whether it looks like a
