@@ -12,7 +12,7 @@ depois de cada parte em `docs/superpowers/history/`; roteiros manuais com hardwa
 `2026-11-03-m2-p1-conferencia-manual.md`. Marco A fechado. Módulo 2: Parte 2.0 (telas e identidade) mergeada (PR #8;
 mockups em `docs/superpowers/mockups/m2/`, logo e ícone em `assets/brand/`). Parte 2.1 (esqueleto do app: janela, temas,
 3 idiomas, lista de discos, permissão) mergeada (PR #9); o que ficou para a 2.2 e as
-perguntas ao Sérgio em `docs/superpowers/history/2026-11-03-m2-p1-pendencias.md`. Próxima: 2.2. Ponto de partida do app:
+decisões em `docs/superpowers/history/2026-11-03-m2-p1-pendencias.md`. Próxima: 2.2. Ponto de partida do app:
 `cd app && npm ci && npm run tauri dev` (ou `npm run tauri build -- --bundles app`); detalhes em
 `crates/revenant-app/README.md`. Roteiro até a 1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de
 desenvolvimento do motor: `revenant-dev` (`bench` mede a velocidade).
