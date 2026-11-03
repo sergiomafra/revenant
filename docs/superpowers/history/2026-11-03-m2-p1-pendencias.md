@@ -39,16 +39,21 @@ Cada decisão traz o custo se estiver errada.
   "use os botões no alto da janela, à direita". O mapa do `index.html` leva a tela 1 para a 2.1.
 - **Modal próprio, sem Radix Dialog**: o Radix puxa `tslib` (0BSD), licença que não está na lista do Sérgio.
 
-## Perguntas para o Sérgio
+## Perguntas ao Sérgio, decididas pelo Claude (03/11/2026)
 
-1. **0BSD.** Permitir 0BSD deixaria usar o Radix Dialog (foco preso, acessibilidade pronta) no lugar do Modal próprio.
-2. **Nota `save_failed`** ("não deu para guardar a sua escolha; vale até fechar o app") não está em nenhum mockup. Entra
-   num mockup ou sai?
-3. **"Os arquivos que você já recuperou…"** aparece também em erros que acontecem antes de qualquer recuperação
-   (por exemplo ao listar os discos), onde não faz sentido. Trocar o texto por código de erro?
-4. **Posição dos botões Ajustes e Sobre** no cabeçalho (canto superior direito de toda tela): confirmar ou mover.
-5. **O disco do sistema aparece pelo modelo**, não por "Macintosh HD". O nome do volume APFS mora num disco sintetizado, e
-   chegar nele é trabalho no motor. Fica assim até lá, ou entra na 2.2?
+O Sérgio pediu que o Claude decidisse sozinho; ele altera depois se quiser. Cada decisão traz o custo se estiver errada.
+
+1. **0BSD: não entra.** O Modal próprio funciona e a lista de licenças fica como está; o Radix Dialog só volta se
+   aparecer uma falha de acessibilidade no Modal (foco, Esc, leitor de tela). Custo: trocar o Modal mais tarde.
+2. **Nota "Não deu para guardar a escolha": fica**, e agora está no mockup (`app.html`, tela 11, estado "Não deu para
+   guardar"). Custo: nenhum, é um estado raro.
+3. **"Os arquivos que você já recuperou continuam salvos" saiu** da tela 13 (mockup e os três idiomas): na 2.1 ainda não
+   existe recuperação. A 2.2 põe a frase de volta só quando um erro acontece depois de arquivos recuperados. Custo:
+   nenhum.
+4. **Botões Ajustes e Sobre: ficam** no canto superior direito de toda tela. Custo: mover dois botões.
+5. **"Macintosh HD" entra na 2.2**, como item pequeno do motor: o disco do sistema leva o nome do volume APFS do disco
+   sintetizado que o sistema cria em cima dele. É só um rótulo, já que o disco do sistema nunca pode ser escolhido.
+   Custo: até lá, ele aparece pelo modelo.
 
 ## Pequenos itens adiados
 

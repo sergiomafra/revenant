@@ -127,7 +127,7 @@
     { key: 'es', name: 'Español', note: '' },
     { key: 'en', name: 'English', note: '' }
   ];
-  function settings() {
+  function settings(saveFailed) {
     themeChoice = currentTheme();
     var seg = [['light', 'Claro'], ['dark', 'Escuro'], ['auto', 'Automático']].map(function (t) {
       return '<button data-tema="' + t[0] + '" role="radio" aria-checked="' + (themeChoice === t[0]) + '" class="' + (themeChoice === t[0] ? 'on' : '') + '">' + t[1] + '</button>';
@@ -138,6 +138,7 @@
     var inner = '<h3>Ajustes</h3>'
       + '<div class="row"><b>Tema</b><div class="seg" role="radiogroup" aria-label="Tema">' + seg + '</div><small>Automático acompanha o tema do seu computador.</small></div>'
       + '<div class="row"><b>Idioma</b><div class="langs" role="radiogroup">' + langs + '</div></div>'
+      + (saveFailed ? Kit.note('mid', 'Não deu para guardar a escolha. Ela vale até você fechar o Revenant.') : '')
       + '<div class="acts"><button class="btn">Concluir</button></div>';
     return backdrop() + modal(inner, 'set');
   }
@@ -179,7 +180,7 @@
     }
     var body = '<div class="wrap center"><span class="tile mid big">' + I('alert') + '</span>'
       + '<h2 class="ttl">Algo deu errado ao ler o cartão</h2>'
-      + '<p class="lead">Nada foi gravado no cartão. Os arquivos que você já recuperou continuam salvos.</p>'
+      + '<p class="lead">Nada foi gravado no cartão.</p>'
       + '<div class="err">'
       + '<div class="next">' + I('info') + '<span><b>O que fazer:</b> tente de novo. Se continuar, faça uma cópia do cartão primeiro e procure os arquivos nela.</span></div>'
       + tech + '</div>'
@@ -199,7 +200,8 @@
     page: 'app',
     screens: [
       { id: 11, name: 'Ajustes', title: 'Revenant', states: [
-        { key: 'geral', label: 'Geral', render: settings, after: wireSettings }
+        { key: 'geral', label: 'Geral', render: function () { return settings(false); }, after: wireSettings },
+        { key: 'falha', label: 'Não deu para guardar', render: function () { return settings(true); }, after: wireSettings }
       ] },
       { id: 12, name: 'Sobre', title: 'Revenant', states: [
         { key: 'sobre', label: 'Sobre', render: about, after: function (app) {

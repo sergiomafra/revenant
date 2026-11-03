@@ -44,7 +44,7 @@
     "close": "Close"
   },
   "error": {
-    "lead": "Nothing was written to the card. The files you already recovered are still saved.",
+    "lead": "Nothing was written to the card.",
     "what_to_do": "What to do:",
     "home": "Back to start",
     "retry": "Try again",
