@@ -118,7 +118,7 @@ pasta seguem o padrão do Mac nos mockups; a diferença de nomes (`D:\`) é da 2
 | 7 | **O cartão saiu** | No meio da busca ou da cópia: "O cartão foi desconectado. Nada se perdeu: conecte de novo para continuar." Espera e retoma sozinho quando volta. | `device_gone` | 2.2 |
 | 8 | **Resultados** | As três visualizações aprovadas (Galeria, Linha do tempo, Detalhes), os selos Íntegro/Parcial/Danificado, "Por pasta" desligado com o motivo; nada encontrado; um arquivo sem o nome original (nome por data e câmera) mostrado como tal. | estados do motor | 2.3 |
 | 9 | **Onde salvar** | Escolher a pasta; recusa no próprio cartão (explicando por quê); espaço insuficiente. | `destination_on_source`, `destination_too_small` | 2.3 |
-| 10 | **Recuperando e resumo** | Progresso da recuperação; fim: "1.284 arquivos recuperados", resumo (íntegros, parciais, danificados), "Abrir pasta". | `write_failed`, `device_gone` | 2.3 |
+| 10 | **Recuperando e resumo** | Progresso da recuperação; fim: "1.321 arquivos recuperados" (o total dos resultados: 1.284 fotos e 37 vídeos), resumo (íntegros, parciais, danificados), "Abrir pasta". | `write_failed`, `device_gone` | 2.3 |
 | 11 | **Ajustes** | Tema (claro, escuro, automático), idioma (pt-BR, es, en). | — | 2.1 |
 | 12 | **Sobre** | Logo, versão, licença GPL-3.0, link do código e da documentação. | — | 2.1 |
 | 13 | **Erro inesperado** | Um padrão único para o que não tem tela própria: o que aconteceu em palavras simples, o que fazer, e "Detalhes técnicos" recolhido com o código. | qualquer outro | 2.1 |
