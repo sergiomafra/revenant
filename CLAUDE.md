@@ -6,12 +6,16 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 
 ## Onde o desenvolvimento está
 
-**02/11/2026.** Módulo 1 (motor) concluído: Partes 1.1 a 1.6 mergeadas (PRs #1 a #7). Decisões e o que ficou para
+**03/11/2026.** Módulo 1 (motor) concluído: Partes 1.1 a 1.6 mergeadas (PRs #1 a #7). Decisões e o que ficou para
 depois de cada parte em `docs/superpowers/history/`; roteiros manuais com hardware (do Sérgio, ainda a fazer) em
-`2026-10-25-m1-p5-conferencia-manual.md` e `2026-11-02-m1-p6-conferencia-manual.md`. Marco A fechado. Módulo 2,
-Parte 2.0 (telas e identidade) concluída e aprovada pelo Sérgio (03/11/2026), PR aberto na branch `feat/m2-p0-screens`:
-mockups em `docs/superpowers/mockups/m2/`, logo e ícone em `assets/brand/`. Próxima: 2.1. Roteiro até a 1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`
-(`bench` mede a velocidade).
+`2026-10-25-m1-p5-conferencia-manual.md`, `2026-11-02-m1-p6-conferencia-manual.md` e
+`2026-11-03-m2-p1-conferencia-manual.md`. Marco A fechado. Módulo 2: Parte 2.0 (telas e identidade) mergeada (PR #8;
+mockups em `docs/superpowers/mockups/m2/`, logo e ícone em `assets/brand/`). Parte 2.1 (esqueleto do app: janela, temas,
+3 idiomas, lista de discos, permissão) pronta, em PR na branch `feat/m2-p1-skeleton`; o que ficou para a 2.2 e as
+perguntas ao Sérgio em `docs/superpowers/history/2026-11-03-m2-p1-pendencias.md`. Próxima: 2.2. Ponto de partida do app:
+`cd app && npm ci && npm run tauri dev` (ou `npm run tauri build -- --bundles app`); detalhes em
+`crates/revenant-app/README.md`. Roteiro até a 1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de
+desenvolvimento do motor: `revenant-dev` (`bench` mede a velocidade).
 Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.
 
 ## Diretrizes fixas
