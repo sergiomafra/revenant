@@ -39,7 +39,8 @@ for (const p of pages) {
 }
 
 // 2. No literal color outside tokens.css (embedded brand SVGs between brand:start/end are exempt).
-const colorRe = /#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(/g;
+// Exempt numeric entities (&#8212;) and in-page anchors (href="#add"); real colors in CSS/attributes still match.
+const colorRe = /(?<!&)(?<!href=["'])#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(/g;
 for (const f of all.filter((f) => /\.(html|css|js)$/.test(f) && f !== 'tokens.css')) {
   let t = read(f);
   if (f === 'kit.js') t = t.replace(/\/\* brand:start \*\/[\s\S]*?\/\* brand:end \*\//g, (m) => m.replace(/[^\n]/g, ' '));
@@ -182,6 +183,17 @@ if (exists('tokens.css')) {
   const sets = { ':root': decl(light), ':root[data-theme="dark"]': decl(dark), 'prefers-color-scheme block': decl(auto) };
   for (const [label, b] of [[':root', light], [':root[data-theme="dark"]', dark], ['prefers-color-scheme block', auto]]) {
     if (b === null) fail(8, `tokens.css has no ${label} block`);
+  }
+  const required = ('paper surface surface-2 line line-soft ink ink-2 ink-3 accent accent-soft accent-ink ok ok-bg warn ' +
+    'warn-bg bad bad-bg img-bg shadow brand-gold tile tile-ink tile-gold overlay photo-tag on-photo info info-bg ' +
+    'win-close win-min win-max font').split(' ').map((n) => `--${n}`);
+  for (const tok of required) {
+    for (const [label, s] of Object.entries(sets)) if (!s.has(tok)) fail(8, `tokens.css: required ${tok} is not defined in ${label}`);
+  }
+  const values = (b) => new Map([...(b || '').matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)].map((m) => [m[1], m[2].trim()]));
+  const dv = values(dark), av = values(auto);
+  for (const [tok, v] of dv) {
+    if (av.has(tok) && av.get(tok) !== v) fail(8, `tokens.css: ${tok} differs between data-theme="dark" (${v}) and prefers-color-scheme (${av.get(tok)})`);
   }
   const union = new Set(Object.values(sets).flatMap((s) => [...s]));
   for (const tok of [...union].sort()) {

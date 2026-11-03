@@ -48,7 +48,7 @@ for page in "${PAGES[@]}"; do
     let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
       const m = s.match(/<pre id="manifest"[^>]*>([\s\S]*?)<\/pre>/);
       if (!m) { console.error("no manifest in page"); process.exit(1); }
-      const t = m[1].replace(/&quot;/g, "\"").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+      const t = m[1].replace(/&quot;/g, "\"").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
       for (const e of JSON.parse(t)) for (const k of e.states) console.log(e.page + " " + e.screen + " " + k);
     });')" || { echo "could not read the manifest of $page" >&2; exit 1; }
   while read -r pg screen state; do
