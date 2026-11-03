@@ -6,12 +6,11 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 
 ## Onde o desenvolvimento está
 
-**02/11/2026.** Módulo 1 (motor): Partes 1.1 a 1.5 mergeadas (PRs #1 a #6). Parte 1.6 (fragmentação avançada: JPEG,
-vídeo e RAW em 3 ou mais pedaços, apagados fragmentados no FAT/exFAT) concluída na branch `feat/m1-p6-fragments`,
-revisão final feita e corrigida (Q61), aguardando o PR/merge; decisões, resíduos aceitos e o que ficou para depois em
-`docs/superpowers/history/2026-11-02-m1-p6-pendencias.md`, roteiro com a A6700 (do Sérgio) em
-`docs/superpowers/history/2026-11-02-m1-p6-conferencia-manual.md`. Marco A fechado. Próxima: Módulo 2. Roteiro até a
-1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`
+**02/11/2026.** Módulo 1 (motor) concluído: Partes 1.1 a 1.6 mergeadas (PRs #1 a #7). Decisões e o que ficou para
+depois de cada parte em `docs/superpowers/history/`; roteiros manuais com hardware (do Sérgio, ainda a fazer) em
+`2026-10-25-m1-p5-conferencia-manual.md` e `2026-11-02-m1-p6-conferencia-manual.md`. Marco A fechado. Módulo 2,
+Parte 2.0 (telas e identidade) concluída e aprovada pelo Sérgio (03/11/2026), PR aberto na branch `feat/m2-p0-screens`:
+mockups em `docs/superpowers/mockups/m2/`, logo e ícone em `assets/brand/`. Próxima: 2.1. Roteiro até a 1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`
 (`bench` mede a velocidade).
 Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.
 
@@ -19,6 +18,8 @@ Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.s
 
 - Um módulo por vez: spec → telas → plano → subagentes. O Sérgio decide o merge.
 - Fim de parte = push + PR; o merge é do Sérgio.
+- Telas do app: os mockups em `docs/superpowers/mockups/m2/` são a referência; mudar uma tela começa por mudar o mockup
+  (e `node scripts/check-mockups.mjs` tem de passar).
 - Código e repositório em inglês (identificadores, comentários, códigos de erro, commits, READMEs, CHANGELOG). Exceções:
   este arquivo e `docs/superpowers/**` (pt-BR).
 - Documentação sempre atualizada e explicando como usar: toda tarefa que muda comportamento atualiza o README do crate e, se

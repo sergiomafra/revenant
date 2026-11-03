@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revenant · início do caminho</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="kit.css">
+<style>
+  /* Page-local styles for screens 1 to 4. Colors only through tokens. */
+  .hd{flex:none;display:flex;align-items:center;gap:12px;padding:12px 24px;border-bottom:1px solid var(--line-soft);background:var(--surface)}
+  .hd .logo{width:26px;height:26px}
+  .hd .name{font-weight:650;letter-spacing:-.01em}
+  .path{display:flex;align-items:center;gap:6px;margin-left:auto;font-size:12px;color:var(--ink-3);font-weight:560}
+  .path span{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .path span::after{content:"";width:14px;height:1px;background:var(--line)}
+  .path span:last-child::after{display:none}
+  .path .done{color:var(--ink-2)}
+  .path .now{color:var(--accent);font-weight:700}
+  .wrap{width:100%;max-width:1000px;margin:0 auto;padding:30px 32px 24px;display:flex;flex-direction:column;gap:16px}
+  .wrap.narrow{max-width:760px}
+  .wrap.fill{min-height:100%}
+  .wrap.fill>.hint-wrap{margin-top:auto}
+  .wrap.center{align-items:center;text-align:center;justify-content:center;min-height:100%}
+  .ttl{font-size:26px;font-weight:650;letter-spacing:-.02em;line-height:1.2}
+  .lead{color:var(--ink-2);font-size:14px;max-width:620px}
+  .tile{width:56px;height:56px;border-radius:15px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;flex:none}
+  .tile svg.i{width:28px;height:28px;stroke-width:1.6}
+  .tile.mid{background:var(--warn-bg);color:var(--warn)}
+  .tile.ok{background:var(--ok-bg);color:var(--ok);border-radius:50%}
+  .tile.big{width:88px;height:88px;border-radius:24px}
+  .tile.big svg.i{width:44px;height:44px;stroke-width:1.5}
+
+  /* screen 1: disk cards */
+  .disks{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+  .disk{display:flex;flex-direction:column;gap:14px;padding:16px;cursor:pointer;min-width:0;text-align:left}
+  .disk.card.sel{padding:15px}
+  .disk .top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+  .disk .tile{width:48px;height:48px;border-radius:12px}
+  .disk .tile svg.i{width:24px;height:24px}
+  .disk b{display:block;font-size:15px;font-weight:650;letter-spacing:-.01em}
+  .disk small{display:block;color:var(--ink-2);font-size:12.5px;margin-top:2px}
+  .disk .pick{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:650;color:var(--accent);visibility:hidden}
+  .disk.sel .pick{visibility:visible}
+  .sys{display:flex;align-items:center;gap:14px;padding:12px 16px}
+  .sys .tile{width:40px;height:40px;border-radius:10px;background:var(--line-soft);color:var(--ink-3)}
+  .sys .tile svg.i{width:20px;height:20px}
+  .sys b{font-weight:620;color:var(--ink-2)}
+  .sys small{display:block;color:var(--ink-2);font-size:12.5px}
+  .sys .tg{margin-left:auto}
+  .why{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:12.5px;color:var(--ink-2);display:flex;gap:8px}
+  .why[hidden]{display:none}
+  .hint b{font-weight:700}
+  .empty{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;padding:70px 0 10px}
+  .empty .ttl{font-size:22px}
+
+  /* screen 3: permission */
+  .perm{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,.9fr);gap:36px;align-items:center;width:100%;max-width:960px;margin:0 auto;padding:40px 32px;min-height:100%}
+  .perm .txt{display:flex;flex-direction:column;gap:14px;align-items:flex-start}
+  .perm .steps{display:flex;flex-direction:column;gap:14px;padding:20px}
+  .perm .steps h3{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+  .stp{display:flex;gap:12px;align-items:flex-start;color:var(--ink-2);font-size:13.5px}
+  .stp em{flex:none;font-style:normal;width:24px;height:24px;border-radius:50%;background:var(--accent-soft);color:var(--accent);font-size:12px;font-weight:700;display:grid;place-items:center}
+  .stp.on em{background:var(--accent);color:var(--accent-ink)}
+  .stp b{color:var(--ink);font-weight:620}
+  .sysdlg{width:300px;background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow-pop);padding:20px;display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center}
+  .sysdlg .appic{width:52px;height:52px;border-radius:13px;background:var(--tile);color:var(--tile-ink);display:grid;place-items:center}
+  .sysdlg .appic .logo{width:34px;height:34px;color:var(--tile-ink)}
+  .sysdlg b{font-weight:650;font-size:13.5px}
+  .sysdlg p{color:var(--ink-2);font-size:12px}
+  .sysdlg .fld{width:100%;display:flex;justify-content:space-between;align-items:center;gap:8px;background:var(--surface-2);border:1px solid var(--line);border-radius:6px;padding:5px 9px;font-size:12px;color:var(--ink-2)}
+  .sysdlg .fld i{font-style:normal;color:var(--ink);letter-spacing:.12em}
+  .sysdlg .acts{display:flex;gap:8px;width:100%}
+  .sysdlg .acts button{flex:1;min-width:0}
+  .sysdlg .acts .btn.ghost{border:1px solid var(--line)}
+  .uac{width:420px;max-width:100%;background:var(--surface);border:1px solid var(--line);box-shadow:var(--shadow-pop);display:flex;flex-direction:column}
+  .uac .uh{display:flex;align-items:center;gap:10px;background:var(--info-bg);color:var(--info);padding:12px 16px;font-weight:650;font-size:13px}
+  .uac .ub{padding:18px 16px;display:flex;flex-direction:column;gap:12px}
+  .uac .ub h3{font-size:17px;font-weight:600;line-height:1.3}
+  .uac .ap{display:flex;gap:12px;align-items:center}
+  .uac .ap .appic{width:44px;height:44px;border-radius:8px;background:var(--tile);display:grid;place-items:center}
+  .uac .ap .appic .logo{width:30px;height:30px;color:var(--tile-ink)}
+  .uac .ap small{display:block;color:var(--ink-2);font-size:12px}
+  .uac .ul{color:var(--info);font-size:12px;text-decoration:underline}
+  .uac .uf{display:flex;gap:8px;padding:14px 16px;background:var(--surface-2)}
+  .uac .uf button{flex:1;min-width:0;border-radius:3px}
+  .uac .uf .btn.ghost{background:var(--surface);border:1px solid var(--line)}
+
+  /* screen 4: pre-check */
+  .spin{width:100%;max-width:360px}
+  .progress.ind>i{width:34%;animation:slide 1.4s ease-in-out infinite}
+  @keyframes slide{0%{margin-left:-34%}100%{margin-left:100%}}
+  @media (prefers-reduced-motion:reduce){.progress.ind>i{animation:none;margin-left:33%}}
+  .issues{display:grid;grid-template-columns:1fr;gap:10px}
+  .issues .sub{grid-column:1/-1;font-size:13px;font-weight:650;color:var(--ink-2);margin-top:6px}
+  .issues.two{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .iss{display:flex;gap:12px;align-items:flex-start;background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:12px 14px;min-width:0}
+  .iss .ib{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;flex:none;background:var(--warn-bg);color:var(--warn)}
+  .iss .ib.bad{background:var(--bad-bg);color:var(--bad)}
+  .iss .ib svg.i{width:18px;height:18px}
+  .iss .tx{min-width:0;display:flex;flex-direction:column;gap:3px}
+  .iss b{font-weight:650;font-size:14px}
+  .iss p{color:var(--ink-2);font-size:13px}
+  .iss p em{font-style:normal;font-weight:650;color:var(--ink)}
+  .iss details.tech{margin-top:4px}
+  .wrap.scroll{padding-bottom:28px}
+</style>
+</head>
+<body>
+<script src="kit.js"></script>
+<script>
+(function () {
+  var I = Kit.icon;
+
+  // ---- shared pieces ----
+  var STEPS = ['Disco', 'Permissão', 'Conferência', 'Cópia', 'Busca', 'Resultados', 'Recuperar'];
+  function header(now) {
+    var p = STEPS.map(function (s, i) {
+      return '<span class="' + (i < now ? 'done' : i === now ? 'now' : '') + '">' + s + '</span>';
+    }).join('');
+    return '<div class="hd">' + Kit.logo({ small: true }) + '<span class="name">Revenant</span><nav class="path" aria-label="Etapas">' + p + '</nav></div>';
+  }
+  function page(now, body, foot) {
+    return header(now) + '<div class="main"><div class="content">' + body + '</div></div>' + (foot ? '<div class="foot">' + foot + '</div>' : '');
+  }
+  function hint(noun) { return Kit.note('info', '<span class="hint"><b>Pare de usar o ' + noun + ' agora.</b> Não grave nada nele.</span>'); }
+
+  // ---- screen 1: disk list ----
+  var WHY_TEXT = 'Nesses discos, o sistema limpa sozinho o espaço dos arquivos apagados, em poucos minutos. Quanto antes você procurar, maior a chance de achar tudo. Não use o disco até lá.';
+  var DISKS = {
+    sd: { icon: 'sd', name: 'Cartão SD 64 GB', sub: 'SanDisk Extreme · parece um cartão de câmera', fs: 'exFAT' },
+    hd: { icon: 'hdd', name: 'HD externo 2 TB', sub: 'LaCie · ligado por USB', fs: 'exFAT' },
+    ssd: { icon: 'usb', name: 'SSD externo T7 1 TB', sub: 'Samsung · ligado por USB', fs: 'exFAT' }
+  };
+  function diskCard(key, sel) {
+    var d = DISKS[key];
+    return '<div class="card disk' + (sel === key ? ' sel' : '') + '" data-disk="' + key + '"' + (sel === key ? ' data-source-disk' : '') + '>'
+      + '<div class="top"><span class="tile">' + I(d.icon) + '</span><span class="tg">' + d.fs + '</span></div>'
+      + '<div><b data-t>' + d.name + '</b><small data-t>' + d.sub + '</small></div>'
+      + '<span class="pick">' + I('check') + 'Escolhido</span></div>';
+  }
+  // o: { sel: 'sd'|'hd'|'ssd'|null, open: bool, empty: bool }
+  function disks(o) {
+    var body;
+    if (o.empty) {
+      body = '<div class="empty"><span class="tile big">' + I('sd') + '</span>'
+        + '<h2 class="ttl">Conecte o cartão ou o disco</h2>'
+        + '<p class="lead">Encaixe o cartão no leitor ou ligue o disco na porta USB. Ele aparece aqui sozinho, sem precisar fazer mais nada.</p></div>' + '<div class="hint-wrap">' + hint(o.sel === 'hd' || o.sel === 'ssd' ? 'disco' : 'cartão') + '</div>';
+    } else {
+      body = '<div><h2 class="ttl">O que você quer recuperar?</h2><p class="lead" style="margin-top:4px">Escolha o cartão ou disco de onde as fotos e vídeos sumiram.</p></div>'
+        + '<div class="disks">' + diskCard('sd', o.sel) + diskCard('hd', o.sel) + diskCard('ssd', o.sel) + '</div>'
+        + '<div class="card off sys" data-code="system_disk"><span class="tile">' + I('hdd') + '</span><div><b data-t>Macintosh HD</b><small data-t>Disco do sistema: não dá para procurar nele</small></div><span class="tg">APFS</span></div>'
+        + '<div>' + Kit.note('mid', 'SSD e cartões CFexpress: os arquivos apagados costumam sumir em minutos. Procure o quanto antes. <a href="#" data-why>Saiba por quê</a>') + '</div>'
+        + '<div class="why" data-why-box' + (o.open ? '' : ' hidden') + '>' + I('info') + '<span>' + WHY_TEXT + '</span></div>'
+        + '<div class="hint-wrap">' + hint(o.sel === 'hd' || o.sel === 'ssd' ? 'disco' : 'cartão') + '</div>';
+    }
+    var foot = '<span class="t">Nada é alterado no cartão</span><span class="sp"></span>'
+      + '<button class="btn" data-go' + (o.sel ? '' : ' disabled') + '>Continuar' + I('chevron-right') + '</button>';
+    return page(0, '<div class="wrap fill">' + body + '</div>', foot);
+  }
+  function wireDisks(app, o) {
+    function redo() { app.innerHTML = disks(o); if (document.documentElement.hasAttribute('data-long')) Kit.lengthen(app); wireDisks(app, o); }
+    Array.prototype.forEach.call(app.querySelectorAll('[data-disk]'), function (c) {
+      c.addEventListener('click', function () { o.sel = c.dataset.disk; o.open = o.sel === 'ssd'; redo(); });
+    });
+    var why = app.querySelector('[data-why]'), box = app.querySelector('[data-why-box]');
+    if (why && box) why.addEventListener('click', function (e) { e.preventDefault(); o.open = box.hidden; box.hidden = !box.hidden; });
+  }
+  function diskState(key, label, o0) {
+    return {
+      key: key, label: label,
+      render: function () { return disks({ sel: o0.sel, open: o0.open, empty: o0.empty }); },
+      after: function (app) { wireDisks(app, { sel: o0.sel, open: o0.open, empty: o0.empty }); }
+    };
+  }
+
+  // ---- screen 2: resume modal over screen 1 ----
+  function resume(inner, wide) {
+    return disks({ sel: null, open: false }) + '<div class="modal"><div class="dlg" role="dialog"' + (wide ? ' style="width:min(580px,100%)"' : '') + '>' + inner + '</div></div>';
+  }
+  function closeModal(app) {
+    Array.prototype.forEach.call(app.querySelectorAll('.modal .acts button'), function (b) {
+      b.addEventListener('click', function () { var m = app.querySelector('.modal'); if (m) m.remove(); });
+    });
+  }
+
+  // ---- screen 3: permission ----
+  function permPage(os, title, lead, steps, foot, extra) {
+    var st = steps.map(function (s, i) { return '<div class="stp' + (i === 0 ? ' on' : '') + '"><em>' + (i + 1) + '</em><span>' + s + '</span></div>'; }).join('');
+    return page(1,
+      '<div class="perm"><div class="txt"><span class="tile">' + I('lock') + '</span>'
+      + '<h2 class="ttl">' + title + '</h2><p class="lead">' + lead + '</p>'
+      + Kit.note('info', 'O Revenant só lê. Ele nunca escreve no cartão.') + '</div>'
+      + '<div class="card steps"><h3>Como funciona</h3>' + st + '</div></div>' + (extra || ''), foot);
+  }
+  var MAC_TITLE = 'Só falta uma permissão do Mac';
+  var MAC_LEAD = 'Para ler o cartão por inteiro, e não só as pastas visíveis, o Mac precisa da senha de administrador. Você digita a senha na janela do sistema, não aqui.';
+  var MAC_STEPS = ['<b>Clique no botão</b> “Pedir a senha de administrador”.', 'Digite a senha que você usa para entrar no Mac.', 'Pronto. A conferência do cartão começa sozinha.'];
+  var MAC_FOOT = '<button class="btn ghost">Voltar</button><span class="t">Seus dados não saem do computador</span><span class="sp"></span><button class="btn" data-ask>' + I('lock') + 'Pedir a senha de administrador</button>';
+  var MAC_DLG = '<div class="modal"><div class="sysdlg" role="dialog"><span class="appic">' + Kit.logo({ small: true, onTile: true }) + '</span>'
+    + '<b>O Revenant quer fazer alterações.</b><p>Digite a senha para permitir.</p>'
+    + '<div class="fld"><span>Usuário</span><span>Sérgio Mafra</span></div>'
+    + '<div class="fld"><span>Senha</span><i>••••••••</i></div>'
+    + '<div class="acts"><button class="btn ghost sm">Cancelar</button><button class="btn sm">Permitir</button></div></div></div>';
+  var WIN_TITLE = 'O Windows vai pedir a sua confirmação';
+  var WIN_LEAD = 'Para ler o cartão por inteiro, o Windows precisa que você autorize o Revenant como administrador. É uma pergunta normal do sistema, com Sim e Não.';
+  var WIN_STEPS = ['<b>Clique em Continuar.</b>', 'O Windows pergunta se pode permitir. Clique em Sim.', 'Pronto. A conferência do cartão começa sozinha.'];
+  var WIN_FOOT = '<button class="btn ghost">Voltar</button><span class="t">Seus dados não saem do computador</span><span class="sp"></span><button class="btn" data-ask>Continuar' + I('chevron-right') + '</button>';
+  var UAC = '<div class="modal"><div class="uac" role="dialog"><div class="uh">' + I('shield') + 'Controle de Conta de Usuário</div>'
+    + '<div class="ub"><h3>Deseja permitir que este aplicativo faça alterações no seu dispositivo?</h3>'
+    + '<div class="ap"><span class="appic">' + Kit.logo({ small: true, onTile: true }) + '</span><div><b>Revenant</b><small>Origem do arquivo: disco rígido neste computador</small></div></div>'
+    + '<a class="ul" href="#">Mostrar mais detalhes</a></div>'
+    + '<div class="uf"><button class="btn">Sim</button><button class="btn ghost">Não</button></div></div></div>';
+  // Kit frames are per screen; screen 3 swaps the title bar per state (Windows frame only in the "win" state).
+  var CTL = '<span class="ctl"><span><svg viewBox="0 0 12 12"><path d="M1 6h10"/></svg></span><span><svg viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9"/></svg></span><span><svg viewBox="0 0 12 12"><path d="M1 1l10 10M11 1L1 11"/></svg></span></span>';
+  function setFrame(app, os) {
+    var win = app.parentNode, tb = win.querySelector('.tb');
+    win.classList.toggle('is-win', os === 'win');
+    tb.className = os === 'win' ? 'tb win-style' : 'tb';
+    tb.innerHTML = os === 'win' ? '<b>Revenant</b>' + CTL : '<i></i><i></i><i></i><b>Revenant</b>';
+  }
+  function askWire(dlg, os) {
+    return function (app) {
+      setFrame(app, os || 'mac');
+      var ask = app.querySelector('[data-ask]');
+      if (ask) ask.addEventListener('click', function () { if (!app.querySelector('.modal')) app.insertAdjacentHTML('beforeend', dlg); closeModal(app); });
+      closeModal(app);
+    };
+  }
+
+  // ---- screen 4: pre-check ----
+  function issue(kind, icon, title, todo, tech) {
+    return '<div class="iss"><span class="ib' + (kind === 'bad' ? ' bad' : '') + '">' + I(icon) + '</span><div class="tx">'
+      + '<b data-t>' + title + '</b><p data-t><em>O que fazer:</em> ' + todo + '</p>' + tech + '</div></div>';
+  }
+  var ISS = {
+    notResponding: function () { return issue('mid', 'clock', 'O cartão não respondeu a tempo', 'Tire e coloque o cartão de novo e confira o leitor.', Kit.tech('device_not_responding', 'O cartão demorou demais para responder.')); },
+    unreadable: function () { return issue('mid', 'alert', 'Uma parte do cartão não pôde ser lida', 'Faça uma cópia do cartão primeiro: ela lê com calma as partes difíceis.', Kit.tech('sample_unreadable', 'A leitura de teste falhou.')); },
+    onSource: function () { return issue('mid', 'folder', 'A pasta escolhida fica no próprio cartão', 'Escolha uma pasta em outro disco.', Kit.tech('destination_on_source', 'Gravar no cartão poderia apagar o que ainda dá para recuperar.')); }
+  };
+  function checkFoot() { return '<button class="btn ghost">Voltar</button><span class="sp"></span><button class="btn">' + I('refresh') + 'Conferir de novo</button>'; }
+  function issuesPage(title, lead, items, two) {
+    return page(2, '<div class="wrap scroll"><div><h2 class="ttl">' + title + '</h2><p class="lead" style="margin-top:4px">' + lead + '</p></div>'
+      + '<div class="issues' + (two ? ' two' : '') + '">' + items.join('') + '</div></div>', checkFoot());
+  }
+
+  Kit.init({
+    page: 'inicio',
+    screens: [
+      { id: 2, name: 'Retomar a busca', title: 'Revenant', states: [
+        { key: 'parou', label: 'Busca parada', after: closeModal, render: function () {
+          return resume('<span class="tile">' + I('pause') + '</span>'
+            + '<h3>A busca no Cartão SD 64 GB parou em 42%.</h3>'
+            + '<p class="lead" style="font-size:13.5px">O que já foi achado está guardado. Você pode continuar de onde parou ou começar tudo de novo.</p>'
+            + '<div class="progress" role="img" aria-label="42%" style="margin:4px 0 6px"><i style="width:42%"></i></div>'
+            + '<div class="acts"><button class="btn ghost">Começar de novo</button><button class="btn">Continuar</button></div>');
+        } },
+        { key: 'outro', label: 'Outro cartão', after: closeModal, render: function () {
+          return resume('<span class="tile mid">' + I('alert') + '</span>'
+            + '<h3>Este não é o cartão da busca que parou.</h3>'
+            + '<p class="lead" style="font-size:13.5px">A busca guardada é do Cartão SD 64 GB, e o cartão conectado agora é outro. Para continuar aquela busca, conecte o cartão original. Ou procure neste cartão do começo.</p>'
+            + Kit.tech('session_other_source', 'A busca guardada pertence a outro cartão.')
+            + '<div class="acts"><button class="btn ghost">Cancelar</button><button class="btn">Procurar neste cartão do começo</button></div>', true);
+        } },
+        { key: 'ilegivel', label: 'Registro ilegível', after: closeModal, render: function () {
+          return resume('<span class="tile mid">' + I('alert') + '</span>'
+            + '<h3>Não deu para ler a busca guardada.</h3>'
+            + '<p class="lead" style="font-size:13.5px">Ela não pode ser continuada, mas nada foi alterado no cartão. Comece de novo para procurar outra vez.</p>'
+            + Kit.tech('session_corrupt', 'O registro da busca salva está danificado.')
+            + '<div class="acts"><button class="btn">Começar de novo</button></div>');
+        } }
+      ] },
+      { id: 1, name: 'Escolher o disco', title: 'Revenant', states: [
+        diskState('lista', 'Lista de discos', { sel: 'sd', open: false }),
+        diskState('vazio', 'Nenhum disco', { sel: null, open: false, empty: true }),
+        diskState('ssd', 'SSD escolhido', { sel: 'ssd', open: true })
+      ] },
+      { id: 3, name: 'Permissão', title: 'Revenant', states: [
+        { key: 'mac', label: 'Mac', after: askWire(MAC_DLG), render: function () { return permPage('mac', MAC_TITLE, MAC_LEAD, MAC_STEPS, MAC_FOOT); } },
+        { key: 'mac-pedido', label: 'Mac: senha pedida', after: askWire(MAC_DLG), render: function () { return permPage('mac', MAC_TITLE, MAC_LEAD, MAC_STEPS, MAC_FOOT, MAC_DLG); } },
+        { key: 'win', label: 'Windows', after: askWire(UAC, 'win'), render: function () { return permPage('win', WIN_TITLE, WIN_LEAD, WIN_STEPS, WIN_FOOT); } },
+        { key: 'win-pedido', label: 'Windows: pedido do UAC', after: askWire(UAC, 'win'), render: function () { return permPage('win', WIN_TITLE, WIN_LEAD, WIN_STEPS, WIN_FOOT, UAC); } },
+        { key: 'recusada', label: 'Recusada', after: function (app) { setFrame(app, 'mac'); }, render: function () {
+          return page(1, '<div class="wrap narrow center"><span class="tile mid big">' + I('lock') + '</span>'
+            + '<h2 class="ttl">Sem a permissão não dá para ler o cartão</h2>'
+            + '<p class="lead">O pedido de autorização foi cancelado ou não foi aceito. Nada foi alterado no cartão. Clique em Tentar de novo e confirme como administrador.</p>'
+            + Kit.tech('permission_denied', 'A permissão de administrador foi recusada.') + '</div>',
+            '<button class="btn ghost">Voltar</button><span class="sp"></span><button class="btn">' + I('refresh') + 'Tentar de novo</button>');
+        } }
+      ] },
+      { id: 4, name: 'Conferência prévia', title: 'Revenant', states: [
+        { key: 'conferindo', label: 'Conferindo', render: function () {
+          return page(2, '<div class="wrap center"><span class="tile">' + I('search') + '</span>'
+            + '<h2 class="ttl">Conferindo o cartão…</h2><p class="lead">Só um instante. Estamos vendo se dá para ler o cartão e se há espaço para salvar.</p>'
+            + '<div class="progress ind spin" role="progressbar" aria-label="Conferindo"><i></i></div></div>');
+        } },
+        { key: 'ok', label: 'Tudo certo', render: function () {
+          return page(2, '<div class="wrap center"><span class="tile ok big">' + I('check') + '</span>'
+            + '<h2 class="ttl">Tudo certo</h2><p class="lead">O cartão responde e dá para lê-lo. Já vamos para o próximo passo.</p>'
+            + '</div>');
+        } },
+        { key: 'problemas', label: 'Com problemas', render: function () {
+          return issuesPage('Antes de procurar, vamos resolver duas coisas', 'Nada foi alterado no cartão. Resolva e confira de novo.', [ISS.notResponding(), ISS.unreadable()]);
+        } },
+        { key: 'todos', label: 'Todos os avisos', render: function () {
+          return issuesPage('Todos os avisos da conferência', 'Esta lista é só para revisar os textos: o app mostra apenas os avisos que valem para o seu caso.', [
+            issue('bad', 'unplug', 'Não achamos o cartão', 'Conecte o cartão de novo e escolha-o na lista.', Kit.tech('device_not_found', 'O cartão escolhido não está mais conectado.')),
+            ISS.notResponding(),
+            ISS.unreadable(),
+            issue('mid', 'lock', 'O cartão não abriu para leitura', 'Feche os programas que usam o cartão e confira de novo.', Kit.tech('open_failed', 'O sistema recusou abrir o cartão.')),
+            issue('mid', 'power', 'O sistema não soltou o cartão', 'Feche as janelas e os programas que usam o cartão e confira de novo.', Kit.tech('unmount_failed', 'Não foi possível liberar o cartão do sistema.')),
+            '<h3 class="sub">Quando já há uma pasta escolhida (ao retomar uma cópia ou uma recuperação)</h3>',
+            issue('mid', 'hdd', 'A pasta escolhida não tem espaço', 'Escolha uma pasta em um disco com mais espaço livre.', Kit.tech('destination_too_small', 'O espaço livre é menor que o necessário.')),
+            ISS.onSource(),
+            issue('mid', 'folder', 'Não deu para conferir a pasta escolhida', 'Escolha a pasta de novo.', Kit.tech('destination_unknown', 'Não foi possível medir o espaço da pasta.')),
+            issue('mid', 'copy', 'O disco da pasta não aceita arquivos tão grandes', 'Escolha outro disco, que aceite arquivos grandes.', Kit.tech('destination_file_too_large', 'Há arquivos maiores que o limite desse disco.'))
+          ], true);
+        } }
+      ] }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

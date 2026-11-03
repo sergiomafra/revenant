@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="64" viewBox="0 0 240 64">
+  <svg x="4" y="4" width="56" height="56" viewBox="0 0 100 100" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" style="color:#7fb7a4;--d:#e2b45e">
+    <path d="M17.1 31 A38 38 0 1 0 48 12.05" stroke-width="6"/>
+    <polyline points="56 4 48 12 56 20" stroke-width="6" style="stroke:var(--d, #b9822a)"/>
+    <g transform="translate(50 51) scale(.58) translate(-52 -51)" stroke-width="12">
+      <path d="M32 42 V18 H52 A16 16 0 0 1 52 50 H44"/>
+      <path d="M32 62 V82"/>
+      <path d="M58 62 L72 84" style="stroke:var(--d, #b9822a)"/>
+    </g>
+  </svg>
+  <text x="72" y="43" font-family="-apple-system, 'SF Pro Display', 'Segoe UI', system-ui, sans-serif" font-size="36" font-weight="650" letter-spacing="-0.025em" fill="#f1eee6">Revenant</text>
+</svg>

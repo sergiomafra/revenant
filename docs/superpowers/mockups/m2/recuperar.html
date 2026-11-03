@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revenant · onde salvar e recuperar</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="kit.css">
+<style>
+  /* Page-local styles for screens 9 and 10. Colors only through tokens. */
+  .hd{flex:none;display:flex;align-items:center;gap:12px;padding:12px 24px;border-bottom:1px solid var(--line-soft);background:var(--surface)}
+  .hd .logo{width:26px;height:26px}
+  .hd .name{font-weight:650;letter-spacing:-.01em}
+  .path{display:flex;align-items:center;gap:6px;margin-left:auto;font-size:12px;color:var(--ink-3);font-weight:560}
+  .path span{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .path span::after{content:"";width:14px;height:1px;background:var(--line)}
+  .path span:last-child::after{display:none}
+  .path .done{color:var(--ink-2)}
+  .path .now{color:var(--accent);font-weight:700}
+  .wrap{width:100%;max-width:1000px;margin:0 auto;padding:26px 32px 20px;display:flex;flex-direction:column;gap:14px}
+  .wrap.center{align-items:center;text-align:center;justify-content:center;min-height:100%}
+  .ttl{font-size:26px;font-weight:650;letter-spacing:-.02em;line-height:1.2}
+  .lead{color:var(--ink-2);font-size:14px;max-width:620px}
+  .tile{width:56px;height:56px;border-radius:15px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;flex:none}
+  .tile svg.i{width:28px;height:28px;stroke-width:1.6}
+  .tile.mid{background:var(--warn-bg);color:var(--warn)}
+  .tile.ok{background:var(--ok-bg);color:var(--ok);border-radius:50%}
+  .tile.big{width:88px;height:88px;border-radius:24px}
+  .tile.big svg.i{width:44px;height:44px;stroke-width:1.5}
+  .progress.ind>i{width:34%;animation:slide 1.4s ease-in-out infinite}
+  @keyframes slide{0%{margin-left:-34%}100%{margin-left:100%}}
+  @media (prefers-reduced-motion:reduce){.progress.ind>i{animation:none;margin-left:33%}}
+
+  /* screen 9 */
+  .wrap.tight{padding-top:20px;gap:12px}
+  .thead{display:flex;justify-content:space-between;align-items:flex-end;gap:16px}
+  .pick{display:inline-flex;align-items:center;gap:8px;flex:none;padding:5px 12px;border-radius:99px;background:var(--accent-soft);color:var(--accent);font-size:12.5px;font-weight:650}
+  .dests{display:flex;flex-direction:column;gap:7px}
+  .dest{display:flex;align-items:center;gap:14px;padding:8px 16px;cursor:pointer;min-width:0}
+  .dest.card.sel{padding:7px 15px}
+  .dest .tile{width:38px;height:38px;border-radius:10px}
+  .dest .tile svg.i{width:19px;height:19px}
+  .dest b{display:block;font-weight:650;font-size:14px}
+  .dest small{display:block;color:var(--ink-2);font-size:12.5px}
+  .dest .free{margin-left:auto;text-align:right;white-space:nowrap}
+  .dest .free b{font-size:13.5px}
+  .dest .free small{display:flex;gap:5px;align-items:center;justify-content:flex-end}
+  .dest.low .free b,.dest.low .free small{color:var(--warn)}
+  .dest .rd{width:20px;height:20px;border-radius:50%;border:1.5px solid var(--ink-3);display:grid;place-items:center;flex:none;color:var(--accent-ink)}
+  .dest.sel .rd{border-color:var(--accent);background:var(--accent)}
+  .dest .rd svg{width:11px;height:11px;stroke-width:3;opacity:0}
+  .dest.sel .rd svg{opacity:1}
+  .other{display:flex;align-items:center;gap:14px;padding:8px 16px;border:1.5px dashed var(--line);border-radius:11px;color:var(--ink);font-weight:600;cursor:pointer;text-align:left;width:100%}
+  .other .tile{width:38px;height:38px;border-radius:10px;background:var(--surface-2);color:var(--ink-2)}
+  .other .tile svg.i{width:19px;height:19px}
+  .other small{display:block;color:var(--ink-2);font-size:12.5px;font-weight:400}
+  .srcoff{display:flex;align-items:center;gap:14px;padding:8px 16px}
+  .srcoff .tile{width:38px;height:38px;border-radius:10px;background:var(--line-soft);color:var(--ink-3)}
+  .srcoff .tile svg.i{width:19px;height:19px}
+  .srcoff b{font-weight:620;color:var(--ink-2);display:block}
+  .srcoff small{display:flex;gap:6px;align-items:center;color:var(--ink-2);font-size:12.5px}
+  .srcoff details.tech{margin-top:3px}
+  .srcoff.hit{border-color:var(--bad)}
+  .srcoff.hit .tile{background:var(--bad-bg);color:var(--bad)}
+  .alert{font-size:13.5px;padding:10px 14px;border-radius:10px}
+  .alert b{font-weight:650}
+  .lbl2{font-size:12px;font-weight:650;color:var(--ink-2);letter-spacing:.02em;text-transform:uppercase;margin-top:2px}
+
+  /* screen 10 */
+  .big-bar{width:100%;max-width:560px}
+  .big-bar .progress{height:10px}
+  .stats{display:flex;gap:24px;justify-content:center;flex-wrap:wrap;color:var(--ink-2);font-size:13.5px}
+  .stats b{color:var(--ink);font-weight:650}
+  .stats span{display:inline-flex;align-items:center;gap:6px}
+  .where{display:inline-flex;align-items:center;gap:8px;color:var(--ink-2);font-size:13px}
+  .sumcard{width:100%;max-width:600px;text-align:left;padding:4px 16px}
+  .sumcard .r{display:flex;align-items:center;gap:14px;padding:11px 0;border-bottom:1px solid var(--line-soft)}
+  .sumcard .r:last-child{border-bottom:0}
+  .sumcard .r .bd{flex:none;font-size:12px;padding:2px 10px 2px 7px;width:104px;justify-content:flex-start}
+  .sumcard .r .bd svg{width:12px;height:12px}
+  .sumcard .n{font-size:20px;font-weight:700;min-width:64px;text-align:right;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+  .sumcard .d{color:var(--ink-2);font-size:12.5px;min-width:0}
+  .done-actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
+  .partial{width:100%;max-width:600px;text-align:left}
+  .dlg.stop{width:min(500px,100%);align-items:flex-start}
+  .dlg.stop .progress{width:100%}
+  .dlg.stop .wt{display:flex;gap:8px;align-items:center;color:var(--ink-2);font-size:12.5px}
+  .dlg.stop .saved{display:flex;gap:8px;align-items:center;color:var(--ok);font-size:13px;font-weight:600}
+  .dlg.stop .lead{font-size:13.5px}
+</style>
+</head>
+<body>
+<script src="kit.js"></script>
+<script>
+(function () {
+  var I = Kit.icon, nf = Kit.nf;
+
+  // ---- shared pieces ----
+  // This page adds a last step, "Recuperar", after "Resultados" (the earlier pages stop at Resultados; the story is the same 1.321 files).
+  var STEPS = ['Disco', 'Permissão', 'Conferência', 'Cópia', 'Busca', 'Resultados', 'Recuperar'];
+  function header(now) {
+    var p = STEPS.map(function (s, i) {
+      return '<span class="' + (i < now ? 'done' : i === now ? 'now' : '') + '">' + s + '</span>';
+    }).join('');
+    return '<div class="hd">' + Kit.logo({ small: true }) + '<span class="name">Revenant</span><nav class="path" aria-label="Etapas">' + p + '</nav></div>';
+  }
+  function page(now, body, foot) {
+    return header(now) + '<div class="main"><div class="content">' + body + '</div></div>' + (foot ? '<div class="foot">' + foot + '</div>' : '');
+  }
+  function isLong() { return document.documentElement.hasAttribute('data-long'); }
+  function modal(inner, cls) {
+    return '<div class="modal"><div class="dlg' + (cls ? ' ' + cls : '') + '" role="dialog">' + inner + '</div></div>';
+  }
+  function closeModal(app) {
+    Array.prototype.forEach.call(app.querySelectorAll('.modal .acts button'), function (b) {
+      b.addEventListener('click', function () { var m = app.querySelector('.modal'); if (m) m.remove(); });
+    });
+  }
+  var SAFE_FOOT = '<span class="t">Nada é alterado no cartão</span>';
+
+  // ---- screen 9: where to save ----
+  var NEED_GB = 19.4;
+  var DESTS = [
+    { key: 'lacie', icon: 'hdd', name: 'HD externo · LaCie', sub: '2 TB · ligado por USB', free: '1,4 TB livres', ok: true },
+    { key: 't7', icon: 'usb', name: 'SSD externo T7', sub: '1 TB · ligado por USB', free: '812 GB livres', ok: true },
+    { key: 'mac', icon: 'folder', name: 'Pasta Documentos neste Mac', sub: 'Macintosh HD', free: '210 GB livres', ok: true },
+    { key: 'pen', icon: 'usb', name: 'Pen drive KINGSTON', sub: '16 GB · ligado por USB', free: '14,2 GB livres', ok: false }
+  ];
+  function destKey(k) { return DESTS.filter(function (d) { return d.key === k; })[0]; }
+  // o: { sel: key|null, refuse: bool }
+  function where(o) {
+    var d = o.sel ? destKey(o.sel) : null;
+    var low = d && !d.ok;
+    var rows = DESTS.map(function (x) {
+      return '<div class="card dest' + (o.sel === x.key ? ' sel' : '') + (x.ok ? '' : ' low') + '" data-destination-option data-dest="' + x.key + '" role="radio" aria-checked="' + (o.sel === x.key) + '">'
+        + '<span class="rd">' + I('check') + '</span><span class="tile">' + I(x.icon) + '</span>'
+        + '<div><b data-t>' + x.name + '</b><small data-t>' + x.sub + '</small></div>'
+        + '<div class="free"><b data-t>' + x.free + '</b>' + (x.ok ? '' : '<small>' + I('alert') + '<span data-t>Não cabe</span></small>') + '</div></div>';
+    }).join('');
+    var other = '<button class="other" data-other><span class="tile">' + I('folder') + '</span><span><span data-t>Escolher outra pasta…</span><small data-t>Qualquer pasta de um disco que não seja o cartão</small></span></button>';
+    var alert = '';
+    if (o.refuse) {
+      alert = Kit.note('bad', '<b>Não dá para salvar no próprio cartão:</b> gravar nele pode apagar fotos que ainda não voltaram. Escolha outro disco.')
+        .replace('class="note bad"', 'class="note bad alert" data-code="destination_on_source" role="alert"');
+    } else if (low) {
+      alert = Kit.note('mid', '<b>Faltam 5,2 GB nesse disco.</b> Escolha outro ou recupere menos arquivos.')
+        .replace('class="note mid"', 'class="note mid alert" data-code="destination_too_small" role="alert"');
+    }
+    var src = '<div class="card off srcoff' + (o.refuse ? ' hit' : '') + '" data-source-disk><span class="tile">' + I('sd') + '</span><div><b data-t>Cartão SD 64 GB</b>'
+      + '<small>' + I('x') + '<span data-t>Os arquivos não podem ser salvos no próprio cartão</span></small>'
+      + Kit.tech('destination_on_source', 'Gravar no cartão poderia apagar o que ainda dá para recuperar.') + '</div></div>';
+    var body = '<div class="wrap tight"><div class="thead"><div><h2 class="ttl">Onde salvar os arquivos?</h2><p class="lead" style="margin-top:4px">Escolha um disco com espaço livre. Os arquivos vão para uma pasta nova, a Revenant.</p></div>'
+      + '<span class="pick">' + I('image') + '<span data-t>1.321 arquivos escolhidos · 19,4 GB</span></span></div>'
+      + alert
+      + '<div class="dests" role="radiogroup">' + rows + other + '</div>'
+      + src + '</div>';
+    var ready = d && d.ok;
+    var foot = '<button class="btn ghost">Voltar aos resultados</button>' + SAFE_FOOT + '<span class="sp"></span>'
+      + (ready ? '<span class="t" data-t>Salvando em: ' + d.name + '</span>' : '')
+      + '<button class="btn" data-go' + (ready ? '' : ' disabled') + '>' + I('dl') + 'Recuperar 1.321 arquivos</button>';
+    return page(6, body, foot);
+  }
+  function wireWhere(app, o) {
+    Array.prototype.forEach.call(app.querySelectorAll('[data-dest]'), function (c) {
+      c.addEventListener('click', function () {
+        o.sel = c.dataset.dest; o.refuse = false;
+        app.innerHTML = where(o);
+        if (isLong()) Kit.lengthen(app);
+        wireWhere(app, o);
+      });
+    });
+  }
+  function whereState(key, label, o0) {
+    return {
+      key: key, label: label,
+      render: function () { return where({ sel: o0.sel, refuse: o0.refuse }); },
+      after: function (app) { wireWhere(app, { sel: o0.sel, refuse: o0.refuse }); }
+    };
+  }
+
+  // ---- screen 10: recovering and summary ----
+  var TOTAL = 1321, DONE = 812;
+  function recovering() {
+    var pct = Math.round(DONE / TOTAL * 100);
+    var body = '<div class="wrap center"><span class="tile">' + I('dl') + '</span>'
+      + '<h2 class="ttl">Recuperando os arquivos…</h2>'
+      + '<span class="where">' + I('folder') + '<span data-t>Salvando em HD externo · LaCie / Revenant</span></span>'
+      + '<div class="big-bar"><div class="progress" role="progressbar" aria-valuenow="' + pct + '" aria-valuemin="0" aria-valuemax="100" aria-label="Recuperação"><i style="width:' + pct + '%"></i></div></div>'
+      + '<div class="stats"><span><b>' + nf(DONE) + '</b> de <b>' + nf(TOTAL) + '</b></span><span>' + I('clock') + 'Faltam cerca de <b>6 min</b></span><span>' + I('dl') + '<b>94 MB/s</b></span></div>'
+      + '<div style="max-width:560px;text-align:left">' + Kit.note('info', 'Pode usar o computador à vontade. Se pausar ou fechar, o que já foi salvo continua na pasta.') + '</div></div>';
+    return page(6, body, '<button class="btn ghost">' + I('pause') + 'Pausar</button>' + SAFE_FOOT);
+  }
+  function done() {
+    function row(state, n, text) {
+      return '<div class="r">' + Kit.badge(state) + '<span class="n">' + nf(n) + '</span><span class="d" data-t>' + text + '</span></div>';
+    }
+    var body = '<div class="wrap center"><span class="tile ok big">' + I('check') + '</span>'
+      + '<div><h2 class="ttl">1.321 arquivos recuperados</h2><p class="lead" style="margin:6px auto 0">19,4 GB salvos em <b data-t>HD externo · LaCie / Revenant</b>, em 14 min.</p></div>'
+      + '<div class="card sumcard">'
+      + row('ok', 1250, 'Abrem normalmente.')
+      + row('mid', 51, 'Abrem, mas falta um pedaço.')
+      + row('bad', 20, 'Podem não abrir. Guardamos o que deu.')
+      + '</div>'
+      + '<div class="partial">' + Kit.note('mid', '<b>O que significa Parcial:</b> o arquivo abre, mas uma parte dele não pôde ser lida. Uma foto pode aparecer cortada ou com uma faixa cinza; um vídeo pode parar antes do fim. Vale conferir esses 51 primeiro.') + '</div>'
+      + '<div class="done-actions"><button class="btn ghost">Voltar aos resultados</button></div></div>';
+    return page(6, body, '<span class="t">Nada foi alterado no cartão</span><span class="sp"></span><button class="btn">' + I('folder') + 'Abrir pasta</button>');
+  }
+  function writeFailed() {
+    var inner = '<span class="tile mid">' + I('alert') + '</span><h3>Não deu para salvar neste disco</h3>'
+      + '<p class="lead">O HD externo · LaCie foi desconectado. Nada foi perdido: escolha outro disco para continuar de onde parou.</p>'
+      + '<div class="saved">' + I('circle-check') + '<span data-t>812 de 1.321 arquivos já estão salvos</span></div>'
+      + Kit.tech('write_failed', 'O Revenant não conseguiu gravar no disco de destino. Os arquivos já gravados não são apagados.')
+      + '<div class="acts" style="align-self:flex-end"><button class="btn ghost">Parar e abrir a pasta</button><button class="btn">Escolher outro disco</button></div>';
+    return recovering() + modal(inner, 'stop');
+  }
+  function cardGone() {
+    var inner = '<span class="tile mid">' + I('unplug') + '</span><h3>O cartão foi desconectado</h3>'
+      + '<p class="lead">Nada se perdeu: conecte de novo para continuar. Os 812 arquivos já salvos ficam na pasta e a recuperação continua dos 509 que faltam.</p>'
+      + '<div class="progress ind" role="progressbar" aria-label="Esperando o cartão"><i></i></div>'
+      + '<div class="wt">' + I('clock') + '<span data-t>Esperando o cartão voltar…</span></div>'
+      + Kit.tech('device_gone', 'O cartão deixou de responder. O Revenant espera e continua sozinho quando ele voltar.')
+      + '<div class="acts" style="align-self:flex-end"><button class="btn ghost">Parar e abrir a pasta</button></div>';
+    return recovering() + modal(inner, 'stop');
+  }
+
+  Kit.init({
+    page: 'recuperar',
+    screens: [
+      { id: 9, name: 'Onde salvar', title: 'Revenant', states: [
+        whereState('escolha', 'Escolha', { sel: 'lacie', refuse: false }),
+        whereState('no-cartao', 'No próprio cartão', { sel: null, refuse: true }),
+        whereState('pouco-espaco', 'Pouco espaço', { sel: 'pen', refuse: false })
+      ] },
+      { id: 10, name: 'Recuperando e resumo', title: 'Revenant', states: [
+        { key: 'recuperando', label: 'Recuperando', render: recovering },
+        { key: 'fim', label: 'Fim', render: done },
+        { key: 'erro-gravar', label: 'Erro ao gravar', render: writeFailed, after: closeModal },
+        { key: 'cartao-saiu', label: 'O cartão saiu', render: cardGone, after: closeModal }
+      ] }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revenant · resultados</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="kit.css">
+<style>
+  /* Page-local styles for screen 8 (results). Colors only through tokens. */
+  .app{container-type:inline-size}
+  .res{flex:1;min-height:0;display:flex;flex-direction:column}
+  .hd{flex:none;display:flex;align-items:center;gap:12px;padding:12px 24px;border-bottom:1px solid var(--line-soft);background:var(--surface)}
+  .hd .logo{width:26px;height:26px}
+  .hd .name{font-weight:650;letter-spacing:-.01em}
+  .path{display:flex;align-items:center;gap:6px;margin-left:auto;font-size:12px;color:var(--ink-2);font-weight:560}
+  .path span{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .path span::after{content:"";width:14px;height:1px;background:var(--line)}
+  .path span:last-child::after{display:none}
+  .path .done{color:var(--ink-2)}
+  .path .now{color:var(--accent);font-weight:700}
+
+  .bar .lbl{color:var(--ink-2)}
+  .grp{display:flex;align-items:center;gap:8px;position:relative}
+  .hint{flex:none;display:none;align-items:center;gap:8px;padding:6px 16px;font-size:12px;color:var(--ink-2);background:var(--surface-2);border-bottom:1px solid var(--line-soft)}
+  .hint.show{display:flex}
+  .content.is-det{display:flex;flex-direction:column;overflow:hidden}
+
+  /* group header */
+  .gh{display:flex;align-items:center;gap:10px;padding:16px 16px 8px}
+  .gh input{width:17px;height:17px;accent-color:var(--accent);cursor:pointer;flex:none}
+  .gh h4{font-size:15px;font-weight:650;letter-spacing:-.01em;display:flex;gap:8px;align-items:center;min-width:0}
+  .gh small{color:var(--ink-2);font-size:12.5px;font-weight:500}
+  .gh .cnt{margin-left:auto;font-size:12.5px;color:var(--ink-2);white-space:nowrap}
+  .gh .cnt b{color:var(--accent);font-weight:650}
+  .grid{display:grid;gap:8px;padding:0 16px}
+  .g6{grid-template-columns:repeat(6,minmax(0,1fr))}
+  .g5{grid-template-columns:repeat(5,minmax(0,1fr))}
+  .more{border:1.5px dashed var(--line);border-radius:7px;display:grid;place-items:center;text-align:center;color:var(--ink-2);font-size:12px;aspect-ratio:3/2;padding:6px}
+  .more b{display:block;color:var(--accent);font-size:15px}
+
+  /* timeline */
+  .hist{padding:14px 16px 10px;background:var(--surface);border-bottom:1px solid var(--line-soft)}
+  .hist p{font-size:12px;color:var(--ink-2);margin-bottom:8px;display:flex;justify-content:space-between;gap:12px}
+  .bars{display:flex;align-items:flex-end;gap:8px;height:120px}
+  .bc{flex:1;height:100%;display:flex;flex-direction:column;justify-content:flex-end;border-radius:6px;position:relative}
+  .bc .bx{border-radius:5px 5px 0 0;background:var(--line);min-height:3px;position:relative;overflow:hidden}
+  .bc .bx i{position:absolute;left:0;right:0;bottom:0;background:var(--accent);display:block}
+  .bc.has{cursor:pointer}
+  .bc.has .bx{background:var(--accent-soft)}
+  .bc.has:hover .bx{filter:brightness(.97)}
+  .bc.on{outline:2px solid var(--accent);outline-offset:2px}
+  .bc em{position:absolute;top:-17px;left:0;right:0;text-align:center;font-style:normal;font-size:10.5px;color:var(--ink-2);font-weight:600}
+  .days{display:flex;gap:8px;margin-top:6px}
+  .days span{flex:1;text-align:center;font-size:11px;color:var(--ink-2)}
+  .days span.on{color:var(--accent);font-weight:700}
+  .legend{display:flex;gap:14px;font-size:11.5px;color:var(--ink-2);margin-top:8px}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+
+  /* details */
+  .det{flex:1;min-height:0;display:grid;grid-template-columns:230px minmax(0,1fr) 300px;grid-template-rows:minmax(0,1fr)}
+  .side{background:var(--surface-2);border-right:1px solid var(--line);padding:12px 10px;overflow:auto}
+  .side h6{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-2);margin:4px 6px 8px;font-weight:650}
+  .sg{display:flex;align-items:flex-start;gap:8px;padding:7px 8px;border-radius:7px;color:var(--ink-2);cursor:pointer;width:100%;text-align:left}
+  .sg input{width:15px;height:15px;accent-color:var(--accent);margin-top:2px;cursor:pointer;flex:none}
+  .sg div{min-width:0;flex:1}
+  .sg b{display:block;font-weight:600;color:var(--ink);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sg small{display:block;color:var(--ink-2);font-size:11px}
+  .sg small u{text-decoration:none;color:var(--accent);font-weight:650}
+  .sg.on{background:var(--accent-soft)}
+  .listw{display:flex;flex-direction:column;min-height:0;min-width:0;background:var(--surface)}
+  .listw .gh{padding:12px 14px 8px;border-bottom:1px solid var(--line-soft)}
+  .rows{overflow:auto;flex:1}
+  .row{display:grid;grid-template-columns:20px 46px minmax(0,1fr) 54px 108px 74px 92px;gap:10px;align-items:center;padding:6px 14px;border-bottom:1px solid var(--line-soft);cursor:pointer}
+  .row.head{position:sticky;top:0;background:var(--surface);z-index:2;font-size:11px;color:var(--ink-2);text-transform:uppercase;letter-spacing:.05em;cursor:default;padding:6px 14px;border-bottom:1px solid var(--line-soft)}
+  .row input{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
+  .row .th{aspect-ratio:1;border-radius:4px}
+  .row b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row small{color:var(--ink-2);font-size:11px;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .row.on{background:var(--accent-soft)}
+  .row .r{color:var(--ink-2);font-size:12px;white-space:nowrap}
+  .row .bd{justify-self:start}
+  .more-rows{padding:12px 14px;color:var(--ink-2);font-size:12px}
+  .prev{border-left:1px solid var(--line);padding:14px;background:var(--surface);overflow:auto;min-width:0}
+  .prev .th{aspect-ratio:4/3;margin-bottom:12px;cursor:default}
+  .prev h5{font-size:15px;font-weight:650;margin-bottom:6px;word-break:break-all}
+  .prev .m{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap;align-items:center}
+  .exif{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12px;margin-bottom:12px}
+  .exif span{color:var(--ink-2)}
+  .prev .note{margin-bottom:12px}
+  .prev .exif{margin-top:2px}
+  .prev .btn{width:100%}
+  .prev .btn.act{position:sticky;bottom:0;box-shadow:0 0 0 8px var(--surface)}
+  .mk{display:inline-flex;align-items:center;gap:5px;border-radius:99px;padding:2px 9px 2px 6px;font-size:11px;font-weight:650;background:var(--info-bg);color:var(--info)}
+  .mk svg{width:12px;height:12px}
+  .prev .mk{margin-bottom:10px}
+
+  /* narrow window: drop two columns and slim the side panels so the name keeps room */
+  @container (max-width:1180px){
+    .det{grid-template-columns:184px minmax(0,1fr) 270px}
+    .row{grid-template-columns:20px 40px minmax(0,1fr) 96px 66px}
+    .row .c-tipo,.row .c-data{display:none}
+    .sg b{font-size:12px}
+    .prev{padding:12px}
+    .prev .th{aspect-ratio:16/9;margin-bottom:10px}
+    .hist{padding-top:12px}
+    .bars{height:96px}
+  }
+
+  /* empty result */
+  .wrap{width:100%;max-width:760px;margin:0 auto;padding:30px 32px 24px;display:flex;flex-direction:column;gap:16px}
+  .wrap.center{align-items:center;text-align:center;justify-content:center;min-height:100%}
+  .ttl{font-size:26px;font-weight:650;letter-spacing:-.02em;line-height:1.2}
+  .lead{color:var(--ink-2);font-size:14px;max-width:560px}
+  .tile{width:56px;height:56px;border-radius:15px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;flex:none}
+  .tile svg.i{width:28px;height:28px;stroke-width:1.6}
+  .todo{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;width:100%;text-align:left}
+  .todo .card{display:flex;flex-direction:column;gap:12px;padding:18px}
+  .todo .tile{width:40px;height:40px;border-radius:10px}
+  .todo .tile svg.i{width:20px;height:20px}
+  .todo b{display:block;font-size:15px;font-weight:650;letter-spacing:-.01em}
+  .todo p{color:var(--ink-2);font-size:13px;margin-top:4px}
+  .todo .btn{margin-top:auto;align-self:flex-start}
+</style>
+</head>
+<body>
+<script src="kit.js"></script>
+<script>
+(function () {
+  var I = Kit.icon, nf = Kit.nf, sz = Kit.sz;
+
+  var STEPS = ['Disco', 'Permissão', 'Conferência', 'Cópia', 'Busca', 'Resultados', 'Recuperar'];
+  function header(now) {
+    var p = STEPS.map(function (s, i) {
+      return '<span class="' + (i < now ? 'done' : i === now ? 'now' : '') + '">' + s + '</span>';
+    }).join('');
+    return '<div class="hd">' + Kit.logo({ small: true }) + '<span class="name">Revenant</span><nav class="path" aria-label="Etapas">' + p + '</nav></div>';
+  }
+  function isLong() { return document.documentElement.hasAttribute('data-long'); }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function hm(m) { return pad(Math.floor(m / 60)) + ':' + pad(m % 60); }
+
+  var DAYS = { 14: 'Sábado, 14 dez', 15: 'Domingo, 15 dez', 16: 'Segunda, 16 dez' };
+  var FOLD = { f100: 'DCIM/100MSDCF', f101: 'DCIM/101MSDCF', clip: 'PRIVATE/M4ROOT/CLIP' };
+  var BAD_NAME = '2025-12-14_07-12-05_A7IV.ARW';
+  var NOTE_TXT = {
+    ok: 'Íntegro: a prévia é em resolução total e é exatamente o que você recebe.',
+    mid: 'Parcial: parte do arquivo foi sobrescrita. Deve abrir, mas pode ter faixas ou áreas cinzas.',
+    bad: 'Danificado: o arquivo provavelmente não abre. Vale tentar a recuperação mesmo assim.'
+  };
+  var TOTAL_LINE = 'Cartão SD 64 GB · 1.284 fotos e 37 vídeos';
+
+  // o: { view: 'gal'|'tl'|'det', fmt: bool, nameless: bool }
+  function makeApp(o) {
+    // ---------- data (same as the approved mockup) ----------
+    var SESS = [
+      { key: 's0', d: 14, title: 'Sábado, 14 dez', a: 7 * 60 + 12, b: 9 * 60 + 40, n: 412 },
+      { key: 's1', d: 14, title: 'Sábado, 14 dez', a: 16 * 60 + 5, b: 17 * 60 + 22, n: 96 },
+      { key: 's2', d: 15, title: 'Domingo, 15 dez', a: 6 * 60 + 48, b: 10 * 60 + 15, n: 538 },
+      { key: 's3', d: 16, title: 'Segunda, 16 dez', a: 8 * 60 + 30, b: 11 * 60 + 5, n: 275 }
+    ];
+    var FILES = [], N = 0;
+    SESS.forEach(function (s, si) {
+      for (var k = 0; k < s.n; k++) {
+        var i = N++;
+        var vid = (i % 36 === 5), tag = vid ? 'VÍDEO' : (i % 4 === 3 ? 'JPG' : 'RAW');
+        var st = (i % 17 === 9) ? 'bad' : (i % 11 === 7 ? 'mid' : 'ok');
+        FILES.push({
+          i: i, s: si, d: s.d, t: tag, st: st, mb: vid ? 410 : (tag === 'JPG' ? 11 : 36),
+          f: vid ? 'clip' : (i < 650 ? 'f100' : 'f101'), min: s.a + Math.floor(k * (s.b - s.a) / s.n),
+          name: vid ? ('C' + pad(0) + pad(Math.floor(i / 36) + 1) + '.MP4') : ('DSC0' + (4000 + i) + (tag === 'JPG' ? '.JPG' : '.ARW'))
+        });
+      }
+    });
+    if (o.nameless) { // the first file of the first day: no original name, partially overwritten
+      FILES[0].name = BAD_NAME; FILES[0].nameless = true; FILES[0].st = 'mid';
+    }
+    var SEL = new Uint8Array(N);
+    (function () {
+      var r = 0, v = 0;
+      for (var i = 0; i < N && (r < 18 || v < 6); i++) {
+        var f = FILES[i];
+        if (f.t === 'VÍDEO') { if (v < 6) { SEL[i] = 1; v++; } }
+        else if (f.t === 'RAW' && r < 18) { SEL[i] = 1; r++; }
+      }
+    })();
+    function mk(pred, g) {
+      var ids = [];
+      for (var i = 0; i < N; i++) if (pred(FILES[i])) ids.push(i);
+      g.ids = ids; g.total = ids.length; return g;
+    }
+    var G = { data: [], pasta: [], dia: [] };
+    SESS.forEach(function (s, si) {
+      G.data.push(mk(function (f) { return f.s === si; }, { key: s.key, title: s.title, sub: hm(s.a) + '–' + hm(s.b) }));
+    });
+    ['f100', 'f101', 'clip'].forEach(function (k) {
+      G.pasta.push(mk(function (f) { return f.f === k; }, { key: k, title: FOLD[k], sub: k === 'clip' ? 'vídeos' : 'pasta original', folder: 1 }));
+    });
+    [14, 15, 16].forEach(function (d) {
+      G.dia.push(mk(function (f) { return f.d === d; }, { key: 'd' + d, d: d, title: DAYS[d], sub: d === 14 ? '2 períodos · 07:12–17:22' : (d === 15 ? '06:48–10:15' : '08:30–11:05') }));
+    });
+    function selCount(g) { var c = 0; for (var j = 0; j < g.ids.length; j++) c += SEL[g.ids[j]]; return c; }
+    function totals() { var c = 0, mb = 0; for (var i = 0; i < N; i++) if (SEL[i]) { c++; mb += FILES[i].mb; } return [c, mb]; }
+    function allGroups() { return G.data.concat(G.pasta, G.dia); }
+    function findG(key) { return allGroups().filter(function (x) { return x.key === key; })[0]; }
+
+    // ---------- state ----------
+    var S = { view: o.view || 'gal', grp: 'data', day: 14, act: { data: 's0', pasta: 'f100' }, file: o.nameless ? 0 : 1, fmt: !!o.fmt };
+    var wrap = null;
+    function q(sel) { return wrap.querySelector(sel); }
+    function qa(sel) { return Array.prototype.slice.call(wrap.querySelectorAll(sel)); }
+
+    // ---------- pieces ----------
+    function thumb(i, w) {
+      var f = FILES[i];
+      return Kit.thumb({ i: i, tag: f.t, state: f.st, sel: !!SEL[i], w: w });
+    }
+    function ghead(g) {
+      var c = selCount(g);
+      return '<div class="gh"><input type="checkbox" class="gcb" data-g="' + g.key + '" aria-label="Selecionar tudo em ' + g.title + '"'
+        + (c === g.total ? ' checked' : '') + (c > 0 && c < g.total ? ' data-some="1"' : '') + '>'
+        + '<h4>' + (g.folder ? I('folder') : '') + g.title + ' <small>' + g.sub + '</small></h4>'
+        + '<span class="cnt">' + nf(g.total) + ' arquivos · <b>' + nf(c) + (c === 1 ? ' selecionado' : ' selecionados') + '</b></span></div>';
+    }
+    function dayShort(f) { return DAYS[f.d].split(',')[1].trim(); }
+    function mark() { return '<span class="mk" title="Este arquivo não tem o nome original. O nome vem da data, da hora e da câmera.">' + I('info') + 'nome criado pelo Revenant</span>'; }
+
+    // ---------- views ----------
+    function viewGal() {
+      var h = '';
+      G[S.grp].forEach(function (g) {
+        h += ghead(g) + '<div class="grid g6">';
+        var n = 11;
+        g.ids.slice(0, n).forEach(function (i) { h += thumb(i); });
+        if (g.total > n) h += '<div class="more"><span><b>+' + nf(g.total - n) + '</b>ver todos</span></div>';
+        h += '</div>';
+      });
+      return h + '<div style="height:20px"></div>';
+    }
+    function viewTl() {
+      var mx = 538;
+      var h = '<div class="hist"><p><span>Arquivos por dia · dezembro</span><span>Clique em um dia para ver só o que importa</span></p><div class="bars">';
+      var dd = []; for (var d = 11; d <= 19; d++) dd.push(d);
+      dd.forEach(function (d) {
+        var g = G.dia.filter(function (x) { return x.d === d; })[0], n = g ? g.total : 0, sel = g ? selCount(g) : 0;
+        h += '<div class="bc' + (g ? ' has' : '') + (g && d === S.day ? ' on' : '') + '"' + (g ? ' data-day="' + d + '"' : '') + '>'
+          + (g ? '<em>' + nf(n) + '</em>' : '') + '<div class="bx" style="height:' + (n ? Math.round(n / mx * 88) : 2) + '%">' + (n ? '<i style="height:' + Math.round(sel / n * 100) + '%"></i>' : '') + '</div></div>';
+      });
+      h += '</div><div class="days">';
+      dd.forEach(function (d) { h += '<span' + (d === S.day ? ' class="on"' : '') + '>' + d + '</span>'; });
+      h += '</div><div class="legend"><span><i style="background:var(--accent)"></i>selecionados</span><span><i style="background:var(--accent-soft)"></i>encontrados</span></div></div>';
+      var g = G.dia.filter(function (x) { return x.d === S.day; })[0];
+      h += ghead(g) + '<div class="grid g5">';
+      g.ids.slice(0, 14).forEach(function (i) { h += thumb(i); });
+      h += '<div class="more"><span><b>+' + nf(g.total - 14) + '</b>ver todos</span></div></div><div style="height:20px"></div>';
+      return h;
+    }
+    function viewDet() {
+      var gs = G[S.grp], ak = S.act[S.grp], g = gs.filter(function (x) { return x.key === ak; })[0] || gs[0];
+      var h = '<div class="det"><div class="side"><h6>' + (S.grp === 'data' ? 'Por data' : 'Por pasta') + '</h6>';
+      gs.forEach(function (x) {
+        var c = selCount(x);
+        h += '<div class="sg' + (x === g ? ' on' : '') + '" data-sg="' + x.key + '" role="button"><input type="checkbox" class="gcb" data-g="' + x.key + '"'
+          + (c === x.total ? ' checked' : '') + (c > 0 && c < x.total ? ' data-some="1"' : '') + '><div><b>' + x.title + '</b><small>' + x.sub + '</small><small>' + nf(x.total) + ' · <u>' + nf(c) + ' sel.</u></small></div></div>';
+      });
+      h += '</div><div class="listw">' + ghead(g) + '<div class="rows"><div class="row head"><span></span><span></span><span>Nome</span><span class="c-tipo">Tipo</span><span>Estado</span><span>Tamanho</span><span class="c-data">Data</span></div>';
+      if (g.ids.indexOf(S.file) < 0) S.file = g.ids[1];
+      g.ids.slice(0, 16).forEach(function (i) {
+        var f = FILES[i];
+        var sub = f.nameless ? 'nome criado pelo Revenant' : (S.fmt ? 'pasta não identificada' : FOLD[f.f]);
+        h += '<div class="row' + (i === S.file ? ' on' : '') + '" data-pick="' + i + '"><input type="checkbox" data-f="' + i + '" aria-label="Selecionar ' + f.name + '"' + (SEL[i] ? ' checked' : '') + '>'
+          + '<div class="th"><img src="' + Kit.photo(i, 120) + '" alt="" onerror="this.remove()"></div><div><b>' + f.name + '</b><small>' + sub + '</small></div>'
+          + '<span class="tg c-tipo">' + f.t + '</span>' + Kit.badge(f.st)
+          + '<span class="r">' + sz(f.mb) + '</span><span class="r c-data">' + dayShort(f) + ' · ' + hm(f.min) + '</span></div>';
+      });
+      h += '<div class="more-rows">+ ' + nf(g.total - 16) + ' arquivos neste grupo</div></div></div>';
+      var f = FILES[S.file], on = !!SEL[S.file];
+      h += '<div class="prev"><div class="th"><img src="' + Kit.photo(S.file, 700) + '" alt="" onerror="this.remove()"></div><h5><span>' + f.name + '</span></h5>'
+        + (f.nameless ? mark() : '')
+        + '<div class="m"><span class="tg">' + f.t + '</span>' + Kit.badge(f.st) + '</div>'
+        + Kit.note(f.st, NOTE_TXT[f.st])
+        + '<div class="exif"><span>Câmera</span>Sony A7 IV<span>Lente</span>70–200 mm f/2.8<span>ISO</span>400<span>Data</span>' + dayShort(f) + ', ' + hm(f.min)
+        + '<span>Tamanho</span>' + sz(f.mb) + '<span>Pasta original</span>' + (S.fmt ? 'não encontrada' : FOLD[f.f])
+        + (f.nameless ? '<span>Nome original</span>não encontrado' : '') + '</div>'
+        + '<button class="btn act' + (on ? ' ghost' : '') + '" data-f="' + S.file + '">' + I(on ? 'x' : 'check') + (on ? 'Remover da seleção' : 'Adicionar à recuperação') + '</button></div></div>';
+      return h;
+    }
+
+    // ---------- shell and updates ----------
+    function shell() {
+      return '<div class="res">' + header(5)
+        + '<div class="bar"><div class="seg" role="group" aria-label="Visualização">'
+        + '<button data-view="gal">' + I('grid') + 'Galeria</button><button data-view="tl">' + I('chart') + 'Linha do tempo</button><button data-view="det">' + I('list') + 'Detalhes</button></div>'
+        + '<div class="grp"><span class="lbl">Agrupar</span><div class="seg" role="group" aria-label="Agrupar">'
+        + '<button data-grp="data">' + I('cal') + 'Por data</button><button data-grp="pasta">' + I('folder') + 'Por pasta</button></div></div>'
+        + '<span class="sp"></span><button class="btn ghost">' + I('search') + 'Buscar</button></div>'
+        + '<div class="hint" role="status"></div>'
+        + '<div class="main"><div class="content"></div></div>'
+        + '<div class="foot"><button class="btn ghost sm" data-clear>Limpar seleção</button><span class="t" data-ftxt></span><span class="sp"></span><button class="btn" data-rec></button></div></div>';
+    }
+    function update() {
+      var c = q('.content'), top = c.scrollTop;
+      c.innerHTML = S.view === 'gal' ? viewGal() : (S.view === 'tl' ? viewTl() : viewDet());
+      c.classList.toggle('is-det', S.view === 'det');
+      c.scrollTop = top;
+      qa('.content .gcb').forEach(function (e) { e.indeterminate = !!e.dataset.some; });
+      qa('[data-view]').forEach(function (b) { b.classList.toggle('on', b.dataset.view === S.view); });
+      var tl = S.view === 'tl';
+      qa('[data-grp]').forEach(function (b) {
+        b.classList.toggle('on', b.dataset.grp === S.grp && !tl);
+        b.disabled = tl || (b.dataset.grp === 'pasta' && S.fmt);
+      });
+      var tip = q('.hint');
+      tip.innerHTML = I('info') + '<span>' + (tl ? 'A linha do tempo sempre agrupa por data' : 'Pastas não encontradas: o cartão foi formatado. Veja os arquivos por data.') + '</span>';
+      tip.classList.toggle('show', tl || S.fmt);
+      var t = totals(), rec = q('[data-rec]');
+      rec.innerHTML = I('dl') + (t[0] ? 'Recuperar ' + nf(t[0]) + (t[0] === 1 ? ' arquivo' : ' arquivos') + ' (' + sz(t[1]) + ')' : 'Nada selecionado');
+      rec.disabled = !t[0];
+      q('[data-clear]').disabled = !t[0];
+      q('[data-ftxt]').textContent = t[0] ? nf(t[0]) + ' de 1.321 arquivos selecionados' : TOTAL_LINE;
+      if (isLong()) Kit.lengthen(wrap);
+    }
+    function mount(root) {
+      wrap = root.querySelector('.res');
+      wrap.addEventListener('click', function (e) {
+        var t = e.target;
+        var gcb = t.closest('.gcb');
+        if (gcb) { var g = findG(gcb.dataset.g), all = selCount(g) === g.total; g.ids.forEach(function (i) { SEL[i] = all ? 0 : 1; }); update(); return; }
+        var f = t.closest('[data-f]');
+        if (f) { var i = +f.dataset.f; SEL[i] = SEL[i] ? 0 : 1; update(); return; }
+        var v = t.closest('[data-view]'); if (v) { S.view = v.dataset.view; update(); return; }
+        var gr = t.closest('[data-grp]'); if (gr && !gr.disabled) { S.grp = gr.dataset.grp; update(); return; }
+        var d = t.closest('[data-day]'); if (d) { S.day = +d.dataset.day; update(); return; }
+        var sg = t.closest('[data-sg]'); if (sg) { S.act[S.grp] = sg.dataset.sg; update(); return; }
+        var p = t.closest('[data-pick]');
+        if (p && S.view === 'det') { S.file = +p.dataset.pick; update(); return; }
+        if (p) { var j = +p.dataset.pick; SEL[j] = SEL[j] ? 0 : 1; update(); return; }
+        if (t.closest('[data-clear]')) { SEL.fill(0); update(); }
+      });
+      update();
+    }
+    return { html: shell, mount: mount };
+  }
+
+  function resultState(key, label, o) {
+    var app;
+    return {
+      key: key, label: label,
+      render: function () { app = makeApp(o); return app.html(); },
+      after: function (root) { app.mount(root); }
+    };
+  }
+
+  // ---- nothing found ----
+  function empty() {
+    var body = '<div class="wrap center"><span class="tile">' + I('search') + '</span>'
+      + '<h2 class="ttl">Nenhuma foto ou vídeo encontrado</h2>'
+      + '<p class="lead">A busca no Cartão SD 64 GB terminou e não achou nada que dê para recuperar. Isso não quer dizer que o cartão esteja com defeito. Veja o que dá para tentar agora.</p>'
+      + '<div class="todo">'
+      + '<div class="card"><span class="tile">' + I('copy') + '</span><div><b data-t>Tentar a cópia</b><p>Se você fez a cópia de segurança, procure nela em vez de procurar no cartão.</p></div><button class="btn">' + I('search') + 'Procurar na cópia</button></div>'
+      + '<div class="card"><span class="tile">' + I('external-link') + '</span><div><b data-t>Ver o guia</b><p>O guia explica o que costuma atrapalhar a recuperação e o que mais dá para tentar.</p></div><button class="btn ghost">' + I('external-link') + 'Ver o guia</button></div>'
+      + '</div></div>';
+    return '<div class="res">' + header(5) + '<div class="main"><div class="content">' + body + '</div></div>'
+      + '<div class="foot"><button class="btn ghost">Escolher outro disco</button><span class="t">Nada foi alterado no cartão</span></div></div>';
+  }
+
+  Kit.init({
+    page: 'resultados',
+    screens: [
+      { id: 8, name: 'Resultados', title: 'Revenant', states: [
+        resultState('galeria', 'Galeria', { view: 'gal' }),
+        resultState('linha', 'Linha do tempo', { view: 'tl' }),
+        resultState('detalhes', 'Detalhes', { view: 'det' }),
+        resultState('formatado', 'Cartão formatado', { view: 'gal', fmt: true }),
+        { key: 'vazio', label: 'Nada encontrado', render: empty },
+        resultState('sem-nome', 'Arquivo sem o nome original', { view: 'det', nameless: true })
+      ] }
+    ]
+  });
+})();
+</script>
+</body>
+</html>

@@ -32,7 +32,8 @@ connected disks, refuses the one holding the system, unmounts the card without e
 knows to be wrong before a long read (permission, a disk that does not answer, room for a copy), copies a failing card into
 an image with a rescue map that tolerates bad sectors and can be resumed, warns early when a card is failing, and saves a
 scan so it resumes with the same results after a crash or a pulled cable. It is tested against real camera files as well
-as synthetic ones and, optionally, against disk images attached to the computer. A graphical app comes next.
+as synthetic ones and, optionally, against disk images attached to the computer. A graphical app comes next: its logo
+and app icon are in [assets/brand](assets/brand/README.md).
 
 ## Trying the engine (developers)
 
