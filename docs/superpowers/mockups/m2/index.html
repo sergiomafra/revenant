@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revenant · telas da 2.0</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="kit.css">
+<style>
+  .wrap{max-width:1180px;margin:0 auto;padding:40px 32px 24px}
+  .head{display:flex;align-items:center;gap:20px;flex-wrap:wrap;margin-bottom:8px}
+  .head h1{font-size:30px;font-weight:650;letter-spacing:-.02em}
+  .sub{color:var(--ink-2);margin:6px 0 24px;max-width:780px}
+  .brand{display:flex;gap:16px;flex-wrap:wrap;margin:0 0 32px}
+  .brand figure{border:1px solid var(--line);border-radius:12px;padding:16px 22px;display:flex;align-items:center;gap:18px;background:var(--tile-ink);color:var(--tile)}
+  .brand figure.dark{background:var(--stage-dark);border-color:var(--stage-dark)}
+  .brand img{display:block;height:56px}
+  .brand figcaption{font-size:12px;color:var(--tile)}
+  .brand figure.dark figcaption{color:var(--tile-ink)}
+  h2{margin:32px 0 12px;font-size:20px}
+  table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line);border-radius:11px;overflow:hidden;font-size:13px}
+  th,td{text-align:left;vertical-align:top;padding:10px 12px;border-bottom:1px solid var(--line-soft)}
+  th{background:var(--surface-2);color:var(--ink-2);font-size:11px;text-transform:uppercase;letter-spacing:.05em}
+  tr:last-child td{border-bottom:0}
+  td.n{font-weight:700;color:var(--accent);width:36px}
+  td.st{color:var(--ink-2);max-width:420px}
+  td.pt{white-space:nowrap}
+  ol.path{padding-left:22px;color:var(--ink-2);max-width:780px}
+  ol.path li{margin:4px 0}
+  .credit{margin-top:32px;color:var(--ink-3);font-size:12px}
+  details.tech code{display:inline-block;margin:2px 4px 2px 0;padding:1px 6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="head">
+    <span id="logo"></span>
+    <h1>Revenant · telas da 2.0</h1>
+  </div>
+  <p class="sub">As 13 telas do app, em claro e escuro, na janela de 1280×800 (mínimo 1024×700). Cada página abaixo tem a barra de simulação (tema e texto 30% mais longo) e os botões de estado de cada tela.</p>
+
+  <div class="brand">
+    <figure><img src="../../../../assets/brand/wordmark-light.svg" alt="Revenant, para fundo claro"><figcaption>Para fundo claro</figcaption></figure>
+    <figure class="dark"><img src="../../../../assets/brand/wordmark-dark.svg" alt="Revenant, para fundo escuro"><figcaption>Para fundo escuro</figcaption></figure>
+  </div>
+
+  <h2>Mapa das telas</h2>
+  <table>
+    <thead><tr><th>Tela</th><th></th><th>Estados</th><th>Códigos do motor</th><th>Parte</th><th>Página</th></tr></thead>
+    <tbody>
+      <tr data-map="1"><td class="n">1</td><td><b>Escolher o disco</b></td><td class="st">Lista de discos em cartões grandes; SD e HD externo em destaque; disco do sistema apagado com o motivo; SSD ou CFexpress com aviso de cautela; nenhum disco; dica "Pare de usar o cartão agora".</td><td><details class="tech"><summary>Detalhes técnicos</summary><code>system_disk</code></details></td><td class="pt">2.2</td><td><a href="inicio.html#tela-1">inicio.html</a></td></tr>
+      <tr data-map="2"><td class="n">2</td><td><b>Retomar a busca</b></td><td class="st">Ao abrir, uma busca salva (continuar ou começar de novo); o caso da busca de outro cartão.</td><td><details class="tech"><summary>Detalhes técnicos</summary><code>session_other_source</code> <code>session_corrupt</code></details></td><td class="pt">2.2</td><td><a href="inicio.html#tela-2">inicio.html</a></td></tr>
+      <tr data-map="3"><td class="n">3</td><td><b>Permissão</b></td><td class="st">Mac: explicação e pedido da senha; Windows: explicação e pedido do UAC; recusada.</td><td><details class="tech"><summary>Detalhes técnicos</summary><code>permission_denied</code></details></td><td class="pt">2.1</td><td><a href="inicio.html#tela-3">inicio.html</a></td></tr>
+      <tr data-map="4"><td class="n">4</td><td><b>Conferência prévia</b></td><td class="st">Conferindo o cartão; tudo certo; com problemas, em uma lista só (dois itens ao mesmo tempo), cada um com o que fazer.</td><td><details class="tech"><summary>Detalhes técnicos</summary><code>device_not_found</code> <code>device_not_responding</code> <code>sample_unreadable</code> <code>open_failed</code> <code>unmount_failed</code> <code>destination_too_small</code> <code>destination_on_source</code> <code>destination_unknown</code> <code>destination_file_too_large</code></details></td><td class="pt">2.2</td><td><a href="inicio.html#tela-4">inicio.html</a></td></tr>
+      <tr data-map="5"><td class="n">5</td><td><b>Cópia de segurança</b></td><td class="st">Copiar primeiro ou procurar direto, com recomendação automática; onde salvar a cópia; cópia em andamento; cópia concluída.</td><td><details class="tech"><summary>Detalhes técnicos</summary><code>CopyEvent::Progress</code> <code>destination_*</code></details></td><td class="pt">2.2</td><td><a href="busca.html#tela-5">busca.html</a></td></tr>
+      <tr data-map="6"><td class="n">6</td><td><b>Procurando</b></td><td class="st">Progresso, tempo restante e contadores; galeria se enchendo; pausar e retomar; aviso de disco falhando; aviso de cartão lento; fechar o app sem perder a busca.</td><td><details class="tech"><summary>Detalhes técnicos</summary><code>DiskFailing</code> <code>Rate</code></details></td><td class="pt">2.2</td><td><a href="busca.html#tela-6">busca.html</a></td></tr>
+      <tr data-map="7"><td class="n">7</td><td><b>O cartão saiu</b></td><td class="st">No meio da busca ou da cópia; espera e retoma sozinho quando o cartão volta.</td><td><details class="tech"><summary>Detalhes técnicos</summary><code>device_gone</code></details></td><td class="pt">2.2</td><td><a href="busca.html#tela-7">busca.html</a></td></tr>
+      <tr data-map="8"><td class="n">8</td><td><b>Resultados</b></td><td class="st">Galeria, Linha do tempo e Detalhes; selos Íntegro, Parcial e Danificado; "Por pasta" desligado com o motivo; nada encontrado; arquivo sem o nome original.</td><td><details class="tech"><summary>Detalhes técnicos</summary><code>estados do motor</code></details></td><td class="pt">2.3</td><td><a href="resultados.html#tela-8">resultados.html</a></td></tr>
+      <tr data-map="9"><td class="n">9</td><td><b>Onde salvar</b></td><td class="st">Escolher a pasta; recusa no próprio cartão, com o motivo; espaço insuficiente.</td><td><details class="tech"><summary>Detalhes técnicos</summary><code>destination_on_source</code> <code>destination_too_small</code></details></td><td class="pt">2.3</td><td><a href="recuperar.html#tela-9">recuperar.html</a></td></tr>
+      <tr data-map="10"><td class="n">10</td><td><b>Recuperando e resumo</b></td><td class="st">Progresso da recuperação; resumo final (íntegros, parciais, danificados) e "Abrir pasta".</td><td><details class="tech"><summary>Detalhes técnicos</summary><code>write_failed</code> <code>device_gone</code></details></td><td class="pt">2.3</td><td><a href="recuperar.html#tela-10">recuperar.html</a></td></tr>
+      <tr data-map="11"><td class="n">11</td><td><b>Ajustes</b></td><td class="st">Tema (claro, escuro, automático) e idioma (pt-BR, es, en).</td><td>—</td><td class="pt">2.1</td><td><a href="app.html#tela-11">app.html</a></td></tr>
+      <tr data-map="12"><td class="n">12</td><td><b>Sobre</b></td><td class="st">Logo, versão, licença GPL-3.0, links do código e da documentação.</td><td>—</td><td class="pt">2.1</td><td><a href="app.html#tela-12">app.html</a></td></tr>
+      <tr data-map="13"><td class="n">13</td><td><b>Erro inesperado</b></td><td class="st">Um padrão único: o que aconteceu, o que fazer, e "Detalhes técnicos" recolhido.</td><td>qualquer outro</td><td class="pt">2.1</td><td><a href="app.html#tela-13">app.html</a></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Ordem do caminho</h2>
+  <ol class="path">
+    <li>Retomar (ao abrir o app)</li>
+    <li>Disco</li>
+    <li>Permissão</li>
+    <li>Conferência prévia</li>
+    <li>Cópia opcional</li>
+    <li>Procurando</li>
+    <li>Resultados</li>
+    <li>Onde salvar</li>
+    <li>Recuperando e resumo</li>
+  </ol>
+
+  <p class="credit">Fotos: Unsplash. Ícones: Lucide (licença ISC).</p>
+</div>
+<script src="kit.js"></script>
+<script>document.getElementById('logo').innerHTML = Kit.logo();</script>
+</body>
+</html>

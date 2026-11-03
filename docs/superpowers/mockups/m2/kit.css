@@ -1,0 +1,127 @@
+/* Revenant Part 2.0 mockup kit: component styles. Sizes and looks come from the approved resultados-v2 mockup.
+   Colors only through the tokens in tokens.css. */
+*{box-sizing:border-box;margin:0}
+html{background:var(--paper)}
+body{background:var(--paper);color:var(--ink);font:15px/1.5 var(--font);padding:0 0 64px;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0}
+a{color:var(--accent)}
+h2{font-size:28px;font-weight:650;letter-spacing:-.02em}
+svg.i{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+svg.i.lg{width:24px;height:24px;stroke-width:1.7}
+.logo{display:inline-block;width:56px;height:56px;color:var(--ink);flex:none}
+
+/* ---- page chrome: simulation bar and screen sections ---- */
+.sim{position:sticky;top:0;z-index:50;display:flex;flex-wrap:wrap;gap:8px 20px;align-items:center;padding:10px 32px;background:var(--surface);border-bottom:1px solid var(--line);font-size:13px;color:var(--ink-2)}
+.sim b{color:var(--ink);font-weight:650}
+.sim label{display:inline-flex;gap:6px;align-items:center;cursor:pointer}
+.sim input{accent-color:var(--accent)}
+.sim .seg button.on{box-shadow:var(--shadow-sm)}
+.screen{padding:36px 32px 0;max-width:1400px;margin:0 auto}
+.screen>header{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin-bottom:12px}
+.screen>header h2{font-size:22px}
+.screen .states{display:flex;flex-wrap:wrap;gap:4px}
+.screen .states button{padding:5px 12px;border-radius:99px;font-size:13px;font-weight:550;color:var(--ink-2);background:var(--surface-2);white-space:nowrap}
+.screen .states button.on{background:var(--accent);color:var(--accent-ink)}
+.fit{position:relative;width:100%}
+.fit>.win{position:absolute;left:0;top:0;transform-origin:0 0}
+
+/* ---- window frame ---- */
+.win{width:var(--w,1280px);height:var(--h,800px);background:var(--paper);border:1px solid var(--line);border-radius:12px;overflow:hidden;box-shadow:var(--shadow);display:flex;flex-direction:column;font-size:13px;line-height:1.4;position:relative;color:var(--ink)}
+.win.is-win{border-radius:8px}
+.tb{height:36px;flex:none;background:var(--surface-2);border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 14px;gap:8px;position:relative}
+.tb i{width:12px;height:12px;border-radius:50%;background:var(--win-close)}
+.tb i:nth-child(2){background:var(--win-min)}
+.tb i:nth-child(3){background:var(--win-max)}
+.tb b{position:absolute;left:0;right:0;text-align:center;font-weight:600;color:var(--ink-2);font-size:13px;pointer-events:none}
+.tb.win-style{padding:0 0 0 14px}
+.tb.win-style b{position:static;text-align:left}
+.tb .ctl{margin-left:auto;display:flex;height:100%}
+.tb .ctl span{width:46px;display:grid;place-items:center;color:var(--ink-2)}
+.tb .ctl span:last-child:hover{background:var(--win-close);color:var(--on-photo)}
+.tb .ctl svg{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.4}
+.app{flex:1;min-height:0;display:flex;flex-direction:column;position:relative}
+.app .logo{color:var(--ink)}
+.main{flex:1;min-height:0;display:flex;flex-direction:column}
+.content{flex:1;overflow:auto;min-height:0}
+
+/* ---- controls ---- */
+.seg{display:flex;background:var(--surface-2);border-radius:8px;padding:2px;width:max-content}
+.seg button{padding:5px 12px;border-radius:6px;color:var(--ink-2);font-weight:550;display:inline-flex;gap:6px;align-items:center;white-space:nowrap}
+.seg button.on{background:var(--surface);color:var(--ink);box-shadow:var(--shadow-sm)}
+.seg button[disabled]{opacity:.45;cursor:not-allowed}
+.btn{background:var(--accent);color:var(--accent-ink);border-radius:8px;padding:7px 14px;font-weight:620;display:inline-flex;align-items:center;justify-content:center;gap:7px;white-space:nowrap}
+.btn.ghost{background:var(--surface-2);color:var(--ink)}
+.btn.sm{padding:5px 10px;font-size:12px}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.sp{flex:1}
+.lbl{font-size:12px;color:var(--ink-3)}
+.bar{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid var(--line-soft);background:var(--surface);flex:none;flex-wrap:wrap}
+.foot{flex:none;display:flex;align-items:center;gap:14px;padding:11px 16px;border-top:1px solid var(--line);background:var(--surface)}
+.foot span.t{color:var(--ink-2)}
+
+/* ---- cards and lists ---- */
+.card{background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:11px 12px}
+.card.sel{border:2px solid var(--accent);padding:10px 11px;box-shadow:0 0 0 3px var(--accent-soft)}
+.card.off{background:var(--surface-2);border-style:dashed}
+.list{background:var(--surface);border:1px solid var(--line);border-radius:11px;overflow:hidden}
+.list>*{padding:9px 12px;border-bottom:1px solid var(--line-soft)}
+.list>*:last-child{border-bottom:0}
+
+/* ---- thumbnails and badges ---- */
+.th{position:relative;border-radius:7px;overflow:hidden;background:var(--img-bg);aspect-ratio:3/2;cursor:pointer}
+.th img{width:100%;height:100%;object-fit:cover;display:block}
+.th .tag{position:absolute;left:6px;top:6px;background:var(--photo-tag);color:var(--on-photo);border-radius:4px;padding:1px 6px;font-size:10px;font-weight:650;letter-spacing:.03em}
+.th .dur{position:absolute;right:6px;bottom:6px;background:var(--photo-tag);color:var(--on-photo);border-radius:4px;padding:1px 6px;font-size:10px;font-weight:600}
+.th .play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:30px;height:30px;border-radius:50%;background:var(--play-bg);color:var(--play-ink);display:grid;place-items:center}
+.th .play svg{width:12px;height:12px;fill:var(--play-ink);margin-left:1px}
+.th.sel{outline:2px solid var(--accent);outline-offset:-2px}
+.ck{position:absolute;right:6px;top:6px;width:20px;height:20px;border-radius:50%;border:1.5px solid var(--on-photo);background:var(--ck-bg);color:var(--accent-ink);display:grid;place-items:center;opacity:0;transition:opacity .12s}
+.ck svg{width:11px;height:11px;stroke-width:3;opacity:0}
+.th:hover .ck{opacity:1}
+.th.sel .ck{opacity:1;background:var(--accent);border-color:var(--accent)}
+.th.sel .ck svg{opacity:1}
+.bd{display:inline-flex;align-items:center;gap:3px;border-radius:99px;padding:1px 8px 1px 5px;font-size:11px;font-weight:650;white-space:nowrap}
+.bd svg{width:11px;height:11px;stroke-width:2.6}
+.bd.ok{background:var(--ok-bg);color:var(--ok)}
+.bd.mid{background:var(--warn-bg);color:var(--warn)}
+.bd.bad{background:var(--bad-bg);color:var(--bad)}
+.th .bd{position:absolute;left:6px;bottom:6px;box-shadow:var(--shadow-sm)}
+.tg{display:inline-block;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:650;letter-spacing:.03em;background:var(--surface-2);color:var(--ink-2)}
+
+/* ---- notes, banners, progress, technical details ---- */
+.note{border-radius:8px;padding:8px 10px;font-size:12px;display:flex;gap:8px;line-height:1.4}
+.note.ok{background:var(--ok-bg);color:var(--ok)}
+.note.mid{background:var(--warn-bg);color:var(--warn)}
+.note.bad{background:var(--bad-bg);color:var(--bad)}
+.note.info{background:var(--info-bg);color:var(--info)}
+.note svg{margin-top:2px}
+.note a{color:inherit;font-weight:650;text-decoration:underline}
+.banner{flex:none;display:flex;align-items:center;gap:10px;padding:10px 16px;font-size:13px;border-bottom:1px solid var(--line-soft);background:var(--info-bg);color:var(--info)}
+.banner.ok{background:var(--ok-bg);color:var(--ok)}
+.banner.mid{background:var(--warn-bg);color:var(--warn)}
+.banner.bad{background:var(--bad-bg);color:var(--bad)}
+.banner svg{width:16px;height:16px}
+.banner .sp{flex:1}
+.progress{height:8px;border-radius:99px;background:var(--surface-2);overflow:hidden;position:relative;border:1px solid var(--line-soft)}
+.progress>i{display:block;height:100%;background:var(--accent);border-radius:99px}
+.progress.mid>i{background:var(--warn)}
+.progress.bad>i{background:var(--bad)}
+details.tech{font-size:12px;color:var(--ink-2)}
+details.tech summary{cursor:pointer;color:var(--ink-3);font-weight:600;list-style:none;display:inline-flex;align-items:center;gap:6px}
+details.tech summary::-webkit-details-marker{display:none}
+details.tech summary::before{content:"";border:4px solid transparent;border-left-color:currentColor;margin-right:2px}
+details.tech[open] summary::before{border:4px solid transparent;border-top-color:currentColor;margin:4px 2px 0 0}
+details.tech code{display:block;margin-top:6px;padding:6px 8px;border-radius:6px;background:var(--surface-2);color:var(--ink-2);font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all}
+details.tech p{margin-top:6px}
+
+/* ---- modal layer: .modal covers the window; put the dialog inside as .dlg ---- */
+.modal{position:absolute;inset:0;z-index:20;background:var(--overlay);display:grid;place-items:center;padding:24px}
+.modal .dlg{background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:22px;width:min(480px,100%);max-height:100%;overflow:auto;display:flex;flex-direction:column;gap:12px}
+.modal .dlg h3{font-size:18px;font-weight:650;letter-spacing:-.01em}
+.modal .dlg .acts{display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap}
+
+/* ---- screenshot mode: only the window, at (0,0), no chrome, no scale ---- */
+html.shot body{padding:0;overflow:hidden}
+html.shot .win{border:0;border-radius:0;box-shadow:none;position:absolute;left:0;top:0}
+html.shot .win.is-win{border-radius:0}
+#manifest{display:none}
