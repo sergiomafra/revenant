@@ -44,7 +44,7 @@
     "close": "Fechar"
   },
   "error": {
-    "lead": "Nada foi gravado no cartão. Os arquivos que você já recuperou continuam salvos.",
+    "lead": "Nada foi gravado no cartão.",
     "what_to_do": "O que fazer:",
     "home": "Voltar ao início",
     "retry": "Tentar de novo",

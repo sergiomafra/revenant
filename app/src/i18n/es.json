@@ -44,7 +44,7 @@
     "close": "Cerrar"
   },
   "error": {
-    "lead": "No se escribió nada en la tarjeta. Los archivos que ya recuperaste siguen guardados.",
+    "lead": "No se escribió nada en la tarjeta.",
     "what_to_do": "Qué hacer:",
     "home": "Volver al inicio",
     "retry": "Intentar de nuevo",
