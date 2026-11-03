@@ -116,18 +116,24 @@ let source = DeviceSource::new(open_with_system_prompt(&disk)?, disk);
 - **macOS:** runs `/usr/libexec/authopen -stdoutpipe /dev/rdisk4` (never `-w`, `-c`, `-a`, `-x` or `-o`: read-only),
   its stdout one end of a socket pair. `authopen` shows the system's password prompt, opens the raw node read-only and
   sends the open descriptor back over the socket (`SCM_RIGHTS`); the engine receives exactly one descriptor (extras are
-  closed) and checks it is open read-only and is the raw node asked for. The rest is `open`'s: the node must exist, the
+  closed), marks it close-on-exec at once (macOS hands it over inheritable, and `diskutil` runs while it is open) and
+  checks it is open read-only and is the raw node asked for. The rest is `open`'s: the node must exist, the
   geometry comes from `diskutil` before the prompt, and after it `diskutil` is asked again, so a card swapped while the
   prompt was up is `device_not_found`. `authopen` exiting non-zero or sending nothing (the user cancelled) is
-  `permission_denied`; `authopen` not starting is `system_tool_failed`.
+  `permission_denied`, except that a non-zero exit once the node is gone (the card pulled while the prompt was up) is
+  `device_not_found`; `authopen` not starting is `system_tool_failed`.
 - **Windows:** relaunches the running program elevated (`ShellExecuteExW` with the `runas` verb: the UAC prompt) with
   `--revenant-elevated-open PhysicalDrive2 <app pid>` and waits for it. The app's `main` must call
   `source::elevated_entry(&args)` before anything else and exit with the code it returns when it is `Some`
-  (`std::process::exit`); otherwise it is `None` (always `None` off Windows). The elevated process opens the disk as
+  (`std::process::exit`); otherwise it is `None` (always `None` off Windows). The elevated process does not take its
+  caller's word: the process it hands the disk to must run this same program (its image path,
+  `QueryFullProcessImageNameW`, and `current_exe`, both canonicalized, compared without case), and the disk must be in
+  its own listing and not the system disk; only then does it open the disk as
   `open` does (`GENERIC_READ` only), duplicates the handle into the app with the same access (`DuplicateHandle`,
   `DUPLICATE_SAME_ACCESS`, not inheritable) and exits with the handle's value; the app adopts the handle and reads the
   geometry from it. Handle values are positive multiples of 4, so failures are odd exit codes: 1 `permission_denied`,
-  3 `device_not_found`, 5 `open_failed`, 7 bad arguments (`open_failed`); any other code (a crash) is `open_failed`.
+  3 `device_not_found`, 5 `open_failed`, 7 bad arguments (`open_failed`), 9 `system_disk`, 11 the caller is not this
+  program (`open_failed`); any other code (a crash) is `open_failed`.
   Declining the UAC prompt is `permission_denied`; the relaunch failing otherwise is `system_tool_failed`.
 - Other systems answer `unsupported_platform`.
 

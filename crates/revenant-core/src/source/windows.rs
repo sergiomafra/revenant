@@ -31,6 +31,7 @@ use windows_sys::Win32::System::Ioctl::{
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_DUP_HANDLE,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Shell::{
@@ -610,6 +611,35 @@ pub(crate) fn duplicate_into_process(file: &File, pid: u32) -> io::Result<u32> {
             Err(io::Error::other("handle value an exit code cannot carry"))
         }
     }
+}
+
+/// The full path of the executable process `pid` runs (`QueryFullProcessImageNameW`, Win32 form), opened with
+/// `PROCESS_QUERY_LIMITED_INFORMATION` only.
+pub(crate) fn process_image_path(pid: u32) -> io::Result<PathBuf> {
+    // SAFETY: plain call with no pointers; a null result is checked below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `process` is a process handle this process just opened and owns; `OwnedHandle` closes it exactly once.
+    let process = unsafe { OwnedHandle::from_raw_handle(process as _) };
+    let mut buf = [0u16; NAME_LEN];
+    let mut len = NAME_LEN as u32;
+    // SAFETY: `process` is a valid process handle with PROCESS_QUERY_LIMITED_INFORMATION; `buf` is a writable buffer of
+    // `len` UTF-16 units and `len` a valid in/out pointer (on success, the units written, without the NUL).
+    let ok = unsafe {
+        QueryFullProcessImageNameW(
+            process.as_raw_handle() as _,
+            PROCESS_NAME_WIN32,
+            buf.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = (len as usize).min(NAME_LEN);
+    Ok(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
 }
 
 /// The whole-disk handle the elevated process duplicated into this one, by the value it reported.

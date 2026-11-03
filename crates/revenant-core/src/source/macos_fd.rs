@@ -3,7 +3,7 @@
 //! file allowed `unsafe` (CLAUDE.md, Sérgio, 2.1); every block says why it is sound.
 
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 /// Most descriptors one message may carry that are received (and closed, past the first) rather than left in flight.
@@ -44,6 +44,7 @@ pub(crate) fn recv_fd(stream: &UnixStream) -> io::Result<OwnedFd> {
         }
     };
     let mut fds = Vec::new();
+    let mut cloexec_error = None;
     // SAFETY: `msg` was filled by `recvmsg`: `msg_control`/`msg_controllen` describe the control data it wrote, inside
     // `control`.
     let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
@@ -62,12 +63,22 @@ pub(crate) fn recv_fd(stream: &UnixStream) -> io::Result<OwnedFd> {
                 if raw >= 0 {
                     // SAFETY: the kernel installed `raw` in this process for this message: it is open and owned by
                     // nothing else, so it is ours to close (exactly once, through `OwnedFd`).
-                    fds.push(unsafe { OwnedFd::from_raw_fd(raw) });
+                    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+                    // macOS has no `MSG_CMSG_CLOEXEC`: received descriptors arrive inheritable, so they are marked
+                    // close-on-exec at once (the extras too, before they are closed), or a `diskutil` child spawned while
+                    // the disk is open would inherit it.
+                    if let Err(e) = set_cloexec(fd.as_fd()) {
+                        cloexec_error.get_or_insert(e);
+                    }
+                    fds.push(fd);
                 }
             }
         }
         // SAFETY: `msg` and `cmsg` are as above; `CMSG_NXTHDR` returns null past the control data.
         cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
+    }
+    if let Some(e) = cloexec_error {
+        return Err(e);
     }
     if msg.msg_flags & libc::MSG_CTRUNC != 0 {
         return Err(io::Error::other("descriptor message truncated"));
@@ -86,6 +97,16 @@ pub(crate) fn recv_fd(stream: &UnixStream) -> io::Result<OwnedFd> {
     }
 }
 
+/// Marks `fd` close-on-exec (`fcntl(F_SETFD, FD_CLOEXEC)`), so no child process inherits it.
+fn set_cloexec(fd: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: `fd` is open for the lifetime of the borrow; `F_SETFD` takes an `int` of descriptor flags and changes only
+    // this descriptor's flags (`FD_CLOEXEC` is the only one).
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Whether `fd` is open for reading only (`fcntl(F_GETFL)`, access mode `O_RDONLY`): what is received is checked, so a
 /// descriptor that could write never becomes a source.
 pub(crate) fn is_read_only(fd: BorrowedFd<'_>) -> io::Result<bool> {
@@ -101,7 +122,7 @@ pub(crate) fn is_read_only(fd: BorrowedFd<'_>) -> io::Result<bool> {
 mod tests {
     use super::*;
     use std::io::Read;
-    use std::os::fd::{AsFd, RawFd};
+    use std::os::fd::RawFd;
 
     /// Sends `fds` over `stream` with `SCM_RIGHTS`, with one byte of data (what `authopen` does).
     fn send_fds(stream: &UnixStream, fds: &[RawFd]) {
@@ -154,6 +175,24 @@ mod tests {
         let mut got = Vec::new();
         std::fs::File::from(fd).read_to_end(&mut got).unwrap();
         assert_eq!(got, b"revenant");
+    }
+
+    #[test]
+    fn recv_fd_sets_close_on_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = sample_file(dir.path());
+        let (a, b) = UnixStream::pair().unwrap();
+        send_fds(&a, &[file.as_raw_fd()]);
+        drop(file);
+        let fd = recv_fd(&b).unwrap();
+        // SAFETY: `fd` is open for this call; `F_GETFD` takes no third argument and changes nothing.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "{}", io::Error::last_os_error());
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "received descriptor would leak into children"
+        );
     }
 
     #[test]

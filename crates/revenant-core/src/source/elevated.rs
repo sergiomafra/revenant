@@ -21,6 +21,12 @@ pub(crate) const ELEVATED_NOT_FOUND: i32 = 3;
 pub(crate) const ELEVATED_OPEN_FAILED: i32 = 5;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const ELEVATED_BAD_ARGS: i32 = 7;
+/// The disk asked for holds the running system: the elevated process never opens it, whatever its caller says.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const ELEVATED_SYSTEM_DISK: i32 = 9;
+/// The process to hand the disk to is not this program (its image path is not this executable's).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const ELEVATED_WRONG_CALLER: i32 = 11;
 
 /// Opens the whole disk `disk` read-only after the system asks the user for permission (blocks until they answer).
 /// Errors: `permission_denied` (the user cancelled or refused), `device_not_found` (the disk is gone, or another medium
@@ -50,6 +56,17 @@ pub(crate) fn authopen_args(disk: &DiskId) -> Vec<String> {
     ]
 }
 
+/// What a failed `authopen` means: the user saying no (`permission_denied`), unless the node asked for no longer exists
+/// (the card pulled while the prompt was open: `device_not_found`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn authopen_failure(node_exists: bool) -> EngineError {
+    if node_exists {
+        EngineError::PermissionDenied
+    } else {
+        EngineError::DeviceNotFound
+    }
+}
+
 /// Whether an exit code can carry `value` as a handle: positive, a multiple of 4, within `i32`.
 fn carries_handle(value: u32) -> bool {
     value > 0 && value.is_multiple_of(4) && value <= i32::MAX as u32
@@ -69,6 +86,7 @@ pub(crate) fn encode_exit(result: Result<u32, EngineError>) -> i32 {
         Ok(_) => ELEVATED_OPEN_FAILED,
         Err(EngineError::PermissionDenied) => ELEVATED_DENIED,
         Err(EngineError::DeviceNotFound) => ELEVATED_NOT_FOUND,
+        Err(EngineError::SystemDisk) => ELEVATED_SYSTEM_DISK,
         Err(_) => ELEVATED_OPEN_FAILED,
     }
 }
@@ -85,12 +103,32 @@ pub(crate) fn decode_exit(code: i32) -> Result<u32, EngineError> {
         ELEVATED_BAD_ARGS => Err(helper_failed(
             "the elevated process refused its arguments".to_string(),
         )),
+        ELEVATED_SYSTEM_DISK => Err(EngineError::SystemDisk),
+        ELEVATED_WRONG_CALLER => Err(helper_failed(
+            "the elevated process refused its caller".to_string(),
+        )),
         // A crash (an NTSTATUS such as 0xC0000005) is negative as an `i32`, never a handle.
         c if c > 0 && carries_handle(c as u32) => Ok(c as u32),
         c => Err(helper_failed(format!(
             "the elevated process ended with code {c}"
         ))),
     }
+}
+
+/// Whether two executable paths, each already canonicalized, name the same program on Windows: compared without case,
+/// with the verbatim prefix (`\\?\`, `\\?\UNC\`) that canonicalizing adds taken away.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn same_program(a: &std::path::Path, b: &std::path::Path) -> bool {
+    fn normal(p: &std::path::Path) -> String {
+        let p = p.to_string_lossy();
+        let p = match p.strip_prefix(r"\\?\UNC\") {
+            Some(rest) => format!(r"\\{rest}"),
+            None => p.strip_prefix(r"\\?\").unwrap_or(&p).to_string(),
+        };
+        p.to_lowercase()
+    }
+    let (a, b) = (normal(a), normal(b));
+    !a.is_empty() && a == b
 }
 
 /// `[app, --revenant-elevated-open, PhysicalDriveN, pid]` → the disk and the app's process id.
@@ -140,7 +178,8 @@ mod imp {
 
     /// Runs `authopen -stdoutpipe /dev/rdiskN` (it shows the system's prompt, opens the node read-only and sends the
     /// descriptor over its stdout, one end of a socket pair) and receives the descriptor on the other end. A non-zero
-    /// exit or no descriptor is the user saying no (`permission_denied`); `authopen` not starting is `system_tool_failed`.
+    /// exit or no descriptor is the user saying no (`permission_denied`), except that a non-zero exit once the node is
+    /// gone is `device_not_found`; `authopen` not starting is `system_tool_failed`.
     /// What comes back must be open read-only and be the raw node asked for, else `open_failed`.
     fn authopen(disk: &DiskId) -> Result<File, EngineError> {
         let (ours, theirs) = UnixStream::pair().map_err(|cause| EngineError::Open { cause })?;
@@ -161,7 +200,9 @@ mod imp {
             .map_err(|_| EngineError::SystemTool { tool: AUTHOPEN })?;
         let received = macos_fd::recv_fd(&ours);
         if !status.success() {
-            return Err(EngineError::PermissionDenied);
+            let gone = std::fs::metadata(disk.device_path())
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+            return Err(authopen_failure(!gone));
         }
         let fd = received.map_err(|_| EngineError::PermissionDenied)?;
         let read_only =
@@ -211,12 +252,37 @@ mod imp {
         device::raw_from_file(windows::file_from_handle_value(handle))
     }
 
+    /// Whether process `pid` runs this very program: its image path (`QueryFullProcessImageNameW`) and this executable's,
+    /// both canonicalized, are the same. Anything that cannot be told is "no".
+    fn caller_is_this_program(pid: u32) -> bool {
+        let Ok(theirs) = windows::process_image_path(pid) else {
+            return false;
+        };
+        let (Ok(theirs), Ok(ours)) = (
+            std::fs::canonicalize(theirs),
+            std::env::current_exe().and_then(std::fs::canonicalize),
+        ) else {
+            return false;
+        };
+        same_program(&theirs, &ours)
+    }
+
     /// The elevated process: opens the disk read-only (as when run as Administrator) and duplicates the handle, with the
-    /// same read-only access, into the app's process.
+    /// same read-only access, into the app's process. It does not take its caller's word: the process to hand the disk
+    /// to must be this program (`ELEVATED_WRONG_CALLER`), and the disk must be listed (`ELEVATED_NOT_FOUND`) and not the
+    /// system's (`ELEVATED_SYSTEM_DISK`) in its own listing, before anything is opened.
     pub(super) fn elevated(args: &[OsString]) -> Option<i32> {
         let Some((disk, pid)) = parse_elevated_args(args) else {
             return Some(ELEVATED_BAD_ARGS);
         };
+        if !caller_is_this_program(pid) {
+            return Some(ELEVATED_WRONG_CALLER);
+        }
+        let allowed = crate::device::win::list()
+            .and_then(|listed| crate::device::unmountable(&listed, &disk).map(|_| ()));
+        if let Err(e) = allowed {
+            return Some(encode_exit(Err(e)));
+        }
         let result = device::open_device_file(&disk).and_then(|file| {
             windows::duplicate_into_process(&file, pid).map_err(|cause| EngineError::Open { cause })
         });
@@ -256,11 +322,18 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_authopen_on_a_gone_node_is_device_not_found() {
+        assert_eq!(authopen_failure(true).code(), "permission_denied");
+        assert_eq!(authopen_failure(false).code(), "device_not_found");
+    }
+
+    #[test]
     fn elevated_exit_codes_round_trip() {
         assert_eq!(decode_exit(encode_exit(Ok(0x1A4))).unwrap(), 0x1A4);
         let errors = [
             EngineError::PermissionDenied,
             EngineError::DeviceNotFound,
+            EngineError::SystemDisk,
             EngineError::Open {
                 cause: std::io::Error::other("x"),
             },
@@ -271,7 +344,16 @@ mod tests {
             assert_eq!(exit % 2, 1, "{code}: {exit}");
             assert_eq!(decode_exit(exit).unwrap_err().code(), code);
         }
-        for odd in [9, 0, -1, 2, 6, ELEVATED_BAD_ARGS, i32::MIN] {
+        for odd in [
+            13,
+            0,
+            -1,
+            2,
+            6,
+            ELEVATED_BAD_ARGS,
+            ELEVATED_WRONG_CALLER,
+            i32::MIN,
+        ] {
             assert_eq!(decode_exit(odd).unwrap_err().code(), "open_failed", "{odd}");
         }
         assert_eq!(
@@ -279,13 +361,56 @@ mod tests {
                 ELEVATED_DENIED,
                 ELEVATED_NOT_FOUND,
                 ELEVATED_OPEN_FAILED,
-                ELEVATED_BAD_ARGS
+                ELEVATED_BAD_ARGS,
+                ELEVATED_SYSTEM_DISK,
+                ELEVATED_WRONG_CALLER
             ],
-            [1, 3, 5, 7]
+            [1, 3, 5, 7, 9, 11]
         );
         // A value an exit code cannot carry as a handle is never encoded as one.
         for bad in [0, 2, 0x8000_0000] {
             assert_eq!(encode_exit(Ok(bad)), ELEVATED_OPEN_FAILED, "{bad}");
+        }
+    }
+
+    #[test]
+    fn same_program_ignores_case_and_the_verbatim_prefix() {
+        use std::path::Path;
+        let same = [
+            (
+                r"C:\Program Files\Revenant\Revenant.exe",
+                r"C:\Program Files\Revenant\Revenant.exe",
+            ),
+            (
+                r"\\?\C:\Program Files\Revenant\revenant.EXE",
+                r"c:\program files\revenant\Revenant.exe",
+            ),
+            (
+                r"\\?\UNC\server\share\Revenant.exe",
+                r"\\SERVER\share\revenant.exe",
+            ),
+            (
+                r"C:\Users\Élodie\Revenant.exe",
+                r"c:\users\élodie\revenant.exe",
+            ),
+        ];
+        for (a, b) in same {
+            assert!(same_program(Path::new(a), Path::new(b)), "{a} vs {b}");
+        }
+        let different = [
+            (
+                r"C:\Program Files\Revenant\Revenant.exe",
+                r"C:\Temp\Revenant.exe",
+            ),
+            (
+                r"C:\Program Files\Revenant\Revenant.exe",
+                r"C:\Program Files\Revenant\Revenant.exe.bak",
+            ),
+            (r"\\?\C:\a.exe", r"\\?\D:\a.exe"),
+            (r"C:\a.exe", ""),
+        ];
+        for (a, b) in different {
+            assert!(!same_program(Path::new(a), Path::new(b)), "{a} vs {b}");
         }
     }
 
