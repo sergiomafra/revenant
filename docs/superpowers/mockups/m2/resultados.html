@@ -22,8 +22,8 @@
 
   .bar .lbl{color:var(--ink-2)}
   .grp{display:flex;align-items:center;gap:8px;position:relative}
-  .tip{position:absolute;top:calc(100% + 8px);left:40px;background:var(--ink);color:var(--surface);font-size:12px;padding:6px 10px;border-radius:7px;white-space:nowrap;z-index:5;box-shadow:var(--shadow-pop);display:none}
-  .tip.show{display:block}
+  .hint{flex:none;display:none;align-items:center;gap:8px;padding:6px 16px;font-size:12px;color:var(--ink-2);background:var(--surface-2);border-bottom:1px solid var(--line-soft)}
+  .hint.show{display:flex}
   .content.is-det{display:flex;flex-direction:column;overflow:hidden}
 
   /* group header */
@@ -72,7 +72,7 @@
   .listw .gh{padding:12px 14px 8px;border-bottom:1px solid var(--line-soft)}
   .rows{overflow:auto;flex:1}
   .row{display:grid;grid-template-columns:20px 46px minmax(0,1fr) 54px 108px 74px 92px;gap:10px;align-items:center;padding:6px 14px;border-bottom:1px solid var(--line-soft);cursor:pointer}
-  .row.hd{position:sticky;top:0;background:var(--surface);z-index:2;font-size:11px;color:var(--ink-2);text-transform:uppercase;letter-spacing:.05em;cursor:default;padding:6px 14px;border-bottom:1px solid var(--line-soft)}
+  .row.head{position:sticky;top:0;background:var(--surface);z-index:2;font-size:11px;color:var(--ink-2);text-transform:uppercase;letter-spacing:.05em;cursor:default;padding:6px 14px;border-bottom:1px solid var(--line-soft)}
   .row input{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
   .row .th{aspect-ratio:1;border-radius:4px}
   .row b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -90,6 +90,7 @@
   .prev .note{margin-bottom:12px}
   .prev .exif{margin-top:2px}
   .prev .btn{width:100%}
+  .prev .btn.act{position:sticky;bottom:0;box-shadow:0 0 0 8px var(--surface)}
   .mk{display:inline-flex;align-items:center;gap:5px;border-radius:99px;padding:2px 9px 2px 6px;font-size:11px;font-weight:650;background:var(--info-bg);color:var(--info)}
   .mk svg{width:12px;height:12px}
   .prev .mk{margin-bottom:10px}
@@ -262,7 +263,7 @@
         h += '<div class="sg' + (x === g ? ' on' : '') + '" data-sg="' + x.key + '" role="button"><input type="checkbox" class="gcb" data-g="' + x.key + '"'
           + (c === x.total ? ' checked' : '') + (c > 0 && c < x.total ? ' data-some="1"' : '') + '><div><b>' + x.title + '</b><small>' + x.sub + '</small><small>' + nf(x.total) + ' · <u>' + nf(c) + ' sel.</u></small></div></div>';
       });
-      h += '</div><div class="listw">' + ghead(g) + '<div class="rows"><div class="row hd"><span></span><span></span><span>Nome</span><span class="c-tipo">Tipo</span><span>Estado</span><span>Tamanho</span><span class="c-data">Data</span></div>';
+      h += '</div><div class="listw">' + ghead(g) + '<div class="rows"><div class="row head"><span></span><span></span><span>Nome</span><span class="c-tipo">Tipo</span><span>Estado</span><span>Tamanho</span><span class="c-data">Data</span></div>';
       if (g.ids.indexOf(S.file) < 0) S.file = g.ids[1];
       g.ids.slice(0, 16).forEach(function (i) {
         var f = FILES[i];
@@ -281,7 +282,7 @@
         + '<div class="exif"><span>Câmera</span>Sony A7 IV<span>Lente</span>70–200 mm f/2.8<span>ISO</span>400<span>Data</span>' + dayShort(f) + ', ' + hm(f.min)
         + '<span>Tamanho</span>' + sz(f.mb) + '<span>Pasta original</span>' + (S.fmt ? 'não encontrada' : FOLD[f.f])
         + (f.nameless ? '<span>Nome original</span>não encontrado' : '') + '</div>'
-        + '<button class="btn' + (on ? ' ghost' : '') + '" data-f="' + S.file + '">' + I(on ? 'x' : 'check') + (on ? 'Remover da seleção' : 'Adicionar à recuperação') + '</button></div></div>';
+        + '<button class="btn act' + (on ? ' ghost' : '') + '" data-f="' + S.file + '">' + I(on ? 'x' : 'check') + (on ? 'Remover da seleção' : 'Adicionar à recuperação') + '</button></div></div>';
       return h;
     }
 
@@ -291,8 +292,9 @@
         + '<div class="bar"><div class="seg" role="group" aria-label="Visualização">'
         + '<button data-view="gal">' + I('grid') + 'Galeria</button><button data-view="tl">' + I('chart') + 'Linha do tempo</button><button data-view="det">' + I('list') + 'Detalhes</button></div>'
         + '<div class="grp"><span class="lbl">Agrupar</span><div class="seg" role="group" aria-label="Agrupar">'
-        + '<button data-grp="data">' + I('cal') + 'Por data</button><button data-grp="pasta">' + I('folder') + 'Por pasta</button></div><span class="tip" role="status"></span></div>'
+        + '<button data-grp="data">' + I('cal') + 'Por data</button><button data-grp="pasta">' + I('folder') + 'Por pasta</button></div></div>'
         + '<span class="sp"></span><button class="btn ghost">' + I('search') + 'Buscar</button></div>'
+        + '<div class="hint" role="status"></div>'
         + '<div class="main"><div class="content"></div></div>'
         + '<div class="foot"><button class="btn ghost sm" data-clear>Limpar seleção</button><span class="t" data-ftxt></span><span class="sp"></span><button class="btn" data-rec></button></div></div>';
     }
@@ -308,8 +310,8 @@
         b.classList.toggle('on', b.dataset.grp === S.grp && !tl);
         b.disabled = tl || (b.dataset.grp === 'pasta' && S.fmt);
       });
-      var tip = q('.tip');
-      tip.textContent = tl ? 'A linha do tempo sempre agrupa por data' : 'Pastas não encontradas: o cartão foi formatado. Veja os arquivos por data.';
+      var tip = q('.hint');
+      tip.innerHTML = I('info') + '<span>' + (tl ? 'A linha do tempo sempre agrupa por data' : 'Pastas não encontradas: o cartão foi formatado. Veja os arquivos por data.') + '</span>';
       tip.classList.toggle('show', tl || S.fmt);
       var t = totals(), rec = q('[data-rec]');
       rec.innerHTML = I('dl') + (t[0] ? 'Recuperar ' + nf(t[0]) + (t[0] === 1 ? ' arquivo' : ' arquivos') + ' (' + sz(t[1]) + ')' : 'Nada selecionado');
