@@ -102,7 +102,7 @@ var Kit = (function () {
   };
   K.logo = function (opts) {
     var small = !!(opts && opts.small);
-    return (small ? SYMBOL_SMALL : SYMBOL).replace('<svg ', '<svg class="logo" role="img" aria-label="Revenant" style="--d:var(--brand-gold)" ');
+    return (small ? SYMBOL_SMALL : SYMBOL).replace('<svg ', '<svg class="logo" role="img" aria-label="Revenant" style="' + (opts && opts.onTile ? '--d:var(--tile-gold);color:var(--tile-ink)' : '--d:var(--brand-gold)') + '" ');
   };
   // opts: { i, tag: 'RAW'|'JPG'|'VÍDEO', state: 'ok'|'mid'|'bad', sel, dur, w, nobadge }
   K.thumb = function (o) {

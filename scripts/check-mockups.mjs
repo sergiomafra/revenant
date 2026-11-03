@@ -85,6 +85,8 @@ const engineCodes = ('device_gone permission_denied device_not_found system_disk
 // Letter-aware boundaries (plain \b does not see "ã" as a letter).
 const jargonRe = /(?<![\p{L}\p{N}_])(setor|setores|cluster|clusters|carving|escultura|sessão|sessões)(?![\p{L}\p{N}_])/giu;
 for (const f of htmlFiles) {
+  // index.html is the builders' map: it shows the engine codes plainly on purpose (the only file exempt from rule 4).
+  if (f.endsWith('index.html')) continue;
   let t = read(f);
   t = t.replace(/<details\s+class="tech"[^>]*>[\s\S]*?<\/details>/g, (m) => m.replace(/[^\n]/g, ' '));
   t = stripKitTech(t);

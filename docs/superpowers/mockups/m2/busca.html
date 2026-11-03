@@ -269,12 +269,12 @@
       + '<div class="meter"><div class="progress" role="progressbar" aria-valuenow="38" aria-valuemin="0" aria-valuemax="100" aria-label="Busca"><i style="width:38%"></i></div><b>38%</b></div>'
       + '<div class="cnts"><span class="cnt">' + I('image') + '<b>412</b>fotos</span><span class="cnt">' + I('video') + '<b>9</b>vídeos</span></div></div>';
     var slow = o.mode === 'slow'
-      ? Kit.note('info', 'O cartão está lento. A busca continua. Você não precisa fazer nada.').replace('class="note info"', 'class="note info" data-code="slow_device"')
+      ? Kit.note('info', 'O cartão está lento. A busca continua. Você não precisa fazer nada.').replace('class="note info"', 'class="note info" data-code="Rate"')
       : '';
     var prog = '<div class="prog"><div class="in">' + row + slow + '</div></div>';
     var banner = o.mode === 'failing'
-      ? '<div class="banner bad" data-code="disk_failing" role="alert">' + I('alert') + '<span><b>O cartão está falhando:</b> faça uma cópia agora antes de continuar.</span><span class="sp"></span>'
-        + '<button class="btn">Fazer a cópia</button><button class="btn ghost sm">Continuar mesmo assim</button></div>'
+      ? '<div class="banner bad" data-code="DiskFailing" role="alert">' + I('alert') + '<span><b>O cartão está falhando:</b> faça uma cópia agora antes de continuar.</span><span class="sp"></span>'
+        + '<button class="btn">Fazer a cópia</button><button class="btn ghost">Continuar mesmo assim</button></div>'
       : '';
     var body = '<div class="wrap gal-wrap"><div class="gh"><span>' + (paused ? 'Você pode marcar agora. A busca segue quando você clicar em Continuar.' : 'Clique nas miniaturas para marcar o que quer recuperar. A busca continua por trás.') + '</span><b data-nsel></b></div>'
       + gallery(paused) + '</div>';
@@ -323,7 +323,7 @@
         + '<div class="progress ind" role="progressbar" aria-label="Continuando"><i></i></div>';
     } else {
       inner = '<span class="tile mid">' + I('unplug') + '</span><h3>O cartão foi desconectado</h3>'
-        + '<p class="lead" style="font-size:13.5px">O cartão foi desconectado. Nada se perdeu: conecte de novo para continuar.</p>'
+        + '<p class="lead" style="font-size:13.5px">Nada se perdeu: conecte de novo para continuar.</p>'
         + '<div class="progress ind" role="progressbar" aria-label="Esperando o cartão"><i></i></div>'
         + '<div class="wt">' + I('clock') + '<span data-t>Esperando o cartão voltar…</span></div>'
         + Kit.tech('device_gone', 'O cartão deixou de responder. O Revenant espera e continua sozinho quando ele voltar.')
@@ -335,7 +335,7 @@
     return {
       key: key, label: label,
       render: function () { return gone(over, back); },
-      after: closeModal
+      after: function (a) { if (over !== 'copia') wireSearching(a); closeModal(a); }
     };
   }
 

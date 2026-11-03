@@ -92,6 +92,7 @@
   @keyframes slide{0%{margin-left:-34%}100%{margin-left:100%}}
   @media (prefers-reduced-motion:reduce){.progress.ind>i{animation:none;margin-left:33%}}
   .issues{display:grid;grid-template-columns:1fr;gap:10px}
+  .issues .sub{grid-column:1/-1;font-size:13px;font-weight:650;color:var(--ink-2);margin-top:6px}
   .issues.two{grid-template-columns:repeat(2,minmax(0,1fr))}
   .iss{display:flex;gap:12px;align-items:flex-start;background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:12px 14px;min-width:0}
   .iss .ib{width:36px;height:36px;border-radius:10px;display:grid;place-items:center;flex:none;background:var(--warn-bg);color:var(--warn)}
@@ -122,7 +123,7 @@
   function page(now, body, foot) {
     return header(now) + '<div class="main"><div class="content">' + body + '</div></div>' + (foot ? '<div class="foot">' + foot + '</div>' : '');
   }
-  function hint(noun) { return Kit.note('ok', '<span class="hint"><b>Pare de usar o ' + noun + ' agora.</b> Não grave nada nele.</span>'); }
+  function hint(noun) { return Kit.note('info', '<span class="hint"><b>Pare de usar o ' + noun + ' agora.</b> Não grave nada nele.</span>'); }
 
   // ---- screen 1: disk list ----
   var WHY_TEXT = 'Nesses discos, o sistema limpa sozinho o espaço dos arquivos apagados, em poucos minutos. Quanto antes você procurar, maior a chance de achar tudo. Não use o disco até lá.';
@@ -196,7 +197,7 @@
   var MAC_LEAD = 'Para ler o cartão por inteiro, e não só as pastas visíveis, o Mac precisa da senha de administrador. Você digita a senha na janela do sistema, não aqui.';
   var MAC_STEPS = ['<b>Clique no botão</b> “Pedir a senha de administrador”.', 'Digite a senha que você usa para entrar no Mac.', 'Pronto. A conferência do cartão começa sozinha.'];
   var MAC_FOOT = '<button class="btn ghost">Voltar</button><span class="t">Seus dados não saem do computador</span><span class="sp"></span><button class="btn" data-ask>' + I('lock') + 'Pedir a senha de administrador</button>';
-  var MAC_DLG = '<div class="modal"><div class="sysdlg" role="dialog"><span class="appic">' + Kit.logo({ small: true }) + '</span>'
+  var MAC_DLG = '<div class="modal"><div class="sysdlg" role="dialog"><span class="appic">' + Kit.logo({ small: true, onTile: true }) + '</span>'
     + '<b>O Revenant quer fazer alterações.</b><p>Digite a senha para permitir.</p>'
     + '<div class="fld"><span>Usuário</span><span>Sérgio Mafra</span></div>'
     + '<div class="fld"><span>Senha</span><i>••••••••</i></div>'
@@ -207,7 +208,7 @@
   var WIN_FOOT = '<button class="btn ghost">Voltar</button><span class="t">Seus dados não saem do computador</span><span class="sp"></span><button class="btn" data-ask>Continuar' + I('chevron-right') + '</button>';
   var UAC = '<div class="modal"><div class="uac" role="dialog"><div class="uh">' + I('shield') + 'Controle de Conta de Usuário</div>'
     + '<div class="ub"><h3>Deseja permitir que este aplicativo faça alterações no seu dispositivo?</h3>'
-    + '<div class="ap"><span class="appic">' + Kit.logo({ small: true }) + '</span><div><b>Revenant</b><small>Origem do arquivo: disco rígido neste computador</small></div></div>'
+    + '<div class="ap"><span class="appic">' + Kit.logo({ small: true, onTile: true }) + '</span><div><b>Revenant</b><small>Origem do arquivo: disco rígido neste computador</small></div></div>'
     + '<a class="ul" href="#">Mostrar mais detalhes</a></div>'
     + '<div class="uf"><button class="btn">Sim</button><button class="btn ghost">Não</button></div></div></div>';
   // Kit frames are per screen; screen 3 swaps the title bar per state (Windows frame only in the "win" state).
@@ -234,6 +235,7 @@
   }
   var ISS = {
     notResponding: function () { return issue('mid', 'clock', 'O cartão não respondeu a tempo', 'Tire e coloque o cartão de novo e confira o leitor.', Kit.tech('device_not_responding', 'O cartão demorou demais para responder.')); },
+    unreadable: function () { return issue('mid', 'alert', 'Uma parte do cartão não pôde ser lida', 'Faça uma cópia do cartão primeiro: ela lê com calma as partes difíceis.', Kit.tech('sample_unreadable', 'A leitura de teste falhou.')); },
     onSource: function () { return issue('mid', 'folder', 'A pasta escolhida fica no próprio cartão', 'Escolha uma pasta em outro disco.', Kit.tech('destination_on_source', 'Gravar no cartão poderia apagar o que ainda dá para recuperar.')); }
   };
   function checkFoot() { return '<button class="btn ghost">Voltar</button><span class="sp"></span><button class="btn">' + I('refresh') + 'Conferir de novo</button>'; }
@@ -294,19 +296,20 @@
         } },
         { key: 'ok', label: 'Tudo certo', render: function () {
           return page(2, '<div class="wrap center"><span class="tile ok big">' + I('check') + '</span>'
-            + '<h2 class="ttl">Tudo certo</h2><p class="lead">O cartão responde e a pasta para salvar está livre. Já vamos para o próximo passo.</p>'
+            + '<h2 class="ttl">Tudo certo</h2><p class="lead">O cartão responde e dá para lê-lo. Já vamos para o próximo passo.</p>'
             + '</div>');
         } },
         { key: 'problemas', label: 'Com problemas', render: function () {
-          return issuesPage('Antes de procurar, vamos resolver duas coisas', 'Nada foi alterado no cartão. Resolva e confira de novo.', [ISS.notResponding(), ISS.onSource()]);
+          return issuesPage('Antes de procurar, vamos resolver duas coisas', 'Nada foi alterado no cartão. Resolva e confira de novo.', [ISS.notResponding(), ISS.unreadable()]);
         } },
         { key: 'todos', label: 'Todos os avisos', render: function () {
           return issuesPage('Todos os avisos da conferência', 'Esta lista é só para revisar os textos: o app mostra apenas os avisos que valem para o seu caso.', [
             issue('bad', 'unplug', 'Não achamos o cartão', 'Conecte o cartão de novo e escolha-o na lista.', Kit.tech('device_not_found', 'O cartão escolhido não está mais conectado.')),
             ISS.notResponding(),
-            issue('mid', 'alert', 'Não deu para ler o começo do cartão', 'Tente outra porta USB ou outro leitor. Se continuar, o cartão pode estar com defeito: faça a cópia de segurança no próximo passo.', Kit.tech('sample_unreadable', 'A leitura de teste falhou.')),
+            ISS.unreadable(),
             issue('mid', 'lock', 'O cartão não abriu para leitura', 'Feche os programas que usam o cartão e confira de novo.', Kit.tech('open_failed', 'O sistema recusou abrir o cartão.')),
             issue('mid', 'power', 'O sistema não soltou o cartão', 'Feche as janelas e os programas que usam o cartão e confira de novo.', Kit.tech('unmount_failed', 'Não foi possível liberar o cartão do sistema.')),
+            '<h3 class="sub">Quando já há uma pasta escolhida (ao retomar uma cópia ou uma recuperação)</h3>',
             issue('mid', 'hdd', 'A pasta escolhida não tem espaço', 'Escolha uma pasta em um disco com mais espaço livre.', Kit.tech('destination_too_small', 'O espaço livre é menor que o necessário.')),
             ISS.onSource(),
             issue('mid', 'folder', 'Não deu para conferir a pasta escolhida', 'Escolha a pasta de novo.', Kit.tech('destination_unknown', 'Não foi possível medir o espaço da pasta.')),

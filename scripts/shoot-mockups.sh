@@ -37,13 +37,17 @@ if [ "$MIN" = 1 ]; then W=1024; H=700; QS="&w=1024&h=700"; SUF="-min"; fi
 if [ "$LONG" = 1 ]; then QS="$QS&long=1"; SUF="-long$SUF"; fi
 mkdir -p "$OUT"
 
+# Percent-encode a path for file:// URLs (spaces, %, #, ? ...).
+urlpath() { node -e 'console.log(process.argv[1].split("/").map(encodeURIComponent).join("/"))' "$1"; }
+
 chrome() { "$CHROME" --headless=new --disable-gpu --hide-scrollbars --no-first-run "$@" 2>/dev/null; }
 
 count=0
 for page in "${PAGES[@]}"; do
   file="$DIR/$page.html"
+  furl="file://$(urlpath "$file")"
   [ -f "$file" ] || { echo "missing page $file" >&2; exit 1; }
-  dom="$(chrome --virtual-time-budget=3000 --dump-dom "file://$file?manifest=1" || true)"
+  dom="$(chrome --virtual-time-budget=3000 --dump-dom "$furl?manifest=1" || true)"
   json="$(printf '%s' "$dom" | node -e '
     let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
       const m = s.match(/<pre id="manifest"[^>]*>([\s\S]*?)<\/pre>/);
@@ -57,7 +61,7 @@ for page in "${PAGES[@]}"; do
       png="$OUT/$pg-$screen-$state-$theme$SUF.png"
       rm -f "$png"
       chrome --window-size="$W,$H" --virtual-time-budget=4000 --screenshot="$png" \
-        "file://$file?screen=$screen&state=$state&theme=$theme$QS" >/dev/null || true
+        "$furl?screen=$screen&state=$state&theme=$theme$QS" >/dev/null || true
       if [ ! -s "$png" ]; then echo "no screenshot written: $png" >&2; exit 1; fi
       count=$((count + 1))
     done

@@ -96,7 +96,7 @@
   var I = Kit.icon, nf = Kit.nf;
 
   // ---- shared pieces ----
-  // This page adds a last step, "Recuperar", after "Resultados" (the other pages stop at Resultados).
+  // This page adds a last step, "Recuperar", after "Resultados" (the earlier pages stop at Resultados; the story is the same 1.321 files).
   var STEPS = ['Disco', 'Permissão', 'Conferência', 'Cópia', 'Busca', 'Resultados', 'Recuperar'];
   function header(now) {
     var p = STEPS.map(function (s, i) {
@@ -119,7 +119,7 @@
   var SAFE_FOOT = '<span class="t">Nada é alterado no cartão</span>';
 
   // ---- screen 9: where to save ----
-  var NEED_GB = 18.6;
+  var NEED_GB = 19.4;
   var DESTS = [
     { key: 'lacie', icon: 'hdd', name: 'HD externo · LaCie', sub: '2 TB · ligado por USB', free: '1,4 TB livres', ok: true },
     { key: 't7', icon: 'usb', name: 'SSD externo T7', sub: '1 TB · ligado por USB', free: '812 GB livres', ok: true },
@@ -143,21 +143,21 @@
       alert = Kit.note('bad', '<b>Não dá para salvar no próprio cartão:</b> gravar nele pode apagar fotos que ainda não voltaram. Escolha outro disco.')
         .replace('class="note bad"', 'class="note bad alert" data-code="destination_on_source" role="alert"');
     } else if (low) {
-      alert = Kit.note('mid', '<b>Faltam 4,4 GB nesse disco.</b> Escolha outro ou recupere menos arquivos.')
+      alert = Kit.note('mid', '<b>Faltam 5,2 GB nesse disco.</b> Escolha outro ou recupere menos arquivos.')
         .replace('class="note mid"', 'class="note mid alert" data-code="destination_too_small" role="alert"');
     }
     var src = '<div class="card off srcoff' + (o.refuse ? ' hit' : '') + '" data-source-disk><span class="tile">' + I('sd') + '</span><div><b data-t>Cartão SD 64 GB</b>'
       + '<small>' + I('x') + '<span data-t>Os arquivos não podem ser salvos no próprio cartão</span></small>'
       + Kit.tech('destination_on_source', 'Gravar no cartão poderia apagar o que ainda dá para recuperar.') + '</div></div>';
     var body = '<div class="wrap tight"><div class="thead"><div><h2 class="ttl">Onde salvar os arquivos?</h2><p class="lead" style="margin-top:4px">Escolha um disco com espaço livre. Os arquivos vão para uma pasta nova, a Revenant.</p></div>'
-      + '<span class="pick">' + I('image') + '<span data-t>1.284 arquivos escolhidos · 18,6 GB</span></span></div>'
+      + '<span class="pick">' + I('image') + '<span data-t>1.321 arquivos escolhidos · 19,4 GB</span></span></div>'
       + alert
       + '<div class="dests" role="radiogroup">' + rows + other + '</div>'
       + src + '</div>';
     var ready = d && d.ok;
     var foot = '<button class="btn ghost">Voltar aos resultados</button>' + SAFE_FOOT + '<span class="sp"></span>'
       + (ready ? '<span class="t" data-t>Salvando em: ' + d.name + '</span>' : '')
-      + '<button class="btn" data-go' + (ready ? '' : ' disabled') + '>' + I('dl') + 'Recuperar 1.284 arquivos</button>';
+      + '<button class="btn" data-go' + (ready ? '' : ' disabled') + '>' + I('dl') + 'Recuperar 1.321 arquivos</button>';
     return page(6, body, foot);
   }
   function wireWhere(app, o) {
@@ -179,7 +179,7 @@
   }
 
   // ---- screen 10: recovering and summary ----
-  var TOTAL = 1284, DONE = 812;
+  var TOTAL = 1321, DONE = 812;
   function recovering() {
     var pct = Math.round(DONE / TOTAL * 100);
     var body = '<div class="wrap center"><span class="tile">' + I('dl') + '</span>'
@@ -195,27 +195,27 @@
       return '<div class="r">' + Kit.badge(state) + '<span class="n">' + nf(n) + '</span><span class="d" data-t>' + text + '</span></div>';
     }
     var body = '<div class="wrap center"><span class="tile ok big">' + I('check') + '</span>'
-      + '<div><h2 class="ttl">1.284 arquivos recuperados</h2><p class="lead" style="margin:6px auto 0">18,6 GB salvos em <b data-t>HD externo · LaCie / Revenant</b>, em 14 min.</p></div>'
+      + '<div><h2 class="ttl">1.321 arquivos recuperados</h2><p class="lead" style="margin:6px auto 0">19,4 GB salvos em <b data-t>HD externo · LaCie / Revenant</b>, em 14 min.</p></div>'
       + '<div class="card sumcard">'
-      + row('ok', 1201, 'Abrem normalmente.')
-      + row('mid', 63, 'Abrem, mas falta um pedaço.')
+      + row('ok', 1250, 'Abrem normalmente.')
+      + row('mid', 51, 'Abrem, mas falta um pedaço.')
       + row('bad', 20, 'Podem não abrir. Guardamos o que deu.')
       + '</div>'
-      + '<div class="partial">' + Kit.note('mid', '<b>O que significa Parcial:</b> o arquivo abre, mas uma parte dele não pôde ser lida. Uma foto pode aparecer cortada ou com uma faixa cinza; um vídeo pode parar antes do fim. Vale conferir esses 63 primeiro.') + '</div>'
+      + '<div class="partial">' + Kit.note('mid', '<b>O que significa Parcial:</b> o arquivo abre, mas uma parte dele não pôde ser lida. Uma foto pode aparecer cortada ou com uma faixa cinza; um vídeo pode parar antes do fim. Vale conferir esses 51 primeiro.') + '</div>'
       + '<div class="done-actions"><button class="btn ghost">Voltar aos resultados</button></div></div>';
     return page(6, body, '<span class="t">Nada foi alterado no cartão</span><span class="sp"></span><button class="btn">' + I('folder') + 'Abrir pasta</button>');
   }
   function writeFailed() {
     var inner = '<span class="tile mid">' + I('alert') + '</span><h3>Não deu para salvar neste disco</h3>'
-      + '<p class="lead">O HD externo · LaCie ficou cheio ou foi desconectado. Nada foi perdido: escolha outro disco para continuar de onde parou.</p>'
-      + '<div class="saved">' + I('circle-check') + '<span data-t>812 de 1.284 arquivos já estão salvos</span></div>'
+      + '<p class="lead">O HD externo · LaCie foi desconectado. Nada foi perdido: escolha outro disco para continuar de onde parou.</p>'
+      + '<div class="saved">' + I('circle-check') + '<span data-t>812 de 1.321 arquivos já estão salvos</span></div>'
       + Kit.tech('write_failed', 'O Revenant não conseguiu gravar no disco de destino. Os arquivos já gravados não são apagados.')
       + '<div class="acts" style="align-self:flex-end"><button class="btn ghost">Parar e abrir a pasta</button><button class="btn">Escolher outro disco</button></div>';
     return recovering() + modal(inner, 'stop');
   }
   function cardGone() {
     var inner = '<span class="tile mid">' + I('unplug') + '</span><h3>O cartão foi desconectado</h3>'
-      + '<p class="lead">Os 812 arquivos já salvos ficam na pasta. Conecte o cartão de novo e a recuperação continua dos 472 que faltam.</p>'
+      + '<p class="lead">Nada se perdeu: conecte de novo para continuar. Os 812 arquivos já salvos ficam na pasta e a recuperação continua dos 509 que faltam.</p>'
       + '<div class="progress ind" role="progressbar" aria-label="Esperando o cartão"><i></i></div>'
       + '<div class="wt">' + I('clock') + '<span data-t>Esperando o cartão voltar…</span></div>'
       + Kit.tech('device_gone', 'O cartão deixou de responder. O Revenant espera e continua sozinho quando ele voltar.')
