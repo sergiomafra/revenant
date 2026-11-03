@@ -21,12 +21,12 @@ function evalExpr(expr, idOk) {
   let pos = 0;
   const parseOr = () => {
     let v = parseAnd();
-    while (tokens[pos] === 'OR') { pos++; const r = parseAnd(); v = v || r; }
+    while (tokens[pos]?.toUpperCase() === 'OR') { pos++; const r = parseAnd(); v = v || r; }
     return v;
   };
   const parseAnd = () => {
     let v = parseAtom();
-    while (tokens[pos] === 'AND') { pos++; const r = parseAtom(); v = v && r; }
+    while (tokens[pos]?.toUpperCase() === 'AND') { pos++; const r = parseAtom(); v = v && r; }
     return v;
   };
   const parseAtom = () => {
@@ -37,6 +37,8 @@ function evalExpr(expr, idOk) {
       if (tokens[pos++] !== ')') throw new Error('missing )');
       return v;
     }
+    // "X WITH Y": an exception to X; the allow check looks at X only.
+    if (tokens[pos]?.toUpperCase() === 'WITH') pos += 2;
     return idOk(t.replace(/\+$/, ''));
   };
   try {
@@ -47,12 +49,25 @@ function evalExpr(expr, idOk) {
   }
 }
 
+// Handles `license` as a string or { type }, and the legacy `licenses: [{ type }]` (several entries mean OR).
+function licenseOf(pkg) {
+  const one = (l) => (typeof l === 'string' ? l : typeof l?.type === 'string' ? l.type : '').trim();
+  const single = one(pkg.license);
+  if (single) return single;
+  if (Array.isArray(pkg.licenses)) {
+    const all = pkg.licenses.map(one).filter(Boolean);
+    return all.length ? all.map((l) => `(${l})`).join(' OR ') : '';
+  }
+  return '';
+}
+
 export function checkLock(lock) {
   const failures = [];
   for (const [key, pkg] of Object.entries(lock.packages ?? {})) {
     if (key === '' || pkg.link) continue;
-    const dev = pkg.dev === true || pkg.devOptional === true;
-    const license = typeof pkg.license === 'string' ? pkg.license.trim() : '';
+    // devOptional is also an optional dependency of a runtime package, so it can ship: runtime rule.
+    const dev = pkg.dev === true;
+    const license = licenseOf(pkg);
     const name = key.replace(/^.*node_modules\//, '');
     if (!license) {
       failures.push(`${name}: no license declared`);
