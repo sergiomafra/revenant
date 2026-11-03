@@ -1,5 +1,7 @@
 //! The Revenant desktop app: the Tauri shell that hosts the interface in `app/` and the commands it calls.
 
+pub mod access;
+pub mod disks;
 pub mod settings;
 
 use serde::Serialize;
@@ -11,6 +13,12 @@ use settings::Settings;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ErrorView {
     pub code: &'static str,
+}
+
+impl From<&revenant_core::EngineError> for ErrorView {
+    fn from(e: &revenant_core::EngineError) -> ErrorView {
+        ErrorView { code: e.code() }
+    }
 }
 
 /// The stored settings, or the defaults when there are none (or the config folder is unknown).
@@ -35,7 +43,12 @@ fn set_settings(app: AppHandle, settings: Settings) -> Result<(), ErrorView> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![get_settings, set_settings])
+        .invoke_handler(tauri::generate_handler![
+            get_settings,
+            set_settings,
+            disks::list_disks,
+            access::request_access
+        ])
         .run(tauri::generate_context!())
         .expect("error while running the Revenant app");
 }
@@ -60,5 +73,17 @@ mod tests {
         assert_eq!(w["minWidth"], 1024);
         assert_eq!(w["minHeight"], 700);
         assert_eq!(conf["productName"], "Revenant");
+    }
+
+    #[test]
+    fn csp_is_strict() {
+        let conf: Value = serde_json::from_str(CONF).expect("tauri.conf.json is JSON");
+        let csp = conf["app"]["security"]["csp"]
+            .as_str()
+            .expect("a content security policy is set");
+        assert!(csp.contains("default-src 'self'"));
+        assert!(!csp.contains("unsafe-eval"));
+        assert!(!csp.contains('*'));
+        assert!(!csp.contains("script-src") || !csp.contains("script-src 'unsafe-inline'"));
     }
 }

@@ -2,8 +2,8 @@
 
 The Revenant desktop app: a [Tauri 2](https://tauri.app/) window around the engine (`revenant-core`). This crate is the
 Rust side; the interface (React, Vite, TypeScript, Tailwind) lives in [`app/`](../../app). For now it has the base of
-the interface (themes, languages, the Kit, Settings, About and the error screen); the path screens and the engine
-commands come next.
+the interface (themes, languages, the Kit, Settings, About and the error screen) and the commands that list the
+disks and ask for access to one; the path screens come next.
 
 ## Requirements
 
@@ -88,6 +88,33 @@ The theme and the language are kept in `settings.json` in the app's config folde
 unreadable file gives the defaults (`auto`, `null`); deleting it resets the settings. The interface reads and writes it
 through two commands, `get_settings` and `set_settings` (`src/settings.rs`); when writing fails, `set_settings` returns
 `{ code: "settings_write_failed" }` and the screen says the choice lasts until the app closes.
+
+## Commands: disks and access
+
+Both run off the window thread (`async` plus `spawn_blocking`). Every error is `{ code }`: the engine's `code()`
+(`system_tool_failed`, `permission_denied`, `device_not_found`, `system_disk`, `not_whole_disk`, ...), or `unknown`
+when the background task itself fails (a panic).
+
+- `list_disks() -> DiskView[]` (`src/disks.rs`): the connected whole disks. Disk images the system attached are left
+  out. Order: cards and external disks first (`highlighted`), then internal ones, then the system disk; inside each
+  group, the engine's order. A `DiskView` is `{ id, name: { label, vendor, model }, size, fs, connection, kind,
+  solid_state, camera_card, selectable, highlighted }`: `kind` is `card`, `external`, `internal` or `system`;
+  `connection` is `usb`, `sd_card`, `thunderbolt`, `internal` or `unknown`; `camera_card` is true when a mounted
+  volume has a `DCIM` folder; `selectable` is false only for the system disk. The interface builds the display name
+  (label; else brand and model; else "Disk" and the size).
+- `request_access(disk_id) -> { id, size }` (`src/access.rs`): refuses the system disk (`system_disk`) and a disk
+  that is not listed (`device_not_found`), then shows the system's own permission prompt (macOS password dialog,
+  Windows UAC), reads the first sector to prove the access works, checks the disk is still listed (the prompt can
+  stay open for a long time) and releases the access. It never writes. The interface asks again for the actual scan.
+
+Tests use a fake `DeviceOps` and an in-memory device: they never touch a real disk.
+
+## Content security policy
+
+`tauri.conf.json` sets a strict policy: everything from the app itself, inline styles allowed (React sets style
+attributes), images from the app, `data:` and `asset:`, and the commands' channel; no remote code and no `eval`.
+`devCsp` adds what the Vite dev server needs (inline scripts for hot reload, its address and WebSocket). The test
+`csp_is_strict` checks the release policy.
 
 ## Interface rules (`npm run check`)
 
