@@ -39,9 +39,11 @@ pub fn access_with(
     let device = opener(&id).map_err(|e| ErrorView::from(&e))?;
     let geometry = device.geometry();
     let mut sector = vec![0u8; geometry.logical_sector.max(1) as usize];
-    device
-        .read_aligned(0, &mut sector)
-        .map_err(|e| ErrorView::from(&e))?;
+    device.read_aligned(0, &mut sector).map_err(|e| match e {
+        // The card pulled between the open and the read: to the interface, the disk is gone.
+        EngineError::DeviceGone { .. } => ErrorView::from(&EngineError::DeviceNotFound),
+        e => ErrorView::from(&e),
+    })?;
     // The password prompt can stay open for a long time: the disk may be gone by now.
     let still_there = check_listed(ops, &id);
     // Release the access before answering, whatever the check says.
@@ -176,6 +178,28 @@ mod tests {
         let ops = FakeOps::new(vec![disk("disk4")]);
         let err = access_with(&ops, &|_| Err(EngineError::PermissionDenied), "disk4").unwrap_err();
         assert_eq!(err.code, "permission_denied");
+    }
+
+    /// The card pulled between the open and the first read: the read says `device_gone`, which the interface knows as the
+    /// disk being gone (`device_not_found`, back to the list).
+    #[test]
+    fn request_access_disk_gone_during_first_read() {
+        struct GoneDevice;
+        impl RawDevice for GoneDevice {
+            fn geometry(&self) -> Geometry {
+                Geometry {
+                    size: 4096,
+                    logical_sector: 512,
+                    physical_sector: 512,
+                }
+            }
+            fn read_aligned(&self, offset: u64, _buf: &mut [u8]) -> Result<usize, EngineError> {
+                Err(EngineError::DeviceGone { offset })
+            }
+        }
+        let ops = FakeOps::new(vec![disk("disk4")]);
+        let err = access_with(&ops, &|_| Ok(Box::new(GoneDevice)), "disk4").unwrap_err();
+        assert_eq!(err.code, "device_not_found");
     }
 
     #[test]

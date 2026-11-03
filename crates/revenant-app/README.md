@@ -108,7 +108,8 @@ when the background task itself fails (a panic).
 - `request_access(disk_id) -> { id, size }` (`src/access.rs`): refuses the system disk (`system_disk`) and a disk
   that is not listed (`device_not_found`), then shows the system's own permission prompt (macOS password dialog,
   Windows UAC), reads the first sector to prove the access works, checks the disk is still listed (the prompt can
-  stay open for a long time) and releases the access. It never writes. The interface asks again for the actual scan.
+  stay open for a long time) and releases the access. A disk gone during that read (`device_gone`) is answered as
+  `device_not_found`, so the interface goes back to the list with its note. It never writes. The interface asks again for the actual scan.
 
 Tests use a fake `DeviceOps` and an in-memory device: they never touch a real disk.
 

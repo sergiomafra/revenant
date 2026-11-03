@@ -20,8 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   "Connect the card or the disk" when there is none. The list follows disks being plugged in and out by itself, without
   losing the choice. Continue explains the system's permission prompt (the administrator password on the Mac, the
   Windows confirmation), asks for it and, once granted, says that Revenant can read the disk (the search comes in the
-  next version). A refused prompt can be tried again; a disk that went away sends you back to the list with a note.
-  Settings and About open from the buttons at the top right of every screen.
+  next version). A refused prompt can be tried again; a disk that went away, even while the permission prompt was up or
+  just after it, sends you back to the list with a note. Settings and About open from the buttons at the top right of every screen.
 - A disk can be opened through the system's own permission prompt (the password prompt on macOS, the UAC prompt on
   Windows), read-only, so the app never has to run as administrator.
 - The disk list tells how each disk is connected (USB, SD card, Thunderbolt, internal) and whether it looks like a
