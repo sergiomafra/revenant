@@ -89,7 +89,7 @@ docs/superpowers/mockups/m2/
 
 ---
 
-### Tarefa 1: Arquivos de marca
+### Task 1: Arquivos de marca
 
 **Files:**
 - Create: `assets/brand/*` (lista acima), `scripts/export-brand.sh`
@@ -130,7 +130,7 @@ docs/superpowers/mockups/m2/
 - [ ] **Step 6: Commit** `feat(brand): logo, app icon and wordmarks` (adicionar `assets/brand` e
   `scripts/export-brand.sh` pelo nome).
 
-### Tarefa 2: Base dos mockups (tokens, kit, conferidor, capturas, índice)
+### Task 2: Base dos mockups (tokens, kit, conferidor, capturas, índice)
 
 **Files:**
 - Create: `docs/superpowers/mockups/m2/tokens.css`, `kit.css`, `kit.js`, `index.html`, `scripts/check-mockups.mjs`,
@@ -227,7 +227,7 @@ docs/superpowers/mockups/m2/
 - [ ] **Step 7: Commit** `docs(mockups): Part 2.0 mockup kit, tokens, checker and index` (adicionar os arquivos pelo
   nome).
 
-### Tarefa 3: `inicio.html` — telas 2, 1, 3 e 4
+### Task 3: `inicio.html` — telas 2, 1, 3 e 4
 
 **Files:** Create: `docs/superpowers/mockups/m2/inicio.html`
 **Interfaces:** Consumes: o `Kit` (Tarefa 2). Base visual: as telas "O que você quer recuperar?" e "Só falta uma
@@ -268,7 +268,7 @@ permissão do Mac" do `fluxo.html`, levadas para a horizontal.
   `--long`. Olhar cada PNG (Read de imagem), no claro e no escuro. Corrigir quebras, cortes e contraste.
 - [ ] **Step 5: Commit** `docs(mockups): start screens, resume, disk, permission, pre-check`.
 
-### Tarefa 4: `busca.html` — telas 5, 6 e 7
+### Task 4: `busca.html` — telas 5, 6 e 7
 
 **Files:** Create: `docs/superpowers/mockups/m2/busca.html`
 **Interfaces:** Consumes: o `Kit`. Base visual: "Primeiro, uma cópia de segurança?" e "Procurando…" do `fluxo.html`.
@@ -301,7 +301,7 @@ permissão do Mac" do `fluxo.html`, levadas para a horizontal.
 - [ ] **Step 4: Capturas e olhada**, também com `--min` (1024×700) na tela 6.
 - [ ] **Step 5: Commit** `docs(mockups): backup copy, searching, card pulled out`.
 
-### Tarefa 5: `resultados.html` — tela 8
+### Task 5: `resultados.html` — tela 8
 
 **Files:** Create: `docs/superpowers/mockups/m2/resultados.html`
 **Interfaces:** Consumes: o `Kit`. Base: o `resultados-v2.html` inteiro (dados, três visualizações, seleção por grupo,
@@ -320,7 +320,7 @@ permissão do Mac" do `fluxo.html`, levadas para a horizontal.
 - [ ] **Step 4: Capturas e olhada**, também com `--min` e com `--long`.
 - [ ] **Step 5: Commit** `docs(mockups): results, gallery, timeline and details`.
 
-### Tarefa 6: `recuperar.html` — telas 9 e 10
+### Task 6: `recuperar.html` — telas 9 e 10
 
 **Files:** Create: `docs/superpowers/mockups/m2/recuperar.html`
 **Interfaces:** Consumes: o `Kit`. Base: "Onde salvar?" e "1.284 arquivos recuperados" do `fluxo.html`.
@@ -346,7 +346,7 @@ permissão do Mac" do `fluxo.html`, levadas para a horizontal.
 - [ ] **Step 4: Capturas e olhada.**
 - [ ] **Step 5: Commit** `docs(mockups): where to save, recovering and summary`.
 
-### Tarefa 7: `app.html` — telas 11, 12 e 13
+### Task 7: `app.html` — telas 11, 12 e 13
 
 **Files:** Create: `docs/superpowers/mockups/m2/app.html`
 **Interfaces:** Consumes: o `Kit`.
@@ -365,7 +365,7 @@ permissão do Mac" do `fluxo.html`, levadas para a horizontal.
 - [ ] **Step 4: Capturas e olhada.**
 - [ ] **Step 5: Commit** `docs(mockups): settings, about and unexpected error`.
 
-### Tarefa 8: Fechamento
+### Task 8: Fechamento
 
 **Files:** Modify: `docs/superpowers/roadmap.md`, `CLAUDE.md` ("Onde o desenvolvimento está"), `README.md` (raiz, uma
 linha que aponta para `assets/brand/`, se o README tiver uma seção de projeto ou de contribuição; se não tiver, nada).
