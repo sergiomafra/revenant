@@ -26,6 +26,25 @@ pub(crate) mod win;
 #[cfg(any(windows, test))]
 pub(crate) mod win_parse;
 
+/// Whether a mounted volume of the disk has a `DCIM` folder (any letter case) at its root, the layout cameras write. Only
+/// lists the mounted folder; the disk itself is never opened.
+pub fn looks_like_camera_card(disk: &DiskInfo) -> bool {
+    disk.volumes
+        .iter()
+        .filter_map(|v| v.mount_point.as_deref())
+        .any(has_dcim_folder)
+}
+
+fn has_dcim_folder(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_name().to_string_lossy().eq_ignore_ascii_case("DCIM")
+            && std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir())
+    })
+}
+
 /// The largest file FAT12/16/32 can hold: 4 GiB − 1.
 pub const FAT_MAX_FILE: u64 = 4_294_967_295;
 
@@ -42,6 +61,31 @@ pub struct VolumeInfo {
     pub size: u64,
 }
 
+/// How a disk is connected to the computer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Connection {
+    Usb,
+    /// An SD or MMC card in a built-in reader.
+    SdCard,
+    Thunderbolt,
+    Internal,
+    /// The system does not say, or says something this list does not know.
+    Unknown,
+}
+
+impl Connection {
+    /// A stable code (`usb`, `sd_card`, `thunderbolt`, `internal`, `unknown`).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Connection::Usb => "usb",
+            Connection::SdCard => "sd_card",
+            Connection::Thunderbolt => "thunderbolt",
+            Connection::Internal => "internal",
+            Connection::Unknown => "unknown",
+        }
+    }
+}
+
 /// A connected whole disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiskInfo {
@@ -55,6 +99,8 @@ pub struct DiskInfo {
     pub removable: bool,
     /// Built into the computer.
     pub internal: bool,
+    /// How the disk is connected.
+    pub connection: Connection,
     /// Holds the running system (the startup volume, or a part of it).
     pub system: bool,
     /// A disk image attached by the system (macOS `hdiutil`, a Windows VHD).
@@ -273,6 +319,7 @@ mod tests {
             serial: None,
             removable: !system,
             internal: system,
+            connection: Connection::Unknown,
             system,
             virtual_disk: false,
             solid_state: None,

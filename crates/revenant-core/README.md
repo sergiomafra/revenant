@@ -109,8 +109,14 @@ privileged helper (Module 2.1) or a test double can serve it; `device::SystemDev
 Windows; elsewhere every call is `unsupported_platform`). `destination` needs no privilege and may stay outside the helper.
 
 `list()` returns the connected whole disks, sorted by id (`disk2` before `disk10`), each a `DiskInfo`: `id`, `geometry`,
-`vendor`, `model`, `serial` (often the card reader's, not the card's), `removable`, `internal`, `system`, `virtual_disk`,
-`solid_state` (`None` when the system does not say) and its `volumes` (`VolumeInfo { id, fs, label, mount_point, size }`).
+`vendor`, `model`, `serial` (often the card reader's, not the card's), `removable`, `internal`, `connection`, `system`,
+`virtual_disk`, `solid_state` (`None` when the system does not say) and its `volumes` (`VolumeInfo { id, fs, label, mount_point, size }`).
+
+`connection` is a `Connection` (`Usb`, `SdCard`, `Thunderbolt`, `Internal`, `Unknown`; `code()` gives `usb`, `sd_card`,
+`thunderbolt`, `internal`, `unknown`): macOS reads `BusProtocol` of `diskutil info` (`USB`, `Secure Digital`,
+`Thunderbolt`; an `Internal` disk is `Internal` whatever the protocol), Windows reads the `BusType` already queried
+(USB, SD and MMC; a disk marked internal is `Internal`). `device::looks_like_camera_card(&DiskInfo)` is `true` when a
+mounted volume has a `DCIM` folder (any letter case) at its root: it only lists the mounted folder and never opens the disk.
 
 - macOS: the whole disks of `diskutil list -plist`, each completed by `diskutil info -plist` of the disk and of each of
   its partitions, plus one `ioreg -a -r -c IOBlockStorageDevice -l` (vendor, product, serial, physical sector). APFS

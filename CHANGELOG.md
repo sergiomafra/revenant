@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The disk list tells how each disk is connected (USB, SD card, Thunderbolt, internal) and whether it looks like a
+  camera card (a `DCIM` folder on a mounted volume); `revenant-dev disks` prints `connection`.
 - `revenant-dev` lists the connected disks, runs the pre-flight check, unmounts and remounts a card, copies a card into
   an image with its rescue map (resumable, checked first: it stops before writing anything when the destination cannot
   hold the card or is on it), prints a digest of a card or image, and scans a card directly, an image with its map (what

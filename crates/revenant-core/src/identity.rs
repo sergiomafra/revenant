@@ -217,6 +217,7 @@ mod tests {
             serial: serial.map(String::from),
             removable: true,
             internal: false,
+            connection: crate::device::Connection::Unknown,
             system: false,
             virtual_disk: false,
             solid_state: None,
