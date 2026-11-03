@@ -1,6 +1,6 @@
 // Tests for check-app.mjs. Run: node --test scripts/check-app.test.mjs
 // (needs `npm ci` in app/: the checker parses with rolldown).
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -9,9 +9,16 @@ import { checkApp } from './check-app.mjs';
 
 const CATALOG = { app: { name: 'Revenant' }, settings: { title: 'Ajustes' } };
 
+// Throwaway app folders made by the current test, removed after it.
+const made = [];
+afterEach(() => {
+  for (const d of made.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
+
 // A throwaway app folder: src/i18n with three catalogs plus the given files (path -> text).
 function appWith(files, catalogs = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'check-app-'));
+  made.push(dir);
   const all = {
     'src/i18n/pt-BR.json': JSON.stringify(catalogs['pt-BR'] ?? CATALOG),
     'src/i18n/es.json': JSON.stringify(catalogs.es ?? CATALOG),

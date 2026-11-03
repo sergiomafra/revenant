@@ -104,4 +104,13 @@ mod tests {
         fs::write(dir.path().join(FILE_NAME), "{{").unwrap();
         assert_eq!(load(dir.path()), Settings::default());
     }
+
+    #[test]
+    fn unwritable_dir_gives_write_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        fs::write(&file, "x").unwrap();
+        let err = save(&file.join("conf"), &Settings::default()).unwrap_err();
+        assert_eq!(err.code, "settings_write_failed");
+    }
 }

@@ -172,14 +172,14 @@
 
   // ---- screen 13: unexpected error ----
   function error(open) {
-    var tech = Kit.tech('read_failed', 'O Revenant não conseguiu continuar lendo o cartão. Nada foi gravado nele.');
+    var tech = Kit.tech('read_failed');
     if (open) {
       tech = tech.replace('<details class="tech">', '<details class="tech" open>')
         .replace('</details>', '<button class="btn ghost sm copy" data-copy>' + I('copy') + 'Copiar detalhes</button></details>');
     }
     var body = '<div class="wrap center"><span class="tile mid big">' + I('alert') + '</span>'
       + '<h2 class="ttl">Algo deu errado ao ler o cartão</h2>'
-      + '<p class="lead">Nada foi gravado nele. Os arquivos que você já recuperou continuam salvos.</p>'
+      + '<p class="lead">Nada foi gravado no cartão. Os arquivos que você já recuperou continuam salvos.</p>'
       + '<div class="err">'
       + '<div class="next">' + I('info') + '<span><b>O que fazer:</b> tente de novo. Se continuar, faça uma cópia do cartão primeiro e procure os arquivos nela.</span></div>'
       + tech + '</div>'

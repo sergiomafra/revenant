@@ -38,4 +38,25 @@ describe('Settings', () => {
       expect(calls).toContainEqual({ cmd: 'set_settings', args: { settings: { theme: 'auto', language: 'es' } } }),
     );
   });
+
+  it('says so when the choice cannot be stored', async () => {
+    fakeBackend({
+      get_settings: () => ({ theme: 'auto', language: 'pt-BR' }),
+      set_settings: () => {
+        throw { code: 'settings_write_failed' };
+      },
+    });
+    render(
+      <SettingsProvider>
+        <Settings onClose={() => {}} />
+      </SettingsProvider>,
+    );
+    await screen.findByRole('dialog', { name: 'Ajustes' });
+    expect(screen.queryByText(/Não deu para guardar a escolha/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('radio', { name: 'Escuro' }));
+    expect(
+      await screen.findByText('Não deu para guardar a escolha. Ela vale até você fechar o Revenant.'),
+    ).toBeInTheDocument();
+    expect(document.documentElement).toHaveAttribute('data-theme', 'dark');
+  });
 });
