@@ -22,6 +22,8 @@
   .tile.big svg.i{width:44px;height:44px;stroke-width:1.5}
 
   /* dimmed backdrop behind the dialogs: a quiet stand-in for the results screen */
+  .hint{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none}
+  .hint .card{display:flex;gap:10px;align-items:center;color:var(--ink-2);font-size:13px;padding:10px 16px}
   .back{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;padding:20px 24px}
   .back i{display:block;aspect-ratio:3/2;border-radius:7px;background:var(--img-bg)}
 
@@ -84,29 +86,40 @@
   }
   function closeModal(app) {
     Array.prototype.forEach.call(app.querySelectorAll('.modal .acts button'), function (b) {
-      b.addEventListener('click', function () { var m = app.querySelector('.modal'); if (m) m.remove(); });
+      b.addEventListener('click', function () {
+        var m = app.querySelector('.modal');
+        if (!m) return;
+        m.remove();
+        // Closed dialog: say how to get it back instead of leaving a bare grid.
+        var h = document.createElement('div');
+        h.className = 'hint';
+        h.innerHTML = '<div class="card">' + I('info') + '<span>Janela fechada. Para abrir de novo, use o menu Revenant.</span></div>';
+        app.appendChild(h);
+      });
     });
   }
 
   // ---- screen 11: settings ----
   // The Tema control really switches the page theme, like the simulation bar does, and both stay in sync.
-  var themeChoice = (function () {
+  // Read on every render: Kit.init may have applied ?theme= (or the sim bar changed it) after this script ran.
+  var themeChoice = 'auto';
+  function currentTheme() {
     var t = document.documentElement.getAttribute('data-theme');
     return t === 'light' || t === 'dark' ? t : 'auto';
-  })();
+  }
   var lang = 'pt';
   function applyTheme(t) {
     var r = document.documentElement;
     themeChoice = t;
     if (t === 'light' || t === 'dark') r.setAttribute('data-theme', t); else r.removeAttribute('data-theme');
-    Array.prototype.forEach.call(document.querySelectorAll('[data-tema]'), function (b) { b.classList.toggle('on', b.dataset.tema === t); });
+    Array.prototype.forEach.call(document.querySelectorAll('[data-tema]'), function (b) { b.classList.toggle('on', b.dataset.tema === t); b.setAttribute('aria-checked', String(b.dataset.tema === t)); });
     Array.prototype.forEach.call(document.querySelectorAll('.sim [data-theme-set]'), function (b) { b.classList.toggle('on', b.dataset.themeSet === t); });
   }
   document.addEventListener('click', function (e) {
     var b = e.target.closest('.sim [data-theme-set]');
     if (b) { // the Kit already applied the theme; mirror it in the dialog
       themeChoice = b.dataset.themeSet;
-      Array.prototype.forEach.call(document.querySelectorAll('[data-tema]'), function (x) { x.classList.toggle('on', x.dataset.tema === themeChoice); });
+      Array.prototype.forEach.call(document.querySelectorAll('[data-tema]'), function (x) { x.classList.toggle('on', x.dataset.tema === themeChoice); x.setAttribute('aria-checked', String(x.dataset.tema === themeChoice)); });
     }
   });
   var LANGS = [
@@ -115,14 +128,15 @@
     { key: 'en', name: 'English', note: '' }
   ];
   function settings() {
+    themeChoice = currentTheme();
     var seg = [['light', 'Claro'], ['dark', 'Escuro'], ['auto', 'Automático']].map(function (t) {
-      return '<button data-tema="' + t[0] + '" aria-pressed="' + (themeChoice === t[0]) + '" class="' + (themeChoice === t[0] ? 'on' : '') + '">' + t[1] + '</button>';
+      return '<button data-tema="' + t[0] + '" role="radio" aria-checked="' + (themeChoice === t[0]) + '" class="' + (themeChoice === t[0] ? 'on' : '') + '">' + t[1] + '</button>';
     }).join('');
     var langs = LANGS.map(function (l) {
       return '<button class="lang' + (lang === l.key ? ' on' : '') + '" data-lang="' + l.key + '" role="radio" aria-checked="' + (lang === l.key) + '"><span class="rd">' + I('check') + '</span><span data-t>' + l.name + '</span>' + (l.note ? '<small>' + l.note + '</small>' : '') + '</button>';
     }).join('');
     var inner = '<h3>Ajustes</h3>'
-      + '<div class="row"><b>Tema</b><div class="seg" role="group" aria-label="Tema">' + seg + '</div><small>Automático acompanha o tema do seu computador.</small></div>'
+      + '<div class="row"><b>Tema</b><div class="seg" role="radiogroup" aria-label="Tema">' + seg + '</div><small>Automático acompanha o tema do seu computador.</small></div>'
       + '<div class="row"><b>Idioma</b><div class="langs" role="radiogroup">' + langs + '</div></div>'
       + '<div class="acts"><button class="btn">Concluir</button></div>';
     return backdrop() + modal(inner, 'set');
@@ -151,7 +165,7 @@
       + '<div class="brand">Revenant</div>'
       + '<div class="ver">Versão 0.9.0-beta</div>'
       + '<div class="lic">Gratuito e de código aberto (GPL-3.0)</div>'
-      + '<div class="links"><a href="#" data-link="source">' + I('external-link') + 'Código-fonte</a><a href="#" data-link="guide">' + I('external-link') + 'Guia de uso</a></div>'
+      + '<div class="links"><a href="#" data-link="source" data-t>' + I('external-link') + 'Código-fonte</a><a href="#" data-link="guide" data-t>' + I('external-link') + 'Guia de uso</a></div>'
       + '<div class="acts"><button class="btn ghost">Fechar</button></div>';
     return backdrop() + modal(inner, 'about');
   }
@@ -188,7 +202,10 @@
         { key: 'geral', label: 'Geral', render: settings, after: wireSettings }
       ] },
       { id: 12, name: 'Sobre', title: 'Revenant', states: [
-        { key: 'sobre', label: 'Sobre', render: about, after: closeModal }
+        { key: 'sobre', label: 'Sobre', render: about, after: function (app) {
+          closeModal(app);
+          Array.prototype.forEach.call(app.querySelectorAll('.links a'), function (a) { a.addEventListener('click', function (e) { e.preventDefault(); }); });
+        } }
       ] },
       { id: 13, name: 'Erro inesperado', title: 'Revenant', states: [
         { key: 'erro', label: 'Erro', render: function () { return error(false); }, after: wireError },
