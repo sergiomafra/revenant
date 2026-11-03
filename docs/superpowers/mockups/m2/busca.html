@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revenant · cópia e busca</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="kit.css">
+<style>
+  /* Page-local styles for screens 5 to 7. Colors only through tokens. */
+  .hd{flex:none;display:flex;align-items:center;gap:12px;padding:12px 24px;border-bottom:1px solid var(--line-soft);background:var(--surface)}
+  .hd .logo{width:26px;height:26px}
+  .hd .name{font-weight:650;letter-spacing:-.01em}
+  .path{display:flex;align-items:center;gap:6px;margin-left:auto;font-size:12px;color:var(--ink-3);font-weight:560}
+  .path span{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .path span::after{content:"";width:14px;height:1px;background:var(--line)}
+  .path span:last-child::after{display:none}
+  .path .done{color:var(--ink-2)}
+  .path .now{color:var(--accent);font-weight:700}
+  .wrap{width:100%;max-width:1000px;margin:0 auto;padding:30px 32px 24px;display:flex;flex-direction:column;gap:16px}
+  .wrap.narrow{max-width:760px}
+  .wrap.center{align-items:center;text-align:center;justify-content:center;min-height:100%}
+  .ttl{font-size:26px;font-weight:650;letter-spacing:-.02em;line-height:1.2}
+  .lead{color:var(--ink-2);font-size:14px;max-width:620px}
+  .tile{width:56px;height:56px;border-radius:15px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;flex:none}
+  .tile svg.i{width:28px;height:28px;stroke-width:1.6}
+  .tile.mid{background:var(--warn-bg);color:var(--warn)}
+  .tile.ok{background:var(--ok-bg);color:var(--ok);border-radius:50%}
+  .tile.big{width:88px;height:88px;border-radius:24px}
+  .tile.big svg.i{width:44px;height:44px;stroke-width:1.5}
+  .tg.acc{background:var(--accent-soft);color:var(--accent)}
+  .tg.warn{background:var(--warn-bg);color:var(--warn)}
+
+  /* indeterminate bar (waiting) */
+  .progress.ind>i{width:34%;animation:slide 1.4s ease-in-out infinite}
+  @keyframes slide{0%{margin-left:-34%}100%{margin-left:100%}}
+  @media (prefers-reduced-motion:reduce){.progress.ind>i{animation:none;margin-left:33%}}
+
+  /* screen 5: choice cards */
+  .opts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+  .opt{display:flex;flex-direction:column;gap:12px;padding:18px;cursor:pointer;min-width:0;text-align:left;position:relative}
+  .opt.card.sel{padding:17px}
+  .opt .top{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+  .opt .rd{width:20px;height:20px;border-radius:50%;border:1.5px solid var(--ink-3);display:grid;place-items:center;flex:none}
+  .opt.sel .rd{border-color:var(--accent);background:var(--accent);color:var(--accent-ink)}
+  .opt .rd svg{width:11px;height:11px;stroke-width:3;opacity:0}
+  .opt.sel .rd svg{opacity:1}
+  .opt b{display:block;font-size:16px;font-weight:650;letter-spacing:-.01em}
+  .opt p{color:var(--ink-2);font-size:13px;margin-top:4px}
+  .opt .fine{color:var(--ink-2);font-size:12px;display:flex;gap:6px;align-items:center;margin-top:auto}
+  .rec{display:flex;gap:7px;align-items:center;background:var(--warn-bg);color:var(--warn);border-radius:8px;padding:6px 10px;font-size:12px;font-weight:650}
+  .opt .tg{align-self:flex-start}
+
+  /* screen 5: destination list */
+  .dests{display:flex;flex-direction:column;gap:10px}
+  .dest{display:flex;align-items:center;gap:14px;padding:12px 16px;cursor:pointer;min-width:0}
+  .dest.card.sel{padding:11px 15px}
+  .dest .tile{width:40px;height:40px;border-radius:10px}
+  .dest .tile svg.i{width:20px;height:20px}
+  .dest b{display:block;font-weight:650;font-size:14px}
+  .dest small{display:block;color:var(--ink-2);font-size:12.5px}
+  .dest .free{margin-left:auto;text-align:right;white-space:nowrap}
+  .dest .rd{width:20px;height:20px;border-radius:50%;border:1.5px solid var(--ink-3);display:grid;place-items:center;flex:none;color:var(--accent-ink)}
+  .dest.sel .rd{border-color:var(--accent);background:var(--accent)}
+  .dest .rd svg{width:11px;height:11px;stroke-width:3;opacity:0}
+  .dest.sel .rd svg{opacity:1}
+  .srcoff{display:flex;align-items:center;gap:14px;padding:12px 16px}
+  .srcoff .tile{width:40px;height:40px;border-radius:10px;background:var(--line-soft);color:var(--ink-3)}
+  .srcoff .tile svg.i{width:20px;height:20px}
+  .srcoff b{font-weight:620;color:var(--ink-2);display:block}
+  .srcoff small{display:flex;gap:6px;align-items:center;color:var(--ink-2);font-size:12.5px}
+  .srcoff details.tech{margin-top:3px}
+
+  /* screen 5: copy in progress and done */
+  .pass{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+  .pass>span{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:99px;font-size:12.5px;font-weight:600;background:var(--surface-2);color:var(--ink-2)}
+  .pass>span.on{background:var(--accent);color:var(--accent-ink)}
+  .pass>span.done{background:var(--accent-soft);color:var(--accent)}
+  .big-bar{width:100%;max-width:560px}
+  .big-bar .progress{height:10px}
+  .stats{display:flex;gap:28px;justify-content:center;flex-wrap:wrap;color:var(--ink-2);font-size:13.5px}
+  .stats b{color:var(--ink);font-weight:650}
+  .stats span{display:inline-flex;align-items:center;gap:6px}
+  .sum{width:100%;max-width:560px;text-align:left}
+  .sum>div{display:flex;justify-content:space-between;gap:16px;font-size:13.5px;color:var(--ink-2)}
+  .sum b{color:var(--ink);font-weight:650;text-align:right}
+
+  /* screen 6: progress strip and live gallery */
+  .prog{flex:none;background:var(--surface);border-bottom:1px solid var(--line-soft)}
+  .prog .in{width:100%;max-width:1000px;margin:0 auto;padding:12px 32px;display:flex;flex-direction:column;gap:8px}
+  .prog .row{display:flex;align-items:center;gap:24px}
+  .prog h2{font-size:18px;letter-spacing:-.01em;white-space:nowrap}
+  .prog .tl{display:inline-flex;gap:6px;align-items:center;color:var(--ink-2);font-size:12.5px;white-space:nowrap}
+  .prog .tl b{color:var(--ink);font-weight:650}
+  .prog .meter{flex:1;display:flex;align-items:center;gap:10px;min-width:120px}
+  .prog .meter .progress{flex:1}
+  .prog .meter b{font-size:13px;font-weight:700;min-width:34px;text-align:right}
+  .cnts{display:flex;gap:18px;flex:none}
+  .cnt{display:inline-flex;align-items:center;gap:6px;color:var(--ink-2);font-size:12.5px;white-space:nowrap}
+  .cnt b{color:var(--ink);font-size:16px;font-weight:700}
+  .cnt svg.i{width:16px;height:16px}
+  .gal-wrap{padding-top:16px;gap:12px}
+  .gh{display:flex;justify-content:space-between;gap:12px;align-items:center;font-size:12.5px;color:var(--ink-2)}
+  .gh b{color:var(--ink);font-weight:650;white-space:nowrap}
+  .gal{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px}
+  .th.ph{background:var(--surface-2);border:1px dashed var(--line);cursor:default;animation:pulse 1.8s ease-in-out infinite}
+  .paused .th.ph{animation:none}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+  @media (prefers-reduced-motion:reduce){.th.ph{animation:none}}
+  .prog .note{align-self:flex-start}
+  .banner.bad .btn.ghost{background:var(--surface);color:var(--ink)}
+  .banner .btn{flex:none}
+  .banner>span{min-width:0}
+
+  /* screen 7: waiting modal */
+  .dlg.wait{width:min(460px,100%);align-items:flex-start}
+  .dlg.wait .progress{width:100%}
+  .dlg.wait .wt{display:flex;gap:8px;align-items:center;color:var(--ink-2);font-size:12.5px}
+</style>
+</head>
+<body>
+<script src="kit.js"></script>
+<script>
+(function () {
+  var I = Kit.icon;
+
+  // ---- shared pieces ----
+  var STEPS = ['Disco', 'Permissão', 'Conferência', 'Cópia', 'Busca', 'Resultados'];
+  function header(now) {
+    var p = STEPS.map(function (s, i) {
+      return '<span class="' + (i < now ? 'done' : i === now ? 'now' : '') + '">' + s + '</span>';
+    }).join('');
+    return '<div class="hd">' + Kit.logo({ small: true }) + '<span class="name">Revenant</span><nav class="path" aria-label="Etapas">' + p + '</nav></div>';
+  }
+  function page(now, body, foot, top) {
+    return header(now) + (top || '') + '<div class="main"><div class="content">' + body + '</div></div>' + (foot ? '<div class="foot">' + foot + '</div>' : '');
+  }
+  function isLong() { return document.documentElement.hasAttribute('data-long'); }
+  function setLabel(btn, text) {
+    var n = btn.lastChild;
+    while (n && n.nodeType !== 3) n = n.previousSibling;
+    if (!n) { n = document.createTextNode(''); btn.appendChild(n); }
+    n.nodeValue = text;
+    if (isLong()) Kit.lengthen(btn.parentNode);
+  }
+  function closeModal(app) {
+    Array.prototype.forEach.call(app.querySelectorAll('.modal .acts button'), function (b) {
+      b.addEventListener('click', function () { var m = app.querySelector('.modal'); if (m) m.remove(); });
+    });
+  }
+  function modal(inner, cls) {
+    return '<div class="modal"><div class="dlg' + (cls ? ' ' + cls : '') + '" role="dialog">' + inner + '</div></div>';
+  }
+
+  // ---- screen 5: backup copy ----
+  var SAFE_FOOT = '<span class="t">Nada é alterado no cartão</span>';
+  // o: { sel: 'copy'|'direct', rec: bool }
+  function choice(o) {
+    function opt(key, icon, title, tag, tagCls, desc, fine, rec) {
+      return '<div class="card opt' + (o.sel === key ? ' sel' : '') + '" data-opt="' + key + '" role="radio" aria-checked="' + (o.sel === key) + '">'
+        + (rec ? '<div class="rec">' + I('alert') + '<span data-t>Recomendado: a leitura deu erro</span></div>' : '')
+        + '<div class="top"><span class="tile">' + I(icon) + '</span><span class="rd">' + I('check') + '</span></div>'
+        + '<div><b data-t>' + title + '</b><p data-t>' + desc + '</p></div>'
+        + '<span class="tg ' + tagCls + '">' + tag + '</span>'
+        + '<span class="fine">' + I('info') + '<span data-t>' + fine + '</span></span></div>';
+    }
+    var lead = o.rec
+      ? 'A leitura do cartão deu erro. Uma cópia protege as suas fotos se o cartão falhar de vez.'
+      : 'Opcional. Uma cópia é mais segura se o cartão falha, trava ou faz barulho ao ser lido.';
+    var body = '<div class="wrap"><div><h2 class="ttl">Primeiro, uma cópia de segurança?</h2><p class="lead" style="margin-top:4px">' + lead + '</p></div>'
+      + '<div class="opts" role="radiogroup">'
+      + opt('copy', 'copy', 'Copiar o cartão primeiro (mais seguro)', 'MAIS SEGURO', 'acc', 'Faz uma cópia inteira do cartão e procura nela. Se o cartão falhar no meio, nada se perde.', 'Precisa de 64 GB livres em outro disco.', o.rec)
+      + opt('direct', 'search', 'Procurar direto (mais rápido)', 'MAIS RÁPIDO', '', 'Lê o cartão uma vez só, sem cópia. Bom para cartões que estão saudáveis.', 'Não precisa de espaço extra.', false)
+      + '</div></div>';
+    var go = o.sel === 'copy' ? 'Escolher onde salvar' : 'Começar a procurar';
+    return page(3, body, '<button class="btn ghost">Voltar</button>' + SAFE_FOOT + '<span class="sp"></span><button class="btn" data-go>' + go + I('chevron-right') + '</button>');
+  }
+  function wireChoice(app, o) {
+    Array.prototype.forEach.call(app.querySelectorAll('[data-opt]'), function (c) {
+      c.addEventListener('click', function () {
+        o.sel = c.dataset.opt;
+        app.innerHTML = choice(o);
+        if (isLong()) Kit.lengthen(app);
+        wireChoice(app, o);
+      });
+    });
+  }
+  function choiceState(key, label, o0) {
+    return {
+      key: key, label: label,
+      render: function () { return choice({ sel: o0.sel, rec: o0.rec }); },
+      after: function (app) { wireChoice(app, { sel: o0.sel, rec: o0.rec }); }
+    };
+  }
+
+  var DESTS = [
+    { key: 'lacie', icon: 'hdd', name: 'HD externo · LaCie', sub: '2 TB · ligado por USB', free: '1,4 TB livres' },
+    { key: 't7', icon: 'usb', name: 'SSD externo T7', sub: '1 TB · ligado por USB', free: '812 GB livres' },
+    { key: 'mac', icon: 'folder', name: 'Pasta Documentos neste Mac', sub: 'Macintosh HD', free: '210 GB livres' }
+  ];
+  function destination(sel) {
+    var rows = DESTS.map(function (d) {
+      return '<div class="card dest' + (sel === d.key ? ' sel' : '') + '" data-destination-option data-dest="' + d.key + '" role="radio" aria-checked="' + (sel === d.key) + '">'
+        + '<span class="rd">' + I('check') + '</span><span class="tile">' + I(d.icon) + '</span>'
+        + '<div><b data-t>' + d.name + '</b><small data-t>' + d.sub + '</small></div>'
+        + '<div class="free"><b data-t>' + d.free + '</b></div></div>';
+    }).join('');
+    var body = '<div class="wrap"><div><h2 class="ttl">Onde salvar a cópia?</h2><p class="lead" style="margin-top:4px">A cópia ocupa 64 GB. Escolha um disco com espaço livre.</p></div>'
+      + '<div class="dests" role="radiogroup">' + rows + '</div>'
+      + '<div class="card off srcoff" data-source-disk><span class="tile">' + I('sd') + '</span><div><b data-t>Cartão SD 64 GB</b>'
+      + '<small>' + I('x') + '<span data-t>A cópia não pode ficar no próprio cartão</span></small>'
+      + Kit.tech('destination_on_source', 'Gravar no cartão poderia apagar o que ainda dá para recuperar.') + '</div></div></div>';
+    return page(3, body, '<button class="btn ghost">Voltar</button>' + SAFE_FOOT + '<span class="sp"></span><button class="btn">Começar a copiar' + I('chevron-right') + '</button>');
+  }
+  function wireDest(app) {
+    Array.prototype.forEach.call(app.querySelectorAll('[data-dest]'), function (c) {
+      c.addEventListener('click', function () {
+        Array.prototype.forEach.call(app.querySelectorAll('[data-dest]'), function (x) {
+          x.classList.toggle('sel', x === c);
+          x.setAttribute('aria-checked', x === c ? 'true' : 'false');
+        });
+      });
+    });
+  }
+
+  // o: { pass: 1|2, pct, speed, left, saved, bad }
+  function copying(o) {
+    var p1 = o.pass === 1;
+    var pass = '<div class="pass"><span data-t class="' + (p1 ? 'on' : 'done') + '">' + (p1 ? '' : I('check')) + '1ª leitura, a rápida</span>'
+      + '<span data-t class="' + (p1 ? '' : 'on') + '">Voltando nos trechos difíceis</span></div>';
+    var body = '<div class="wrap center"><span class="tile">' + I('copy') + '</span>'
+      + '<h2 class="ttl">Copiando o cartão…</h2>'
+      + pass
+      + '<div class="big-bar"><div class="progress" role="progressbar" aria-valuenow="' + o.pct + '" aria-valuemin="0" aria-valuemax="100" aria-label="Cópia"><i style="width:' + o.pct + '%"></i></div></div>'
+      + '<div class="stats"><span>' + I('dl') + '<b>' + o.speed + '</b></span><span>' + I('clock') + 'Faltam cerca de <b>' + o.left + '</b></span><span><b>' + o.saved + '</b> de 64 GB salvos</span></div>'
+      + '<div style="max-width:560px;text-align:left">' + Kit.note('mid', '<span data-t>' + o.bad + ' trechos não puderam ser lidos até agora.</span> Não precisa fazer nada: vamos tentar de novo no fim.') + '</div></div>';
+    return page(3, body, '<button class="btn ghost">' + I('pause') + 'Pausar</button>' + SAFE_FOOT);
+  }
+  function copyDone() {
+    var body = '<div class="wrap center"><span class="tile ok big">' + I('check') + '</span>'
+      + '<h2 class="ttl">Cópia pronta</h2>'
+      + '<p class="lead">O cartão foi copiado. A busca vai usar a cópia, então o cartão não será mais lido. Você já pode tirá-lo do leitor.</p>'
+      + '<div class="card sum">'
+      + '<div><span>Copiado</span><b>64 GB</b></div>'
+      + '<div style="margin-top:6px"><span>Salvo em</span><b data-t>HD externo · LaCie</b></div>'
+      + '<div style="margin-top:6px"><span>Tempo</span><b>28 min</b></div>'
+      + '<div style="margin-top:6px"><span>Trechos que não puderam ser lidos</span><b>3</b></div></div></div>';
+    return page(3, body, '<span class="t">Nada foi alterado no cartão</span><span class="sp"></span><button class="btn">' + I('search') + 'Procurar na cópia</button>');
+  }
+
+  // ---- screen 6: searching ----
+  var KINDS = ['JPG', 'RAW', 'JPG', 'VÍDEO', 'RAW', 'JPG', 'RAW', 'JPG', 'VÍDEO', 'JPG', 'RAW', 'JPG', 'JPG', 'RAW', 'VÍDEO', 'JPG', 'RAW', 'JPG'];
+  var FLAGS = { 4: 'mid', 9: 'bad', 13: 'mid' };
+  var FOUND = 421;
+  function gallery(paused) {
+    var h = '';
+    for (var i = 0; i < KINDS.length; i++) h += Kit.thumb({ i: i, tag: KINDS[i], state: FLAGS[i], sel: i === 1 || i === 3 });
+    for (var k = 0; k < 6; k++) h += '<div class="th ph" aria-hidden="true"></div>';
+    return '<div class="gal">' + h + '</div>';
+  }
+  // o: { mode: 'run'|'paused'|'failing'|'slow', modal: bool }
+  function searching(o) {
+    var paused = o.mode === 'paused';
+    var head = paused
+      ? '<div><h2>Busca pausada</h2><span class="tl">' + I('pause') + 'Parada em <b>38%</b></span></div>'
+      : '<div><h2>Procurando…</h2><span class="tl">' + I('clock') + 'Faltam cerca de <b>12 min</b></span></div>';
+    var row = '<div class="row">' + head
+      + '<div class="meter"><div class="progress" role="progressbar" aria-valuenow="38" aria-valuemin="0" aria-valuemax="100" aria-label="Busca"><i style="width:38%"></i></div><b>38%</b></div>'
+      + '<div class="cnts"><span class="cnt">' + I('image') + '<b>412</b>fotos</span><span class="cnt">' + I('video') + '<b>9</b>vídeos</span></div></div>';
+    var slow = o.mode === 'slow'
+      ? Kit.note('info', 'O cartão está lento. A busca continua. Você não precisa fazer nada.').replace('class="note info"', 'class="note info" data-code="slow_device"')
+      : '';
+    var prog = '<div class="prog"><div class="in">' + row + slow + '</div></div>';
+    var banner = o.mode === 'failing'
+      ? '<div class="banner bad" data-code="disk_failing" role="alert">' + I('alert') + '<span><b>O disco está falhando:</b> faça uma cópia agora antes de continuar</span><span class="sp"></span>'
+        + '<button class="btn sm">Fazer a cópia</button><button class="btn ghost sm">Continuar mesmo assim</button></div>'
+      : '';
+    var body = '<div class="wrap gal-wrap"><div class="gh"><span>Clique nas miniaturas para marcar o que quer recuperar. A busca continua por trás.</span><b data-nsel></b></div>'
+      + gallery(paused) + '</div>';
+    var pauseBtn = paused
+      ? '<button class="btn ghost">' + I('play') + 'Continuar a busca</button>'
+      : '<button class="btn ghost">' + I('pause') + 'Pausar</button>';
+    var foot = pauseBtn + SAFE_FOOT + '<span class="sp"></span><button class="btn" data-recover>' + I('dl') + 'Recuperar ' + FOUND + ' arquivos</button>';
+    var out = header(4) + banner + '<div class="main' + (paused ? ' paused' : '') + '">' + prog + '<div class="content">' + body + '</div></div><div class="foot">' + foot + '</div>';
+    return out + (o.modal || '');
+  }
+  function wireSearching(app) {
+    var rec = app.querySelector('[data-recover]'), ns = app.querySelector('[data-nsel]');
+    function update() {
+      if (!rec) return;
+      var n = app.querySelectorAll('.gal .th.sel').length;
+      setLabel(rec, 'Recuperar ' + (n || FOUND) + (n === 1 ? ' arquivo' : ' arquivos'));
+      if (ns) ns.textContent = n ? n + (n === 1 ? ' marcado' : ' marcados') : 'Nada marcado: recupera tudo o que foi achado';
+    }
+    Array.prototype.forEach.call(app.querySelectorAll('.gal .th[data-pick]'), function (t) {
+      t.addEventListener('click', function () { t.classList.toggle('sel'); update(); });
+    });
+    update();
+    closeModal(app);
+  }
+  function searchState(key, label, mode, withModal) {
+    return {
+      key: key, label: label,
+      render: function () { return searching({ mode: mode, modal: withModal ? closeDlg() : '' }); },
+      after: wireSearching
+    };
+  }
+  function closeDlg() {
+    return modal('<span class="tile mid">' + I('power') + '</span><h3>Fechar o Revenant?</h3>'
+      + '<p class="lead" style="font-size:13.5px">A busca fica salva e continua quando você abrir de novo. Nada é alterado no cartão.</p>'
+      + '<div class="acts"><button class="btn ghost">Continuar procurando</button><button class="btn">Fechar o Revenant</button></div>');
+  }
+
+  // ---- screen 7: card pulled out ----
+  function gone(over, back) {
+    var copy = over === 'copia';
+    var under = copy ? copying({ pass: 1, pct: 64, speed: '38 MB/s', left: '10 min', saved: '41,2', bad: 3 }) : searching({ mode: 'run' });
+    var inner;
+    if (back) {
+      inner = '<span class="tile ok">' + I('circle-check') + '</span><h3>Cartão de volta. Continuando…</h3>'
+        + '<p class="lead" style="font-size:13.5px">' + (copy ? 'A cópia continua de onde parou.' : 'A busca continua de onde parou.') + '</p>'
+        + '<div class="progress ind" role="progressbar" aria-label="Continuando"><i></i></div>';
+    } else {
+      inner = '<span class="tile mid">' + I('unplug') + '</span><h3>O cartão foi desconectado</h3>'
+        + '<p class="lead" style="font-size:13.5px">O cartão foi desconectado. Nada se perdeu: conecte de novo para continuar.</p>'
+        + '<div class="progress ind" role="progressbar" aria-label="Esperando o cartão"><i></i></div>'
+        + '<div class="wt">' + I('clock') + '<span data-t>Esperando o cartão voltar…</span></div>'
+        + Kit.tech('device_gone', 'O cartão deixou de responder. O Revenant espera e continua sozinho quando ele voltar.')
+        + '<div class="acts" style="align-self:flex-end"><button class="btn ghost">' + (copy ? 'Cancelar a cópia' : 'Parar e ver o que já foi achado') + '</button></div>';
+    }
+    return under + modal(inner, 'wait');
+  }
+  function goneState(key, label, over, back) {
+    return {
+      key: key, label: label,
+      render: function () { return gone(over, back); },
+      after: closeModal
+    };
+  }
+
+  Kit.init({
+    page: 'busca',
+    screens: [
+      { id: 5, name: 'Cópia de segurança', title: 'Revenant', states: [
+        choiceState('escolha', 'Escolha', { sel: 'direct', rec: false }),
+        choiceState('recomendada', 'Cópia recomendada', { sel: 'copy', rec: true }),
+        { key: 'destino', label: 'Onde salvar a cópia', render: function () { return destination('lacie'); }, after: wireDest },
+        { key: 'copiando', label: 'Copiando', render: function () { return copying({ pass: 1, pct: 64, speed: '38 MB/s', left: '10 min', saved: '41,2', bad: 3 }); } },
+        { key: 'segunda', label: 'Trechos difíceis', render: function () { return copying({ pass: 2, pct: 96, speed: '6 MB/s', left: '3 min', saved: '61,5', bad: 3 }); } },
+        { key: 'pronta', label: 'Cópia pronta', render: copyDone }
+      ] },
+      { id: 6, name: 'Procurando', title: 'Revenant', states: [
+        searchState('andando', 'Andando (38%)', 'run'),
+        searchState('pausada', 'Pausada', 'paused'),
+        searchState('falhando', 'Disco falhando', 'failing'),
+        searchState('lento', 'Cartão lento', 'slow'),
+        searchState('fechar', 'Fechar o app', 'run', true)
+      ] },
+      { id: 7, name: 'O cartão saiu', title: 'Revenant', states: [
+        goneState('busca', 'Durante a busca', 'busca', false),
+        goneState('copia', 'Durante a cópia', 'copia', false),
+        goneState('voltou', 'Cartão de volta', 'busca', true)
+      ] }
+    ]
+  });
+})();
+</script>
+</body>
+</html>
