@@ -28,8 +28,10 @@ Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.s
 - Exceção única (Sérgio, 1.5): no Windows, uma alça de **volume** pode ser aberta com escrita só para `FSCTL_LOCK_VOLUME`/
   `FSCTL_DISMOUNT_VOLUME`, quando a alça só leitura é recusada, nunca para ler ou gravar dados; fica em
   `source/windows.rs` (`lock_volume_for_dismount`), marcada, e o teste `source_has_no_write_path` confere.
-- Licenças: só MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, Unlicense, CC0-1.0, BSL-1.0. Proibido
-  GPL/AGPL/LGPL/MPL de terceiros e qualquer código copiado do PhotoRec/TestDisk. O Revenant é GPL-3.0-only.
+- Licenças do que vai dentro do app: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, Unlicense, CC0-1.0,
+  BSL-1.0, mais MPL-2.0 sem modificação (Sérgio, 2.1). Ferramentas só de montagem (devDependencies do npm): qualquer licença
+  aberta, menos GPL e AGPL. Proibido GPL/AGPL/LGPL de terceiros no que vai dentro e qualquer código copiado do
+  PhotoRec/TestDisk. O Revenant é GPL-3.0-only.
 - Erros por código: todo erro do motor tem `code() -> &'static str` em `snake_case`; nenhum texto de UI no motor.
 - Rust edição 2024, `rust-version = "1.88"`. Sem `unsafe` fora de `source/windows.rs` e `source/macos_fd.rs`
   (Sérgio, 2.1: receber o disco aberto pelo `authopen`), cada bloco com `// SAFETY:` (o teste `unsafe_only_in_allowed_files`

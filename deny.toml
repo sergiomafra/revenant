@@ -10,6 +10,8 @@ allow = [
     "Unlicense",
     "CC0-1.0",
     "BSL-1.0",
+    # MPL-2.0 only for unmodified runtime dependencies (Sergio, 2026-11-03; spec 2.1 design).
+    "MPL-2.0",
 ]
 
 [licenses.private]

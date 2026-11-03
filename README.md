@@ -59,4 +59,6 @@ saved scans.
 
 Issues and pull requests are welcome. Everything in the repository (code, comments, commits, docs) is in English. Before
 opening a pull request, run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test --workspace`.
-Dependencies must be under permissive licenses (see `deny.toml`).
+Dependencies that ship inside the app must be under permissive licenses, or MPL-2.0 if unmodified (see `deny.toml`;
+`node scripts/check-npm-licenses.mjs app` checks the npm side). Build-only npm tools may use any open license except
+GPL and AGPL.
