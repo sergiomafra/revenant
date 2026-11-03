@@ -9,7 +9,7 @@ App gratuito (GPL-3.0) para Mac e Windows que recupera fotos e vídeos de cartõ
 **02/11/2026.** Módulo 1 (motor) concluído: Partes 1.1 a 1.6 mergeadas (PRs #1 a #7). Decisões e o que ficou para
 depois de cada parte em `docs/superpowers/history/`; roteiros manuais com hardware (do Sérgio, ainda a fazer) em
 `2026-10-25-m1-p5-conferencia-manual.md` e `2026-11-02-m1-p6-conferencia-manual.md`. Marco A fechado. Módulo 2,
-Parte 2.0 (telas e identidade) concluída na branch `feat/m2-p0-screens`, aguardando a aprovação do Sérgio e o PR:
+Parte 2.0 (telas e identidade) concluída e aprovada pelo Sérgio (03/11/2026), PR aberto na branch `feat/m2-p0-screens`:
 mockups em `docs/superpowers/mockups/m2/`, logo e ícone em `assets/brand/`. Próxima: 2.1. Roteiro até a 1.0: `docs/superpowers/roadmap.md`. MSRV: Rust 1.88. CLI de desenvolvimento: `revenant-dev`
 (`bench` mede a velocidade).
 Amostras reais de câmera (CC0, nunca no repositório): `scripts/fetch-samples.sh` + teste ignorado `real_samples`.

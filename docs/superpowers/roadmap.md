@@ -81,7 +81,7 @@ subagentes e um PR. Quem faz o merge é o Sérgio. A documentação é atualizad
 
 ## Módulo 2: App (Tauri 2 + React; telas aprovadas antes de cada parte)
 
-- **2.0, telas e identidade, concluída (aguardando a aprovação do Sérgio e o PR):**
+- **2.0, telas e identidade, concluída** (aprovada pelo Sérgio em 03/11/2026; PR #8):
   - Mockups clicáveis, na horizontal, em claro e escuro, das 13 telas: `docs/superpowers/mockups/m2/` (abrir o
     `index.html`, que liga as telas às partes e aos códigos do motor). Regras conferidas por
     `node scripts/check-mockups.mjs`; capturas de cada estado por `bash scripts/shoot-mockups.sh`.
