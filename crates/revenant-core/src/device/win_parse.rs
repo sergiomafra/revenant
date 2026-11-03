@@ -189,8 +189,8 @@ pub(crate) fn disks(
     Some(out)
 }
 
-/// How a disk is connected, from the `STORAGE_BUS_TYPE` of its descriptor: USB (7), SD (12) and MMC (13); a disk already
-/// marked internal is `Internal`.
+/// How a disk is connected, from the `STORAGE_BUS_TYPE` of its descriptor: USB (7), SD (12) and MMC (13), even on a disk marked
+/// internal; any other disk already marked internal is `Internal`.
 pub(crate) fn connection_from_bus_type(bus: i32, internal: bool) -> Connection {
     match bus {
         7 => Connection::Usb,
@@ -348,17 +348,6 @@ pub(crate) fn unmount_outcome(results: &[(String, Result<(), i32>)]) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn connection_from_bus_type_maps_the_bus() {
-        assert_eq!(connection_from_bus_type(7, false), Connection::Usb);
-        assert_eq!(connection_from_bus_type(12, false), Connection::SdCard);
-        assert_eq!(connection_from_bus_type(13, false), Connection::SdCard);
-        assert_eq!(connection_from_bus_type(11, true), Connection::Internal);
-        assert_eq!(connection_from_bus_type(17, true), Connection::Internal);
-        assert_eq!(connection_from_bus_type(11, false), Connection::Unknown);
-        assert_eq!(connection_from_bus_type(0, false), Connection::Unknown);
-    }
-
     use super::*;
 
     fn id(s: &str) -> DiskId {
@@ -714,5 +703,18 @@ mod tests {
             3,
             "unknown volumes are never guessed onto a disk"
         );
+    }
+
+    #[test]
+    fn connection_from_bus_type_maps_the_bus() {
+        assert_eq!(connection_from_bus_type(7, false), Connection::Usb);
+        assert_eq!(connection_from_bus_type(12, false), Connection::SdCard);
+        assert_eq!(connection_from_bus_type(13, false), Connection::SdCard);
+        assert_eq!(connection_from_bus_type(12, true), Connection::SdCard);
+        assert_eq!(connection_from_bus_type(13, true), Connection::SdCard);
+        assert_eq!(connection_from_bus_type(11, true), Connection::Internal);
+        assert_eq!(connection_from_bus_type(17, true), Connection::Internal);
+        assert_eq!(connection_from_bus_type(11, false), Connection::Unknown);
+        assert_eq!(connection_from_bus_type(0, false), Connection::Unknown);
     }
 }

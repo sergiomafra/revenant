@@ -165,7 +165,8 @@ stdout is pure JSON, one object per line; progress goes to stderr as human-reada
 Other commands:
 
 - `disks`: one line per connected whole disk (sorted by id); `vendor`, `model`, `serial` and a volume's `fs`, `label` and
-  `mount_point` are left out when the system does not know them, `solid_state` is `null` when it does not say, and `connection` (`usb`, `sd_card`, `thunderbolt`, `internal` or `unknown`) is always there:
+  `mount_point` are left out when the system does not know them, `solid_state` is `null` when it does not say, and
+  `connection` (`usb`, `sd_card`, `thunderbolt`, `internal` or `unknown`) is always there:
 
   ```json
   {"event":"disk","id":"disk4","size":63864569856,"logical_sector":512,"physical_sector":512,"vendor":"Generic","model":"SD Card Reader","serial":"000000000820","removable":true,"internal":false,"connection":"usb","system":false,"virtual":false,"solid_state":null,"volumes":[{"id":"disk4s1","fs":"exfat","label":"CARD","mount_point":"/Volumes/CARD","size":63847792640}]}

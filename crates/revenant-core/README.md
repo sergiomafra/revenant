@@ -114,9 +114,10 @@ Windows; elsewhere every call is `unsupported_platform`). `destination` needs no
 
 `connection` is a `Connection` (`Usb`, `SdCard`, `Thunderbolt`, `Internal`, `Unknown`; `code()` gives `usb`, `sd_card`,
 `thunderbolt`, `internal`, `unknown`): macOS reads `BusProtocol` of `diskutil info` (`USB`, `Secure Digital`,
-`Thunderbolt`; an `Internal` disk is `Internal` whatever the protocol), Windows reads the `BusType` already queried
-(USB, SD and MMC; a disk marked internal is `Internal`). `device::looks_like_camera_card(&DiskInfo)` is `true` when a
-mounted volume has a `DCIM` folder (any letter case) at its root: it only lists the mounted folder and never opens the disk.
+`Thunderbolt`), Windows reads the `BusType` already queried (USB, SD and MMC). An SD or MMC card is `SdCard` even in a
+built-in slot that the system calls internal; any other disk marked internal is `Internal` whatever its protocol.
+`device::looks_like_camera_card(&DiskInfo)` is `true` when a mounted volume has a `DCIM` folder (any letter case) at
+its root: it only lists the mounted folder and never opens the disk.
 
 - macOS: the whole disks of `diskutil list -plist`, each completed by `diskutil info -plist` of the disk and of each of
   its partitions, plus one `ioreg -a -r -c IOBlockStorageDevice -l` (vendor, product, serial, physical sector). APFS

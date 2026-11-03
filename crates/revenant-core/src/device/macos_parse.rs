@@ -228,15 +228,17 @@ pub(crate) fn disks(
     Some(out)
 }
 
-/// How a disk is connected, from `diskutil info`'s `BusProtocol`. A disk built into the computer is `Internal` whatever
-/// its protocol says.
+/// How a disk is connected, from `diskutil info`'s `BusProtocol`. `Secure Digital` is always an SD card (a built-in
+/// slot reports `Internal`); any other disk built into the computer is `Internal` whatever its protocol says.
 pub(crate) fn connection_from_bus_protocol(protocol: Option<&str>, internal: bool) -> Connection {
+    if protocol == Some("Secure Digital") {
+        return Connection::SdCard;
+    }
     if internal {
         return Connection::Internal;
     }
     match protocol {
         Some("USB") => Connection::Usb,
-        Some("Secure Digital") => Connection::SdCard,
         Some("Thunderbolt") => Connection::Thunderbolt,
         _ => Connection::Unknown,
     }
@@ -350,22 +352,6 @@ pub(crate) fn unmount_result(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn connection_from_bus_protocol_maps_the_bus() {
-        let c = |p: Option<&str>, internal| connection_from_bus_protocol(p, internal);
-        assert_eq!(c(Some("USB"), false), Connection::Usb);
-        assert_eq!(c(Some("Secure Digital"), false), Connection::SdCard);
-        assert_eq!(c(Some("Thunderbolt"), false), Connection::Thunderbolt);
-        for p in ["PCI-Express", "SATA", "Apple Fabric"] {
-            assert_eq!(c(Some(p), true), Connection::Internal, "{p}");
-        }
-        assert_eq!(c(Some("USB"), true), Connection::Internal);
-        assert_eq!(c(Some("Secure Digital"), true), Connection::Internal);
-        assert_eq!(c(None, false), Connection::Unknown);
-        assert_eq!(c(Some("Fibre Channel"), false), Connection::Unknown);
-        assert_eq!(c(None, true), Connection::Internal);
-    }
-
     use super::super::plist::parse;
     use super::*;
 
@@ -689,5 +675,22 @@ mod tests {
             unmount_result(true, &unmounted, &id("disk7")),
             Err(Vec::new())
         );
+    }
+
+    #[test]
+    fn connection_from_bus_protocol_maps_the_bus() {
+        let c = |p: Option<&str>, internal| connection_from_bus_protocol(p, internal);
+        assert_eq!(c(Some("USB"), false), Connection::Usb);
+        assert_eq!(c(Some("Secure Digital"), false), Connection::SdCard);
+        assert_eq!(c(Some("Thunderbolt"), false), Connection::Thunderbolt);
+        for p in ["PCI-Express", "SATA", "Apple Fabric"] {
+            assert_eq!(c(Some(p), true), Connection::Internal, "{p}");
+        }
+        assert_eq!(c(Some("USB"), true), Connection::Internal);
+        // A built-in SD slot is Internal, yet the card is an SD card.
+        assert_eq!(c(Some("Secure Digital"), true), Connection::SdCard);
+        assert_eq!(c(None, false), Connection::Unknown);
+        assert_eq!(c(Some("Fibre Channel"), false), Connection::Unknown);
+        assert_eq!(c(None, true), Connection::Internal);
     }
 }
